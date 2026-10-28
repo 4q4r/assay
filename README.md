@@ -37,6 +37,7 @@
 - [🔒 Security Model](#-security-model)
 - [⚠️ Landmine Warnings](#️-landmine-warnings)
 - [⚙️ Configuration](#️-configuration)
+- [📋 Config resolution (`-c` is optional)](#️-config-resolution--c-is-optional)
 - [✅ Testing](#-testing)
 - [🗺️ Roadmap](#️-roadmap)
 
@@ -264,7 +265,7 @@ public_vpn/
 
 ## ⚡ Quick Start
 
-1. **Create `config.toml`** — start from [`config.example.toml`](config.example.toml) (sanitized defaults + schema comments; the real config is gitignored): copy it, set `data_dir` and your real `template`/`target` paths, review the `[plugins]` dir (the built-in Lua sources materialize there on first run — see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5).
+1. **Create `config.toml`** — start from [`config.example.toml`](config.example.toml) (sanitized defaults + schema comments; the real config is gitignored): copy it, set `data_dir` and your real `template`/`target` paths, review the `[plugins]` dir (the built-in Lua sources materialize there on first run — see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5). The config is **optional**: without it every data stage runs configless on built-in defaults (see [Config resolution](#️-config-resolution--c-is-optional)) — the file is required for `render`/`activate` and for `install`.
 2. **`publicvpn fetch`** — run the Lua source plugins and cache their raw links.
 3. **`publicvpn parse`** — decode the cached bodies into normalized node records.
 4. **`publicvpn filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
@@ -286,10 +287,12 @@ public_vpn/
 
 ```bash
 go build -o publicvpn ./cmd/publicvpn
-./publicvpn install -c /absolute/path/to/config.toml   # config is required: the unit embeds its path
+./publicvpn install                              # uses ~/.config/publicvpn/config.toml when it exists
+./publicvpn install -c /absolute/path/to/config.toml   # explicit path wins; must exist
 ```
 
-- **install never creates or moves config files** — the unit references the path you pass; keep that file in place.
+- **The config resolves install-style** (the unit embeds its path): explicit `-c` wins; else the home default `~/.config/publicvpn/config.toml` when present; otherwise install fails loud with guidance. The cwd default (`./config.toml`) is deliberately ignored by install — a daemon unit must reference a stable location. The rendered unit carries the resolved absolute path.
+- **install never creates or moves config files** — the unit references the resolved path; keep that file in place.
 - **No user systemd session?** install fails loud with an actionable message; pass `--no-systemd` to copy the binary only (unit skipped, documented in the output).
 - **`publicvpn uninstall`** — the symmetric teardown: disables the daemon (and any legacy timers still present) → removes every known unit file (current + the W5-era names) → `daemon-reload` → report. User data (config, data dir, installed binary) is **kept by default**; `--purge` (explicit, destructive) also removes the config file and `[data_dir]` — and nothing else, in particular nothing xray-raw.
 - **`publicvpn status`** — install state: installed binary, the watch unit, its enablement (read-only filesystem inspection), and a `LEGACY:` hint while old timer units survive. **Default dirs only:** detection reads `~/.local/bin` and `~/.config/systemd/user` — custom `--bin-dir`/`--unit-dir` installs are not tracked (`status` keeps no state file, by design).
@@ -302,6 +305,7 @@ go build -o publicvpn ./cmd/publicvpn
 - **wave scheduler** — refresh waves every `[maintain].refresh_interval` (**default 1h since W10**), speedtest waves every `[maintain].speedtest_interval` (the speedtest tick runs the full wave with `-S` and covers the refresh); waves re-arm from completion, so they never overlap; the **first wave runs immediately** at start;
 - **stats poll** — inside every wave (the existing stage cadence);
 - **broken-plugin waves** — one dead provider never kills a refresh: per-plugin failures are loud, the healthy plugins carry the wave;
+- **configless boot** — the daemon runs fine with no config file at all: data stages work from the built-in defaults (plugins dir under `~/.local/share/publicvpn/plugins`), while the render/activate stages fail loud at their boundary once per wave and the schedule keeps re-arming — the same wave-continues semantics as a broken plugin; stats accounting logs an INFO and skips;
 - **graceful shutdown** — `SIGINT`/`SIGTERM` finish the current stage, flush, exit `0` (the unit's `Restart=always` is for crashes, not for config reloads).
 
 ```toml
@@ -350,6 +354,27 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 | `[maintain]` | wave schedule (the watch daemon reads it live) | `prune_dead_after` (default `48h`), `refresh_interval` (default **`1h`** since W10), `speedtest_interval` (default `168h`), `stats_timeout` (default `10s`), `prune_backup_keep` (`0` = unlimited) |
 
 **Validation policy (owner ruling, binding):** the 5-minute floor applies **ONLY** to `[maintain].refresh_interval` / `speedtest_interval` (W5, owner-approved). Every W6 knob (`cache_max_age`, `test_timeout`, `skip_fresh_within`, `stats_timeout`, `observatory_interval`, `tcp_max_seg`, `tls_fingerprint`, `balancer_tolerance`, `tie_band_rtt_tolerance`, `pool_inbound_tags`, `api_base`, `raw_base`, `user_agent`, `service_name`, `backup_keep`, `prune_backup_keep`) is **deliberately unbounded** — the only structural checks are value parsing, rejection of negative numbers (sign correctness), and the per-knob `0` semantics documented above. Values the xray core rejects fail the `-test` gate loud. Defaults preserve the pre-W6 behavior byte-for-byte.
+
+## 📋 Config resolution (`-c` is optional)
+
+The CLI does not require a config path. `-c/--config` is optional on every command, and exactly **one** source wins whole — there is no merging, ever. The first existing file in this order IS the configuration:
+
+| Precedence | Source | Behavior |
+| :-- | :-- | :-- |
+| 1 | `-c <path>` (explicit) | wins **always**; the file must exist — a missing explicit path fails loud naming the path (no silent fall-through) |
+| 2 | `~/.config/publicvpn/config.toml` | used when it exists (the home default) |
+| 3 | `./config.toml` | used when it exists (keeps the repo/owner operational workflow working) |
+| 4 | nothing found | **configless run** — built-in defaults (`data_dir = $XDG_DATA_HOME/publicvpn` when the env var is set, else `~/.local/share/publicvpn`; every other knob at its documented default; the plugins dir defaults under `data_dir`, so the embedded Lua sources materialize there on first run) |
+
+Every command prints the resolved source as a `config:` line (`explicit -c <path>` / `home default <path>` / `cwd default <path>` / `configless (built-in defaults)`), and `status` carries the same line.
+
+**What works without any config file** (pure defaults, out of the box): `fetch`, `parse`, `filter`, `probe`, `geo`, `select`, `check`, `list`, `status`, and the `watch` daemon's data stages. Stage commands that find no pipeline data yet fail with their normal loud "run the previous stage first" messages — that is data flow, not configuration.
+
+**What REQUIRES a config (loud stage boundaries):**
+
+- **`render`** needs a configured `[render].template`; **`activate`** needs a configured `[activate].target`. A configless run fails at the stage boundary — `configless mode cannot render — provide -c or a config at ~/.config/publicvpn/config.toml` (same wording for activate) — instead of silently defaulting those paths at the live client's config. Inside `maintain`/`watch` waves the boundary ends the wave loud while every earlier stage stays flushed and usable.
+- **`install`** (and `uninstall --purge`) always needs a resolvable config — the daemon unit embeds the path — but resolves it install-style: explicit `-c` wins; else the **home default** when present; else loud with guidance. The **cwd default is deliberately not consulted** here: a unit must reference a stable location, never the directory the operator happened to stand in. With the home default, the unit carries the resolved absolute path.
+- **`stats` accounting** (inside waves) degrades to INFO in configless mode (`no activate.target — stats accounting unavailable`) and the wave continues — accounting is never correctness.
 
 ## ✅ Testing
 

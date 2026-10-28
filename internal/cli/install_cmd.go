@@ -27,6 +27,12 @@ func resolveExecutable() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
+// installExecutor is the systemctl seam at the command level: production
+// wires the allowlisted SystemctlExecutor; tests inject a recorder so the
+// cobra-level install flow never executes systemd (same pattern as
+// signalChannel in watch_cmd.go).
+var installExecutor = func() install.Executor { return install.SystemctlExecutor{} }
+
 func newInstallCommand(cfgPath *string) *cobra.Command {
 	var (
 		binDir    string
@@ -49,17 +55,25 @@ scheduler; [maintain].refresh_interval / [maintain].speedtest_interval and
 restart of the unit, never a re-install. Legacy W5 timer units
 (public_vpn-refresh/speedtest.*) still on disk are disabled and removed by
 this install: waves fire from exactly ONE scheduler. Config files are NEVER
-created or moved: the unit references the --config path you pass, so it must
+created or moved: the unit references the resolved --config path, so it must
 be absolute or ~-expanded and must stay in place.
+
+Install REQUIRES a resolvable config (the unit embeds its path): an explicit
+-c wins and must exist; otherwise the home default
+(~/.config/publicvpn/config.toml) is used when present; otherwise install
+fails loud with guidance. The CWD default (./config.toml) is deliberately
+NOT consulted — a daemon unit must reference a stable location, never the
+directory the operator happened to stand in.
 
 --no-systemd installs the binary only (hosts without a systemd user session;
 the unit is skipped).`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveInstallPath(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runInstall(cmd.OutOrStdout(), cfg, *cfgPath, installOptions{
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runInstall(cmd.OutOrStdout(), res.Config, res.Path, installOptions{
 				binDir:    binDir,
 				unitDir:   unitDir,
 				noSystemd: noSystemd,
@@ -118,7 +132,7 @@ func runInstall(w io.Writer, _ *config.Config, cfgPath string, opts installOptio
 	}
 	executor := opts.exec
 	if executor == nil {
-		executor = install.SystemctlExecutor{}
+		executor = installExecutor()
 	}
 	res, err := install.Install(install.Options{
 		BinDir:        binDir,
@@ -165,18 +179,33 @@ manager (so it drops its not-found entries for the removed units), and
 reports. The installed binary and all user data are KEPT by default.
 
 --purge is DESTRUCTIVE and must be passed explicitly: it also removes the
-config file (-c) and the pipeline data dir ([data_dir]). It never touches
-anything outside those two paths — in particular nothing xray-raw.`,
+config file and the pipeline data dir ([data_dir]). It never touches
+anything outside those two paths — in particular nothing xray-raw. The
+config resolves the same way install does (explicit -c, else the home
+default; never the cwd default): a purge must never depend on the caller's
+working directory.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			var cfg *config.Config
+			var res *config.Resolved
 			if purge {
 				var err error
-				cfg, err = load(*cfgPath)
+				res, err = resolveInstallPath(*cfgPath)
 				if err != nil {
-					return fmt.Errorf("--purge needs the config (-c) to resolve the data dir: %w", err)
+					return fmt.Errorf("--purge needs the config: %w", err)
 				}
+				reportConfigSource(cmd.OutOrStdout(), res)
 			}
-			return runUninstall(cmd.OutOrStdout(), cfg, *cfgPath, uninstallOptions{
+			var cfg *config.Config
+			if res != nil {
+				cfg = res.Config
+			}
+			// C-1: res is nil on the non-purge path — only --purge resolves a
+			// config. cfgPath must stay "" there (runUninstall's purge branch
+			// is the only consumer), never a nil dereference.
+			var cfgPath string
+			if res != nil {
+				cfgPath = res.Path
+			}
+			return runUninstall(cmd.OutOrStdout(), cfg, cfgPath, uninstallOptions{
 				unitDir: unitDir,
 				purge:   purge,
 			})
@@ -205,7 +234,7 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	}
 	executor := opts.exec
 	if executor == nil {
-		executor = install.SystemctlExecutor{}
+		executor = installExecutor()
 	}
 	uo := install.UninstallOptions{UnitDir: unitDir, Exec: executor}
 	if opts.purge {
@@ -305,7 +334,12 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
 		}
 	}
 	if present > 0 {
-		outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate\n",
-			present, cfgPath)
+		if cfgPath != "" {
+			outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate\n",
+				present, cfgPath)
+		} else {
+			outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install` "+
+				"with a config (-c or %s) to migrate\n", present, config.HomeConfigDisplay)
+		}
 	}
 }

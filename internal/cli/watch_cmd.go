@@ -41,17 +41,24 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
     errors); a single plugin run is additionally bounded by
     [plugins].run_timeout (a hanging plugin is abandoned loud, the wave
     proceeds);
+  - configless boot (no -c, no home/cwd config) is supported: the daemon
+    runs from the built-in defaults with the plugins dir under the XDG data
+    dir (~/.local/share/publicvpn/plugins); the render/activate stages fail
+    loud at their boundary each wave (logged once per wave) while every
+    other stage keeps working — the same wave-continues semantics as a
+    broken plugin;
   - under the Type=notify unit the daemon sends READY=1 on start and pings
     WATCHDOG=1 every WatchdogSec/2 — a wedged daemon stops pinging and
     systemd kills + restarts it; without NOTIFY_SOCKET (no systemd) this is
     a no-op;
   - SIGINT/SIGTERM: finish the current stage, flush, exit 0.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runWatch(cmd.OutOrStdout(), cfg, defaultWatchDeps())
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runWatch(cmd.OutOrStdout(), res.Config, defaultWatchDeps())
 		},
 	}
 }

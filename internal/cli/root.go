@@ -4,8 +4,6 @@
 package cli
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 
 	"public_vpn/internal/config"
@@ -25,8 +23,10 @@ func New() *cobra.Command {
 			HiddenDefaultCmd: true,
 		},
 	}
-	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "config.toml",
-		"path to the TOML configuration file (single source of truth — no env vars)")
+	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "",
+		"path to the TOML configuration file (optional — resolution: this path, else "+
+			config.HomeConfigDisplay+", else ./config.toml, else built-in defaults; "+
+			"one file wins whole, nothing is ever merged)")
 
 	root.AddCommand(
 		newFetchCommand(&cfgPath),
@@ -46,18 +46,6 @@ func New() *cobra.Command {
 		newCheckCommand(&cfgPath),
 	)
 	return root
-}
-
-// load is the shared config loader with loud failure.
-func load(path string) (*config.Config, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := os.Stat(abs); err != nil {
-		return nil, fmt.Errorf("config not found at %s (pass -c /path/to/config.toml)", abs)
-	}
-	return config.Load(abs)
 }
 
 // stage paths derived from the config data dir.

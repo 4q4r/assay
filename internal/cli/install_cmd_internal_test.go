@@ -47,6 +47,14 @@ speedtest_interval = %q
 	return cfgPath
 }
 
+// explicitResolved wraps a loaded config as an explicit-source resolution —
+// the direct-call seam the runStatus tests use (the cobra-level resolution
+// itself is pinned in resolve_internal_test.go).
+func explicitResolved(t *testing.T, cfgPath string) *config.Resolved {
+	t.Helper()
+	return &config.Resolved{Config: mustLoad(t, cfgPath), Source: config.SourceExplicit, Path: cfgPath}
+}
+
 // TestRunInstallEndToEnd renders the units from config intervals into a fake
 // HOME and verifies the exact systemctl sequence — the mocked integration
 // gate for the whole install surface (never executes systemctl).
@@ -202,6 +210,32 @@ func TestRunUninstallDisablesAndRemoves(t *testing.T) {
 	}
 }
 
+// TestUninstallWithoutPurgeCobraLevel pins the C-1 regression at the cobra
+// seam: plain `uninstall` (no --purge) must exit 0 with the teardown report.
+// The suite missed the nil-pointer panic because every earlier uninstall
+// test called runUninstall directly — the cobra RunE (where the purge-less
+// path left res nil and dereferenced res.Path) is exactly the point.
+func TestUninstallWithoutPurgeCobraLevel(t *testing.T) {
+	env := newHermeticEnv(t)
+	// Hermetic user-session probe (uninstall's disable flow checks it).
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(env.home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(env.home, "run", "systemd"), 0o755))
+
+	ex := &fakeCtl{}
+	orig := installExecutor
+	installExecutor = func() install.Executor { return ex }
+	t.Cleanup(func() { installExecutor = orig })
+
+	root := newTestRoot()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"uninstall"})
+	require.NoError(t, root.Execute(), "plain uninstall must succeed; output:\n%s", buf.String())
+	assert.Contains(t, buf.String(), "unit absent", "the teardown report must list the known units")
+	assert.Contains(t, buf.String(), "user data kept (config, data dir, installed binary)")
+}
+
 func TestRunUninstallPurgeRequiresConfig(t *testing.T) {
 	// The runner itself must refuse (not just the cobra layer): a purge
 	// without the config cannot resolve the data dir — and must never fall
@@ -253,7 +287,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	status := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(status)
-	require.NoError(t, runStatus(cmd, mustLoad(t, cfgPath), cfgPath))
+	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	out := status.String()
 	assert.Contains(t, out, "install:")
 	assert.Contains(t, out, "binary:    "+filepath.Join(binDir, "publicvpn"))
@@ -266,7 +300,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	// Legacy units on disk get the migration hint.
 	require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.RefreshTimer), []byte("[Unit]\n"), 0o644))
 	status.Reset()
-	require.NoError(t, runStatus(cmd, mustLoad(t, cfgPath), cfgPath))
+	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	assert.Contains(t, status.String(), "LEGACY:", "old timer units must be flagged for migration")
 	assert.Contains(t, status.String(), "re-run `publicvpn install")
 }

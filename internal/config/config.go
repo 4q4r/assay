@@ -342,7 +342,7 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	applyDefaults(cfg)
+	applyDefaults(cfg, false)
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -394,15 +394,15 @@ func checkRemovedSections(raw []byte) error {
 	return nil // a lenient-decode failure is the strict decode's problem below
 }
 
-func applyDefaults(c *Config) {
+func applyDefaults(c *Config, configless bool) {
 	applyPluginsDefaults(c)
 	applyFetchDefaults(&c.Fetch)
 	applyFilterDefaults(&c.Filter)
 	applyProbeDefaults(&c.Probe)
 	applyGeoDefaults(&c.Geo)
 	applySelectDefaults(&c.Select)
-	applyRenderDefaults(&c.Render)
-	applyActivateDefaults(&c.Activate)
+	applyRenderDefaults(&c.Render, configless)
+	applyActivateDefaults(&c.Activate, configless)
 	applyMaintainDefaults(&c.Maintain)
 	applyHTTPDefaults(&c.HTTP)
 }
@@ -524,12 +524,15 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-func applyRenderDefaults(r *RenderConfig) {
+func applyRenderDefaults(r *RenderConfig, configless bool) {
 	// Normalize duplicates at the load boundary (M-4): "socks-in" twice must
 	// not render a duplicated inboundTag — first occurrence wins, order is
 	// preserved.
 	r.PoolInboundTags = dedupeStrings(r.PoolInboundTags)
-	if r.Template == "" {
+	// The template default is a FILE-LOADED default only: a configless run
+	// keeps render.template empty so the render stage fails loud at its
+	// boundary instead of silently pointing at the live client's config.
+	if !configless && r.Template == "" {
 		r.Template = "~/projects/xray-raw/config.json"
 	}
 	if r.OutputDir == "" {
@@ -555,8 +558,11 @@ func applyRenderDefaults(r *RenderConfig) {
 	}
 }
 
-func applyActivateDefaults(a *ActivateConfig) {
-	if a.Target == "" {
+func applyActivateDefaults(a *ActivateConfig, configless bool) {
+	// The target default is a FILE-LOADED default only: configless mode
+	// keeps activate.target empty so activation fails loud at its boundary
+	// instead of silently aiming at the live client's config.
+	if !configless && a.Target == "" {
 		a.Target = "~/projects/xray-raw/config.json"
 	}
 	if a.XrayBin == "" {

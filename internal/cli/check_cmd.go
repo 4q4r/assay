@@ -50,11 +50,12 @@ Liveness comes from the LAST probe wave — re-run ` + "`publicvpn probe` + `pub
 geo.ttl.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runCheck(cmd, cfg, args, f)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runCheck(cmd, res.Config, args, f)
 		},
 	}
 	cmd.Flags().StringVar(&f.countries, "countries", "",
