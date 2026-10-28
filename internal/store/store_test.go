@@ -61,6 +61,51 @@ func TestGeoBaseUpsertPreservesFirstSeenAndTag(t *testing.T) {
 	assert.True(t, recs[0].Alive)
 }
 
+// TestUpsertGeoBlankFoldsGeoSource pins the provenance fold rule: geo_source
+// follows the fields it describes — a wave that sets geo fields carries its
+// provenance in, and a wave that leaves the geo fields blank (no evidence)
+// keeps the previous wave's provenance instead of erasing it.
+func TestUpsertGeoBlankFoldsGeoSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "geo-base.jsonl")
+
+	reported := &model.GeoRecord{
+		Source: "s", Scheme: "vless", Host: "h1", Port: 443,
+		Country: "de", City: "Frankfurt am Main", GeoSource: "self-report",
+		FirstSeen: "2026-10-01T00:00:00Z", LastSeen: "2026-10-01T00:00:00Z",
+	}
+	require.NoError(t, store.UpsertGeo(path, []*model.GeoRecord{reported}))
+
+	// A later wave with NO geo evidence (blank geo + blank provenance):
+	// fields AND their provenance survive.
+	unknown := &model.GeoRecord{
+		Source: "s", Scheme: "vless", Host: "h1", Port: 443,
+		FirstSeen: "2026-10-02T00:00:00Z", LastSeen: "2026-10-02T00:00:00Z",
+		LastProbe: "2026-10-02T01:00:00Z", RTTMs: 90, Alive: true,
+	}
+	require.NoError(t, store.UpsertGeo(path, []*model.GeoRecord{unknown}))
+	recs, err := store.ReadGeo(path)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	assert.Equal(t, "self-report", recs[0].GeoSource, "provenance survives a no-evidence wave with the fields it describes")
+	assert.Equal(t, "de", recs[0].Country)
+
+	// A wave with FRESH evidence overwrites both: the fields describe the
+	// fallback's evidence, and the provenance says so.
+	fallback := &model.GeoRecord{
+		Source: "s", Scheme: "vless", Host: "h1", Port: 443,
+		Country: "nl", City: "Amsterdam", GeoSource: "doh-fallback",
+		FirstSeen: "2026-10-03T00:00:00Z", LastSeen: "2026-10-03T00:00:00Z",
+		LastProbe: "2026-10-03T01:00:00Z", RTTMs: 91, Alive: true,
+	}
+	require.NoError(t, store.UpsertGeo(path, []*model.GeoRecord{fallback}))
+	recs, err = store.ReadGeo(path)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	assert.Equal(t, "doh-fallback", recs[0].GeoSource, "fresh evidence overwrites fields and provenance together")
+	assert.Equal(t, "nl", recs[0].Country)
+}
+
 func TestGeoIdentityIsSchemeHostPort(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "geo-base.jsonl")

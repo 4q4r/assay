@@ -156,27 +156,33 @@ func (n *Node) ssLink() string {
 // GeoRecord is the DESIGN.md §5 cold-base record. The JSON field set is a
 // regression contract with geo-base.jsonl on disk.
 type GeoRecord struct {
-	Tag         string  `json:"tag"`
-	Source      string  `json:"source"`
-	Scheme      string  `json:"scheme"`
-	Host        string  `json:"host"`
-	Port        int     `json:"port"`
-	IP          string  `json:"ip"`
-	Country     string  `json:"country"`
-	City        string  `json:"city"`
-	ASN         string  `json:"asn"`
-	ASName      string  `json:"asname"`
-	ISP         string  `json:"isp"`
-	ProxyFlag   bool    `json:"proxy_flag"`
-	HostingFlag bool    `json:"hosting_flag"`
-	FirstSeen   string  `json:"first_seen"`
-	LastSeen    string  `json:"last_seen"`
-	LastProbe   string  `json:"last_probe"`
-	RTTMs       float64 `json:"rtt_ms"`
-	SpeedBPS    int64   `json:"speed_bps"`
-	Alive       bool    `json:"alive"`
-	BytesUp     int64   `json:"bytes_up"`
-	BytesDown   int64   `json:"bytes_down"`
+	Tag         string `json:"tag"`
+	Source      string `json:"source"`
+	Scheme      string `json:"scheme"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	IP          string `json:"ip"`
+	Country     string `json:"country"`
+	City        string `json:"city"`
+	ASN         string `json:"asn"`
+	ASName      string `json:"asname"`
+	ISP         string `json:"isp"`
+	ProxyFlag   bool   `json:"proxy_flag"`
+	HostingFlag bool   `json:"hosting_flag"`
+	// GeoSource marks the provenance of the geo fields: "self-report" (the
+	// node answered ip-api through its own tunnel — the strongest exit-geo
+	// evidence), "doh-fallback" (the through-tunnel DoH view, indirect), or
+	// "" (no geo evidence in the wave that last set the fields). Old
+	// batch-era records read as "".
+	GeoSource string  `json:"geo_source"`
+	FirstSeen string  `json:"first_seen"`
+	LastSeen  string  `json:"last_seen"`
+	LastProbe string  `json:"last_probe"`
+	RTTMs     float64 `json:"rtt_ms"`
+	SpeedBPS  int64   `json:"speed_bps"`
+	Alive     bool    `json:"alive"`
+	BytesUp   int64   `json:"bytes_up"`
+	BytesDown int64   `json:"bytes_down"`
 }
 
 // ApplyProbe merges a probe wave outcome into the cold record.

@@ -42,14 +42,17 @@ const (
 	instanceLogBuffers = 8 * 1024
 )
 
-// newXrayFactory returns the production InstanceFactory: each node gets a
+// NewXrayFactory returns the production InstanceFactory: each node gets a
 // temporary single-node xray instance (managed binary) — a socks inbound on a
 // free 127.0.0.1 18xxx port plus the node's outbound built by the SAME
 // render.BuildOutbound the live renderer uses, carrying the SAME hardening
 // knobs (one builder, no drift): tcp_max_seg is emitted mandatorily and the
 // TLS fingerprint is applied — hardening IS uniform across live and temp.
 // Nothing here ever touches the live client, its config, or geo-base.
-func newXrayFactory(xrayBin, workDir string, knobs render.Config) InstanceFactory {
+//
+// Exported for the W11 geo stage: the per-node self-report piggybacks on ONE
+// such instance per node (the CLI wires this factory into geo.Input.Factory).
+func NewXrayFactory(xrayBin, workDir string, knobs render.Config) InstanceFactory {
 	return func(ctx context.Context, n *model.Node) (SocksInstance, error) {
 		// Zero knobs normalize to the config defaults — a caller passing a
 		// bare render.Config must never get an unhardened temp instance.

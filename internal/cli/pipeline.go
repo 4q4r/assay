@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"public_vpn/internal/activate"
+	"public_vpn/internal/checker"
 	"public_vpn/internal/config"
 	"public_vpn/internal/fetch"
 	"public_vpn/internal/filter"
@@ -513,7 +514,7 @@ func firstNonEmpty(vals ...string) string {
 func newGeoCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "geo",
-		Short: "Geo-enrich alive nodes' tunnel exit IPs via ip-api batch (L6 rate-capped)",
+		Short: "Exit-geo self-report: every alive node asks ip-api through its own tunnel (no aggregate limit)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := load(*cfgPath)
 			if err != nil {
@@ -541,12 +542,26 @@ func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 		return fmt.Errorf("no probe results (%s) — run `publicvpn probe` first (geo keys on exit IPs, D8)",
 			p.probeResults)
 	}
-	records, err := geo.Run(context.Background(), geo.Input{
+	// The self-report piggybacks on the SAME per-node temp-instance
+	// infrastructure the check stage uses (one render.BuildOutbound-hardened
+	// xray per node — no second implementation, no drift). The adapter makes
+	// the structural handoff explicit: checker's instance satisfies geo's
+	// SocksInstance seam 1:1.
+	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
+		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+		TLSFingerprint: cfg.Render.TLSFingerprint,
+	})
+	factory := geo.Factory(func(ctx context.Context, n *model.Node) (geo.SocksInstance, error) {
+		return xrayFactory(ctx, n)
+	})
+	records, summary, err := geo.Run(context.Background(), geo.Input{
 		DataDir:    p.dataDir,
 		Nodes:      nodes,
 		ProbeByKey: probeByKey,
 		Cfg:        cfg.Geo,
 		UserAgent:  cfg.HTTP.UserAgent,
+		Factory:    factory,
+		Progress:   cmd.OutOrStdout(),
 	})
 	if err != nil {
 		return err
@@ -561,8 +576,16 @@ func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 			alive++
 		}
 	}
-	outf(cmd.OutOrStdout(), "geo complete: %d records (%d alive, %d geo-enriched) → %s\n",
-		len(records), alive, withGeo, p.geoBase)
+	outf(cmd.OutOrStdout(),
+		"geo complete: %d eligible nodes — %d self-report, %d doh-fallback, %d unknown "+
+			"(nodes stay usable; geo preserved) → %s\n",
+		summary.Eligible, summary.SelfReport, summary.DoHFallback, summary.Unknown, p.geoBase)
+	if summary.Churn > 0 {
+		outf(cmd.OutOrStdout(),
+			"WARNING: %d node(s) reported an exit IP different from the probe wave "+
+				"(exit churn — geo reflects the freshest tunnel truth)\n", summary.Churn)
+	}
+	outf(cmd.OutOrStdout(), "geo store: %d records (%d alive, %d geo-enriched)\n", len(records), alive, withGeo)
 	return nil
 }
 

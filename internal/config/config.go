@@ -114,14 +114,24 @@ func (p ProbeConfig) IsSpeedtest() bool {
 	return p.Speedtest == nil || *p.Speedtest
 }
 
-// GeoConfig controls ip-api.com batch enrichment (L6: free tier is HTTP-only,
-// 15 batch req/min; 429 risks a 1h ban).
+// GeoConfig controls the geo stage (W11 self-report design): every alive
+// node asks ip-api THROUGH ITS OWN TUNNEL (`http://ip-api.com/json/` with no
+// ip parameter — the response IS that node's exit geo), so the requests
+// originate from thousands of distinct node IPs and ip-api's per-source
+// budget never pools — the old aggregate batch clamp (endpoint/batch_size/
+// per_minute, retired loud) is gone in principle. Nodes whose self-report
+// fails fall back to the through-tunnel DoH view (o-o.myaddr TXT → the exit
+// network's resolver IP → ip-api single-IP lookup through the same tunnel);
+// geo.doh_url configures the DoH endpoint.
 type GeoConfig struct {
-	Endpoint  string   `toml:"endpoint"`
-	BatchSize int      `toml:"batch_size"`
-	PerMinute int      `toml:"per_minute"`
-	TTL       Duration `toml:"ttl"`
-	Timeout   Duration `toml:"timeout"`
+	// DoHURL is the DoH endpoint the fallback queries THROUGH the tunnel.
+	// Must be https (DoH is a TLS protocol — structural check, not a range
+	// bound). Default: DefaultDoHURL.
+	DoHURL string   `toml:"doh_url"`
+	TTL    Duration `toml:"ttl"`
+	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
+	// (self-report and each fallback hop alike).
+	Timeout Duration `toml:"timeout"`
 }
 
 // SelectConfig controls the ranking caps (D7): countries unlimited,
@@ -258,6 +268,10 @@ const (
 	DefaultBalancerTolerance   = 0.2
 	DefaultTieBandRTTTolerance = 1.2
 	DefaultServiceName         = "xray-raw.service"
+	// DefaultDoHURL is the [geo].doh_url default: the DoH endpoint the geo
+	// fallback queries through the tunnel (the same endpoint the checker's
+	// doh-via-exit view uses — one DoH host across the pipeline).
+	DefaultDoHURL = "https://dns.google/resolve"
 	// DefaultPluginRunTimeout bounds one plugin's whole fetch run (the
 	// [plugins].run_timeout default): generous enough for a nested
 	// multi-subscription fetch, small enough that a hung plugin wastes one
@@ -335,9 +349,15 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// checkRemovedSections fails LOUD on the removed [sources.*] layout, naming
-// the exact migration path (W10: the ingest layer is Lua plugins — there is
-// no silent fallback chain from the old section).
+// checkRemovedSections fails LOUD on removed layouts, naming the exact
+// migration path. Two removed generations live here:
+//   - [sources.*] (W10): the ingest layer is Lua plugins — no silent fallback
+//     chain from the old section;
+//   - [geo] batch knobs (W11): the geo stage self-reports per node through
+//     its own tunnel, so geo.endpoint / geo.batch_size / geo.per_minute are
+//     dead — requests originate from thousands of distinct node IPs and the
+//     aggregate limit they clamped cannot pool. The self-report is automatic
+//     (no knob); the surviving knobs are ttl / timeout / doh_url.
 func checkRemovedSections(raw []byte) error {
 	probe := map[string]any{}
 	decodeErr := toml.NewDecoder(strings.NewReader(string(raw))).Decode(&probe)
@@ -350,6 +370,25 @@ func checkRemovedSections(raw []byte) error {
 					"(matin, epodonios, radikal, haker, stintikvpn) materialize into the plugins " +
 					"dir on first run — edit or add .lua files there; a new provider is a new " +
 					".lua file, no Go rebuild")
+		}
+		if geoTable, ok := probe["geo"].(map[string]any); ok {
+			dead := make([]string, 0, 3)
+			for _, key := range []string{"endpoint", "batch_size", "per_minute"} {
+				if _, present := geoTable[key]; present {
+					dead = append(dead, "geo."+key)
+				}
+			}
+			if len(dead) > 0 {
+				return fmt.Errorf(
+					"%s: removed — the geo stage now SELF-REPORTS per node: every alive node asks "+
+						"ip-api (http://ip-api.com/json/, no ip parameter) through its own tunnel, so "+
+						"requests come from thousands of distinct node IPs and the aggregate per-source "+
+						"limit these batch knobs clamped can never pool (W11). The self-report is "+
+						"automatic — there is no replacement knob. Delete the dead key(s) from your "+
+						"[geo] table (keep ttl and timeout; the DoH fallback endpoint is [geo].doh_url, "+
+						"default %s)",
+					strings.Join(dead, ", "), DefaultDoHURL)
+			}
 		}
 	}
 	return nil // a lenient-decode failure is the strict decode's problem below
@@ -438,14 +477,8 @@ func applyProbeDefaults(p *ProbeConfig) {
 }
 
 func applyGeoDefaults(g *GeoConfig) {
-	if g.Endpoint == "" {
-		g.Endpoint = "http://ip-api.com/batch"
-	}
-	if g.BatchSize == 0 {
-		g.BatchSize = 100
-	}
-	if g.PerMinute == 0 {
-		g.PerMinute = 15
+	if g.DoHURL == "" {
+		g.DoHURL = DefaultDoHURL
 	}
 	if g.TTL.Duration == 0 {
 		g.TTL.Duration = 24 * time.Hour
@@ -686,15 +719,11 @@ func validateSelect(s SelectConfig) error {
 }
 
 func validateGeo(g GeoConfig) error {
-	// L6: ip-api free tier is HTTP-only; https on the free endpoint fails.
-	if !strings.HasPrefix(g.Endpoint, "http://") {
-		return fmt.Errorf("geo.endpoint must use plain http (ip-api free tier is HTTP-only), got %q", g.Endpoint)
-	}
-	if g.BatchSize < 1 || g.BatchSize > 100 {
-		return fmt.Errorf("geo.batch_size must be 1..100, got %d", g.BatchSize)
-	}
-	if g.PerMinute < 1 || g.PerMinute > 15 {
-		return fmt.Errorf("geo.per_minute must be 1..15 (free-tier batch limit), got %d", g.PerMinute)
+	// DoH is a TLS protocol: a plain-http doh_url is a config error (the
+	// dns.google/resolve default and every real DoH endpoint serve TLS-only).
+	// Structural scheme check, not a range bound.
+	if !strings.HasPrefix(g.DoHURL, "https://") {
+		return fmt.Errorf("geo.doh_url must use https (DoH is a TLS protocol), got %q", g.DoHURL)
 	}
 	return nil
 }

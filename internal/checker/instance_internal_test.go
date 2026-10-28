@@ -431,7 +431,7 @@ func TestFreeInstancePortSkipsOccupiedAndFailsLoud(t *testing.T) {
 	assert.Contains(t, err.Error(), "no free port")
 }
 
-// M2 test lands with the M2 implementation (newXrayFactory knobs) — see the
+// M2 test lands with the M2 implementation (NewXrayFactory knobs) — see the
 // fix commit; its RED is the build failure against the old 2-arg signature.
 
 // M2: temp outbounds carry the SAME hardening as the live renderer —
@@ -454,7 +454,7 @@ func TestTempOutboundCarriesHardeningKnobs(t *testing.T) {
 			node := model.NewNode("test", "vless", "uuid-1", "tls.example.com", 443, map[string]string{
 				"type": "ws", "path": "/p", "security": "tls", "sni": "tls.example.com",
 			})
-			inst, err := newXrayFactory(fakeBin(t, checkFakeModeServe), workDir, tc.knobs)(context.Background(), node)
+			inst, err := NewXrayFactory(fakeBin(t, checkFakeModeServe), workDir, tc.knobs)(context.Background(), node)
 			require.NoError(t, err)
 			raw, rerr := os.ReadFile(filepath.Join(inst.(*xrayInstance).dir, "config.json"))
 			require.NoError(t, rerr)
