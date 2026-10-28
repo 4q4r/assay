@@ -1,8 +1,8 @@
-// Package install implements `publicvpn install` / `uninstall`: self-install
-// of the running binary plus rendered systemd user units (timers driven by
-// the [maintain] intervals), with the systemctl surface pinned to an exact
-// allowlist. Units are rendered from the repo's systemd/ templates (single
-// source of truth, go:embed).
+// install.go carries the systemctl executor seam of package install (see
+// units.go for the package doc and the install/uninstall flows): the EXACT
+// allowlist of sanctioned invocations (--user, public_vpn-* units only),
+// the command constructors, and the production executor.
+
 package install
 
 import (
@@ -16,22 +16,16 @@ import (
 	"time"
 )
 
-// Unit file base names installed into the user unit directory.
-const (
-	RefreshService   = "public_vpn-refresh.service"
-	RefreshTimer     = "public_vpn-refresh.timer"
-	SpeedtestService = "public_vpn-speedtest.service"
-	SpeedtestTimer   = "public_vpn-speedtest.timer"
-)
+// Unit file base names installed into the user unit directory / cleaned up
+// from older installs live in units.go (WatchService + the legacy timer
+// names).
 
 // userFlag is the mandatory scope of every systemctl invocation: the USER
 // service manager only — the system bus is outside the allowlist by design.
-const userFlag = "--user"
-
-// UnitNames lists the four unit files install renders.
-func UnitNames() []string {
-	return []string{RefreshService, RefreshTimer, SpeedtestService, SpeedtestTimer}
-}
+const (
+	userFlag = "--user"
+	nowFlag  = "--now"
+)
 
 // Executor is the injected seam for systemctl: tests never execute systemd —
 // they record invocations. The production executor validates every call
@@ -40,14 +34,17 @@ type Executor interface {
 	Systemctl(args ...string) error
 }
 
-// allowedCommands is the EXACT set of systemctl invocations the installer may
-// execute. Hard scope (W5 mandate): every invocation carries --user and
-// references ONLY the two public_vpn-* timers; there is no restart, no other
-// unit, no --system, nothing else. Both the code (validateArgs, below) and
-// the guard tests pin this set.
+// allowedCommands is the EXACT set of systemctl invocations the installer
+// may execute. Hard scope (W5 mandate, W10 surface): every invocation
+// carries --user and references ONLY public_vpn-* units; there is no
+// restart of anything else, no --system, nothing else. The legacy-timer
+// disable exists solely for the one-time W5→W10 migration (stale timers
+// must not fire waves concurrently with the daemon). Both the code
+// (validateArgs, below) and the guard tests pin this set.
 var allowedCommands = [][]string{
 	{userFlag, "daemon-reload"},
-	{userFlag, "enable", "--now", RefreshTimer, SpeedtestTimer},
+	{userFlag, "enable", "--now", WatchService},
+	{userFlag, "disable", "--now", WatchService},
 	{userFlag, "disable", "--now", RefreshTimer, SpeedtestTimer},
 }
 
@@ -58,12 +55,16 @@ func cmdDaemonReload() []string {
 	return []string{userFlag, "daemon-reload"}
 }
 
-func cmdEnableTimers() []string {
-	return []string{userFlag, "enable", "--now", RefreshTimer, SpeedtestTimer}
+func cmdEnableWatch() []string {
+	return []string{userFlag, "enable", nowFlag, WatchService}
 }
 
-func cmdDisableTimers() []string {
-	return []string{userFlag, "disable", "--now", RefreshTimer, SpeedtestTimer}
+func cmdDisableWatch() []string {
+	return []string{userFlag, "disable", nowFlag, WatchService}
+}
+
+func cmdDisableLegacyTimers() []string {
+	return []string{userFlag, "disable", nowFlag, RefreshTimer, SpeedtestTimer}
 }
 
 func validateArgs(args []string) error {

@@ -38,10 +38,6 @@ func TestStatusShowsFoldedTraffic(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 `, dir)), 0o600))
 	geoBase := filepath.Join(dir, "geo-base.jsonl")
 	require.NoError(t, os.WriteFile(geoBase, []byte(
@@ -99,10 +95,6 @@ func TestFilterUsesConfigSourceCapAndFlagOverride(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 [filter]
 source_cap = 2
 `, dir)), 0o600))
@@ -176,11 +168,6 @@ func TestStateArtifactsAre0600(t *testing.T) {
 	require.NoError(t, os.WriteFile(tmplPath, []byte(`{}`), 0o600))
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
-enabled = true
 [render]
 template = %q
 `, dir, tmplPath)), 0o600))

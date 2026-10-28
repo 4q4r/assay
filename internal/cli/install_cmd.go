@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"public_vpn/internal/config"
 	"public_vpn/internal/install"
@@ -36,24 +35,25 @@ func newInstallCommand(cfgPath *string) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Self-install: copy the running binary and render + enable the systemd user timers",
+		Short: "Self-install: copy the running binary and render + enable the watch daemon unit",
 		Long: `Copies the RUNNING binary (os.Executable) to --bin-dir as ` + "`publicvpn`" + `
 (atomic write, mode 0755; re-running after a rebuild = self-upgrade), then
-renders the four systemd user units from the repo templates and enables both
-timers:
+renders the watch-daemon unit from the repo template and enables it:
 
   systemctl --user daemon-reload
-  systemctl --user enable --now public_vpn-refresh.timer public_vpn-speedtest.timer
+  systemctl --user enable --now public_vpn-watch.service
 
-The timers' recheck periods come from [maintain].refresh_interval /
-[maintain].speedtest_interval (rendered as OnBootSec + OnUnitActiveSec, so
-any duration works). Changing a period = edit the config and re-run install
-(idempotent). Config files are NEVER created or moved: the units reference
-the --config path you pass, so it must be absolute or ~-expanded and must
-stay in place.
+The daemon (publicvpn watch) runs the plugin watchdog and the maintain-wave
+scheduler; [maintain].refresh_interval / [maintain].speedtest_interval and
+[plugins].dir are read from the config LIVE — changing them needs only a
+restart of the unit, never a re-install. Legacy W5 timer units
+(public_vpn-refresh/speedtest.*) still on disk are disabled and removed by
+this install: waves fire from exactly ONE scheduler. Config files are NEVER
+created or moved: the unit references the --config path you pass, so it must
+be absolute or ~-expanded and must stay in place.
 
 --no-systemd installs the binary only (hosts without a systemd user session;
-timers skipped).`,
+the unit is skipped).`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := load(*cfgPath)
 			if err != nil {
@@ -81,7 +81,7 @@ type installOptions struct {
 	exec      install.Executor // nil = production SystemctlExecutor
 }
 
-func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOptions) error {
+func runInstall(w io.Writer, _ *config.Config, cfgPath string, opts installOptions) error {
 	binDir, err := absDir(config.ExpandHome(opts.binDir))
 	if err != nil {
 		return err
@@ -121,14 +121,12 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 		executor = install.SystemctlExecutor{}
 	}
 	res, err := install.Install(install.Options{
-		BinDir:            binDir,
-		UnitDir:           unitDir,
-		RunningBinary:     running,
-		ConfigPath:        cfgAbs,
-		NoSystemd:         opts.noSystemd,
-		RefreshInterval:   cfg.Maintain.RefreshInterval.Duration,
-		SpeedtestInterval: cfg.Maintain.SpeedtestInterval.Duration,
-		Exec:              executor,
+		BinDir:        binDir,
+		UnitDir:       unitDir,
+		RunningBinary: running,
+		ConfigPath:    cfgAbs,
+		NoSystemd:     opts.noSystemd,
+		Exec:          executor,
 	})
 	if err != nil {
 		return err
@@ -142,10 +140,13 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	for _, p := range res.UnitPaths {
 		outf(w, "unit written:     %s\n", p)
 	}
-	outf(w, "timers active:    refresh every %s, speedtest every %s (OnUnitActiveSec)\n",
-		install.Span(cfg.Maintain.RefreshInterval.Duration), install.Span(cfg.Maintain.SpeedtestInterval.Duration))
+	outln(w, "daemon active:    publicvpn watch (Restart=always) — wave intervals and the plugins dir")
+	outln(w, "                  are read from the config live (a change needs a restart, not a re-install)")
+	for _, name := range res.LegacyCleaned {
+		outf(w, "legacy removed:   %s (W5 timer unit — the daemon replaced the timers)\n", name)
+	}
 	outf(w, "config reference: %s (install never creates or moves it — keep it in place)\n", cfgAbs)
-	outln(w, "journal: journalctl --user -u public_vpn-refresh.service -f")
+	outln(w, "journal: journalctl --user -u public_vpn-watch.service -f")
 	return nil
 }
 
@@ -156,12 +157,12 @@ func newUninstallCommand(cfgPath *string) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Disable the timers and remove the rendered unit files (default: user data kept)",
-		Long: `Symmetric teardown: disables both timers
-(systemctl --user disable --now public_vpn-refresh.timer public_vpn-speedtest.timer),
-removes the four rendered unit files, daemon-reloads the user manager (so it
-drops its not-found entries for the removed units), and reports. The installed
-binary and all user data are KEPT by default.
+		Short: "Disable the watch daemon and remove the rendered unit files (default: user data kept)",
+		Long: `Symmetric teardown: disables the watch daemon and any legacy timer units
+still present, removes every known unit file (public_vpn-watch.service plus
+the W5-era public_vpn-refresh/speedtest units), daemon-reloads the user
+manager (so it drops its not-found entries for the removed units), and
+reports. The installed binary and all user data are KEPT by default.
 
 --purge is DESTRUCTIVE and must be passed explicitly: it also removes the
 config file (-c) and the pipeline data dir ([data_dir]). It never touches
@@ -216,10 +217,10 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 		return err
 	}
 	switch {
-	case res.DisabledTimers:
-		outln(w, "timers disabled:  public_vpn-refresh.timer, public_vpn-speedtest.timer")
+	case len(res.DisabledUnits) > 0:
+		outf(w, "disabled:         %s\n", strings.Join(res.DisabledUnits, ", "))
 	case res.SkippedDisable:
-		outln(w, "timers:           no systemd user session — nothing to disable")
+		outln(w, "units:            no systemd user session — nothing to disable")
 	}
 	for _, name := range res.RemovedUnits {
 		outf(w, "unit removed:     %s\n", name)
@@ -264,9 +265,10 @@ func checkExecStartPath(flag, p string) error {
 }
 
 // printInstallStatus extends `status` with the install state: binary path,
-// unit files present, timers enabled, and configured-vs-installed periods
-// (mismatch = the config changed after the last install — re-run install).
-// Read-only: pure filesystem inspection of the user unit dir, no systemctl.
+// the watch-daemon unit, its enablement, and any legacy W5 timer units still
+// awaiting migration. Read-only: pure filesystem inspection of the user unit
+// dir, no systemctl. The daemon reads intervals from the config live, so —
+// unlike the W5 timers — there is no configured-vs-installed mismatch class.
 func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
 	outln(out, "install:")
 	binPath := filepath.Join(config.ExpandHome("~/.local/bin"), "publicvpn")
@@ -276,59 +278,34 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
 		outln(out, "  binary:    not installed ("+binPath+" missing) — run `publicvpn install`")
 	}
 	unitDir := config.ExpandHome("~/.config/systemd/user")
-	missing := 0
-	for _, name := range install.UnitNames() {
-		if _, err := os.Stat(filepath.Join(unitDir, name)); err != nil {
-			missing++
+	_, watchErr := os.Stat(filepath.Join(unitDir, install.WatchService))
+	if watchErr != nil {
+		outln(out, "  units:     watch daemon not rendered ("+unitDir+")")
+	} else {
+		outf(out, "  units:     %s present in %s\n", install.WatchService, unitDir)
+		enabled := false
+		for _, wants := range []string{"default.target.wants", "multi-user.target.wants"} {
+			if _, err := os.Stat(filepath.Join(unitDir, wants, install.WatchService)); err == nil {
+				enabled = true
+			}
+		}
+		if enabled {
+			outln(out, "  service:   enabled (wants symlink) — waves: refresh "+
+				install.Span(cfg.Maintain.RefreshInterval.Duration)+", speedtest "+
+				install.Span(cfg.Maintain.SpeedtestInterval.Duration)+" (read live from the config)")
+		} else {
+			outln(out, "  service:   not enabled — run `publicvpn install`")
 		}
 	}
-	if missing == len(install.UnitNames()) {
-		outln(out, "  units:     none rendered ("+unitDir+")")
-		return
-	}
-	outf(out, "  units:     %d/4 present in %s\n", len(install.UnitNames())-missing, unitDir)
-
-	enabled := 0
-	for _, name := range []string{install.RefreshTimer, install.SpeedtestTimer} {
-		if _, err := os.Stat(filepath.Join(unitDir, "timers.target.wants", name)); err == nil {
-			enabled++
+	legacy := install.LegacyUnitNames()
+	present := 0
+	for _, name := range legacy {
+		if _, err := os.Stat(filepath.Join(unitDir, name)); err == nil {
+			present++
 		}
 	}
-	outf(out, "  timers:    %d/2 enabled (timers.target.wants symlinks)\n", enabled)
-
-	installedRefresh, errRefresh := installedPeriod(unitDir, install.RefreshTimer)
-	installedSpeed, errSpeed := installedPeriod(unitDir, install.SpeedtestTimer)
-	cfgRefresh := cfg.Maintain.RefreshInterval.Duration
-	cfgSpeed := cfg.Maintain.SpeedtestInterval.Duration
-	outf(out, "  refresh:   configured %s, installed %s\n", cfgRefresh, orUnreadable(installedRefresh, errRefresh))
-	outf(out, "  speedtest: configured %s, installed %s\n", cfgSpeed, orUnreadable(installedSpeed, errSpeed))
-	installHint := fmt.Sprintf(" — re-run `publicvpn install -c %s` to apply\n", cfgPath)
-	if errRefresh == nil && installedRefresh != cfgRefresh {
-		outf(out, "  MISMATCH:  refresh period changed in the config%s", installHint)
+	if present > 0 {
+		outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate\n",
+			present, cfgPath)
 	}
-	if errSpeed == nil && installedSpeed != cfgSpeed {
-		outf(out, "  MISMATCH:  speedtest period changed in the config%s", installHint)
-	}
-}
-
-func orUnreadable(d time.Duration, err error) string {
-	if err != nil {
-		return "unreadable (" + err.Error() + ")"
-	}
-	return d.String()
-}
-
-// installedPeriod reads OnUnitActiveSec from an installed timer unit.
-func installedPeriod(unitDir, unit string) (time.Duration, error) {
-	b, err := os.ReadFile(filepath.Join(unitDir, unit))
-	if err != nil {
-		return 0, err
-	}
-	for line := range strings.SplitSeq(string(b), "\n") {
-		line = strings.TrimSpace(line)
-		if value, ok := strings.CutPrefix(line, "OnUnitActiveSec="); ok {
-			return install.ParseSpan(value)
-		}
-	}
-	return 0, fmt.Errorf("no OnUnitActiveSec in %s", unit)
 }

@@ -15,42 +15,20 @@
 
 data_dir = "~/.local/share/publicvpn"
 
-# ── Sources (D9: repo ids + discovery method, raw URLs are NEVER pinned —
-#    discovery resolves current paths every wave). All repos below are public
-#    GitHub config aggregators; enable whichever you want to ingest. ─────────
-[sources.matin]
-repo = "MatinGhanbari/v2ray-configs"
-discovery = "github-contents"
-include = [
-  "subscriptions/v2ray/super-sub.txt",
-  "subscriptions/v2ray/all_sub.txt",
-  "subscriptions/filtered/subs/vless.txt",
-]
-enabled = true
-
-[sources.epodonios]
-repo = "Epodonios/v2ray-configs"
-discovery = "github-contents"
-include = [
-  "Splitted-By-Protocol/vless.txt",
-  "Splitted-By-Protocol/trojan.txt",
-]
-enabled = true
-
-[sources.radikal]
-repo = "0xRadikal/Free-v2ray-Configs"
-discovery = "manifest"          # reads index.json and follows the file URLs it lists
-manifest = "index.json"
-include = ["secure/configs.txt"] # SECURE list = forward-secrecy pre-filter
-enabled = true
-
-# Example of a disabled source: re-verify the repo id before enabling (D9
-# means only this block changes, no code).
-[sources.haker]
-repo = "haker23378-netizen/free-vpn-telegram"
-discovery = "github-contents"
-include = ["vless.txt"]
-enabled = false
+# ── Plugins (W10): the source-ingest layer is LUA PLUGINS, not config
+#    tables. Each .lua file in [plugins].dir is one source: it fetches and
+#    iterates, hands raw links to Go as publicvpn.node records, and Go keeps
+#    owning URI parsing/dedupe. The built-in plugins (matin, epodonios,
+#    radikal, haker, stintikvpn) materialize into the dir on FIRST RUN —
+#    owner edits and removals persist; a new provider is a new .lua file, no
+#    rebuild. The `publicvpn watch` daemon hot-reloads the dir on the fly. ──
+[plugins]
+# dir = "~/.local/share/publicvpn/plugins"  # default: <data_dir>/plugins
+# run_timeout = "120s"  # bound on ONE plugin's whole fetch run; an explicit
+#                       # "0s" = unbounded. A plugin exceeding the bound is
+#                       # abandoned loud and the wave continues with the
+#                       # healthy sources (the abandoned run leaks by
+#                       # design — see the README Security Model).
 
 [fetch]
 timeout = "30s"
@@ -59,9 +37,10 @@ concurrency = 4
 # github_token = "ghp_…"  # optional; raises api.github.com rate limits
 # api_base = "https://api.github.com"        # mirror support: GitHub API host
 # raw_base = "https://raw.githubusercontent.com"  # mirror support: raw host
-# cache_max_age = "6h"  # Gap-0 freshness: a cached source body younger than
-#                       # this skips the network fetch entirely ("cache fresh,
-#                       # skipping"). Explicit "0s" = always fetch.
+# cache_max_age = "6h"  # W5-era file-cache freshness — NO LONGER USED by the
+#                       # plugin-based ingest (plugins fetch fresh every wave;
+#                       the github_files helper is fresh-per-wave too). Kept
+#                       parsed for config compatibility.
 
 [filter]
 # Per-source node cap per wave. 0 = unlimited. The `--source-cap` CLI flag
@@ -84,7 +63,8 @@ path = "~/.local/bin/xray-knife"   # out-of-band prober (never inside the live c
 timeout = "10s"
 threads = 20
 url = "https://cloudflare.com/cdn-cgi/trace"  # response carries the tunnel exit IP (D8)
-speedtest = false                   # -S throughput wave: run explicitly, it is slow
+speedtest = true                    # W10 default ON: every wave carries -S speed data
+                                    # (explicit false turns it off). Slow by design.
 speedtest_timeout = "30s"
 check_preset = ""                   # optional panel grading: cloudflare|global|google|gstatic|streaming
 url_success_threshold = 1.0
@@ -161,13 +141,12 @@ backup_keep = 0               # retain only the N newest config backups (0 = unl
 # physically (stale-but-referenced records stay refreshable). Every pruning
 # pass leaves geo-base.jsonl.bak-<ts> next to the store.
 prune_dead_after = "48h"
-# Recheck periods for the systemd timers (`publicvpn install` renders them
-# as OnUnitActiveSec; floor 5m — anything lower fails config validation).
-# NOTE: the 5m floor applies ONLY to these two maintenance intervals (W5,
-# owner-approved). Every other knob is deliberately unbounded.
-# Changing a period = edit here, then re-run `publicvpn install -c <config>`
-# (idempotent; `publicvpn status` flags a configured-vs-installed mismatch).
-refresh_interval = "6h"      # refresh wave recheck (default 6h)
+# Recheck periods for the `publicvpn watch` daemon's wave scheduler
+# (floor 5m — anything lower fails config validation; the floor applies ONLY
+# to these two intervals, every other knob is deliberately unbounded). The
+# daemon reads these from the config LIVE: a change needs only
+# `systemctl --user restart public_vpn-watch.service`, never a re-install.
+refresh_interval = "1h"      # refresh wave recheck (W10 default 1h — was 6h)
 speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly)
 stats_timeout = "10s"        # bounds one `xray api statsquery` exec
 prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)

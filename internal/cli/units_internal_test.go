@@ -10,12 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The systemd user units are REPO TEMPLATES (single source of truth,
-// embedded by internal/install via go:embed): `publicvpn install` renders them into the
-// user unit dir and enables the timers via the allowlisted executor seam.
-// These tests pin the template content so the OnBootSec/OnUnitActiveSec
-// mechanics, the maintain verbs, and the placeholder set cannot silently
-// drift from DESIGN §4.9.
+// The systemd user unit is a REPO TEMPLATE (single source of truth,
+// embedded by internal/install via go:embed): `publicvpn install` renders it
+// into the user unit dir and enables the daemon via the allowlisted executor
+// seam. These tests pin the template content so the Restart=always daemon
+// contract, the watch verb, and the placeholder set cannot silently drift.
+// The W5 timer units are gone — their legacy names survive ONLY as the
+// uninstall/migration cleanup set.
 
 const systemdDir = "../../systemd"
 
@@ -26,34 +27,18 @@ func readUnit(t *testing.T, name string) string {
 	return string(b)
 }
 
-func TestRefreshTimerUnitTemplate(t *testing.T) {
-	timer := readUnit(t, "public_vpn-refresh.timer")
-	assert.Regexp(t, `(?m)^OnBootSec=\S+$`, timer, "first run after boot")
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=\{\{ \.RefreshInterval \}\}$`,
-		timer, "the recheck period is the config-driven OnUnitActiveSec (arbitrary durations)")
-	assert.NotRegexp(t, `(?m)^OnCalendar=`, timer, "config-driven periods must not use OnCalendar")
-	assert.Contains(t, timer, "Persistent=true", "catch-up after sleep/reboot")
-	assert.Contains(t, timer, "Unit=public_vpn-refresh.service")
-	assert.Contains(t, timer, "WantedBy=timers.target")
-
-	service := readUnit(t, "public_vpn-refresh.service")
-	assert.Contains(t, service, "Type=oneshot", "a wave runs to completion")
-	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} maintain -c \{\{ \.ConfigPath \}\}$`,
-		service, "ExecStart = installed binary + maintain + the config the user passed")
+func TestWatchUnitTemplate(t *testing.T) {
+	service := readUnit(t, "public_vpn-watch.service")
+	assert.Contains(t, service, "Type=notify", "sd_notify(3): READY=1 + WATCHDOG=1 pings")
+	assert.Contains(t, service, "WatchdogSec=300",
+		"a wedged daemon stops pinging — systemd kills and restarts it")
+	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} watch -c \{\{ \.ConfigPath \}\}$`,
+		service, "ExecStart = installed binary + watch + the config the user passed")
+	assert.Regexp(t, `(?m)^Restart=always$`, service, "a daemon crash restarts automatically")
+	assert.NotContains(t, service, "{{ .RefreshInterval", "no timer-era placeholders survive")
+	assert.NotContains(t, service, "{{ .SpeedtestInterval", "no timer-era placeholders survive")
 	assert.NotContains(t, service, "systemctl", "units never invoke systemctl themselves")
-	assert.NotContains(t, service, "{{ .SpeedtestInterval", "no cross-unit placeholder leakage")
-}
-
-func TestSpeedtestTimerUnitTemplate(t *testing.T) {
-	timer := readUnit(t, "public_vpn-speedtest.timer")
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=\{\{ \.SpeedtestInterval \}\}$`, timer)
-	assert.Regexp(t, `(?m)^OnBootSec=\S+$`, timer)
-	assert.Contains(t, timer, "Persistent=true")
-
-	service := readUnit(t, "public_vpn-speedtest.service")
-	assert.Contains(t, service, "Type=oneshot")
-	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} maintain --speedtest -c \{\{ \.ConfigPath \}\}$`,
-		service, "the speedtest wave is maintain with the throughput probe enabled")
+	assert.NotContains(t, service, "OnBootSec", "the timer era is over — scheduling lives in the daemon")
 }
 
 // TestSystemdReadmeDocumentsInstallSteps pins that the repo README carries

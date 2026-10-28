@@ -19,21 +19,8 @@ func TestLoadFullConfig(t *testing.T) {
 	content := `
 data_dir = "/tmp/publicvpn-test-data"
 
-[sources.matin]
-repo = "MatinGhanbari/v2ray-configs"
-discovery = "github-contents"
-include = ["vless.txt", "all_sub.txt", "super-sub.txt"]
-enabled = true
 
-[sources.radikal]
-repo = "0xRadikal/Free-v2ray-Configs"
-discovery = "manifest"
-manifest = "index.json"
-include = ["secure/"]
-enabled = true
 
-[sources.tvc]
-enabled = false
 
 [fetch]
 timeout = "20s"
@@ -80,15 +67,7 @@ xray_bin = "/usr/bin/xray"
 	require.NoError(t, err)
 
 	assert.Equal(t, "/tmp/publicvpn-test-data", cfg.DataDir)
-	assert.Len(t, cfg.Sources, 3)
-	matin := cfg.Sources["matin"]
-	assert.Equal(t, "github-contents", matin.Discovery)
-	assert.True(t, matin.IsEnabled())
-	assert.Equal(t, []string{"vless.txt", "all_sub.txt", "super-sub.txt"}, matin.Include)
-	radikal := cfg.Sources["radikal"]
-	assert.Equal(t, "manifest", radikal.Discovery)
-	assert.Equal(t, "index.json", radikal.Manifest)
-	assert.False(t, cfg.Sources["tvc"].IsEnabled())
+	assert.Equal(t, "/tmp/publicvpn-test-data/plugins", cfg.Plugins.Dir, "plugins dir defaults under data_dir")
 
 	assert.Equal(t, 20*time.Second, cfg.Fetch.Timeout.Duration)
 	assert.Equal(t, 2, cfg.Fetch.Retries)
@@ -98,7 +77,9 @@ xray_bin = "/usr/bin/xray"
 	assert.Equal(t, "~/.local/bin/xray-knife", cfg.Probe.Path)
 	assert.Equal(t, 8*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 20, cfg.Probe.Threads)
-	assert.False(t, cfg.Probe.Speedtest)
+	require.NotNil(t, cfg.Probe.Speedtest)
+	assert.False(t, *cfg.Probe.Speedtest, "explicit speedtest=false is honored")
+	assert.False(t, cfg.Probe.IsSpeedtest())
 
 	assert.Equal(t, 100, cfg.Geo.BatchSize)
 	assert.Equal(t, 15, cfg.Geo.PerMinute)
@@ -123,9 +104,6 @@ func TestDefaultsAreApplied(t *testing.T) {
 	minimal := `
 data_dir = "/tmp/publicvpn-defaults"
 
-[sources.matin]
-repo = "MatinGhanbari/v2ray-configs"
-discovery = "github-contents"
 `
 	require.NoError(t, os.WriteFile(path, []byte(minimal), 0o644))
 	cfg, err := config.Load(path)
@@ -133,7 +111,8 @@ discovery = "github-contents"
 	assert.Equal(t, 30*time.Second, cfg.Fetch.Timeout.Duration)
 	assert.Equal(t, 3, cfg.Fetch.Retries)
 	assert.Equal(t, 4, cfg.Fetch.Concurrency)
-	assert.True(t, cfg.Sources["matin"].IsEnabled(), "a declared source defaults to enabled")
+	assert.True(t, cfg.Probe.IsSpeedtest(), "speedtest defaults to ON (W10 owner ruling)")
+	assert.Nil(t, cfg.Probe.Speedtest)
 	assert.Equal(t, "~/.local/bin/xray-knife", cfg.Probe.Path)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 20, cfg.Probe.Threads)
@@ -167,33 +146,38 @@ time_out = "30s"
 }
 
 func TestValidationRejectsBadConfig(t *testing.T) {
-	t.Run("no enabled sources", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "config.toml")
-		content := `
-data_dir = "/tmp/x"
-
-[sources.tvc]
-enabled = false
-`
-		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
-		_, err := config.Load(path)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "no enabled sources")
-	})
-
-	t.Run("bad discovery method", func(t *testing.T) {
+	t.Run("removed [sources.*] section fails loud with the migration path", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.toml")
 		content := `
 data_dir = "/tmp/x"
 
 [sources.matin]
-repo = "a/b"
-discovery = "telepathy"
+repo = "MatinGhanbari/v2ray-configs"
+discovery = "github-contents"
 `
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 		_, err := config.Load(path)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "discovery")
+		assert.Contains(t, err.Error(), "[sources.*] section was removed")
+		assert.Contains(t, err.Error(), "[plugins]")
+		assert.Contains(t, err.Error(), "matin, epodonios, radikal, haker, stintikvpn")
+	})
+
+	t.Run("unknown key still fails loud", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		content := `
+data_dir = "/tmp/x"
+
+[frobnicate]
+level = 11
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		_, err := config.Load(path)
+		require.Error(t, err)
+		// go-toml strict mode names no field in the message (the known
+		// generic-message behavior — the [sources] migration check above
+		// exists precisely to give the loud, actionable variant).
+		assert.Contains(t, err.Error(), "strict mode")
 	})
 
 	t.Run("cap window invalid", func(t *testing.T) {
@@ -201,9 +185,6 @@ discovery = "telepathy"
 		content := `
 data_dir = "/tmp/x"
 
-[sources.matin]
-repo = "a/b"
-discovery = "github-contents"
 
 [select]
 per_country_cap = 0
@@ -221,9 +202,6 @@ ceiling = 10
 		content := `
 data_dir = "/tmp/x"
 
-[sources.matin]
-repo = "a/b"
-discovery = "github-contents"
 
 [geo]
 endpoint = "https://ip-api.com/batch"
@@ -239,9 +217,6 @@ endpoint = "https://ip-api.com/batch"
 		content := `
 data_dir = "/tmp/x"
 
-[sources.matin]
-repo = "a/b"
-discovery = "github-contents"
 
 [render]
 stats_port = 80
@@ -264,10 +239,6 @@ func TestMaintainSectionParsesAndDefaults(t *testing.T) {
 		return path
 	}
 	base := `data_dir = "/tmp/publicvpn-maintain"
-[sources.s]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 `
 
 	t.Run("absent section defaults to 48h", func(t *testing.T) {
@@ -303,10 +274,6 @@ func TestFilterSourceCapConfigParsesAndValidates(t *testing.T) {
 	base := func(caps string) string {
 		return fmt.Sprintf(`
 data_dir = "/tmp/publicvpn-test"
-[sources.s]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 [filter]
 source_cap = %s
 `, caps)
@@ -341,16 +308,17 @@ func load(t *testing.T, body string) *config.Config {
 	return cfg
 }
 
-// TestMaintainIntervalsDefaultsFloorAndStrict pins the W5 knobs: defaults
-// 6h/168h, a 5-minute floor with loud failure below, and strict decoding.
+// TestMaintainIntervalsDefaultsFloorAndStrict pins the maintain knobs:
+// defaults 1h (W10)/168h, a 5-minute floor with loud failure below, and
+// strict decoding.
 func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
-		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n")
-		assert.Equal(t, 6*time.Hour, cfg.Maintain.RefreshInterval.Duration)
+		cfg := load(t, "data_dir = \"d\"\n")
+		assert.Equal(t, time.Hour, cfg.Maintain.RefreshInterval.Duration, "refresh default is 1h (W10 owner ruling)")
 		assert.Equal(t, 168*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
 	})
 	t.Run("custom values parse", func(t *testing.T) {
-		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\nrefresh_interval = \"90m\"\nspeedtest_interval = \"240h\"\n")
+		cfg := load(t, "data_dir = \"d\"\n[maintain]\nrefresh_interval = \"90m\"\nspeedtest_interval = \"240h\"\n")
 		assert.Equal(t, 90*time.Minute, cfg.Maintain.RefreshInterval.Duration)
 		assert.Equal(t, 240*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
 	})
@@ -359,13 +327,13 @@ func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 			"refresh_interval":   `"4m"`,
 			"speedtest_interval": `"1m"`,
 		} {
-			_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\n"+name+" = "+val+"\n"))
+			_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[maintain]\n"+name+" = "+val+"\n"))
 			require.Error(t, err, "%s below the 5m floor must fail", name)
 			assert.Contains(t, err.Error(), "5m0s")
 		}
 	})
 	t.Run("unknown maintain key fails loud", func(t *testing.T) {
-		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\nrefresh_intervalz = \"6h\"\n"))
+		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[maintain]\nrefresh_intervalz = \"6h\"\n"))
 		require.Error(t, err)
 	})
 }
@@ -373,24 +341,24 @@ func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 // TestFilterProtocolsAndAllowInsecureConfig pins the W5 filter policy knobs.
 func TestFilterProtocolsAndAllowInsecureConfig(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
-		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n")
+		cfg := load(t, "data_dir = \"d\"\n")
 		assert.Equal(t, []string{"vless", "vmess", "trojan"}, cfg.Filter.Protocols)
 		assert.False(t, cfg.Filter.AllowInsecure)
 	})
 	t.Run("ss opt-in", func(t *testing.T) {
-		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[filter]\nprotocols = [\"vless\", \"ss\"]\nallow_insecure = true\n")
+		cfg := load(t, "data_dir = \"d\"\n[filter]\nprotocols = [\"vless\", \"ss\"]\nallow_insecure = true\n")
 		assert.Equal(t, []string{"vless", "ss"}, cfg.Filter.Protocols)
 		assert.True(t, cfg.Filter.AllowInsecure)
 	})
 	t.Run("unknown scheme fails loud", func(t *testing.T) {
-		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[filter]\nprotocols = [\"vless\", \"tuic\"]\n"))
+		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[filter]\nprotocols = [\"vless\", \"tuic\"]\n"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "tuic")
 	})
 }
 
 // w6Base is the minimal valid config body every W6 knob test builds on.
-const w6Base = "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n"
+const w6Base = "data_dir = \"d\"\n"
 
 // TestW6PoolInboundTagsDeduplicatedAtLoad pins M-4: duplicate entries in
 // [render].pool_inbound_tags are collapsed at config load — order preserved,
@@ -526,6 +494,7 @@ func TestW6NegativeValuesAreStructurallyInvalid(t *testing.T) {
 		"render.balancer_tolerance":     "[render]\nbalancer_tolerance = -0.2\n",
 		"maintain.stats_timeout":        "[maintain]\nstats_timeout = \"-1s\"\n",
 		"maintain.prune_backup_keep":    "[maintain]\nprune_backup_keep = -2\n",
+		"plugins.run_timeout":           "[plugins]\nrun_timeout = \"-1s\"\n",
 	}
 	for name, section := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -574,6 +543,26 @@ prune_backup_keep = 1
 	assert.Equal(t, 1, cfg.Activate.BackupKeep)
 	assert.Equal(t, time.Second, cfg.Maintain.StatsTimeout.Duration)
 	assert.Equal(t, 1, cfg.Maintain.PruneBackupKeep)
+}
+
+// TestPluginRunTimeoutConfigParsesAndDefaults pins the W10 I-1 knob: unset →
+// the 120s default; an explicit value passes through; an explicit "0s" means
+// UNBOUNDED (owner ruling — no artificial floor, the same 0-semantics class
+// as activate.test_timeout).
+func TestPluginRunTimeoutConfigParsesAndDefaults(t *testing.T) {
+	cfg := load(t, w6Base+"")
+	require.NotNil(t, cfg.Plugins.RunTimeout, "the knob resolves to a value even when unset")
+	assert.Equal(t, config.DefaultPluginRunTimeout, cfg.Plugins.RunTimeout.Duration,
+		"unset run_timeout = the 120s default")
+
+	cfg = load(t, w6Base+"[plugins]\nrun_timeout = \"45s\"\n")
+	require.NotNil(t, cfg.Plugins.RunTimeout)
+	assert.Equal(t, 45*time.Second, cfg.Plugins.RunTimeout.Duration, "explicit value passes through")
+
+	cfg = load(t, w6Base+"[plugins]\nrun_timeout = \"0s\"\n")
+	require.NotNil(t, cfg.Plugins.RunTimeout)
+	assert.Equal(t, time.Duration(0), cfg.Plugins.RunTimeout.Duration,
+		"explicit 0s = unbounded (no artificial floor)")
 }
 
 // TestW6UnknownKeysFailStrict pins that the strict decode covers every new W6

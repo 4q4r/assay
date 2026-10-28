@@ -1,12 +1,14 @@
 // Package systemd is the SINGLE source of truth for the publicvpn systemd
-// user units: the .service/.timer files in this directory are Go text
-// templates — `publicvpn install` renders them (go:embed) into the user unit
-// directory. There is no second copy of the unit content anywhere.
+// user unit: the .service file in this directory is a Go text template —
+// `publicvpn install` renders it (go:embed) into the user unit directory.
+// There is no second copy of the unit content anywhere. Since W10 the unit
+// is the watch DAEMON; the two W5 timer units are gone (their legacy names
+// are cleaned up by install/uninstall for existing users).
 package systemd
 
 import "embed"
 
-// Units carries the four unit templates from this directory.
+// Units carries the unit template from this directory.
 //
-//go:embed public_vpn-refresh.service public_vpn-refresh.timer public_vpn-speedtest.service public_vpn-speedtest.timer
+//go:embed public_vpn-watch.service
 var Units embed.FS

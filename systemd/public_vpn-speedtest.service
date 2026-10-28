@@ -1,9 +1,0 @@
-[Unit]
-Description=publicvpn weekly speedtest wave (maintain with -S throughput probe)
-
-[Service]
-Type=oneshot
-# Same wave as the refresh timer, plus the slow -S throughput measurement in
-# the probe stage (xray-knife --speedtest). Slow by design. Rendered by
-# `publicvpn install` from this template.
-ExecStart={{ .BinaryPath }} maintain --speedtest -c {{ .ConfigPath }}

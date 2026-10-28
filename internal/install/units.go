@@ -1,3 +1,10 @@
+// Package install implements `publicvpn install` / `uninstall`: self-install
+// of the running binary plus the rendered systemd user unit (the W10 watch
+// daemon, Restart=always), with the systemctl surface pinned to an exact
+// allowlist. The unit is rendered from the repo's systemd/ template (single
+// source of truth, go:embed). Scheduling lives in the daemon — there are no
+// timers anymore; install additionally cleans up the W5 timer units left by
+// older installs.
 package install
 
 import (
@@ -8,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"text/template"
 	"time"
 
@@ -18,40 +24,68 @@ import (
 // installedBinaryName is the fixed executable name in BinDir.
 const installedBinaryName = "publicvpn"
 
-// TemplateData is rendered into the systemd/ unit templates.
+// WatchService is the W10 daemon unit installed into the user unit
+// directory.
+const WatchService = "public_vpn-watch.service"
+
+// Legacy unit names from the W5 timer era: never installed again, but
+// uninstall removes them and install cleans them up (existing users get the
+// migration for free — stale timers would fire waves concurrently with the
+// daemon and stampede the probe origin).
+const (
+	RefreshService   = "public_vpn-refresh.service"
+	RefreshTimer     = "public_vpn-refresh.timer"
+	SpeedtestService = "public_vpn-speedtest.service"
+	SpeedtestTimer   = "public_vpn-speedtest.timer"
+)
+
+// UnitNames lists the unit files CURRENT install renders.
+func UnitNames() []string {
+	return []string{WatchService}
+}
+
+// LegacyUnitNames lists the W5-era timer units older installs may still
+// carry; both install and uninstall clean them up.
+func LegacyUnitNames() []string {
+	return []string{RefreshService, RefreshTimer, SpeedtestService, SpeedtestTimer}
+}
+
+// AllKnownUnitNames is legacy ∪ current — the uninstall removal set.
+func AllKnownUnitNames() []string {
+	return append(LegacyUnitNames(), WatchService)
+}
+
+// TemplateData is rendered into the systemd unit template.
 type TemplateData struct {
-	BinaryPath        string
-	ConfigPath        string
-	RefreshInterval   string // systemd time span, from [maintain].refresh_interval
-	SpeedtestInterval string // systemd time span, from [maintain].speedtest_interval
+	BinaryPath string
+	ConfigPath string
 }
 
 // Options configures Install. Paths must be absolute (the CLI layer expands
-// ~); intervals come from the loaded config.
+// ~); the daemon reads intervals and the plugins dir from the config at
+// runtime — no period rendering happens anymore.
 type Options struct {
-	BinDir            string
-	UnitDir           string
-	RunningBinary     string // os.Executable() of the caller
-	ConfigPath        string // required unless NoSystemd
-	NoSystemd         bool
-	RefreshInterval   time.Duration
-	SpeedtestInterval time.Duration
-	Exec              Executor // required unless NoSystemd
+	BinDir        string
+	UnitDir       string
+	RunningBinary string // os.Executable() of the caller
+	ConfigPath    string // required unless NoSystemd
+	NoSystemd     bool
+	Exec          Executor // required unless NoSystemd
 }
 
 // Result reports what install did.
 type Result struct {
-	BinaryPath   string
-	UnitPaths    []string
-	TimersActive bool
-	SkippedUnits bool // --no-systemd: binary copy only, units skipped
+	BinaryPath    string
+	UnitPaths     []string
+	LegacyCleaned []string // legacy timer units disabled + removed by this install
+	ServiceActive bool
+	SkippedUnits  bool // --no-systemd: binary copy only, units skipped
 }
 
 // Install copies the running binary into BinDir (atomic, 0755 — self-upgrade
-// is a re-run), renders the four systemd user units from the repo templates
-// (timers carry the configured [maintain] intervals as OnUnitActiveSec), and
-// then — only then — daemon-reloads and enables the timers through the
-// injected Executor.
+// is a re-run), renders the daemon unit from the repo template, cleans up
+// the legacy W5 timer units when present, and then — only then —
+// daemon-reloads and enables the daemon through the injected Executor.
 func Install(o Options) (Result, error) {
 	if o.BinDir == "" || o.RunningBinary == "" {
 		return Result{}, errors.New("install: BinDir and RunningBinary are required")
@@ -66,7 +100,7 @@ func Install(o Options) (Result, error) {
 		return res, nil
 	}
 	if o.ConfigPath == "" {
-		return res, errors.New("install: --config is required to render the unit files (the units embed the config path); " +
+		return res, errors.New("install: --config is required to render the unit file (the unit embeds the config path); " +
 			"use --no-systemd to install the binary without units")
 	}
 	if o.Exec == nil {
@@ -79,23 +113,59 @@ func Install(o Options) (Result, error) {
 		return res, errors.New("install: UnitDir is required")
 	}
 	unitPaths, err := writeUnits(TemplateData{
-		BinaryPath:        binPath,
-		ConfigPath:        o.ConfigPath,
-		RefreshInterval:   Span(o.RefreshInterval),
-		SpeedtestInterval: Span(o.SpeedtestInterval),
+		BinaryPath: binPath,
+		ConfigPath: o.ConfigPath,
 	}, o.UnitDir)
 	if err != nil {
 		return res, err
 	}
 	res.UnitPaths = unitPaths
+	// One-time migration: disable + remove the W5 timer units so waves fire
+	// from exactly ONE scheduler (the daemon). Nothing to do when absent.
+	res.LegacyCleaned, err = cleanupLegacyUnits(o.UnitDir, o.Exec)
+	if err != nil {
+		return res, err
+	}
 	if err := o.Exec.Systemctl(cmdDaemonReload()...); err != nil {
-		return res, fmt.Errorf("units written but not enabled: %w", err)
+		return res, fmt.Errorf("unit written but not enabled: %w", err)
 	}
-	if err := o.Exec.Systemctl(cmdEnableTimers()...); err != nil {
-		return res, fmt.Errorf("units written and reloaded but not enabled: %w", err)
+	if err := o.Exec.Systemctl(cmdEnableWatch()...); err != nil {
+		return res, fmt.Errorf("unit written and reloaded but not enabled: %w", err)
 	}
-	res.TimersActive = true
+	res.ServiceActive = true
 	return res, nil
+}
+
+// cleanupLegacyUnits disables the legacy timers (only when their unit files
+// still exist) and removes all four files. Returns the names actually
+// removed.
+func cleanupLegacyUnits(unitDir string, exec Executor) ([]string, error) {
+	present := legacyUnitsPresent(unitDir)
+	if len(present) == 0 {
+		return nil, nil
+	}
+	if err := exec.Systemctl(cmdDisableLegacyTimers()...); err != nil {
+		return nil, fmt.Errorf("install: disabling the legacy timer units failed: %w", err)
+	}
+	var removed []string
+	for _, name := range present {
+		if err := os.Remove(filepath.Join(unitDir, name)); err != nil {
+			return removed, fmt.Errorf("install: remove legacy unit %s: %w", name, err)
+		}
+		removed = append(removed, name)
+	}
+	return removed, nil
+}
+
+// legacyUnitsPresent returns the legacy unit names whose files exist.
+func legacyUnitsPresent(unitDir string) []string {
+	var present []string
+	for _, name := range LegacyUnitNames() {
+		if _, err := os.Stat(filepath.Join(unitDir, name)); err == nil {
+			present = append(present, name)
+		}
+	}
+	return present
 }
 
 // UninstallOptions configures Uninstall.
@@ -110,18 +180,19 @@ type UninstallOptions struct {
 
 // UninstallResult reports what uninstall did.
 type UninstallResult struct {
-	DisabledTimers bool
+	DisabledUnits  []string // service/timers actually disabled (present on disk)
 	RemovedUnits   []string
 	MissingUnits   []string
 	Purged         []string
 	SkippedDisable bool // no user systemd session — nothing to disable
 }
 
-// Uninstall disables both timers (one allowlisted invocation), removes the
-// four unit files, daemon-reloads so the user manager drops its not-found
-// entries for them (I-2), and reports. --purge additionally removes the
-// config file and data dir; anything else on the system (the installed binary
-// included) is left untouched.
+// Uninstall stops the daemon and legacy timers (each only when its unit
+// file still exists), removes every known unit file (current + legacy),
+// daemon-reloads so the user manager drops its not-found entries (I-2), and
+// reports. --purge additionally removes the config file and data dir;
+// anything else on the system (the installed binary included) is left
+// untouched.
 func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	res := UninstallResult{}
 	if o.UnitDir == "" {
@@ -129,14 +200,18 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	}
 	talksToManager := o.Exec != nil && UserSystemdAvailable() == nil
 	if talksToManager {
-		if err := o.Exec.Systemctl(cmdDisableTimers()...); err != nil {
-			return res, fmt.Errorf("uninstall: disabling the timers failed: %w", err)
+		var disableErr error
+		res.DisabledUnits, disableErr = disablePresentUnits(o.UnitDir, o.Exec)
+		if disableErr != nil {
+			return res, disableErr
 		}
-		res.DisabledTimers = true
+		if len(res.DisabledUnits) == 0 {
+			res.SkippedDisable = true
+		}
 	} else {
 		res.SkippedDisable = true
 	}
-	for _, name := range UnitNames() {
+	for _, name := range AllKnownUnitNames() {
 		path := filepath.Join(o.UnitDir, name)
 		if err := os.Remove(path); err != nil {
 			if os.IsNotExist(err) {
@@ -152,7 +227,7 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	// "not-found" entries for the removed units until the next unrelated
 	// reload. Same session guard as the disable step: no session, no manager
 	// to inform.
-	if talksToManager {
+	if talksToManager && len(res.RemovedUnits) > 0 {
 		if err := o.Exec.Systemctl(cmdDaemonReload()...); err != nil {
 			return res, fmt.Errorf("uninstall: unit files removed but daemon-reload failed: %w", err)
 		}
@@ -167,6 +242,27 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 		res.Purged = append(res.Purged, purge)
 	}
 	return res, nil
+}
+
+// disablePresentUnits disables the watch service and the legacy timers —
+// each allowlisted disable command runs only when at least one of its units
+// is still on disk (disabling a missing unit errors). Returns the unit
+// names that were disabled.
+func disablePresentUnits(unitDir string, exec Executor) ([]string, error) {
+	var disabled []string
+	if _, err := os.Stat(filepath.Join(unitDir, WatchService)); err == nil {
+		if err := exec.Systemctl(cmdDisableWatch()...); err != nil {
+			return disabled, fmt.Errorf("uninstall: disabling %s failed: %w", WatchService, err)
+		}
+		disabled = append(disabled, WatchService)
+	}
+	if len(legacyUnitsPresent(unitDir)) > 0 {
+		if err := exec.Systemctl(cmdDisableLegacyTimers()...); err != nil {
+			return disabled, fmt.Errorf("uninstall: disabling the legacy timers failed: %w", err)
+		}
+		disabled = append(disabled, LegacyUnitNames()...)
+	}
+	return disabled, nil
 }
 
 // copyBinary atomically copies src into dir as `publicvpn` (temp file in the
@@ -218,12 +314,12 @@ func copyBinary(src, dir string) (string, error) {
 	return target, nil
 }
 
-// writeUnits renders the four embedded templates and writes them into
-// unitDir (created 0750, files 0644, atomic replace — idempotent re-install).
+// writeUnits renders the embedded template and writes it into unitDir
+// (created 0750, files 0644, atomic replace — idempotent re-install).
 func writeUnits(data TemplateData, unitDir string) ([]string, error) {
-	tmpl, err := template.ParseFS(units.Units, "public_vpn-*.service", "public_vpn-*.timer")
+	tmpl, err := template.ParseFS(units.Units, "public_vpn-*.service")
 	if err != nil {
-		return nil, fmt.Errorf("install: parse embedded unit templates: %w", err)
+		return nil, fmt.Errorf("install: parse embedded unit template: %w", err)
 	}
 	if err := os.MkdirAll(unitDir, 0o750); err != nil {
 		return nil, fmt.Errorf("install: create unit dir %s: %w", unitDir, err)
@@ -278,10 +374,8 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
-// Span renders d as a systemd time span: the largest single unit that is
-// exact (hours → "6h"/"168h", minutes → "5m", else seconds). systemd accepts
-// concatenated unit sequences, but a single exact unit round-trips cleanly
-// through ParseSpan and reads best in the unit file.
+// Span renders d as a systemd time span (kept for status/ops display of
+// config intervals).
 func Span(d time.Duration) string {
 	switch {
 	case d == 0:
@@ -293,69 +387,4 @@ func Span(d time.Duration) string {
 	default:
 		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
 	}
-}
-
-// ParseSpan parses a systemd time span ("6h", "5min", "90m", "1h30m", "2d",
-// "1w") back into a Duration — the read side status uses to compare the
-// installed OnUnitActiveSec against the configured interval.
-func ParseSpan(s string) (time.Duration, error) {
-	s = string(bytes.TrimSpace([]byte(s)))
-	if s == "" {
-		return 0, errors.New("empty time span")
-	}
-	var total time.Duration
-	numStart := -1
-scan:
-	for i := 0; i <= len(s); i++ {
-		if i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			if numStart < 0 {
-				numStart = i
-			}
-			continue
-		}
-		if numStart < 0 {
-			if i == len(s) {
-				break scan // trailing characters fully consumed
-			}
-			return 0, fmt.Errorf("invalid time span %q: expected a number", s)
-		}
-		if i == len(s) {
-			return 0, fmt.Errorf("invalid time span %q: missing unit after %q", s, s[numStart:i])
-		}
-		n, err := strconv.Atoi(s[numStart:i])
-		if err != nil {
-			return 0, fmt.Errorf("invalid time span %q: %w", s, err)
-		}
-		unit, unitLen := spanUnit(s[i:])
-		if unit == 0 {
-			return 0, fmt.Errorf("invalid time span %q: missing unit after %q", s, s[numStart:i])
-		}
-		total += time.Duration(n) * unit
-		i += unitLen - 1
-		numStart = -1
-	}
-	return total, nil
-}
-
-// spanUnit matches a time-span unit prefix (longest match first: min before
-// m); returns the unit duration and its length, (0, 0) when no unit matches.
-func spanUnit(s string) (time.Duration, int) {
-	for _, u := range []struct {
-		name string
-		d    time.Duration
-	}{
-		{"min", time.Minute},
-		{"us", time.Microsecond},
-		{"ms", time.Millisecond},
-		{"s", time.Second},
-		{"m", time.Minute},
-		{"h", time.Hour},
-		{"d", 24 * time.Hour},
-		{"w", 7 * 24 * time.Hour},
-	} {
-		if strings.HasPrefix(s, u.name) {
-			return u.d, len(u.name)
-		}
-	}
-	return 0, 0
 }
