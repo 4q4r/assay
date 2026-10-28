@@ -701,6 +701,16 @@ func buildOutbound(n *model.Node, tag string, cfg Config) (map[string]any, []str
 	}, dropped, nil
 }
 
+// BuildOutbound is the exported seam for out-of-band consumers that need one
+// node's rendered xray outbound — the site checker (W8) embeds it into a
+// temporary single-node xray config. It is the SAME builder the live renderer
+// uses (one literal, no drift): identical params handling, L9 drop report and
+// tcpMaxSeg/fingerprint hardening. The tag is caller-owned (the temp config's
+// outbound tag; no pool/proxy namespace applies to throwaway instances).
+func BuildOutbound(n *model.Node, tag string, cfg Config) (map[string]any, []string, error) {
+	return buildOutbound(n, tag, cfg)
+}
+
 // protocolName maps the link scheme onto the xray outbound protocol name
 // (the ss share scheme renders as protocol "shadowsocks"; the hysteria2
 // share scheme renders as protocol "hysteria" — the core's hysteria2 client,
