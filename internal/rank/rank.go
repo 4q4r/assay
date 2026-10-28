@@ -126,8 +126,13 @@ func effectiveCap(cands []candidate, cfg config.SelectConfig) int {
 }
 
 // greedySelect runs the cap-aware greedy pass with the city-diversity
-// tie-break inside metric tie-bands.
+// tie-break inside metric tie-bands. The band width comes from the
+// [select].tie_band_rtt_tolerance knob (0 → the DefaultTieBandRTTTolerance).
 func greedySelect(cands []candidate, cfg config.SelectConfig, capApplied int) []candidate {
+	tolerance := cfg.TieBandRTTTolerance
+	if tolerance <= 0 {
+		tolerance = config.DefaultTieBandRTTTolerance
+	}
 	selected := make([]candidate, 0, capApplied)
 	picked := make([]bool, len(cands))
 	countryCount := map[string]int{}
@@ -137,7 +142,7 @@ func greedySelect(cands []candidate, cfg config.SelectConfig, capApplied int) []
 		if base < 0 {
 			break
 		}
-		pick := pickWithCityTieBreak(cands, picked, countryCount, cityCount, cfg, base)
+		pick := pickWithCityTieBreak(cands, picked, countryCount, cityCount, cfg, base, tolerance)
 		chosen := cands[pick]
 		picked[pick] = true
 		countryCount[chosen.rec.Country]++
@@ -162,6 +167,7 @@ func nextSelectable(cands []candidate, picked []bool, countryCount map[string]in
 // pickWithCityTieBreak scans the head's tie-band for an unrepresented city.
 func pickWithCityTieBreak(
 	cands []candidate, picked []bool, countryCount, cityCount map[string]int, cfg config.SelectConfig, base int,
+	tolerance float64,
 ) int {
 	head := cands[base]
 	pick := base
@@ -170,7 +176,7 @@ func pickWithCityTieBreak(
 		if picked[i] || countryCount[c.rec.Country] >= cfg.PerCountryCap {
 			continue
 		}
-		if !sameBand(head, c) {
+		if !sameBand(head, c, tolerance) {
 			break
 		}
 		if cityCount[c.rec.City] == 0 && cityCount[head.rec.City] > 0 {
@@ -207,9 +213,10 @@ func assignTags(selected []candidate, capApplied int, all []candidate) *model.Se
 
 // sameBand reports whether two candidates tie on the primary metrics closely
 // enough that city diversity may decide (same checks, same speed, rtt within
-// 20% of the band head).
-func sameBand(head, c candidate) bool {
+// tolerance·head RTT). tolerance is the [select].tie_band_rtt_tolerance knob
+// (normalized: > 0).
+func sameBand(head, c candidate, tolerance float64) bool {
 	return head.checks == c.checks &&
 		head.rec.SpeedBPS == c.rec.SpeedBPS &&
-		(head.rec.RTTMs <= 0 || c.rec.RTTMs <= head.rec.RTTMs*1.2)
+		(head.rec.RTTMs <= 0 || c.rec.RTTMs <= head.rec.RTTMs*tolerance)
 }

@@ -157,7 +157,7 @@ func TestRewriteGeoWithBackupKeepsPrePruneCopy(t *testing.T) {
 
 	pruned := original[:1]
 	clock := now.Add(30 * time.Minute) // deterministic backup stamp
-	backupPath, err := store.RewriteGeoWithBackup(path, pruned, clock)
+	backupPath, err := store.RewriteGeoWithBackup(path, pruned, clock, 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, backupPath)
 	assert.Contains(t, filepath.Base(backupPath), ".bak-20261028-123000",
@@ -184,7 +184,7 @@ func TestRewriteGeoWithBackupKeepsPrePruneCopy(t *testing.T) {
 
 func TestRewriteGeoWithBackupOnMissingStoreSkipsBackup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "geo-base.jsonl")
-	backupPath, err := store.RewriteGeoWithBackup(path, []*model.GeoRecord{}, now)
+	backupPath, err := store.RewriteGeoWithBackup(path, []*model.GeoRecord{}, now, 0)
 	require.NoError(t, err)
 	assert.Empty(t, backupPath, "nothing to back up when the store does not exist yet")
 }

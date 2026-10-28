@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"public_vpn/internal/config"
 	"public_vpn/internal/model"
 )
 
@@ -134,10 +135,30 @@ func appendEarlyData(path, ed string) string {
 	return path + sep + "ed=" + ed
 }
 
-// Config carries the render knobs.
+// Config carries the render knobs. Zero-value fields fall back to the W6
+// defaults (config.Default*) so direct Render callers keep the W3 shape
+// byte-for-byte; config.Load always fills them with the same values (one
+// literal per default — no layer drift).
 type Config struct {
 	StatsPort  int
 	PoolRoutes []PoolRoute
+	// PoolInboundTags: inbound tags every pool rule carries; render-time
+	// validated against the template's inbounds. Zero → DefaultPoolInboundTags.
+	PoolInboundTags []string
+	// ObservatoryInterval: Plan-A probeInterval, verbatim string passthrough.
+	// Zero → config.DefaultObservatoryInterval. NEVER validated here (no
+	// floor per owner ruling); the L1 empty-selector refusal is orthogonal
+	// and stays unconditional.
+	ObservatoryInterval string
+	// TCPMaxSeg: mandatory sockopt value on every pool outbound.
+	// Zero → config.DefaultTCPMaxSeg.
+	TCPMaxSeg int
+	// TLSFingerprint: client fingerprint on tls/reality settings.
+	// Zero → config.DefaultTLSFingerprint.
+	TLSFingerprint string
+	// BalancerTolerance: leastLoad tolerance on country AND city balancers.
+	// Zero → config.DefaultBalancerTolerance.
+	BalancerTolerance float64
 }
 
 // Input bundles render dependencies.
@@ -149,8 +170,6 @@ type Input struct {
 }
 
 const (
-	tcpMaxSeg          = 1440
-	clientFingerprint  = "firefox"
 	poolOutboundPrefix = "pool-"
 	poolBalancerPrefix = "pool_"
 )
@@ -177,6 +196,8 @@ func Render(in Input) (Result, error) {
 		return Result{Config: b}, err
 	}
 
+	cfg := normalizeKnobs(in.Cfg)
+
 	byTag := map[string]bool{}
 	for _, o := range toAnySlice(m["outbounds"]) {
 		if om, ok := o.(map[string]any); ok {
@@ -192,7 +213,7 @@ func Render(in Input) (Result, error) {
 		if !ok {
 			return Result{}, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
 		}
-		ob, unparsed, err := buildOutbound(n, sn.Tag)
+		ob, unparsed, err := buildOutbound(n, sn.Tag, cfg)
 		if err != nil {
 			return Result{}, err
 		}
@@ -206,21 +227,45 @@ func Render(in Input) (Result, error) {
 		byTag[sn.Tag] = true
 	}
 
-	renderedBalancers := addBalancers(m, in.Selection)
+	renderedBalancers := addBalancers(m, in.Selection, cfg.BalancerTolerance)
 
 	// Plan A: legacy observatory covering exactly the pool namespace. The
 	// burstObservatory (Germans) is untouched — verified coexistence.
+	// probeInterval is a verbatim passthrough of the observatory_interval
+	// knob; the L1 empty-selector refusal above is untouched by it.
 	m["observatory"] = map[string]any{
 		"subjectSelector":   []any{poolOutboundPrefix},
-		"probeInterval":     "60s",
+		"probeInterval":     cfg.ObservatoryInterval,
 		"enableConcurrency": true,
 	}
 
-	if err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers, byTag); err != nil {
+	if err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers, byTag, cfg.PoolInboundTags); err != nil {
 		return Result{}, err
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
 	return Result{Config: b, DroppedParams: dropped}, err
+}
+
+// normalizeKnobs applies the W6 default fallbacks: a zero knob value means
+// "owner-mandated default" (the same values config.Load fills in — the
+// defaults live once in config, referenced here, so they cannot drift).
+func normalizeKnobs(c Config) Config {
+	if len(c.PoolInboundTags) == 0 {
+		c.PoolInboundTags = config.DefaultPoolInboundTags()
+	}
+	if c.ObservatoryInterval == "" {
+		c.ObservatoryInterval = config.DefaultObservatoryInterval
+	}
+	if c.TCPMaxSeg == 0 {
+		c.TCPMaxSeg = config.DefaultTCPMaxSeg
+	}
+	if c.TLSFingerprint == "" {
+		c.TLSFingerprint = config.DefaultTLSFingerprint
+	}
+	if c.BalancerTolerance == 0 {
+		c.BalancerTolerance = config.DefaultBalancerTolerance
+	}
+	return c
 }
 
 // stripPoolArtifacts removes every pool-owned artifact from a (possibly
@@ -399,9 +444,10 @@ func ensureStatsAndPolicy(m map[string]any) {
 }
 
 // addBalancers renders pool_<cc> for every country in the selection and
-// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). Returns the
-// rendered balancer tags.
-func addBalancers(m map[string]any, sel *model.Selection) []string {
+// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). tolerance is
+// the [render].balancer_tolerance knob, applied to BOTH balancer layers.
+// Returns the rendered balancer tags.
+func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []string {
 	routing, _ := m["routing"].(map[string]any)
 	if routing == nil {
 		routing = map[string]any{}
@@ -434,7 +480,7 @@ func addBalancers(m map[string]any, sel *model.Selection) []string {
 				"type": "leastLoad",
 				"settings": map[string]any{
 					"expected":  1,
-					"tolerance": 0.2,
+					"tolerance": tolerance,
 				},
 			},
 		})
@@ -467,7 +513,7 @@ func addBalancers(m map[string]any, sel *model.Selection) []string {
 					"type": "leastLoad",
 					"settings": map[string]any{
 						"expected":  1,
-						"tolerance": 0.2,
+						"tolerance": tolerance,
 					},
 				},
 			})
@@ -482,12 +528,25 @@ func addBalancers(m map[string]any, sel *model.Selection) []string {
 // user-traffic rule and before the catch-all (DESIGN.md §4.7). A route target
 // is either a rendered pool_* balancer (emitted as balancerTag) or a rendered
 // pool-<cc>-NN outbound tag (emitted as outboundTag — D5 single-node city);
-// anything else fails loud (D6 namespace wall, unknown target).
+// anything else fails loud (D6 namespace wall, unknown target). Every rule
+// carries inboundTag: inboundTags (the [render].pool_inbound_tags knob) —
+// and every listed tag is validated against the template's inbounds FIRST:
+// a missing tag fails the render loud, naming it (a silent fall-through to
+// the template's catch-all is exactly the D2 violation this closes).
 func addPoolRules(
 	m map[string]any, routes []PoolRoute, renderedBalancers []string, renderedOutbounds map[string]bool,
+	inboundTags []string,
 ) error {
 	if len(routes) == 0 {
 		return nil
+	}
+	missing := templateInboundTags(m).complement(inboundTags)
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"render: pool_inbound_tags %v reference inbound tags missing from the template: %v — "+
+				"pool rules routed from nonexistent inbounds would silently fall through to the catch-all (D2); "+
+				"fix the template inbounds or pool_inbound_tags",
+			inboundTags, missing)
 	}
 	validBalancer := map[string]bool{}
 	for _, b := range renderedBalancers {
@@ -502,9 +561,13 @@ func addPoolRules(
 		for i, d := range route.Domains {
 			domains[i] = d
 		}
+		tagged := make([]any, len(inboundTags))
+		for i, t := range inboundTags {
+			tagged[i] = t
+		}
 		rule := map[string]any{
 			"type":       "field",
-			"inboundTag": []any{"socks-in", "http-in"},
+			"inboundTag": tagged,
 			"domain":     domains,
 		}
 		switch {
@@ -551,14 +614,44 @@ func addPoolRules(
 	return nil
 }
 
+// tagSet is a set of inbound tags harvested from the template.
+type tagSet map[string]bool
+
+// complement returns every wanted tag not present in the set, sorted (the
+// error names them deterministically).
+func (s tagSet) complement(wanted []string) []string {
+	var missing []string
+	for _, w := range wanted {
+		if !s[w] {
+			missing = append(missing, w)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// templateInboundTags collects the inbound tags defined by the template.
+func templateInboundTags(m map[string]any) tagSet {
+	set := tagSet{}
+	for _, inb := range toAnySlice(m["inbounds"]) {
+		if im, ok := inb.(map[string]any); ok {
+			if tag, _ := im["tag"].(string); tag != "" {
+				set[tag] = true
+			}
+		}
+	}
+	return set
+}
+
 // buildOutbound converts one node into a complete xray outbound. Auth and
 // transport params are copied 1:1 from the link (L9); only sockopt.tcpMaxSeg
-// and the client TLS fingerprint are owner-mandated overrides. It returns the
-// names of link params that could NOT be placed in the outbound, so the
-// caller can surface them instead of dropping silently.
-func buildOutbound(n *model.Node, tag string) (map[string]any, []string, error) {
+// and the client TLS fingerprint are owner-mandated overrides (values from
+// the W6 render knobs, defaults preserved). It returns the names of link
+// params that could NOT be placed in the outbound, so the caller can surface
+// them instead of dropping silently.
+func buildOutbound(n *model.Node, tag string, cfg Config) (map[string]any, []string, error) {
 	consumed := map[string]bool{}
-	stream, err := buildStreamSettings(n, consumed)
+	stream, err := buildStreamSettings(n, consumed, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -601,7 +694,7 @@ func protocolName(scheme string) string {
 // upgrade/kcp/tcp-header) carry the link's own params verbatim. Every param
 // consulted is recorded in consumed so unrendered params surface in the drop
 // report.
-func buildStreamSettings(n *model.Node, consumed map[string]bool) (map[string]any, error) {
+func buildStreamSettings(n *model.Node, consumed map[string]bool, cfg Config) (map[string]any, error) {
 	network, err := networkOf(n, consumed)
 	if err != nil {
 		return nil, err
@@ -615,13 +708,13 @@ func buildStreamSettings(n *model.Node, consumed map[string]bool) (map[string]an
 	stream := map[string]any{
 		"network":  network,
 		"security": security,
-		"sockopt":  map[string]any{"tcpMaxSeg": tcpMaxSeg},
+		"sockopt":  map[string]any{"tcpMaxSeg": cfg.TCPMaxSeg},
 	}
 	switch security {
 	case "tls":
-		stream["tlsSettings"] = buildTLSSettings(n.Params, consumed)
+		stream["tlsSettings"] = buildTLSSettings(n.Params, consumed, cfg.TLSFingerprint)
 	case "reality":
-		rs, err := buildRealitySettings(n.Params, consumed)
+		rs, err := buildRealitySettings(n.Params, consumed, cfg.TLSFingerprint)
 		if err != nil {
 			return nil, err
 		}
@@ -633,8 +726,8 @@ func buildStreamSettings(n *model.Node, consumed map[string]bool) (map[string]an
 	return stream, nil
 }
 
-func buildTLSSettings(p map[string]string, consumed map[string]bool) map[string]any {
-	tls := map[string]any{"fingerprint": clientFingerprint}
+func buildTLSSettings(p map[string]string, consumed map[string]bool, fingerprint string) map[string]any {
+	tls := map[string]any{"fingerprint": fingerprint}
 	// The link's own fp is the same datum (TLS fingerprint) with a mandated
 	// value: the owner override to firefox is deliberate policy, not a drop.
 	consumed["fp"] = true
@@ -655,8 +748,8 @@ func buildTLSSettings(p map[string]string, consumed map[string]bool) map[string]
 	return tls
 }
 
-func buildRealitySettings(p map[string]string, consumed map[string]bool) (map[string]any, error) {
-	rs := map[string]any{"fingerprint": clientFingerprint}
+func buildRealitySettings(p map[string]string, consumed map[string]bool, fingerprint string) (map[string]any, error) {
+	rs := map[string]any{"fingerprint": fingerprint}
 	consumed["fp"] = true // owner-mandated firefox override, same datum (see buildTLSSettings)
 	if v := p["sni"]; v != "" {
 		consumed["sni"] = true
