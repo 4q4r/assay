@@ -276,9 +276,7 @@
           "serverName": "donor.example"
         },
         "wsSettings": {
-          "headers": {
-            "Host": "ws.example"
-          },
+          "host": "ws.example",
           "path": "/tj"
         }
       },

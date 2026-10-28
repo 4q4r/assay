@@ -106,3 +106,52 @@ func TestFilterIsDeterministicAndStable(t *testing.T) {
 	kept2, _ := filter.Run(nodes)
 	assert.Equal(t, kept1, kept2, "filter output order must be deterministic")
 }
+
+// TestProtocolsAllowlist pins the W5 acceptance policy: ss is parsed but
+// DROPPED unless allowlisted ([filter].protocols, default vless,vmess,trojan).
+func TestProtocolsAllowlist(t *testing.T) {
+	ssNode := model.NewNode("s", "ss", "aes-128-gcm:pw", "ss.example.com", 8388,
+		map[string]string{"method": "aes-128-gcm", "password": "pw", "security": "tls", "type": "tcp"})
+	vlessNode := model.NewNode("s", "vless", "u", "v.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+
+	t.Run("default drops ss", func(t *testing.T) {
+		kept, dropped := filter.Run([]*model.Node{ssNode, vlessNode})
+		assert.Equal(t, []*model.Node{vlessNode}, kept)
+		require.Len(t, dropped, 1)
+		assert.Contains(t, dropped[0].Reason, "allowlist")
+		assert.Contains(t, dropped[0].Reason, `"ss"`)
+	})
+	t.Run("ss opt-in passes security-checked", func(t *testing.T) {
+		kept, dropped := filter.Run([]*model.Node{ssNode, vlessNode}, filter.WithProtocols([]string{"vless", "vmess", "trojan", "ss"}))
+		assert.Len(t, kept, 2)
+		assert.Empty(t, dropped)
+	})
+	t.Run("PSK-only ss still fails the security stance", func(t *testing.T) {
+		plain := model.NewNode("s", "ss", "aes-128-gcm:pw", "ss.example.com", 8388,
+			map[string]string{"method": "aes-128-gcm", "password": "pw", "type": "tcp"})
+		kept, dropped := filter.Run([]*model.Node{plain}, filter.WithProtocols([]string{"ss"}))
+		assert.Empty(t, kept, "no security=reality|tls → dropped even when allowlisted (documented stance)")
+		assert.Contains(t, dropped[0].Reason, "no reality/tls security")
+	})
+	t.Run("empty allowlist option falls back to default", func(t *testing.T) {
+		kept, _ := filter.Run([]*model.Node{vlessNode}, filter.WithProtocols(nil))
+		assert.Len(t, kept, 1)
+	})
+}
+
+// TestAllowInsecurePolicy pins the W5 [filter].allow_insecure knob: denial in
+// filter (default), admitted links reach the renderer (which surfaces the
+// removed feature as a drop-report entry — never a rendered key).
+func TestAllowInsecurePolicy(t *testing.T) {
+	// Keys arrive lowercased from parse (pipeline-realistic input).
+	n := model.NewNode("s", "vless", "u", "v.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp", "allowinsecure": "1"})
+	kept, dropped := filter.Run([]*model.Node{n})
+	assert.Empty(t, kept)
+	require.Len(t, dropped, 1)
+	assert.Contains(t, dropped[0].Reason, "allow_insecure=false")
+
+	kept, _ = filter.Run([]*model.Node{n}, filter.WithAllowInsecure(true))
+	assert.Len(t, kept, 1, "explicit policy admits the link (renderer reports the limitation)")
+}

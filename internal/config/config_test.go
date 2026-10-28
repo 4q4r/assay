@@ -325,3 +325,66 @@ source_cap = %s
 	require.Error(t, err, "negative cap is a config error, not unlimited")
 	assert.Contains(t, err.Error(), "source_cap")
 }
+
+// writeCfg writes a TOML body to a temp file and returns its path.
+func writeCfg(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+	return path
+}
+
+func load(t *testing.T, body string) *config.Config {
+	t.Helper()
+	cfg, err := config.Load(writeCfg(t, body))
+	require.NoError(t, err)
+	return cfg
+}
+
+// TestMaintainIntervalsDefaultsFloorAndStrict pins the W5 knobs: defaults
+// 6h/168h, a 5-minute floor with loud failure below, and strict decoding.
+func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n")
+		assert.Equal(t, 6*time.Hour, cfg.Maintain.RefreshInterval.Duration)
+		assert.Equal(t, 168*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
+	})
+	t.Run("custom values parse", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\nrefresh_interval = \"90m\"\nspeedtest_interval = \"240h\"\n")
+		assert.Equal(t, 90*time.Minute, cfg.Maintain.RefreshInterval.Duration)
+		assert.Equal(t, 240*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
+	})
+	t.Run("below floor fails loud", func(t *testing.T) {
+		for name, val := range map[string]string{
+			"refresh_interval":   `"4m"`,
+			"speedtest_interval": `"1m"`,
+		} {
+			_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\n"+name+" = "+val+"\n"))
+			require.Error(t, err, "%s below the 5m floor must fail", name)
+			assert.Contains(t, err.Error(), "5m0s")
+		}
+	})
+	t.Run("unknown maintain key fails loud", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[maintain]\nrefresh_intervalz = \"6h\"\n"))
+		require.Error(t, err)
+	})
+}
+
+// TestFilterProtocolsAndAllowInsecureConfig pins the W5 filter policy knobs.
+func TestFilterProtocolsAndAllowInsecureConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n")
+		assert.Equal(t, []string{"vless", "vmess", "trojan"}, cfg.Filter.Protocols)
+		assert.False(t, cfg.Filter.AllowInsecure)
+	})
+	t.Run("ss opt-in", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[filter]\nprotocols = [\"vless\", \"ss\"]\nallow_insecure = true\n")
+		assert.Equal(t, []string{"vless", "ss"}, cfg.Filter.Protocols)
+		assert.True(t, cfg.Filter.AllowInsecure)
+	})
+	t.Run("unknown scheme fails loud", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[sources.s]\nrepo = \"o/r\"\ndiscovery = \"github-contents\"\n[filter]\nprotocols = [\"vless\", \"tuic\"]\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tuic")
+	})
+}

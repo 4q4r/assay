@@ -99,14 +99,22 @@ func TestRejectedSchemesAreCounted(t *testing.T) {
 		"hysteria://pw@h:443",
 		"hysteria2://pw@h:443",
 		"ssr://base64stuff",
-		"ss://YWVzLTI1Ni1nY206cHc@h:443",
 		"vless://u@ok.example.com:443?security=tls&type=tcp#ok",
 	}
 	res := parse.Lines("s", strings.Join(lines, "\n"))
 	require.Len(t, res.Nodes, 1)
-	assert.Equal(t, 6, res.Rejected, "tuic/hy2/hysteria/hysteria2/ssr/ss are rejected")
+	assert.Equal(t, 5, res.Rejected, "tuic/hy2/hysteria/hysteria2/ssr are rejected")
 	assert.Equal(t, "ok.example.com", res.Nodes[0].Host)
-	assert.Len(t, res.RejectedKinds, 6)
+	assert.Len(t, res.RejectedKinds, 5)
+}
+
+// TestSSIsParsedNotRejected pins the W5 policy shift: ss links are PARSED
+// (acceptance is a filter policy — [filter].protocols), never scheme-rejected.
+func TestSSIsParsedNotRejected(t *testing.T) {
+	res := parse.Lines("s", "ss://YWVzLTI1Ni1nY206cHc@h:443")
+	require.Len(t, res.Nodes, 1)
+	assert.Equal(t, 0, res.Rejected, "ss is parsed; acceptance is the filter's allowlist decision")
+	assert.Equal(t, "ss", res.Nodes[0].Scheme)
 }
 
 func TestBase64BodyIsDetectedAndDecoded(t *testing.T) {
@@ -230,4 +238,70 @@ func TestExactDuplicateKeyKeepsFirstOccurrence(t *testing.T) {
 	n, err := parse.Link("s", "vless://u@h.example.com:443?security=tls&type=ws&type=grpc")
 	require.NoError(t, err)
 	assert.Equal(t, "ws", n.Network, "first occurrence wins within one exact key")
+}
+
+// TestSSSIP002Links pins the shadowsocks link variants the parser accepts.
+func TestSSSIP002Links(t *testing.T) {
+	t.Run("base64url userinfo", func(t *testing.T) {
+		n, err := parse.Link("s", "ss://"+b64URL("aes-128-gcm:secret-pw")+"@ss.example.com:8388?sni=s.example.com&type=tcp#ss-node")
+		require.NoError(t, err)
+		assert.Equal(t, "ss", n.Scheme)
+		assert.Equal(t, "ss.example.com", n.Host)
+		assert.Equal(t, 8388, n.Port)
+		assert.Equal(t, "aes-128-gcm", n.Params["method"])
+		assert.Equal(t, "secret-pw", n.Params["password"])
+		assert.Equal(t, "s.example.com", n.Params["sni"], "query params pass through verbatim")
+		assert.Equal(t, "ss-node", n.Fragment)
+	})
+	t.Run("plaintext userinfo", func(t *testing.T) {
+		n, err := parse.Link("s", "ss://chacha20-ietf-poly1305:pw123@ss2.example.com:443?security=tls")
+		require.NoError(t, err)
+		assert.Equal(t, "chacha20-ietf-poly1305", n.Params["method"])
+		assert.Equal(t, "pw123", n.Params["password"])
+		assert.Equal(t, "tls", n.Security, "ss+security=tls is admitted by NewNode like any scheme")
+	})
+	t.Run("legacy whole-link base64", func(t *testing.T) {
+		n, err := parse.Link("s", "ss://"+b64("aes-256-gcm:legacypw@ss3.example.com:8388"))
+		require.NoError(t, err)
+		assert.Equal(t, "ss3.example.com", n.Host)
+		assert.Equal(t, "aes-256-gcm", n.Params["method"])
+		assert.Equal(t, "legacypw", n.Params["password"])
+	})
+	t.Run("plugin param passes through verbatim", func(t *testing.T) {
+		n, err := parse.Link("s", "ss://"+b64URL("aes-128-gcm:pw")+"@ss4.example.com:443?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dcdn.example")
+		require.NoError(t, err)
+		assert.Equal(t, "obfs-local;obfs=http;obfs-host=cdn.example", n.Params["plugin"], "plugin params parsed and stored 1:1 (render fails loud)")
+	})
+	t.Run("round-trips through Node.Link", func(t *testing.T) {
+		n, err := parse.Link("s", "ss://"+b64URL("aes-128-gcm:pw")+"@ss5.example.com:443?type=tcp&sni=s.example.com#frag")
+		require.NoError(t, err)
+		again, err := parse.Link("s", n.Link())
+		require.NoError(t, err)
+		assert.Equal(t, n.Key, again.Key, "rebuilt ss link parses to the same identity")
+		assert.Equal(t, n.Params["method"], again.Params["method"])
+	})
+	t.Run("malformed", func(t *testing.T) {
+		for _, bad := range []string{
+			"ss://",                                // empty
+			"ss://nosuffix",                        // no @ and not base64 of a target
+			"ss://withoutcolons@h.example.com:443", // userinfo without method:password
+			"ss://" + b64URL("m:pw") + "@h.example.com:0",     // port 0
+			"ss://" + b64URL("m:pw") + "@h.example.com:99999", // port out of range
+		} {
+			_, err := parse.Link("s", bad)
+			require.Error(t, err, "expected %q to be rejected", bad)
+		}
+	})
+}
+
+// TestVMESSHeaderTypePreserved pins the vmess tcp http-obfs datum: the JSON
+// "type" field is the header-obfuscation value (never the network), and it
+// survives parse as headerType so tcp+type=http renders its header block.
+func TestVMESSHeaderTypePreserved(t *testing.T) {
+	payload := `{"v":"2","ps":"vm","add":"vm.example.com","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","aid":"0","net":"tcp","type":"http","host":"","path":"","tls":"tls","sni":"s.example.com"}`
+	n, err := parse.Link("s", "vmess://"+b64(payload))
+	require.NoError(t, err)
+	assert.Equal(t, "tcp", n.Network, "net wins as the network")
+	assert.Equal(t, "http", n.Params["headerType"], "the header datum is preserved as headerType")
+	assert.Equal(t, "tcp", n.Params["type"])
 }
