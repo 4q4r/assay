@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,18 @@ type Options struct {
 	DBPath              string        // isolated knife database (never the user default)
 	WorkDir             string        // scratch dir for links/results files
 	MaxPassed           int           // stop after N passed (0 = all)
+	// SkipFreshWithin is [probe].skip_fresh_within: nodes whose LATEST probe
+	// result is exactly `passed` and newer than this window are skipped in
+	// the wave — no link, no probe-log entry (their passed history stays
+	// intact for rank's geo.ttl gate). 0 = probe everything (the default).
+	SkipFreshWithin time.Duration
+	// Latest carries the newest outcome per node key (store.LatestProbeByKey)
+	// the skip decision reads. nil/empty = nothing to skip on.
+	Latest map[string]store.ProbeResult
+	// Now is the clock seam (tests inject; nil = time.Now().UTC()).
+	Now func() time.Time
+	// Progress receives per-skipped-node lines ("skipping …"). nil = discard.
+	Progress io.Writer
 }
 
 // RawResult mirrors one xray-knife http -x jsonl record (v11.4.1 wire shape).
@@ -60,13 +73,24 @@ type Runner interface {
 }
 
 // Run probes every node and appends outcomes to the probe log. Nodes without
-// a knife result are recorded as not-alive-this-wave.
+// a knife result are recorded as not-alive-this-wave. Nodes skipped by
+// [probe].skip_fresh_within (latest result exactly `passed`, newer than the
+// window) produce NEITHER a link NOR a log entry — their probe history is
+// preserved untouched.
 func Run(
 	ctx context.Context, nodes []*model.Node, r Runner, opts Options, resultsPath string,
 ) ([]store.ProbeResult, error) {
+	now := time.Now().UTC()
+	if opts.Now != nil {
+		now = opts.Now().UTC()
+	}
+	skipped := freshSkipSet(nodes, opts, now)
 	links := make([]string, 0, len(nodes))
 	keyByLink := make(map[string]string, len(nodes))
 	for _, n := range nodes {
+		if skipped[n.Key] {
+			continue
+		}
 		link := n.Link()
 		if _, dup := keyByLink[link]; dup {
 			continue // identical links probe once; both nodes take the outcome
@@ -80,7 +104,6 @@ func Run(
 	}
 	out := make([]store.ProbeResult, 0, len(nodes))
 	seen := make(map[string]bool, len(raw))
-	now := time.Now().UTC()
 	for _, rr := range raw {
 		key, ok := keyByLink[rr.Link]
 		if !ok {
@@ -103,9 +126,10 @@ func Run(
 		})
 	}
 	for _, n := range nodes {
-		if !seen[n.Key] {
-			out = append(out, store.ProbeResult{Key: n.Key, Host: n.Host, Alive: false, CheckedAt: now})
+		if skipped[n.Key] || seen[n.Key] {
+			continue // skipped nodes keep their history; no synthetic dead record
 		}
+		out = append(out, store.ProbeResult{Key: n.Key, Host: n.Host, Alive: false, CheckedAt: now})
 	}
 	if resultsPath != "" {
 		if err := store.AppendProbeResults(resultsPath, out); err != nil {
@@ -113,6 +137,34 @@ func Run(
 		}
 	}
 	return out, nil
+}
+
+// freshSkipSet resolves the [probe].skip_fresh_within skip list: a node is
+// skipped when its latest outcome is exactly `passed` (strict — semi-passed
+// is re-probed) and its age is inside the window. Every skip is logged.
+func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]bool {
+	if opts.SkipFreshWithin <= 0 || len(opts.Latest) == 0 {
+		return nil
+	}
+	var skipped map[string]bool
+	for _, n := range nodes {
+		pr, ok := opts.Latest[n.Key]
+		if !ok || pr.Status != "passed" {
+			continue
+		}
+		if age := now.Sub(pr.CheckedAt); age < opts.SkipFreshWithin {
+			if skipped == nil {
+				skipped = map[string]bool{}
+			}
+			skipped[n.Key] = true
+			if opts.Progress != nil {
+				_, _ = fmt.Fprintf(opts.Progress,
+					"probe: skipping %s (%s): latest passed %s ago, within skip_fresh_within %s\n",
+					n.Key, n.Host, age.Round(time.Second), opts.SkipFreshWithin)
+			}
+		}
+	}
+	return skipped
 }
 
 func normalizeIP(s string) string {

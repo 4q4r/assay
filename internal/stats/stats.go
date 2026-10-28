@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"public_vpn/internal/config"
 	"public_vpn/internal/model"
 )
 
@@ -77,7 +78,10 @@ type statsResponse struct {
 func Run(ctx context.Context, opts Options) (Result, error) {
 	res := Result{PolledAt: time.Now().UTC().Format(time.RFC3339)}
 	if opts.Timeout <= 0 {
-		opts.Timeout = 5 * time.Second
+		// Fallback for direct callers that leave Timeout unset — the SAME
+		// default the pipeline passes via [maintain].stats_timeout (one knob,
+		// both sites; the old 5s/10s inconsistency is gone).
+		opts.Timeout = config.DefaultStatsTimeout
 	}
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()

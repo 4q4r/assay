@@ -53,6 +53,9 @@ type Input struct {
 	Nodes      []*model.Node
 	ProbeByKey map[string]store.ProbeResult
 	Cfg        config.GeoConfig
+	// UserAgent is [http].user_agent — the ONE pipeline UA knob; empty falls
+	// back to config.DefaultUserAgent inside the client constructor.
+	UserAgent string
 }
 
 // Run enriches alive nodes' exit IPs, merges probe outcomes, and upserts the
@@ -61,7 +64,7 @@ func Run(ctx context.Context, in Input) ([]*model.GeoRecord, error) {
 	exitIPs := collectExitIPs(in.Nodes, in.ProbeByKey)
 	byIP := map[string]Response{}
 	if len(exitIPs.distinct) > 0 {
-		resp, err := NewClient(in.Cfg).Enrich(ctx, exitIPs.distinct)
+		resp, err := NewClient(in.Cfg, in.UserAgent).Enrich(ctx, exitIPs.distinct)
 		if err != nil {
 			return nil, err
 		}
@@ -178,9 +181,10 @@ func applyGeoLookup(rec *model.GeoRecord, ip string, byIP map[string]Response) {
 
 // Client is the ip-api.com batch client.
 type Client struct {
-	cfg     config.GeoConfig
-	http    *http.Client
-	limiter *rate.Limiter
+	cfg       config.GeoConfig
+	userAgent string
+	http      *http.Client
+	limiter   *rate.Limiter
 }
 
 // batchInterval derives the production batch interval: the free-tier clamp
@@ -194,18 +198,23 @@ func batchInterval(perMinute int) time.Duration {
 
 // NewClient builds a client; the rate limiter is clamped to the free-tier
 // batch ceiling of 15 requests/min regardless of configuration generosity.
-func NewClient(cfg config.GeoConfig) *Client {
-	return NewClientWithLimiter(cfg, rate.NewLimiter(rate.Every(batchInterval(cfg.PerMinute)), 1))
+// An empty userAgent falls back to config.DefaultUserAgent.
+func NewClient(cfg config.GeoConfig, userAgent string) *Client {
+	return NewClientWithLimiter(cfg, rate.NewLimiter(rate.Every(batchInterval(cfg.PerMinute)), 1), userAgent)
 }
 
 // NewClientWithLimiter is the construction seam: tests inject a limiter to
 // assert spacing contracts without real 4-second waits. Production callers
 // use NewClient.
-func NewClientWithLimiter(cfg config.GeoConfig, limiter *rate.Limiter) *Client {
+func NewClientWithLimiter(cfg config.GeoConfig, limiter *rate.Limiter, userAgent string) *Client {
+	if userAgent == "" {
+		userAgent = config.DefaultUserAgent
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil // L5: geo lookups must not ride the owner's VPN
 	return &Client{
-		cfg: cfg,
+		cfg:       cfg,
+		userAgent: userAgent,
 		http: &http.Client{
 			Timeout:   cfg.Timeout.Duration,
 			Transport: transport,
@@ -268,7 +277,7 @@ func (c *Client) enrichBatch(ctx context.Context, batch []string) ([]Response, e
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "public_vpn (pipeline; contact: owner)")
+	req.Header.Set("User-Agent", c.userAgent)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err

@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -175,4 +176,97 @@ func TestJSONLArtifactsAreExplicitly0600(t *testing.T) {
 	ms, err := os.Stat(manifest)
 	require.NoError(t, err)
 	assert.Equal(t, fs.FileMode(0o600), ms.Mode().Perm(), "fetch manifest must be 0600")
+}
+
+// writeFakeBackup drops a <prefix>.bak-<stamp> file with distinct stamps.
+func writeFakeBackup(t *testing.T, dir, prefix, stamp, body string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, prefix+".bak-"+stamp), []byte(body), 0o600))
+}
+
+// TestKeepNewestBackupsKeepsNewest pins the retention semantics: keep=N
+// retains the N newest <prefix>.bak-* files and deletes the older ones;
+// keep=0 is a no-op (unlimited).
+func TestKeepNewestBackupsKeepsNewest(t *testing.T) {
+	dir := t.TempDir()
+	stamps := []string{"20260101-000001", "20260101-000002", "20260101-000003", "20260101-000004", "20260101-000005"}
+	for i, s := range stamps {
+		writeFakeBackup(t, dir, "config.json", s, fmt.Sprintf("v%d", i))
+	}
+
+	require.NoError(t, store.KeepNewestBackups(dir, "config.json", 2))
+	remaining, err := filepath.Glob(filepath.Join(dir, "config.json.bak-*"))
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2)
+	assert.Contains(t, remaining, filepath.Join(dir, "config.json.bak-20260101-000005"))
+	assert.Contains(t, remaining, filepath.Join(dir, "config.json.bak-20260101-000004"))
+
+	// keep=0 = unlimited: a fresh set survives untouched.
+	require.NoError(t, store.KeepNewestBackups(dir, "config.json", 0))
+	remaining, err = filepath.Glob(filepath.Join(dir, "config.json.bak-*"))
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2, "keep=0 must never delete")
+}
+
+// TestKeepNewestBackupsIsPrefixScoped pins that the retention only touches
+// backups of ITS prefix (activate backups and geo-base backups can share a
+// directory shape without cross-deleting).
+func TestKeepNewestBackupsIsPrefixScoped(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeBackup(t, dir, "config.json", "20260101-000001", "a")
+	writeFakeBackup(t, dir, "other.json", "20260101-000002", "b")
+	require.NoError(t, store.KeepNewestBackups(dir, "config.json", 1))
+	_, err := os.Stat(filepath.Join(dir, "other.json.bak-20260101-000002"))
+	require.NoError(t, err, "another prefix's backup must never be touched")
+}
+
+// TestKeepNewestBackupsLoudOnDeletionFailure pins the safety rule: a backup
+// that cannot be deleted fails the call loud — rollback depth is never
+// silently reduced without an error.
+func TestKeepNewestBackupsLoudOnDeletionFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeBackup(t, dir, "config.json", "20260101-000001", "old")
+	// A non-empty DIRECTORY wearing a backup name cannot be removed as a
+	// file — the deletion must surface as an error, not a silent skip. It
+	// wears the OLDEST stamp so retention actually tries to delete it.
+	stubDir := filepath.Join(dir, "config.json.bak-20200101-000000")
+	require.NoError(t, os.Mkdir(stubDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(stubDir, "x"), []byte("stub"), 0o600))
+	err := store.KeepNewestBackups(dir, "config.json", 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "20200101-000000", "the undeletable backup must be named")
+}
+
+// TestRewriteGeoWithBackupAppliesRetention pins the prune-side wiring: the
+// new backup is written first, then retention applies, then the store is
+// rewritten — and a retention failure aborts BEFORE the store is touched.
+func TestRewriteGeoWithBackupAppliesRetention(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "geo-base.jsonl")
+	require.NoError(t, os.WriteFile(storePath, []byte(`{"host":"old"}`+"\n"), 0o600))
+	// Two pre-existing backups; keep=1 → only the NEW backup survives.
+	writeFakeBackup(t, dir, "geo-base.jsonl", "20260101-000001", "older")
+	writeFakeBackup(t, dir, "geo-base.jsonl", "20260101-000002", "old")
+
+	records := []*model.GeoRecord{{Host: "new.example.com", Scheme: "vless", Port: 443}}
+	bp, err := store.RewriteGeoWithBackup(storePath, records, time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC), 1)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, "geo-base.jsonl.bak-20261028-120000"), bp)
+
+	remaining, err := filepath.Glob(filepath.Join(dir, "geo-base.jsonl.bak-*"))
+	require.NoError(t, err)
+	assert.Len(t, remaining, 1, "keep=1: only the fresh backup remains")
+
+	// Retention failure must abort BEFORE the store rewrite (loud, atomic).
+	// A non-empty DIRECTORY wearing a backup name cannot be removed as a file.
+	stubDir := filepath.Join(dir, "geo-base.jsonl.bak-20200101-000000")
+	require.NoError(t, os.Mkdir(stubDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(stubDir, "x"), []byte("stub"), 0o600))
+	before, readErr := os.ReadFile(storePath)
+	require.NoError(t, readErr)
+	_, err = store.RewriteGeoWithBackup(storePath, records, time.Date(2026, 10, 28, 13, 0, 0, 0, time.UTC), 2)
+	require.Error(t, err)
+	after, readErr := os.ReadFile(storePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, string(before), string(after), "the store must be untouched when retention fails")
 }

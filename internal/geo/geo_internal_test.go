@@ -29,7 +29,7 @@ func TestBatchIntervalClampsToFreeTier(t *testing.T) {
 // really builds a burst-1 limiter at the clamped interval: exactly one
 // immediate token, then the spacing is real (no burst-y 429 drivers).
 func TestNewClientDelegatesToBatchInterval(t *testing.T) {
-	cl := NewClient(config.GeoConfig{PerMinute: 900})
+	cl := NewClient(config.GeoConfig{PerMinute: 900}, "")
 	require.NotNil(t, cl.limiter)
 	assert.True(t, cl.limiter.Allow(), "burst is 1: the first batch goes immediately")
 	assert.False(t, cl.limiter.Allow(), "burst is 1: the second batch must wait out the clamped 4s interval")

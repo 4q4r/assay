@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,10 +25,14 @@ func node(t *testing.T, name string) *model.Node {
 type fakeRunner struct {
 	results []probe.RawResult
 	calls   int
+	run     func(links []string) // test seam: observe the link list knife receives
 }
 
-func (f *fakeRunner) Run(_ context.Context, _ []string, _ probe.Options) ([]probe.RawResult, error) {
+func (f *fakeRunner) Run(_ context.Context, links []string, _ probe.Options) ([]probe.RawResult, error) {
 	f.calls++
+	if f.run != nil {
+		f.run(links)
+	}
 	return f.results, nil
 }
 
@@ -96,6 +101,92 @@ func TestStageLoudOnUnmappedLink(t *testing.T) {
 	_, err := probe.Run(context.Background(), []*model.Node{n}, fr, probe.Options{}, filepath.Join(t.TempDir(), "p.jsonl"))
 	require.Error(t, err, "a knife result we cannot attribute is a contract breach — fail loud")
 	assert.Contains(t, err.Error(), "unmapped")
+}
+
+// skipFreshFixture builds two nodes with latest probe outcomes: one passed
+// and fresh, one passed but stale. A third failed node joins via the runner.
+func skipFreshFixture(t *testing.T) ([]*model.Node, *fakeRunner, map[string]store.ProbeResult) {
+	t.Helper()
+	freshNode, staleNode := node(t, "freshpass"), node(t, "stalepass")
+	now := time.Now().UTC()
+	latest := map[string]store.ProbeResult{
+		freshNode.Key: {Key: freshNode.Key, Host: freshNode.Host, Alive: true, Status: "passed", CheckedAt: now.Add(-time.Minute)},
+		staleNode.Key: {Key: staleNode.Key, Host: staleNode.Host, Alive: true, Status: "passed", CheckedAt: now.Add(-2 * time.Hour)},
+	}
+	return []*model.Node{freshNode, staleNode}, &fakeRunner{}, latest
+}
+
+// TestSkipFreshDefaultProbesEverything pins the default: window 0s (and nil
+// latest map) probes EVERY node — identical link list, no behavioral change.
+func TestSkipFreshDefaultProbesEverything(t *testing.T) {
+	nodes, fr, latest := skipFreshFixture(t)
+	fr.results = []probe.RawResult{
+		{Link: nodes[0].Link(), Status: "failed"},
+		{Link: nodes[1].Link(), Status: "passed"},
+	}
+	var gotLinks []string
+	fr.run = func(links []string) { gotLinks = links }
+	out, err := probe.Run(context.Background(), nodes, fr, probe.Options{Latest: latest}, "")
+	require.NoError(t, err)
+	assert.Len(t, out, 2, "window 0 = probe everything (default behavior)")
+	assert.Len(t, gotLinks, 2, "both nodes must be on the probe link list")
+}
+
+// TestSkipFreshWindowSkipsFreshPassed pins the consumption contract: with a
+// window set, a node whose latest result is `passed` and NEWER than the
+// window is skipped (no link, NO probe-log entry at all — its history stays
+// untouched), with a per-skipped-node log line.
+func TestSkipFreshWindowSkipsFreshPassed(t *testing.T) {
+	nodes, fr, latest := skipFreshFixture(t)
+	fr.results = []probe.RawResult{
+		{Link: nodes[1].Link(), Status: "passed"}, // only the stale one probed
+	}
+	var gotLinks []string
+	fr.run = func(links []string) { gotLinks = links }
+	logBuf := &strings.Builder{}
+	out, err := probe.Run(context.Background(), nodes, fr,
+		probe.Options{SkipFreshWithin: 30 * time.Minute, Latest: latest, Progress: logBuf}, "")
+	require.NoError(t, err)
+	require.Len(t, gotLinks, 1, "fresh-passed node excluded from the link list")
+	assert.Equal(t, nodes[1].Link(), gotLinks[0], "only the stale node is probed")
+	require.Len(t, out, 1, "the skipped node gets NO probe-log entry (its history stays intact)")
+	assert.Equal(t, nodes[1].Key, out[0].Key)
+	assert.Contains(t, logBuf.String(), nodes[0].Key, "the skip must be logged per node")
+	assert.Contains(t, logBuf.String(), "skipping")
+}
+
+// TestSkipFreshIncludesFailedAndSemiPassed pins the strictness: only status
+// exactly `passed` qualifies — failed and semi-passed nodes are re-probed
+// even when fresh.
+func TestSkipFreshIncludesFailedAndSemiPassed(t *testing.T) {
+	failedNode, semiNode := node(t, "freshfail"), node(t, "freshsemi")
+	now := time.Now().UTC()
+	latest := map[string]store.ProbeResult{
+		failedNode.Key: {Key: failedNode.Key, Alive: false, Status: "failed", CheckedAt: now.Add(-time.Minute)},
+		semiNode.Key:   {Key: semiNode.Key, Alive: true, Status: "semi-passed", CheckedAt: now.Add(-time.Minute)},
+	}
+	var gotLinks []string
+	fr := &fakeRunner{run: func(links []string) { gotLinks = links }}
+	_, err := probe.Run(context.Background(), []*model.Node{failedNode, semiNode}, fr,
+		probe.Options{SkipFreshWithin: time.Hour, Latest: latest}, "")
+	require.NoError(t, err)
+	assert.Len(t, gotLinks, 2, "failed/semi-passed are not `passed` — both must be probed")
+}
+
+// TestSkipFreshSkippedNodeKeepsHistory pins the safety property end-to-end:
+// after a wave that skipped a fresh-passed node, its LATEST probe record in
+// the log is still the old passed one — never a synthetic dead record.
+func TestSkipFreshSkippedNodeKeepsHistory(t *testing.T) {
+	nodes, fr, latest := skipFreshFixture(t)
+	path := filepath.Join(t.TempDir(), "p.jsonl")
+	fr.results = []probe.RawResult{{Link: nodes[1].Link(), Status: "passed"}}
+	_, err := probe.Run(context.Background(), nodes, fr,
+		probe.Options{SkipFreshWithin: 30 * time.Minute, Latest: latest}, path)
+	require.NoError(t, err)
+	got, err := store.LatestProbeByKey(path)
+	require.NoError(t, err)
+	assert.NotContains(t, got, nodes[0].Key, "a skipped node must not gain a synthetic (dead) record")
+	assert.Contains(t, got, nodes[1].Key)
 }
 
 // --- KnifeRunner against a scripted fake binary: verifies command

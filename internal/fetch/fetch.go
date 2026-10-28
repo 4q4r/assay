@@ -32,12 +32,16 @@ type ClientConfig struct {
 	Timeout     time.Duration // per request
 	Retries     int           // attempts on retryable (5xx/network) failures
 	Concurrency int           // parallel file downloads per source
+	UserAgent   string        // [http].user_agent; empty = config.DefaultUserAgent
 }
 
 // Client discovers and downloads source files.
 type Client struct {
 	cfg  ClientConfig
 	http *http.Client
+	// LogOut receives per-file stage progress lines (the Gap-0
+	// "cache fresh, skipping" note). nil = io.Discard.
+	LogOut io.Writer
 }
 
 // FetchedFile is one downloaded source body.
@@ -56,16 +60,19 @@ type FetchedFile struct {
 // VPN (landmine L5 — the in-process equivalent of env -u http_proxy).
 func NewClient(cfg ClientConfig) *Client {
 	if cfg.APIBase == "" {
-		cfg.APIBase = "https://api.github.com"
+		cfg.APIBase = config.DefaultAPIBase
 	}
 	if cfg.RawBase == "" {
-		cfg.RawBase = "https://raw.githubusercontent.com"
+		cfg.RawBase = config.DefaultRawBase
 	}
 	if cfg.Retries == 0 {
 		cfg.Retries = 3
 	}
 	if cfg.Concurrency == 0 {
 		cfg.Concurrency = 4
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = config.DefaultUserAgent
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
@@ -87,30 +94,51 @@ func (c *Client) Source(ctx context.Context, id string, src config.Source) ([]Fe
 	return c.fetchPaths(ctx, id, src.Repo, paths)
 }
 
+// fetchJob is one file to resolve for a source: its resolved path, cached
+// validator, freshness verdict, and the freshness window (for the skip log).
+type fetchJob struct {
+	idx    int
+	path   string
+	etag   string
+	fresh  bool          // cached body younger than maxAge → no network fetch
+	maxAge time.Duration // the freshness window (for the skip log line)
+}
+
+// cachePath maps one job to its on-disk cache file.
+func cachePath(j fetchJob, cacheDir, id string) string {
+	return filepath.Join(cacheDir, id, SafePath(j.path))
+}
+
 // SourceCached is Source with disk caching: bodies land under
 // cacheDir/<source>/<safe-path> and conditional GETs (ETag/If-None-Match)
-// turn into 304 → cached-body reuse.
+// turn into 304 → cached-body reuse. maxAge is the [fetch].cache_max_age
+// freshness window (Gap-0): a cached body file younger than maxAge skips the
+// network fetch for that file entirely ("cache fresh, skipping"); 0 disables
+// the skip (always fetch). Stale or missing cache → the normal conditional
+// GET + cache write path.
 func (c *Client) SourceCached(
-	ctx context.Context, id string, src config.Source, cacheDir string,
+	ctx context.Context, id string, src config.Source, cacheDir string, maxAge time.Duration,
 ) ([]FetchedFile, error) {
 	paths, err := c.Discover(ctx, src)
 	if err != nil {
 		return nil, err
 	}
-	type job struct {
-		idx  int
-		path string
-		etag string
-	}
-	jobs := make([]job, len(paths))
+	jobs := make([]fetchJob, len(paths))
 	for i, p := range paths {
-		jobs[i] = job{idx: i, path: p, etag: readCacheEtag(filepath.Join(cacheDir, id, SafePath(p)))}
+		cp := filepath.Join(cacheDir, id, SafePath(p))
+		jobs[i] = fetchJob{
+			idx:    i,
+			path:   p,
+			etag:   readCacheEtag(cp),
+			fresh:  cacheBodyFresh(cp, maxAge),
+			maxAge: maxAge,
+		}
 	}
 	out := make([]FetchedFile, len(paths))
 	var mu sync.Mutex
 	var firstErr error
-	fanErr := bounded(ctx, c.cfg.Concurrency, jobs, func(j job) error {
-		body, etag, err := c.fetchWithValidator(ctx, src.Repo, j.path, j.etag)
+	fanErr := bounded(ctx, c.cfg.Concurrency, jobs, func(j fetchJob) error {
+		ff, err := c.fetchOne(ctx, id, src, j, cachePath(j, cacheDir, id))
 		if err != nil {
 			mu.Lock()
 			if firstErr == nil {
@@ -119,33 +147,8 @@ func (c *Client) SourceCached(
 			mu.Unlock()
 			return nil
 		}
-		cachePath := filepath.Join(cacheDir, id, SafePath(j.path))
-		cached, err := storeCache(cachePath, body, etag)
-		if err != nil {
-			mu.Lock()
-			if firstErr == nil {
-				firstErr = err
-			}
-			mu.Unlock()
-			return nil
-		}
-		if body == nil {
-			body, err = os.ReadFile(cachePath)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return nil
-			}
-		}
-		sum := sha256.Sum256(body)
 		mu.Lock()
-		out[j.idx] = FetchedFile{
-			Source: id, Path: j.path, URL: c.rawURL(src.Repo, j.path), Body: body,
-			Sha256: hex.EncodeToString(sum[:]), Cached: cached, FetchedAt: time.Now().UTC(),
-		}
+		out[j.idx] = ff
 		mu.Unlock()
 		return nil
 	})
@@ -156,6 +159,78 @@ func (c *Client) SourceCached(
 		return nil, fmt.Errorf("fetch source %s: %w", id, fanErr)
 	}
 	return out, nil
+}
+
+// fetchOne resolves one file: the Gap-0 freshness skip (fresh cache = no
+// network call at all) or the normal fetch + cache-write path.
+func (c *Client) fetchOne(
+	ctx context.Context, id string, src config.Source, j fetchJob, path string,
+) (FetchedFile, error) {
+	var body []byte
+	var cached bool
+	if j.fresh {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return FetchedFile{}, fmt.Errorf("fresh cache unreadable for %s: %w", j.path, err)
+		}
+		body, cached = b, true
+		c.logf("cache fresh, skipping %s/%s (younger than %s)\n", id, j.path, j.maxAge)
+	} else {
+		var etag string
+		var err error
+		body, etag, err = c.fetchWithValidator(ctx, src.Repo, j.path, j.etag)
+		if err != nil {
+			return FetchedFile{}, err
+		}
+		cached, err = storeCache(path, body, etag)
+		if err != nil {
+			return FetchedFile{}, err
+		}
+		if body == nil {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return FetchedFile{}, err
+			}
+			body = b
+		}
+	}
+	sum := sha256.Sum256(body)
+	fetchedAt := time.Now().UTC()
+	if j.fresh {
+		if st, statErr := os.Stat(path); statErr == nil {
+			fetchedAt = st.ModTime().UTC()
+		}
+	}
+	return FetchedFile{
+		Source: id, Path: j.path, URL: c.rawURL(src.Repo, j.path), Body: body,
+		Sha256: hex.EncodeToString(sum[:]), Cached: cached, FetchedAt: fetchedAt,
+	}, nil
+}
+
+// cacheBodyFresh reports whether the cached body file exists and its
+// modification time is younger than maxAge (0 = never fresh — always fetch).
+func cacheBodyFresh(cachePath string, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+	st, err := os.Stat(cachePath)
+	if err != nil {
+		return false
+	}
+	// Clock-skew clamp: a FUTURE mtime yields a negative age, which the bare
+	// comparison would count as fresh for the entire skewed window. A
+	// negative age is not fresh — the file reads as stale and the fetch
+	// happens.
+	age := time.Since(st.ModTime())
+	return age >= 0 && age < maxAge
+}
+
+// logf writes a stage progress line when a log sink is attached.
+func (c *Client) logf(format string, a ...any) {
+	if c.LogOut == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(c.LogOut, format, a...)
 }
 
 // Discover resolves the current file paths a source contributes (D9).
@@ -383,7 +458,7 @@ func (c *Client) fetchAttempt(ctx context.Context, url, etag string) ([]byte, st
 	if err != nil {
 		return nil, "", err
 	}
-	req.Header.Set("User-Agent", "public_vpn (pipeline; contact: owner)")
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
@@ -424,7 +499,7 @@ func (c *Client) getJSON(ctx context.Context, url string, v any) error {
 		if err != nil {
 			return err
 		}
-		req.Header.Set("User-Agent", "public_vpn (pipeline; contact: owner)")
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
 		req.Header.Set("Accept", "application/vnd.github+json")
 		if c.cfg.Token != "" && strings.Contains(url, "api.github.com") {
 			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
