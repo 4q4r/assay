@@ -33,10 +33,6 @@ func TestCheckLoudOnEmptyColdBase(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 `, dir)), 0o600))
 
 	root := cli.New()
@@ -55,10 +51,6 @@ func TestCheckLoudOnBadTarget(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 `, dir)), 0o600))
 
 	root := cli.New()
@@ -91,10 +83,6 @@ func TestCheckColorFlagSurface(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 `, dir)), 0o600))
 
 	root = cli.New()

@@ -1,71 +1,64 @@
-# systemd user units (templates)
+# systemd user unit (template)
 
-These four files are the **single source of truth** for the publicvpn systemd
-user units. They are Go text templates — `publicvpn install` embeds them
-(`go:embed`), renders the placeholders (binary path, config path, recheck
-periods from `[maintain]`), writes them to `~/.config/systemd/user/`, and
-enables the timers. You normally never touch systemd yourself:
+This file is the **single source of truth** for the publicvpn systemd user
+unit. It is a Go text template — `publicvpn install` embeds it (`go:embed`),
+renders the placeholders (binary path, config path), writes it to
+`~/.config/systemd/user/`, and enables the daemon. You normally never touch
+systemd yourself:
 
 ```bash
 go build -o publicvpn ./cmd/publicvpn
 ./publicvpn install -c /absolute/path/to/config.toml
 ```
 
-- `public_vpn-refresh.timer` + `.service` — the full refresh wave
-  (fetch → parse → filter → probe → geo → stats → prune → select → render →
-  activate-if-changed) every `[maintain].refresh_interval` (default 6h).
-- `public_vpn-speedtest.timer` + `.service` — the same wave weekly
-  (`[maintain].speedtest_interval`, default 168h), with the slow `-S`
-  throughput measurement in the probe stage.
+- `public_vpn-watch.service` — the long-running **watch daemon** (W10):
+  fsnotify watchdog on the plugins dir (new provider = new .lua file, no
+  rebuild) plus the wave scheduler — refresh waves every
+  `[maintain].refresh_interval` (default 1h), speedtest waves every
+  `[maintain].speedtest_interval`, stats poll inside every wave,
+  activate-if-changed behind the `-test` gate. `Restart=always` brings a
+  crashed daemon back in 5s.
 
-## Timer mechanics
+## Scheduling mechanics
 
-The timers use `OnBootSec` + `OnUnitActiveSec` — **not** `OnCalendar` — so the
-period is whatever duration your config carries (90m, 8h, 10d): the timer
-re-arms N after each completed wave, which also means waves can never overlap.
-`Persistent=true` replays a missed wave after sleep or downtime.
-
-**Changing a period:** edit `[maintain].refresh_interval` /
-`[maintain].speedtest_interval` in the config, then re-run
-`publicvpn install -c <config>` (idempotent — it re-renders the units,
-daemon-reloads, and re-enables). `publicvpn status` flags a mismatch between
-the configured and the installed periods.
+There are **no timers** anymore: the daemon re-arms each wave from the
+moment the previous one completes, so waves can never overlap, and the
+intervals are read from the config **live** — a period change is a config
+edit plus `systemctl --user restart public_vpn-watch.service`, never a
+re-install. The W5 timer units (`public_vpn-refresh/speedtest.*`) are
+retired: `install` disables and removes them automatically when they are
+still on disk (waves must fire from exactly one scheduler).
 
 ## What install executes
 
 Exactly two `systemctl --user` calls, pinned to an internal allowlist (no
-restart, no other units, ever):
+restart of anything, no other units, ever):
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now public_vpn-refresh.timer public_vpn-speedtest.timer
+systemctl --user enable --now public_vpn-watch.service
 ```
 
-`uninstall` runs the symmetric `disable --now` and removes the four unit
-files (`--purge` also removes the config + data dir; default keeps user
-data). Hosts without a user systemd session: `publicvpn install
---no-systemd` copies the binary only and skips the timers.
+(A legacy-timer `disable --now` runs first, only when the old units are
+still present.) `uninstall` runs the symmetric disables and removes every
+known unit file (`--purge` also removes the config + data dir; default keeps
+user data). Hosts without a user systemd session: `publicvpn install
+--no-systemd` copies the binary only and skips the unit.
 
 ## Journald cheatsheet
 
 ```bash
-# Follow the refresh wave live.
-journalctl --user -u public_vpn-refresh.service -f
+# Follow the daemon live (watchdog reloads + wave output).
+journalctl --user -u public_vpn-watch.service -f
 
-# Last run's full output (waves are oneshot — one journal session per run).
-journalctl --user -u public_vpn-refresh.service -n 200
+# Last restart's full output.
+journalctl --user -u public_vpn-watch.service -n 200
 
-# Speedtest wave output.
-journalctl --user -u public_vpn-speedtest.service -n 200
-
-# Timer state: when did it last run, when is the next fire?
-systemctl --user list-timers 'public_vpn-*'
-
-# Manually fire a wave right now (same as running publicvpn maintain).
-systemctl --user start public_vpn-refresh.service
+# Daemon state: active since, restarts.
+systemctl --user status public_vpn-watch.service
 ```
 
-If the timers should keep running after logout, enable lingering:
+If the daemon should keep running after logout, enable lingering:
 
 ```bash
 sudo loginctl enable-linger whoami

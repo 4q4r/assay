@@ -14,22 +14,41 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 )
 
-// Source is one upstream node feed (D9): repo id + discovery method. Raw URLs
+// Source is one upstream node feed descriptor (D9): repo id + discovery
+// method. Since W10 this is a PROGRAMMATIC type only — the [sources.*]
+// config table is gone (the ingest layer is Lua plugins; the host's
+// github_files helper builds Source values from plugin arguments). Raw URLs
 // are never pinned; discovery resolves current paths every wave.
 type Source struct {
 	Repo      string   `toml:"repo"`
 	Discovery string   `toml:"discovery"` // "github-contents" | "manifest"
 	Manifest  string   `toml:"manifest"`  // for discovery="manifest": manifest file path in repo
 	Include   []string `toml:"include"`   // path patterns the discovery must fetch
-	Enabled   *bool    `toml:"enabled"`   // nil = enabled (a declared source is opted in)
 }
 
-// IsEnabled reports whether the source participates in fetch waves.
-func (s Source) IsEnabled() bool {
-	return s.Enabled == nil || *s.Enabled
+// PluginsConfig points the pipeline at the Lua plugins dir (W10: the source
+// ingest layer is plugin-based; sources are .lua files, not config tables).
+type PluginsConfig struct {
+	// Dir is the watched plugins directory. Empty = <data_dir>/plugins. The
+	// embedded defaults materialize into it on FIRST RUN only; owner edits
+	// and removals persist. A removed/re-named plugin = source disabled.
+	Dir string `toml:"dir"`
+	// RunTimeout bounds ONE plugin's entire fetch run (the Lua chunk + the
+	// discover call, network included). gopher-lua has no hook/budget API, so
+	// a spinning plugin (`while true do end`) cannot be interrupted from
+	// inside the VM — the run timeout abandons it instead: the wave logs
+	// LOUD, continues with the healthy plugins, and the abandoned goroutine
+	// + Lua state leak (one per wave for a persistently hanging plugin — the
+	// documented trade-off; the daemon-level WatchdogSec covers the hang
+	// class honestly). Nil = unset → DefaultPluginRunTimeout (120s); an
+	// explicit "0s" means UNBOUNDED (owner ruling: no artificial floor — a
+	// legitimately slow plugin may take as long as it takes). Negative
+	// values are structurally invalid.
+	RunTimeout *Duration `toml:"run_timeout"`
 }
 
-// FetchConfig controls source fetching.
+// FetchConfig controls the fetch-stage client shared by pipeline discovery
+// and the plugins' github_files helper.
 type FetchConfig struct {
 	Timeout     Duration `toml:"timeout"`
 	Retries     int      `toml:"retries"`
@@ -69,11 +88,15 @@ type FilterConfig struct {
 
 // ProbeConfig controls the xray-knife probe wave (out-of-band only).
 type ProbeConfig struct {
-	Path                string   `toml:"path"`
-	Timeout             Duration `toml:"timeout"`
-	Threads             int      `toml:"threads"`
-	URL                 string   `toml:"url"`
-	Speedtest           bool     `toml:"speedtest"`
+	Path    string   `toml:"path"`
+	Timeout Duration `toml:"timeout"`
+	Threads int      `toml:"threads"`
+	URL     string   `toml:"url"`
+	// Speedtest opts every wave's probe into the -S throughput measurement.
+	// W10 owner ruling: default TRUE (speed data on every wave; the
+	// dedicated speedtest_interval wave remains for deeper runs). nil =
+	// unset → true; an explicit false turns it off.
+	Speedtest           *bool    `toml:"speedtest"`
 	SpeedtestTimeout    Duration `toml:"speedtest_timeout"`
 	CheckPreset         string   `toml:"check_preset"`
 	URLSuccessThreshold float64  `toml:"url_success_threshold"`
@@ -83,6 +106,12 @@ type ProbeConfig struct {
 	// and NEWER than this window (0s = probe everything, the default).
 	// Negative values are structurally invalid.
 	SkipFreshWithin Duration `toml:"skip_fresh_within"`
+}
+
+// IsSpeedtest resolves the speedtest default: on unless explicitly
+// disabled (W10 owner ruling — the former false default flipped).
+func (p ProbeConfig) IsSpeedtest() bool {
+	return p.Speedtest == nil || *p.Speedtest
 }
 
 // GeoConfig controls ip-api.com batch enrichment (L6: free tier is HTTP-only,
@@ -179,9 +208,9 @@ type MaintainConfig struct {
 	// PruneDeadAfter removes a geo-base record that is not alive and whose
 	// last_probe is older than this window (default 48h).
 	PruneDeadAfter Duration `toml:"prune_dead_after"`
-	// RefreshInterval is the refresh-wave recheck period. install renders it
-	// into the refresh timer as OnUnitActiveSec (default 6h, floor 5m);
-	// re-running install after a config change applies the new period.
+	// RefreshInterval is the refresh-wave recheck period (default 1h since
+	// W10, floor 5m). install is unaffected — the watch daemon reads the
+	// config live, so a period change needs no re-install.
 	RefreshInterval Duration `toml:"refresh_interval"`
 	// SpeedtestInterval is the speedtest-wave recheck period (default 168h,
 	// floor 5m) — rendered into the speedtest timer's OnUnitActiveSec.
@@ -229,6 +258,14 @@ const (
 	DefaultBalancerTolerance   = 0.2
 	DefaultTieBandRTTTolerance = 1.2
 	DefaultServiceName         = "xray-raw.service"
+	// DefaultPluginRunTimeout bounds one plugin's whole fetch run (the
+	// [plugins].run_timeout default): generous enough for a nested
+	// multi-subscription fetch, small enough that a hung plugin wastes one
+	// wave slot, not the whole schedule.
+	DefaultPluginRunTimeout = 120 * time.Second
+	// DefaultRefreshInterval is the W10 owner ruling: the refresh wave
+	// rechecks hourly (was 6h in the timer era).
+	DefaultRefreshInterval = time.Hour
 )
 
 // defaultPoolInboundTags is the render.pool_inbound_tags default (the tags
@@ -242,17 +279,17 @@ func DefaultPoolInboundTags() []string {
 
 // Config is the pipeline configuration root.
 type Config struct {
-	DataDir  string            `toml:"data_dir"`
-	Sources  map[string]Source `toml:"sources"`
-	Fetch    FetchConfig       `toml:"fetch"`
-	Filter   FilterConfig      `toml:"filter"`
-	Probe    ProbeConfig       `toml:"probe"`
-	Geo      GeoConfig         `toml:"geo"`
-	Select   SelectConfig      `toml:"select"`
-	Render   RenderConfig      `toml:"render"`
-	Activate ActivateConfig    `toml:"activate"`
-	Maintain MaintainConfig    `toml:"maintain"`
-	HTTP     HTTPConfig        `toml:"http"`
+	DataDir  string         `toml:"data_dir"`
+	Plugins  PluginsConfig  `toml:"plugins"`
+	Fetch    FetchConfig    `toml:"fetch"`
+	Filter   FilterConfig   `toml:"filter"`
+	Probe    ProbeConfig    `toml:"probe"`
+	Geo      GeoConfig      `toml:"geo"`
+	Select   SelectConfig   `toml:"select"`
+	Render   RenderConfig   `toml:"render"`
+	Activate ActivateConfig `toml:"activate"`
+	Maintain MaintainConfig `toml:"maintain"`
+	HTTP     HTTPConfig     `toml:"http"`
 }
 
 // Duration wraps time.Duration for TOML string values like "30s", "24h".
@@ -275,11 +312,15 @@ func (d *Duration) MarshalText() ([]byte, error) {
 	return []byte(d.String()), nil
 }
 
-// Load reads, strict-decodes, defaults, and validates the config file.
+// Load reads, migration-checks, strict-decodes, defaults, and validates the
+// config file.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if err := checkRemovedSections(raw); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	cfg := &Config{}
 	dec := toml.NewDecoder(strings.NewReader(string(raw)))
@@ -294,7 +335,28 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// checkRemovedSections fails LOUD on the removed [sources.*] layout, naming
+// the exact migration path (W10: the ingest layer is Lua plugins — there is
+// no silent fallback chain from the old section).
+func checkRemovedSections(raw []byte) error {
+	probe := map[string]any{}
+	decodeErr := toml.NewDecoder(strings.NewReader(string(raw))).Decode(&probe)
+	if decodeErr == nil {
+		if _, ok := probe["sources"]; ok {
+			return errors.New(
+				"the [sources.*] section was removed — the source-ingest layer is now Lua plugins " +
+					"(W10). Delete every [sources.<id>] table and use the [plugins] section " +
+					"([plugins] dir = \"...\", default <data_dir>/plugins). The built-in plugins " +
+					"(matin, epodonios, radikal, haker, stintikvpn) materialize into the plugins " +
+					"dir on first run — edit or add .lua files there; a new provider is a new " +
+					".lua file, no Go rebuild")
+		}
+	}
+	return nil // a lenient-decode failure is the strict decode's problem below
+}
+
 func applyDefaults(c *Config) {
+	applyPluginsDefaults(c)
 	applyFetchDefaults(&c.Fetch)
 	applyFilterDefaults(&c.Filter)
 	applyProbeDefaults(&c.Probe)
@@ -304,6 +366,18 @@ func applyDefaults(c *Config) {
 	applyActivateDefaults(&c.Activate)
 	applyMaintainDefaults(&c.Maintain)
 	applyHTTPDefaults(&c.HTTP)
+}
+
+// applyPluginsDefaults resolves the plugins dir default: <data_dir>/plugins,
+// and the run timeout default (nil = unset → DefaultPluginRunTimeout; an
+// explicit "0s" stays 0 = unbounded).
+func applyPluginsDefaults(c *Config) {
+	if c.Plugins.Dir == "" {
+		c.Plugins.Dir = filepath.Join(c.DataDir, "plugins")
+	}
+	if c.Plugins.RunTimeout == nil {
+		c.Plugins.RunTimeout = &Duration{Duration: DefaultPluginRunTimeout}
+	}
 }
 
 // defaultProtocols is the protocol acceptance allowlist applied when
@@ -472,7 +546,7 @@ func applyMaintainDefaults(m *MaintainConfig) {
 		m.PruneDeadAfter.Duration = 48 * time.Hour
 	}
 	if m.RefreshInterval.Duration == 0 {
-		m.RefreshInterval.Duration = 6 * time.Hour
+		m.RefreshInterval.Duration = DefaultRefreshInterval
 	}
 	if m.SpeedtestInterval.Duration == 0 {
 		m.SpeedtestInterval.Duration = 168 * time.Hour
@@ -491,9 +565,6 @@ func applyHTTPDefaults(h *HTTPConfig) {
 
 func validate(c *Config) error {
 	if err := validateBasics(c); err != nil {
-		return err
-	}
-	if err := validateSources(c); err != nil {
 		return err
 	}
 	if err := validateSelect(c.Select); err != nil {
@@ -516,6 +587,11 @@ func validate(c *Config) error {
 	}
 	if c.Fetch.CacheMaxAge != nil {
 		if err := validateNonNegative("fetch.cache_max_age", c.Fetch.CacheMaxAge.Duration); err != nil {
+			return err
+		}
+	}
+	if c.Plugins.RunTimeout != nil {
+		if err := validateNonNegative("plugins.run_timeout", c.Plugins.RunTimeout.Duration); err != nil {
 			return err
 		}
 	}
@@ -589,35 +665,6 @@ func validateFilter(f FilterConfig) error {
 func validateBasics(c *Config) error {
 	if c.DataDir == "" {
 		return errors.New("data_dir is required")
-	}
-	if len(c.Sources) == 0 {
-		return errors.New("at least one [sources.<id>] must be declared")
-	}
-	return nil
-}
-
-func validateSources(c *Config) error {
-	enabled := 0
-	for id, s := range c.Sources {
-		if !s.IsEnabled() {
-			continue
-		}
-		enabled++
-		if s.Repo == "" {
-			return fmt.Errorf("source %q: repo is required", id)
-		}
-		switch s.Discovery {
-		case "github-contents":
-		case "manifest":
-			if s.Manifest == "" {
-				return fmt.Errorf("source %q: discovery %q requires manifest path", id, "manifest")
-			}
-		default:
-			return fmt.Errorf("source %q: discovery must be %q or %q, got %q", id, "github-contents", "manifest", s.Discovery)
-		}
-	}
-	if enabled == 0 {
-		return errors.New("no enabled sources")
 	}
 	return nil
 }

@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"public_vpn/internal/geo"
 	"public_vpn/internal/model"
 	"public_vpn/internal/parse"
+	"public_vpn/internal/plugins"
 	"public_vpn/internal/probe"
 	"public_vpn/internal/prune"
 	"public_vpn/internal/rank"
@@ -52,7 +55,7 @@ func outln(w io.Writer, a ...any) {
 func newFetchCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "fetch",
-		Short: "Discover and download source files (D9 dynamic discovery, cached)",
+		Short: "Run the Lua source plugins and store their raw links (D9 via plugins, cached)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := load(*cfgPath)
 			if err != nil {
@@ -63,12 +66,41 @@ func newFetchCommand(cfgPath *string) *cobra.Command {
 	}
 }
 
+// runFetch is the one-shot entry: fresh registry from disk (materialize
+// defaults, compile everything) — one-shot is implicitly fresh.
 func runFetch(cmd *cobra.Command, cfg *config.Config) error {
+	return runFetchWith(cmd, cfg, nil)
+}
+
+// runFetchWith executes every plugin in the (shared or fresh) registry and
+// materializes the returned raw links as ONE synthetic cache file per source
+// id (cacheDir/<source>/<plugin>.txt) recorded in the fetch manifest. The
+// downstream parse/filter stages are unchanged: Go keeps owning URI
+// normalization, parsing, rejection counters, and dedupe. reg == nil loads a
+// fresh registry from disk; the watch daemon passes its shared, watchdog-
+// maintained registry (the wave snapshots it once, at fetch start).
+func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry) error {
 	p := newPaths(cfg)
+	out := cmd.OutOrStdout()
 	if err := os.MkdirAll(p.cacheDir, 0o750); err != nil {
 		return err
 	}
-	cl := fetch.NewClient(fetch.ClientConfig{
+	if reg == nil {
+		if err := plugins.EnsureDefaults(config.ExpandHome(cfg.Plugins.Dir)); err != nil {
+			return err
+		}
+		fresh, err := plugins.LoadDir(config.ExpandHome(cfg.Plugins.Dir), out)
+		if err != nil {
+			return err
+		}
+		reg = fresh
+	}
+	snapshot := reg.Snapshot()
+	if len(snapshot) == 0 {
+		return fmt.Errorf("no plugins in %s — add .lua files or delete the dir to restore the defaults",
+			config.ExpandHome(cfg.Plugins.Dir))
+	}
+	engine := plugins.NewEngine(fetch.ClientConfig{
 		APIBase:     cfg.Fetch.APIBase,
 		RawBase:     cfg.Fetch.RawBase,
 		Token:       cfg.Fetch.GitHubToken,
@@ -76,35 +108,15 @@ func runFetch(cmd *cobra.Command, cfg *config.Config) error {
 		Retries:     cfg.Fetch.Retries,
 		Concurrency: cfg.Fetch.Concurrency,
 		UserAgent:   cfg.HTTP.UserAgent,
-	})
-	// Per-file freshness skips are stage progress: they flow through the same
-	// writer as the per-source summary lines.
-	cl.LogOut = cmd.OutOrStdout()
-	manifest := fetchManifest{FetchedAt: time.Now().UTC(), Sources: map[string][]fetch.FetchedFile{}}
-	totalFiles, failed := 0, 0
-	for id, src := range cfg.Sources {
-		if !src.IsEnabled() {
-			outf(cmd.OutOrStdout(), "source %-10s disabled, skipped\n", id)
-			continue
-		}
-		files, err := cl.SourceCached(context.Background(), id, src, p.cacheDir, cfg.Fetch.CacheMaxAge.Duration)
-		if err != nil {
-			failed++
-			outf(cmd.OutOrStdout(), "source %-10s FAILED: %v\n", id, err)
-			continue
-		}
-		manifest.Sources[id] = files
-		totalFiles += len(files)
-		cached := 0
-		for _, f := range files {
-			if f.Cached {
-				cached++
-			}
-		}
-		outf(cmd.OutOrStdout(), "source %-10s ok: %d files (%d from cache)\n", id, len(files), cached)
+	}, out)
+
+	collected, failed, hinted, totalNodes := runAllPlugins(out, engine, snapshot, pluginRunTimeout(cfg))
+	if failed == len(snapshot) {
+		return fmt.Errorf("all %d attempted plugins failed; nothing fetched", failed)
 	}
-	if totalFiles == 0 && failed > 0 {
-		return fmt.Errorf("all %d attempted sources failed; nothing fetched", failed)
+	manifest, files, err := writePluginArtifacts(p.cacheDir, collected)
+	if err != nil {
+		return err
 	}
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -113,9 +125,156 @@ func runFetch(cmd *cobra.Command, cfg *config.Config) error {
 	if err := store.WriteManifest(p.manifest, b); err != nil {
 		return err
 	}
-	outf(cmd.OutOrStdout(), "fetch wave complete: %d files from %d sources (manifest: %s)\n",
-		totalFiles, len(manifest.Sources), p.manifest)
+	outf(out, "fetch wave complete: %d nodes from %d plugins (%d source files, %d hinted) → %s\n",
+		totalNodes, len(snapshot)-failed, files, hinted, p.manifest)
 	return nil
+}
+
+// pluginLinks carries one plugin's raw-link output plus its per-source
+// grouping (Node.Source override or the plugin id).
+type pluginLinks struct {
+	plugin string
+	nodes  []plugins.Node
+}
+
+// pluginRunTimeout resolves [plugins].run_timeout: the knob's explicit "0s"
+// means UNBOUNDED (owner ruling — no artificial floor); nil (unset, after
+// config.Load defaults) means DefaultPluginRunTimeout. This helper only
+// guards direct struct construction (tests): a nil pointer there reads as
+// the default, mirroring activateTestTimeout.
+func pluginRunTimeout(cfg *config.Config) time.Duration {
+	if cfg.Plugins.RunTimeout == nil {
+		return config.DefaultPluginRunTimeout
+	}
+	return cfg.Plugins.RunTimeout.Duration
+}
+
+// runAllPlugins executes every snapshot plugin, grouping the returned nodes
+// by their effective source id. Per-plugin failures are LOUD and non-fatal —
+// one bad provider must not kill the wave.
+//
+// Each run is bounded by runTimeout (> 0): the fetch executes in a goroutine
+// and the wave selects on the run's completion vs the timer. HONEST
+// TRADE-OFF, by design: gopher-lua v1.1.2 has no hook/budget API, so a
+// spinning plugin (`while true do end`) cannot be interrupted — on timeout
+// the wave ABANDONS it: the goroutine keeps running (hot Lua loop) and its
+// LState leaks, one per wave, for as long as the plugin keeps hanging. The
+// wave itself ALWAYS proceeds — that is the contract this function pins.
+// Plugins are pure fetch (no temp side effects), so abandonment loses
+// nothing but the nodes. The leak is the detection-first mitigation; the
+// honest backstop for the hang class itself is the daemon's systemd
+// watchdog (public_vpn-watch.service: Type=notify + WatchdogSec) and the
+// operator removing the offending .lua. runTimeout <= 0 = unbounded (owner
+// ruling: an explicit "0s" is legitimate).
+func runAllPlugins(
+	out io.Writer, engine *plugins.Engine, snapshot []*plugins.Plugin, runTimeout time.Duration,
+) ([]pluginLinks, int, int, int) {
+	collected := []pluginLinks{}
+	failed, hinted, total := 0, 0, 0
+	for _, pl := range snapshot {
+		nodes, err := runOnePlugin(engine, pl, runTimeout)
+		if err != nil {
+			failed++
+			if errors.Is(err, errPluginAbandoned) {
+				// Loud, plugin-attributed, bound-naming abandonment — the
+				// detection signal for the operator to fix or remove the
+				// file.
+				outf(out, "plugin %-10s exceeded %s — abandoned\n", pl.ID, runTimeout)
+				continue
+			}
+			outf(out, "plugin %-10s FAILED: %v\n", pl.ID, err)
+			continue
+		}
+		for _, n := range nodes {
+			if n.Scheme != "" || n.Host != "" || n.Port != 0 {
+				hinted++
+			}
+		}
+		collected = append(collected, pluginLinks{plugin: pl.ID, nodes: nodes})
+		total += len(nodes)
+		outf(out, "plugin %-10s ok: %d nodes\n", pl.ID, len(nodes))
+	}
+	return collected, failed, hinted, total
+}
+
+// errPluginAbandoned marks a run that hit the [plugins].run_timeout bound
+// (internal sentinel; the abandonment line is the user-facing surface).
+var errPluginAbandoned = errors.New("plugin run exceeded the timeout and was abandoned")
+
+// runOnePlugin bounds one plugin run. runTimeout <= 0 runs unbounded in the
+// caller's goroutine (explicit "0s" — the honest no-deadline mode). The
+// result channel is buffered so an ABANDONED run's goroutine never blocks on
+// send: it finishes (or spins forever) detached, leaking by documented
+// design; the wave never waits on it again.
+func runOnePlugin(engine *plugins.Engine, pl *plugins.Plugin, runTimeout time.Duration) ([]plugins.Node, error) {
+	if runTimeout <= 0 {
+		return engine.Run(context.Background(), pl)
+	}
+	type runResult struct {
+		nodes []plugins.Node
+		err   error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		nodes, err := engine.Run(context.Background(), pl)
+		done <- runResult{nodes: nodes, err: err}
+	}()
+	timer := time.NewTimer(runTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.nodes, r.err
+	case <-timer.C:
+		return nil, errPluginAbandoned
+	}
+}
+
+// writePluginArtifacts materializes the collected raw links as one cache
+// file per (source id, plugin) and records them in the fetch manifest — the
+// unchanged contract the parse stage reads.
+func writePluginArtifacts(cacheDir string, collected []pluginLinks) (fetchManifest, int, error) {
+	manifest := fetchManifest{FetchedAt: time.Now().UTC(), Sources: map[string][]fetch.FetchedFile{}}
+	files := 0
+	for _, cl := range collected {
+		groups := map[string]*strings.Builder{}
+		for _, n := range cl.nodes {
+			source := n.Source
+			if source == "" {
+				source = cl.plugin
+			}
+			if groups[source] == nil {
+				groups[source] = &strings.Builder{}
+			}
+			_, _ = groups[source].WriteString(n.Raw)
+			_, _ = groups[source].WriteString("\n")
+		}
+		sources := make([]string, 0, len(groups))
+		for source := range groups {
+			sources = append(sources, source)
+		}
+		sort.Strings(sources)
+		for _, source := range sources {
+			body := []byte(groups[source].String())
+			sum := sha256.Sum256(body)
+			dir := filepath.Join(cacheDir, source)
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				return manifest, files, err
+			}
+			// 0600: the link lists carry node credentials, like every other
+			// pipeline artifact on disk.
+			if err := os.WriteFile(filepath.Join(dir, cl.plugin+".txt"), body, 0o600); err != nil {
+				return manifest, files, err
+			}
+			manifest.Sources[source] = append(manifest.Sources[source], fetch.FetchedFile{
+				Source: source, Path: cl.plugin + ".txt",
+				URL: "plugin://" + cl.plugin, Body: body,
+				Sha256:    hex.EncodeToString(sum[:]),
+				FetchedAt: manifest.FetchedAt,
+			})
+			files++
+		}
+	}
+	return manifest, files, nil
 }
 
 func newParseCommand(cfgPath *string) *cobra.Command {
@@ -290,7 +449,7 @@ func probeOptions(cfg *config.Config, speedtestFlag bool, presetFlag string) pro
 		Timeout:             cfg.Probe.Timeout.Duration,
 		Threads:             cfg.Probe.Threads,
 		URL:                 cfg.Probe.URL,
-		Speedtest:           speedtestFlag || cfg.Probe.Speedtest,
+		Speedtest:           speedtestFlag || cfg.Probe.IsSpeedtest(),
 		SpeedtestTimeout:    cfg.Probe.SpeedtestTimeout.Duration,
 		CheckPreset:         firstNonEmpty(presetFlag, cfg.Probe.CheckPreset),
 		URLSuccessThreshold: cfg.Probe.URLSuccessThreshold,
@@ -684,11 +843,26 @@ func defaultMaintainStages(opts maintainOptions) *maintainStages {
 	}
 }
 
-// runMaintain executes one maintenance wave. Stage failures fail the wave
-// loud — except the stats poll, which is accounting, not correctness: an
-// unreachable API inbound (first run before the owner ever activated) must
-// not block the refresh, so it surfaces as a loud warning line instead.
+// runMaintain executes one maintenance wave (the one-shot entry — no
+// shutdown checkpoints).
 func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages) error {
+	return runMaintainGraceful(w, cfg, opts, stages, nil)
+}
+
+// errWavePaused is internal: between() fired — the wave stops after the
+// last COMPLETED stage (graceful shutdown; nothing is torn down, stores are
+// already flushed by the completed stages).
+var errWavePaused = errors.New("shutdown requested between stages")
+
+// runMaintainGraceful executes one maintenance wave with an optional
+// between-stage shutdown checkpoint: between() is checked BEFORE each stage;
+// when it fires, the wave returns nil (clean pause — the caller decides what
+// graceful means) after finishing the current stage. A nil between never
+// fires. Stage failures still fail the wave loud, except the stats poll,
+// which is accounting, not correctness (classified by reportStatsFailure).
+func runMaintainGraceful(
+	w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages, between func() bool,
+) error {
 	// The wave's stages print through their own writer; give them a command
 	// shim bound to w so the seam stays signature-compatible with the W1–W3
 	// runners.
@@ -698,51 +872,99 @@ func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *
 	outf(w, "maintain: refresh wave starting (probe=%t, speedtest=%t, activate=%t)\n",
 		!opts.skipProbe, opts.speedtest, !opts.noActivate)
 
-	run := func(name string, stage func(*cobra.Command, *config.Config) error) error {
-		if err := stage(cmd, cfg); err != nil {
-			return fmt.Errorf("maintain stage %s: %w", name, err)
-		}
-		return nil
+	wave := &waveRunState{
+		w: w, cmd: cmd, cfg: cfg, stages: stages, between: between,
 	}
-	if err := run("fetch", stages.fetch); err != nil {
-		return err
+	run := func(name string, stage func(*cobra.Command, *config.Config) error) bool {
+		return wave.runStage(name, stage)
 	}
-	if err := run("parse", stages.parse); err != nil {
-		return err
+	if !run("fetch", stages.fetch) {
+		return wave.pauseOrErr()
 	}
-	if err := run("filter", stages.filter); err != nil {
-		return err
+	if !run("parse", stages.parse) {
+		return wave.pauseOrErr()
+	}
+	if !run("filter", stages.filter) {
+		return wave.pauseOrErr()
 	}
 	if !opts.skipProbe {
-		if err := run("probe", stages.probe); err != nil {
-			return err
+		if !run("probe", stages.probe) {
+			return wave.pauseOrErr()
 		}
-		if err := run("geo", stages.geo); err != nil {
-			return err
+		if !run("geo", stages.geo) {
+			return wave.pauseOrErr()
 		}
 	}
-	if err := stages.stats(cmd, cfg); err != nil {
+	return wave.runTail(opts)
+}
+
+// waveRunState carries one wave's mutable run state through the stage
+// closures (writers, the current stage error, and the shutdown checkpoint).
+type waveRunState struct {
+	w       io.Writer
+	cmd     *cobra.Command
+	cfg     *config.Config
+	stages  *maintainStages
+	between func() bool
+	waveErr error
+}
+
+// runStage checks the shutdown checkpoint, then runs one stage; a false
+// result means the wave stops (waveErr carries the pause sentinel or the
+// loud stage failure).
+func (s *waveRunState) runStage(name string, stage func(*cobra.Command, *config.Config) error) bool {
+	if s.between != nil && s.between() {
+		outf(s.w, "maintain: shutdown requested — wave paused before stage %s (completed stages are flushed)\n", name)
+		s.waveErr = errWavePaused
+		return false
+	}
+	if err := stage(s.cmd, s.cfg); err != nil {
+		s.waveErr = fmt.Errorf("maintain stage %s: %w", name, err)
+		return false
+	}
+	return true
+}
+
+func (s *waveRunState) pauseOrErr() error {
+	if errors.Is(s.waveErr, errWavePaused) {
+		return nil
+	}
+	return s.waveErr
+}
+
+// runTail executes the accounting + selection + activation half of the wave
+// (stats → prune → select → render → activate-if-changed).
+func (s *waveRunState) runTail(opts maintainOptions) error {
+	if s.between != nil && s.between() {
+		outln(s.w, "maintain: shutdown requested — wave paused before stage stats (completed stages are flushed)")
+		return nil
+	}
+	if err := s.stages.stats(s.cmd, s.cfg); err != nil {
 		// W7 item 9: the stats stage classifies its own failures (see
 		// reportStatsFailure). Injected stages returning plain errors keep
 		// the WARNING behavior.
-		if fatal := reportStatsFailure(w, err); fatal != nil {
+		if fatal := reportStatsFailure(s.w, err); fatal != nil {
 			return fatal
 		}
 	}
-	if err := run("prune", stages.prune); err != nil {
-		return err
+	if !s.runStage("prune", s.stages.prune) {
+		return s.pauseOrErr()
 	}
-	if err := run("select", stages.selectS); err != nil {
-		return err
+	if !s.runStage("select", s.stages.selectS) {
+		return s.pauseOrErr()
 	}
-	if err := run("render", stages.render); err != nil {
-		return err
+	if !s.runStage("render", s.stages.render) {
+		return s.pauseOrErr()
 	}
 	if opts.noActivate {
-		outln(w, "maintain: --no-activate — live config not touched")
+		outln(s.w, "maintain: --no-activate — live config not touched")
 		return nil
 	}
-	if err := stages.activate(cmd, cfg); err != nil {
+	if s.between != nil && s.between() {
+		outln(s.w, "maintain: shutdown requested — wave paused before stage activate (completed stages are flushed)")
+		return nil
+	}
+	if err := s.stages.activate(s.cmd, s.cfg); err != nil {
 		return fmt.Errorf("maintain stage activate: %w", err)
 	}
 	return nil
