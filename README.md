@@ -160,7 +160,7 @@ public_vpn/
 │   ├── install/            # W5 self-install: binary copy, unit rendering, allowlisted systemctl seam
 │   └── store/              # JSONL cold base, probe log, selection — all writes atomic
 ├── systemd/                # unit TEMPLATES (single source of truth, go:embed'd by install) + embed.go
-├── config.toml             # the single source of truth
+├── config.example.toml     # sanitized template (defaults + schema comments); real config.toml stays local, gitignored
 └── DESIGN.md               # full design: decisions D1–D11, landmines, resource budget
 ```
 
@@ -173,7 +173,7 @@ public_vpn/
 
 ## ⚡ Quick Start
 
-1. **Create `config.toml`** — start from the repo default: set `data_dir`, review `[sources.*]` (D9 discovery means only repo ids live here), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5).
+1. **Create `config.toml`** — start from [`config.example.toml`](config.example.toml) (sanitized defaults + schema comments; the real config is gitignored): copy it, set `data_dir` and your real `template`/`target` paths, review `[sources.*]` (D9 discovery means only repo ids live here), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5).
 2. **`publicvpn fetch`** — discover and cache the source files.
 3. **`publicvpn parse`** — decode the cached bodies into normalized node records.
 4. **`publicvpn filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
