@@ -69,7 +69,7 @@ func TestBatchEnrichmentMapsFields(t *testing.T) {
 		BatchSize: 100,
 		PerMinute: 15,
 		Timeout:   config.Duration{Duration: 5 * time.Second},
-	})
+	}, "")
 	resp, err := cl.Enrich(context.Background(), []string{"5.6.7.8"})
 	require.NoError(t, err)
 	require.Len(t, resp, 1)
@@ -80,6 +80,38 @@ func TestBatchEnrichmentMapsFields(t *testing.T) {
 	assert.True(t, resp[0].Proxy)
 	assert.True(t, resp[0].Hosting)
 	assert.Equal(t, 1, int(calls.Load()))
+}
+
+// TestUserAgentFromConfig pins the geo arm of [http].user_agent: the batch
+// request carries the configured UA verbatim, and the empty value falls back
+// to today's exact default string (behavior preservation).
+func TestUserAgentFromConfig(t *testing.T) {
+	var mu sync.Mutex
+	got := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.Header.Get("User-Agent")
+		mu.Unlock()
+		w.Header().Set("X-Rl", "14")
+		w.Header().Set("X-Ttl", "60")
+		_, _ = w.Write([]byte(`[{"query":"5.6.7.8","status":"success","countryCode":"NL"}]`))
+	}))
+	t.Cleanup(srv.Close)
+	cfg := config.GeoConfig{
+		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
+		BatchSize: 100,
+		PerMinute: 15,
+		Timeout:   config.Duration{Duration: 5 * time.Second},
+	}
+
+	cl := geo.NewClient(cfg, "geo-agent/2")
+	_, err := cl.Enrich(context.Background(), []string{"5.6.7.8"})
+	require.NoError(t, err)
+	assert.Equal(t, "geo-agent/2", got, "the configured UA must ride the batch request")
+
+	_, err = geo.NewClient(cfg, "").Enrich(context.Background(), []string{"5.6.7.8"})
+	require.NoError(t, err)
+	assert.Equal(t, config.DefaultUserAgent, got, "empty UA must fall back to today's exact default")
 }
 
 func TestBatchingSplitsOver100IPs(t *testing.T) {
@@ -97,7 +129,7 @@ func TestBatchingSplitsOver100IPs(t *testing.T) {
 		BatchSize: 100,
 		PerMinute: 900,
 		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, rate.NewLimiter(rate.Inf, 1))
+	}, rate.NewLimiter(rate.Inf, 1), "")
 	ips := make([]string, 0, 250)
 	for i := range 250 {
 		ips = append(ips, fmt.Sprintf("10.%d.%d.1", i/256%256, i%256))
@@ -131,7 +163,7 @@ func TestClientSpacesBatchesThroughLimiter(t *testing.T) {
 		BatchSize: 1,
 		PerMinute: 900, // irrelevant: the limiter is injected below
 		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, rate.NewLimiter(rate.Every(interval), 1))
+	}, rate.NewLimiter(rate.Every(interval), 1), "")
 	_, err := cl.Enrich(context.Background(), []string{"a", "b", "c", "d"}) // 4 batches of 1
 	require.NoError(t, err)
 
@@ -177,7 +209,7 @@ func Test429AbortsLoudlyNeverRetries(t *testing.T) {
 		BatchSize: 100,
 		PerMinute: 15,
 		Timeout:   config.Duration{Duration: 5 * time.Second},
-	})
+	}, "")
 	ips := make([]string, 0, 150)
 	for i := range 150 {
 		ips = append(ips, fmt.Sprintf("10.0.0.%d", i+1))
@@ -207,7 +239,7 @@ func TestFailedStatusEntriesAreSkipped(t *testing.T) {
 		BatchSize: 100,
 		PerMinute: 15,
 		Timeout:   config.Duration{Duration: 5 * time.Second},
-	})
+	}, "")
 	resp, err := cl.Enrich(context.Background(), []string{"192.168.0.1", "8.8.8.8"})
 	require.NoError(t, err)
 	require.Len(t, resp, 1, "failed lookups are skipped")

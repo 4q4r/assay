@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -177,10 +178,13 @@ func WriteGeo(path string, records []*model.GeoRecord) error {
 }
 
 // RewriteGeoWithBackup backs the pre-prune store up next to itself as
-// <name>.bak-<ts> (0600) and then atomically rewrites it with the pruned
-// records. A missing store has nothing to back up: the backup path is empty
-// and only the write happens.
-func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time) (string, error) {
+// <name>.bak-<ts> (0600), applies the [maintain].prune_backup_keep retention
+// (keep = N newest .bak-<ts> files; 0 = unlimited), and only then atomically
+// rewrites the store with the pruned records. A missing store has nothing to
+// back up: the backup path is empty and only the write happens. Retention
+// runs BEFORE the rewrite on purpose: a retention failure aborts loud with
+// the store untouched — rollback depth is never silently reduced.
+func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time, keep int) (string, error) {
 	backupPath := ""
 	if _, err := os.Stat(path); err == nil {
 		bp, err := backupFile(path, now)
@@ -188,11 +192,44 @@ func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time
 			return "", fmt.Errorf("backup before prune rewrite: %w", err)
 		}
 		backupPath = bp
+		if err := KeepNewestBackups(filepath.Dir(path), filepath.Base(path), keep); err != nil {
+			return "", fmt.Errorf("prune backup retention (prune_backup_keep=%d): %w", keep, err)
+		}
 	}
 	if err := WriteGeo(path, records); err != nil {
 		return "", err
 	}
 	return backupPath, nil
+}
+
+// KeepNewestBackups retains only the keep newest <prefix>.bak-<ts> files in
+// dir and deletes the older ones (keep = 0 or less is a no-op: unlimited).
+// It must run AFTER a successful new backup write. Deletion failures are
+// LOUD: never silently lose rollback depth without an error.
+func KeepNewestBackups(dir, prefix string, keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("list backups in %s: %w", dir, err)
+	}
+	// Backup names carry the fixed YYYYMMDD-HHMMSS stamp, so lexicographic
+	// order is chronological; descending = newest first.
+	var backups []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, prefix+".bak-") {
+			backups = append(backups, name)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(backups)))
+	for _, name := range backups[keep:] {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("delete old backup %s (rollback depth must never shrink silently): %w", name, err)
+		}
+	}
+	return nil
 }
 
 // backupFile copies path to <path>.bak-<YYYYMMDD-HHMMSS> in the same

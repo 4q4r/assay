@@ -68,11 +68,17 @@ func runFetch(cmd *cobra.Command, cfg *config.Config) error {
 		return err
 	}
 	cl := fetch.NewClient(fetch.ClientConfig{
+		APIBase:     cfg.Fetch.APIBase,
+		RawBase:     cfg.Fetch.RawBase,
 		Token:       cfg.Fetch.GitHubToken,
 		Timeout:     cfg.Fetch.Timeout.Duration,
 		Retries:     cfg.Fetch.Retries,
 		Concurrency: cfg.Fetch.Concurrency,
+		UserAgent:   cfg.HTTP.UserAgent,
 	})
+	// Per-file freshness skips are stage progress: they flow through the same
+	// writer as the per-source summary lines.
+	cl.LogOut = cmd.OutOrStdout()
 	manifest := fetchManifest{FetchedAt: time.Now().UTC(), Sources: map[string][]fetch.FetchedFile{}}
 	totalFiles, failed := 0, 0
 	for id, src := range cfg.Sources {
@@ -80,7 +86,7 @@ func runFetch(cmd *cobra.Command, cfg *config.Config) error {
 			outf(cmd.OutOrStdout(), "source %-10s disabled, skipped\n", id)
 			continue
 		}
-		files, err := cl.SourceCached(context.Background(), id, src, p.cacheDir)
+		files, err := cl.SourceCached(context.Background(), id, src, p.cacheDir, cfg.Fetch.CacheMaxAge.Duration)
 		if err != nil {
 			failed++
 			outf(cmd.OutOrStdout(), "source %-10s FAILED: %v\n", id, err)
@@ -288,6 +294,7 @@ func probeOptions(cfg *config.Config, speedtestFlag bool, presetFlag string) pro
 		CheckPreset:         firstNonEmpty(presetFlag, cfg.Probe.CheckPreset),
 		URLSuccessThreshold: cfg.Probe.URLSuccessThreshold,
 		MaxPassed:           cfg.Probe.MaxPassed,
+		SkipFreshWithin:     cfg.Probe.SkipFreshWithin.Duration,
 	}
 }
 
@@ -310,6 +317,16 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 	opts := probeOptions(cfg, speedtest, preset)
 	opts.DBPath = p.knifeDB
 	opts.WorkDir = p.workDir
+	opts.Progress = cmd.OutOrStdout()
+	if opts.SkipFreshWithin > 0 {
+		// The freshness skip reads the recorded history: skipped nodes keep
+		// their last passed outcome for rank's geo.ttl gate.
+		latest, err := store.LatestProbeByKey(p.probeResults)
+		if err != nil {
+			return err
+		}
+		opts.Latest = latest
+	}
 	results, err := probe.Run(context.Background(), nodes, runner, opts, p.probeResults)
 	if err != nil {
 		return err
@@ -369,6 +386,7 @@ func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 		Nodes:      nodes,
 		ProbeByKey: probeByKey,
 		Cfg:        cfg.Geo,
+		UserAgent:  cfg.HTTP.UserAgent,
 	})
 	if err != nil {
 		return err
@@ -476,8 +494,13 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 		Selection:  sel,
 		NodesByKey: byKey,
 		Cfg: render.Config{
-			StatsPort:  cfg.Render.StatsPort,
-			PoolRoutes: toRenderRoutes(cfg.Render.PoolRoutes),
+			StatsPort:           cfg.Render.StatsPort,
+			PoolRoutes:          toRenderRoutes(cfg.Render.PoolRoutes),
+			PoolInboundTags:     cfg.Render.PoolInboundTags,
+			ObservatoryInterval: cfg.Render.ObservatoryInterval,
+			TCPMaxSeg:           cfg.Render.TCPMaxSeg,
+			TLSFingerprint:      cfg.Render.TLSFingerprint,
+			BalancerTolerance:   cfg.Render.BalancerTolerance,
 		},
 	})
 	if err != nil {
@@ -548,6 +571,9 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 		BackupDir:    p.backupDir,
 		Backup:       backup,
 		NoRestart:    true,
+		TestTimeout:  activateTestTimeout(cfg),
+		ServiceName:  cfg.Activate.ServiceName,
+		BackupKeep:   cfg.Activate.BackupKeep,
 	})
 	if err != nil {
 		return err
@@ -562,6 +588,15 @@ func orNone(s string) string {
 		return "(none)"
 	}
 	return s
+}
+
+// activateTestTimeout resolves [activate].test_timeout: the knob's explicit
+// 0s means NO deadline; nil (unset) means the DefaultTestTimeout.
+func activateTestTimeout(cfg *config.Config) time.Duration {
+	if cfg.Activate.TestTimeout == nil {
+		return config.DefaultTestTimeout
+	}
+	return cfg.Activate.TestTimeout.Duration
 }
 
 func selectionSize(path string) int {
@@ -719,7 +754,7 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 		BinPath: config.ExpandHome(cfg.Activate.XrayBin),
 		Server:  fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort),
 		Pattern: "outbound>>>pool-",
-		Timeout: 10 * time.Second,
+		Timeout: cfg.Maintain.StatsTimeout.Duration,
 	})
 	if err != nil {
 		return err
@@ -763,7 +798,7 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
 			len(records), cfg.Maintain.PruneDeadAfter.Duration, cfg.Geo.TTL.Duration)
 		return nil
 	}
-	backupPath, err := store.RewriteGeoWithBackup(p.geoBase, kept, time.Now().UTC())
+	backupPath, err := store.RewriteGeoWithBackup(p.geoBase, kept, time.Now().UTC(), cfg.Maintain.PruneBackupKeep)
 	if err != nil {
 		return err
 	}

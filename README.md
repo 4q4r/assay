@@ -208,14 +208,17 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 | Section | Owns | Notable keys |
 | :-- | :-- | :-- |
 | `[sources.*]` | upstream feeds (D9) | `repo`, `discovery`, `include`, `enabled` |
-| `[fetch]` | download behavior | `timeout`, `retries`, `concurrency`, `cache_max_age` |
+| `[fetch]` | download behavior | `timeout`, `retries`, `concurrency`, `cache_max_age` (freshness window, `0s` = always fetch), `api_base`/`raw_base` (mirrors) |
+| `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
 | `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss opt-in), `allow_insecure` (default `false`) |
-| `[probe]` | xray-knife wave | `path`, `threads`, `url`, `speedtest`, `check_preset`, `max_passed` |
+| `[probe]` | xray-knife wave | `path`, `threads`, `url`, `speedtest`, `check_preset`, `max_passed`, `skip_fresh_within` (skip re-probing fresh-passed nodes, `0s` = probe everything) |
 | `[geo]` | ip-api enrichment | `endpoint`, `batch_size`, `per_minute`, `ttl` |
-| `[select]` | ranking caps (D7) | `per_country_cap`, `soft_cap`, `city_expand_threshold`, `ceiling` |
-| `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes` |
-| `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir` |
-| `[maintain]` | W4/W5 maintenance | `prune_dead_after` (default `48h`), `refresh_interval` (default `6h`), `speedtest_interval` (default `168h`) |
+| `[select]` | ranking caps (D7) | `per_country_cap`, `soft_cap`, `city_expand_threshold`, `ceiling`, `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`) |
+| `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes`, `pool_inbound_tags` (validated against template inbounds — missing tag fails the render loud), `observatory_interval` (verbatim string, default `"60s"`), `tcp_max_seg` (mandatory on every pool outbound), `tls_fingerprint` (default `firefox`), `balancer_tolerance` (default `0.2`) |
+| `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir`, `test_timeout` (`0s` = no deadline), `service_name`, `backup_keep` (N newest, `0` = unlimited) |
+| `[maintain]` | W4/W5 maintenance | `prune_dead_after` (default `48h`), `refresh_interval` (default `6h`), `speedtest_interval` (default `168h`), `stats_timeout` (default `10s`), `prune_backup_keep` (`0` = unlimited) |
+
+**Validation policy (owner ruling, binding):** the 5-minute floor applies **ONLY** to `[maintain].refresh_interval` / `speedtest_interval` (W5, owner-approved). Every W6 knob (`cache_max_age`, `test_timeout`, `skip_fresh_within`, `stats_timeout`, `observatory_interval`, `tcp_max_seg`, `tls_fingerprint`, `balancer_tolerance`, `tie_band_rtt_tolerance`, `pool_inbound_tags`, `api_base`, `raw_base`, `user_agent`, `service_name`, `backup_keep`, `prune_backup_keep`) is **deliberately unbounded** — the only structural checks are value parsing, rejection of negative numbers (sign correctness), and the per-knob `0` semantics documented above. Values the xray core rejects fail the `-test` gate loud. Defaults preserve the pre-W6 behavior byte-for-byte.
 
 ## ✅ Testing
 
