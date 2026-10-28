@@ -198,6 +198,7 @@
         "tag": "best_rtt"
       },
       {
+        "fallbackTag": "block",
         "selector": [
           "pool-nl-"
         ],
