@@ -58,11 +58,12 @@ func newFetchCommand(cfgPath *string) *cobra.Command {
 		Use:   "fetch",
 		Short: "Run the Lua source plugins and store their raw links (D9 via plugins, cached)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runFetch(cmd, cfg)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runFetch(cmd, res.Config)
 		},
 	}
 }
@@ -283,11 +284,12 @@ func newParseCommand(cfgPath *string) *cobra.Command {
 		Use:   "parse",
 		Short: "Parse cached source bodies into normalized node records",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runParse(cmd, cfg)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runParse(cmd, res.Config)
 		},
 	}
 }
@@ -353,11 +355,12 @@ func newFilterCommand(cfgPath *string) *cobra.Command {
 		Use:   "filter",
 		Short: "Apply the ingest security filter (reality|tls, no insecure, no private hosts, dedupe)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runFilter(cmd, cfg, sourceCap)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runFilter(cmd, res.Config, sourceCap)
 		},
 	}
 	cmd.Flags().IntVar(&sourceCap, "source-cap", 0,
@@ -428,11 +431,12 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 		Use:   "probe",
 		Short: "Out-of-band xray-knife probe: liveness, latency, exit IP (D8), optional speed/grading",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runProbe(cmd, cfg, limit, speedtest, preset)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runProbe(cmd, res.Config, limit, speedtest, preset)
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "probe only the first N filtered nodes (0 = all)")
@@ -516,11 +520,12 @@ func newGeoCommand(cfgPath *string) *cobra.Command {
 		Use:   "geo",
 		Short: "Exit-geo self-report: every alive node asks ip-api through its own tunnel (no aggregate limit)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runGeo(cmd, cfg)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runGeo(cmd, res.Config)
 		},
 	}
 }
@@ -594,11 +599,12 @@ func newSelectCommand(cfgPath *string) *cobra.Command {
 		Use:   "select",
 		Short: "Rank alive nodes (alive → checks → speed), apply caps D7, assign pool tags",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runSelect(cmd, cfg)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runSelect(cmd, res.Config)
 		},
 	}
 }
@@ -640,17 +646,31 @@ func newRenderCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "render",
 		Short: "Render the full xray client config (template + pool + balancers + Plan A observatory)",
+		Long: `Renders the full client config from the configured template (render.template)
+plus the selected pool. The template is a REQUIRED configured value: a
+configless run (no -c, no home/cwd config) fails loud at this boundary —
+"configless mode cannot render — provide -c or a config at
+~/.config/publicvpn/config.toml" — instead of silently defaulting the
+template to the live client's config.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runRender(cmd, cfg)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runRender(cmd, res.Config)
 		},
 	}
 }
 
 func runRender(cmd *cobra.Command, cfg *config.Config) error {
+	// Loud stage boundary (W12): render needs a CONFIGURED template. A
+	// configless run leaves render.template deliberately empty (the old
+	// default pointed at the live client's config — silently rendering
+	// against it from pure defaults is exactly the accident this refuses).
+	if cfg.Render.Template == "" {
+		return config.ConfiglessBoundaryError("render")
+	}
 	p := newPaths(cfg)
 	sel, err := store.ReadSelection(p.selection)
 	if err != nil {
@@ -725,12 +745,19 @@ func newActivateCommand(cfgPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "activate",
 		Short: "-test gate, date-stamped backup, atomic replace of the live config (never restarts)",
+		Long: `Runs the -test gate, takes a date-stamped backup, and atomically replaces
+the configured live target (activate.target). The target is a REQUIRED
+configured value: a configless run fails loud at this boundary —
+"configless mode cannot activate — provide -c or a config at
+~/.config/publicvpn/config.toml" — instead of silently defaulting the target
+to the live client's config.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runActivate(cmd, cfg, target, backup)
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runActivate(cmd, res.Config, target, backup)
 		},
 	}
 	cmd.Flags().StringVar(&target, "target", "", "override the activation target path (default from config)")
@@ -740,6 +767,16 @@ func newActivateCommand(cfgPath *string) *cobra.Command {
 
 func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup bool) error {
 	p := newPaths(cfg)
+	// Loud stage boundary (W12): activate needs a CONFIGURED target, and the
+	// boundary fires AT STAGE ENTRY on the configured value alone — the
+	// --target flag cannot bypass it (I-1). A configless run has no
+	// configured template either, so there is nothing legitimate to activate
+	// against; keying on the flag let a configless --target run fall into the
+	// misleading "no rendered config — run render first" loop, while
+	// configless render refuses with the same boundary.
+	if cfg.Activate.Target == "" {
+		return config.ConfiglessBoundaryError("activate")
+	}
 	if target == "" {
 		target = config.ExpandHome(cfg.Activate.Target)
 	}
@@ -801,6 +838,10 @@ pruning, and finally activates ONLY when the rendered config differs from the
 live one and passes the -test gate (L10). An unchanged render is a clear
 "no changes" no-op — the live config is never rewritten without a diff.
 
+Configless runs (no -c, no home/cwd config) work for the data stages; the
+render/activate stages fail loud at their boundary and end the wave — the
+daemon keeps the schedule (see ` + "`publicvpn watch`" + `).
+
 Flags:
   --no-activate  render and diff only; never touch the live config
   --skip-probe   reselect from the cold base without probing (geo is skipped
@@ -809,11 +850,12 @@ Flags:
   --speedtest    run the probe wave with -S throughput measurement (weekly
                  speedtest timer)`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runMaintain(cmd.OutOrStdout(), cfg, opts, defaultMaintainStages(opts))
+			reportConfigSource(cmd.OutOrStdout(), res)
+			return runMaintain(cmd.OutOrStdout(), res.Config, opts, defaultMaintainStages(opts))
 		},
 	}
 	cmd.Flags().BoolVar(&opts.noActivate, "no-activate", false,
@@ -1046,6 +1088,15 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 	server := fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort)
 
 	target := config.ExpandHome(cfg.Activate.Target)
+	if target == "" {
+		// Configless boundary (W12): without activate.target there is no
+		// live config to inspect and nothing to poll against. Accounting
+		// skips the wave — INFO (expected shape), never LOUD: no data is
+		// lost, the working stages keep running.
+		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
+			"configless mode: no activate.target — stats accounting unavailable "+
+				"(provide -c or a config at %s to enable the poll)", config.HomeConfigDisplay))
+	}
 	hasAPI, err := stats.TargetHasAPI(target, cfg.Render.StatsPort)
 	if err != nil {
 		return stats.NewClassified(stats.ClassWarning, err)
@@ -1129,6 +1180,11 @@ func runActivateStage(cmd *cobra.Command, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("no rendered config (%s) — the render stage must run before activation", p.rendered)
 	}
+	// Configless boundary (W12): no configured target — refuse before any
+	// diff/replace consideration (runActivate enforces the same contract).
+	if cfg.Activate.Target == "" {
+		return config.ConfiglessBoundaryError("activate")
+	}
 	live, err := os.ReadFile(config.ExpandHome(cfg.Activate.Target))
 	if err == nil && bytes.Equal(rendered, live) {
 		outln(cmd.OutOrStdout(), "no changes — the live config already matches the rendered pool; nothing activated")
@@ -1143,27 +1199,30 @@ func newStatusCommand(cfgPath *string) *cobra.Command {
 		Short: "Pipeline state summary (read-only)",
 		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
 selection, render) plus the install state: installed binary, unit files,
-timers, and configured-vs-installed timer periods.
+timers, and configured-vs-installed timer periods. The resolved config
+source is printed as the config line (explicit -c, home default, cwd
+default, or configless built-in defaults).
 
 Install detection reads the DEFAULT directories only — ~/.local/bin for the
 binary and ~/.config/systemd/user for the units — because publicvpn keeps no
 state file by design. An install made with custom --bin-dir/--unit-dir paths
 is NOT tracked here; inspect those locations directly.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runStatus(cmd, cfg, *cfgPath)
+			return runStatus(cmd, res)
 		},
 	}
 }
 
-func runStatus(cmd *cobra.Command, cfg *config.Config, cfgPath string) error {
-	p := newPaths(cfg)
+func runStatus(cmd *cobra.Command, res *config.Resolved) error {
+	p := newPaths(res.Config)
 	out := cmd.OutOrStdout()
 
 	outln(out, "publicvpn pipeline status")
+	reportConfigSource(out, res)
 	outln(out, "data dir:", p.dataDir)
 	printFetchStatus(out, p)
 	printStageCounts(out, p)
@@ -1171,7 +1230,7 @@ func runStatus(cmd *cobra.Command, cfg *config.Config, cfgPath string) error {
 	printGeoStatus(out, p)
 	printSelectionStatus(out, p)
 	printRenderStatus(out, p)
-	printInstallStatus(out, cfg, cfgPath)
+	printInstallStatus(out, res.Config, res.Path)
 	return nil
 }
 

@@ -305,8 +305,9 @@ func TestWatchFetchContinuesWithBrokenPlugin(t *testing.T) {
 	reg.Set(&plugins.Plugin{ID: "broken", Path: "broken.lua", Code: []byte(`
 		return function() error("discovery exploded") end`)})
 
-	cfg, err := load(cfgPath)
+	res, err := resolveCommand(cfgPath)
 	require.NoError(t, err)
+	cfg := res.Config
 	out := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(out)
