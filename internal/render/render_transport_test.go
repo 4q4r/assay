@@ -54,6 +54,11 @@ type variant struct {
 // transportVariants covers one golden per supported transport + ss. kcp is
 // golden'd PLAIN: seed/header are REMOVED from the 26.3.27 core and their
 // presence is a loud render failure (tested below), not a golden.
+// hysteria2 is golden'd too (W7 item 10): the core's hysteria2 client is
+// real (verified against the binary + tagged source) — but it is a QUIC/UDP
+// transport, so it carries NO sockopt.tcpMaxSeg (TCP-gated upstream,
+// isTCPSocket in transport/internet/sockopt_linux.go; the brief rule:
+// tcpMaxSeg 1440 only for stream-based transports).
 func transportVariants() []variant {
 	return []variant{
 		{"tcp-raw", "vless", map[string]string{"type": "tcp", "security": "tls", "sni": "donor.example", "flow": "xtls-rprx-vision"}},
@@ -64,6 +69,11 @@ func transportVariants() []variant {
 		{"kcp-plain", "vless", map[string]string{"type": "kcp", "security": "none"}},
 		{"xhttp-reality", "vless", map[string]string{"type": "xhttp", "mode": "packet-up", "path": "/pool", "host": "cdn.example", "security": "reality", "sni": "donor.example", "pbk": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M", "sid": "b1"}},
 		{"ss-tls", "ss", map[string]string{"type": "tcp", "method": "aes-128-gcm", "password": "ss-pw", "security": "tls", "sni": "donor.example"}},
+		{"hysteria2-tls", "hysteria2", map[string]string{
+			"sni":       "hy.example",
+			"pinsha256": "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+			"ech":       "AEz+DQBIAAAg",
+		}},
 	}
 }
 
@@ -78,9 +88,16 @@ func TestTransportGoldenVariants(t *testing.T) {
 			m, res := renderOne(t, n, sn)
 			assert.Empty(t, res.DroppedParams, "variant %s must consume every param", v.name)
 
-			// sockopt.tcpMaxSeg 1440 on EVERY tunneled outbound (W5 mandate).
+			// sockopt.tcpMaxSeg 1440 on every STREAM-based tunneled outbound
+			// (W5 mandate). hysteria2 is QUIC/UDP — tcpMaxSeg is TCP-gated in
+			// the core (isTCPSocket) and MUST NOT render (W7 item 10: the
+			// brief rule "tcpMaxSeg 1440 if stream-based").
 			ss := poolOutbound(t, m, tag)["streamSettings"].(map[string]any)
-			assert.InDelta(t, 1440, ss["sockopt"].(map[string]any)["tcpMaxSeg"], 0.001)
+			if v.scheme == "hysteria2" {
+				assert.Nil(t, ss["sockopt"], "hysteria2 is not stream-based: no tcpMaxSeg sockopt")
+			} else {
+				assert.InDelta(t, 1440, ss["sockopt"].(map[string]any)["tcpMaxSeg"], 0.001)
+			}
 
 			goldenPath := filepath.Join("testdata", "golden-transport-"+v.name+".json")
 			golden, err := os.ReadFile(goldenPath)
@@ -416,4 +433,119 @@ func TestFingerprintOnlyOnTLSReality(t *testing.T) {
 	_, res := renderOne(t, n, sn)
 	require.Len(t, res.DroppedParams, 1)
 	assert.Contains(t, res.DroppedParams[0].Params, "fp", "security=none has no uTLS fingerprint — fp is reported")
+}
+
+// --- W7 item 10: hysteria2 render surface (xray 26.3.27, core-verified) ---
+//
+// The verified construct (probes 8/10b/11: `xray run -test` → Configuration
+// OK; infra/conf/hysteria.go + infra/conf/transport_internet.go at the tag):
+//
+//	{"protocol": "hysteria", "settings": {"version": 2, "address": H, "port": P}}
+//	"streamSettings": {"network": "hysteria", "security": "tls",
+//	  "hysteriaSettings": {"version": 2, "auth": AUTH},
+//	  "tlsSettings": {"serverName": SNI, "fingerprint": "firefox",
+//	                  ["pinnedPeerCertSha256": pin], ["echConfigList": ech]}}
+//
+// security=tls is rendered UNCONDITIONALLY: `-test` passes without it, but
+// the transport dialer errors "tls config is nil" at runtime
+// (transport/internet/hysteria/dialer.go Dial) — a no-TLS hy2 outbound would
+// be runtime-dead while every gate stayed green.
+
+// TestHysteria2OutboundRenders pins the full verified construct: protocol
+// "hysteria", flat version/address/port settings, hysteriaSettings.auth from
+// the link credential, mandatory security=tls, the mandated firefox
+// fingerprint, and the 1:1 pin/ech passthrough into the core's
+// pinnedPeerCertSha256/echConfigList.
+func TestHysteria2OutboundRenders(t *testing.T) {
+	n, sn := mkTransportNode("pool-nl-01", "hysteria2", "hy1.example.com", 8443, map[string]string{
+		"sni":       "real.example.com",
+		"pinsha256": "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+		"ech":       "AEz+DQBIAAAg",
+	})
+	m, res := renderOne(t, n, sn)
+	ob := poolOutbound(t, m, "pool-nl-01")
+
+	assert.Equal(t, "hysteria", ob["protocol"], "the xray protocol name for hysteria2 is hysteria (version 2)")
+	settings := ob["settings"].(map[string]any)
+	assert.InDelta(t, 2, settings["version"], 0.001, "the core enforces version == 2 (infra/conf/hysteria.go)")
+	assert.Equal(t, "hy1.example.com", settings["address"])
+	assert.InDelta(t, 8443, settings["port"], 0.001)
+
+	ss := ob["streamSettings"].(map[string]any)
+	assert.Equal(t, "hysteria", ss["network"])
+	assert.Equal(t, "tls", ss["security"], "security=tls renders unconditionally: the QUIC dialer errors 'tls config is nil' without it")
+	hy := ss["hysteriaSettings"].(map[string]any)
+	assert.InDelta(t, 2, hy["version"], 0.001)
+	assert.Equal(t, "pool-uuid-1", hy["auth"], "the link credential rides hysteriaSettings.auth (transport layer)")
+	tls := ss["tlsSettings"].(map[string]any)
+	assert.Equal(t, "real.example.com", tls["serverName"])
+	assert.Equal(t, "firefox", tls["fingerprint"], "the owner-mandated uTLS override applies to the hy2 handshake too")
+	assert.Equal(t, "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233", tls["pinnedPeerCertSha256"],
+		"pinSHA256 maps 1:1 to the core's pinnedPeerCertSha256 (same datum, colon-tolerant hex, 32 bytes)")
+	assert.Equal(t, "AEz+DQBIAAAg", tls["echConfigList"], "ech maps 1:1 to the core's echConfigList")
+	assert.Nil(t, ss["sockopt"], "no tcpMaxSeg on the UDP transport")
+	assert.Empty(t, res.DroppedParams, "every hy2 param is consumed")
+}
+
+// TestHysteria2EmptyAuthRendersEmpty pins the optional-auth passthrough: the
+// official URI spec marks auth optional, and the renderer never invents one.
+func TestHysteria2EmptyAuthRendersEmpty(t *testing.T) {
+	n := model.NewNode("s", "hysteria2", "", "open.example.com", 443, nil)
+	sn := model.SelectedNode{Tag: "pool-nl-01", Key: n.Key, Country: "nl", City: "Amsterdam"}
+	m, res := renderOne(t, n, sn)
+	hy := poolOutbound(t, m, "pool-nl-01")["streamSettings"].(map[string]any)["hysteriaSettings"].(map[string]any)
+	assert.Empty(t, hy["auth"], "auth-less links render an empty auth, never a fabricated credential")
+	assert.Empty(t, res.DroppedParams)
+}
+
+// TestHysteria2ObfsFailsLoud pins the salamander verdict: hysteria2's
+// obfs/obfs-password are the protocol's OWN obfuscation layer (apernet
+// salamander) — the xray transport has no salamander support (finalmask
+// udpmask is a different mechanism). Dropping them would silently change
+// the wire format, so the render FAILS loud naming the params (L9).
+func TestHysteria2ObfsFailsLoud(t *testing.T) {
+	for _, param := range []string{"obfs", "obfs-password"} {
+		n, sn := mkTransportNode("pool-nl-01", "hysteria2", "hy1.example.com", 443,
+			map[string]string{"sni": "hy.example", param: "salamander"})
+		_, err := render.Render(render.Input{
+			Template:   testTemplate(t),
+			Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
+			NodesByKey: map[string]*model.Node{n.Key: n},
+			Cfg:        renderCfg(nil),
+		})
+		require.Error(t, err, "hy2 %s cannot be expressed by this core — refusing the silent drop", param)
+		assert.Contains(t, err.Error(), param, "the offending param must be named")
+	}
+}
+
+// TestHysteria2EmptyHostFailsLoud pins the defensive guard: the core's own
+// builder PANICS on a nil address (HysteriaClientConfig.Build →
+// Address.Build, infra/conf/hysteria.go — probed: SIGSEGV). A record with a
+// lost host must never reach the core: the renderer refuses loud first.
+func TestHysteria2EmptyHostFailsLoud(t *testing.T) {
+	n := model.NewNode("s", "hysteria2", "pw", "", 443, nil)
+	sn := model.SelectedNode{Tag: "pool-nl-01", Key: n.Key, Country: "nl", City: "Amsterdam"}
+	_, err := render.Render(render.Input{
+		Template:   testTemplate(t),
+		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
+		NodesByKey: map[string]*model.Node{n.Key: n},
+		Cfg:        renderCfg(nil),
+	})
+	require.Error(t, err, "an empty host would nil-panic the core's own builder — refuse loud")
+	assert.Contains(t, err.Error(), "host")
+}
+
+// TestHysteria2InsecureSurfacesInDropReport pins the policy split: the
+// insecure param is dropped by the FILTER (allow_insecure=false default);
+// if an owner admitted the link, the renderer surfaces the param in the
+// drop report — the core removed allowInsecure after 2026-06-01
+// (PrintRemovedFeatureError), identical to the tls-transport behavior.
+func TestHysteria2InsecureSurfacesInDropReport(t *testing.T) {
+	n, sn := mkTransportNode("pool-nl-01", "hysteria2", "hy1.example.com", 443,
+		map[string]string{"sni": "hy.example", "insecure": "1"})
+	m, res := renderOne(t, n, sn)
+	tls := poolOutbound(t, m, "pool-nl-01")["streamSettings"].(map[string]any)["tlsSettings"].(map[string]any)
+	assert.Nil(t, tls["allowInsecure"], "the removed feature must never render")
+	require.Len(t, res.DroppedParams, 1)
+	assert.Contains(t, res.DroppedParams[0].Params, "insecure")
 }

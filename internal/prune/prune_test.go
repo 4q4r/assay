@@ -105,7 +105,7 @@ func TestPruneStaleOrphanRemovedOnlyWhenSourceDroppedIt(t *testing.T) {
 		opts(),
 	)
 	require.Len(t, removed, 1)
-	assert.Equal(t, "vless|gone.example.com|443", prune.Identity(removed[0]))
+	assert.Equal(t, "vless|gone.example.com|443", model.GeoIdentity(removed[0]))
 	assert.Equal(t, 1, report.RemovedStale)
 	assert.Equal(t, 0, report.RemovedDead)
 	require.Len(t, kept, 1)

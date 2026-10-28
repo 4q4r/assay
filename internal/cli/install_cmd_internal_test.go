@@ -134,6 +134,45 @@ func TestRunInstallRejectsWhitespaceInConfigPath(t *testing.T) {
 	assert.Empty(t, ex.calls, "no systemctl interaction on a rejected install")
 }
 
+// TestRunInstallAcceptsWhitespaceUnitDir pins the W7 item 8 verdict: a
+// whitespace-bearing --unit-dir is HARMLESS and must NOT be refused.
+// Unlike --bin-dir/--config (I-1: their paths land INSIDE ExecStart=, which
+// systemd argv-splits on whitespace), the unit dir never enters the unit
+// file — it is only where the unit FILES are written, and systemd's own
+// discovery/parsing accepts whitespace paths there: `systemd-analyze
+// verify` on rendered units loads all four from
+// "/tmp/.../unit dir with space/" with EXIT=0, byte-identical to a plain
+// dir (probed 2026-10-28, probe has teeth — it failed the unrendered
+// templates and a missing ExecStart binary earlier in the same session).
+// enable(1) symlink creation and uninstall(8) removal are plain POSIX
+// filesystem operations on the dir, equally whitespace-tolerant.
+func TestRunInstallAcceptsWhitespaceUnitDir(t *testing.T) {
+	home := t.TempDir()
+	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
+	unitDir := filepath.Join(home, "my units dir") // SPACE and no I-1 refusal
+	ex := &fakeCtl{}
+
+	buf := &bytes.Buffer{}
+	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
+		binDir:  filepath.Join(home, "bin"),
+		unitDir: unitDir,
+		exec:    ex,
+	}), "a whitespace unit dir is harmless — install must accept it")
+
+	// The four units landed in the whitespace dir, rendered as usual.
+	timer, err := os.ReadFile(filepath.Join(unitDir, install.RefreshTimer))
+	require.NoError(t, err)
+	assert.Regexp(t, `(?m)^OnUnitActiveSec=6h$`, string(timer))
+	for _, name := range install.UnitNames() {
+		_, err := os.Stat(filepath.Join(unitDir, name))
+		require.NoError(t, err, "unit %s must be written into the whitespace dir", name)
+	}
+	// The exact allowlisted systemctl sequence is unchanged.
+	require.Len(t, ex.calls, 2)
+	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[0])
+	assert.Equal(t, []string{"--user", "enable", "--now", install.RefreshTimer, install.SpeedtestTimer}, ex.calls[1])
+}
+
 func TestRunInstallNoSystemdSkipsUnits(t *testing.T) {
 	home := t.TempDir()
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)

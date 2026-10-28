@@ -173,6 +173,36 @@ func failingXrayWithPipeHolder(t *testing.T, dir string) string {
 	return path
 }
 
+// TestGateStartFailureIsNotATimeout pins the M-2 residual discrimination
+// (W7): a child that never STARTED (bad xray_bin path — exec error, no
+// process) coinciding with an elapsed deadline must read as "start failed",
+// never as "timed out". The old predicate classified any non-own-exit error
+// under an expired deadline as a timeout, which told the owner the config
+// was hanging when in fact the binary path was broken.
+func TestGateStartFailureIsNotATimeout(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config.json")
+	rendered := filepath.Join(dir, "rendered.json")
+	writeConfig(t, target)
+	require.NoError(t, os.WriteFile(rendered, []byte(`{"v":1}`), 0o644))
+
+	// TestTimeout=1ns pre-expires the deadline before Start runs, so the
+	// start error lands under an elapsed clock — exactly the geometry the
+	// old code mislabeled as a timeout. Deterministic: the binary never
+	// exists, no process is ever spawned, nothing sleeps.
+	_, err := activate.Run(activate.Input{
+		RenderedPath: rendered, TargetPath: target,
+		XrayBin:     filepath.Join(dir, "no-such-xray"),
+		TestTimeout: 1 * time.Nanosecond,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "start failed",
+		"a child that never started must be reported as a start failure")
+	assert.NotContains(t, err.Error(), "timed out",
+		"a start failure must never be mislabeled as a timeout")
+	assert.Contains(t, err.Error(), "no-such-xray", "the failure must name the binary path")
+}
+
 // TestGateOwnExitAtDeadlineReportsTheExit pins M-2: a non-zero exit that
 // lands at (or past) the deadline instant is the child's OWN failure — a real
 // config problem the operator must see — and must be reported as such, never

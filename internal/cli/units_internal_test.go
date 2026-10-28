@@ -56,6 +56,8 @@ func TestSpeedtestTimerUnitTemplate(t *testing.T) {
 		service, "the speedtest wave is maintain with the throughput probe enabled")
 }
 
+// TestSystemdReadmeDocumentsInstallSteps pins that the repo README carries
+// the install/journald cheatsheet (kept adjacent to the template pins).
 func TestSystemdReadmeDocumentsInstallSteps(t *testing.T) {
 	readme := readUnit(t, "README.md")
 	for _, want := range []string{
@@ -71,7 +73,7 @@ func TestSystemdReadmeDocumentsInstallSteps(t *testing.T) {
 
 // w4MaintainSources is the full W4 production surface (DESIGN §11, wave W4):
 // the cli orchestration and every stage package the maintain wave drives.
-var w4MaintainSources = []string{
+var w4MaintainSources = [8]string{
 	filepath.Join("..", "cli", "pipeline.go"),
 	filepath.Join("..", "cli", "root.go"),
 	filepath.Join("..", "stats", "stats.go"),
@@ -82,23 +84,35 @@ var w4MaintainSources = []string{
 	filepath.Join("..", "rank", "rank.go"),
 }
 
+// compile-time: the surface is an immutable 8-element array (not a slice) —
+// an append-capable slice would let the guard list drift silently.
+var _ [8]string = w4MaintainSources
+
 // TestNoSystemdInvocationInMaintainSource extends the activate package's
 // TestNoSystemdInvocationInSource pattern to the full W4 surface — the eight
 // files in w4MaintainSources: the pipeline must never execute systemctl;
 // systemd interaction is the operator's job via the repo unit files.
+// The list is pinned EXACTLY (the EXACTLY-8 subtest): both directions of set
+// equality, not merely "contains" — a silently added ninth file would escape
+// the guard, a silently removed one would fake coverage.
 func TestNoSystemdInvocationInMaintainSource(t *testing.T) {
-	t.Run("guard covers every W4 file", func(t *testing.T) {
+	t.Run("guard covers EXACTLY the eight W4 files", func(t *testing.T) {
 		guarded := map[string]bool{}
 		for _, f := range w4MaintainSources {
 			guarded[filepath.Join(filepath.Base(filepath.Dir(f)), filepath.Base(f))] = true
 		}
-		for _, want := range []string{
-			"cli/pipeline.go", "cli/root.go",
-			"stats/stats.go", "prune/prune.go",
-			"config/config.go", "render/render.go",
-			"store/store.go", "rank/rank.go",
-		} {
-			assert.Contains(t, guarded, want, "systemd guard must cover W4 file %s", want)
+		want := map[string]bool{
+			"cli/pipeline.go": true, "cli/root.go": true,
+			"stats/stats.go": true, "prune/prune.go": true,
+			"config/config.go": true, "render/render.go": true,
+			"store/store.go": true, "rank/rank.go": true,
+		}
+		assert.Len(t, guarded, 8, "the W4 surface is exactly eight files — widen this pin deliberately, never silently")
+		for f := range guarded {
+			assert.Contains(t, want, f, "guarded file %s is outside the pinned W4 surface", f)
+		}
+		for f := range want {
+			assert.Contains(t, guarded, f, "pinned W4 file %s escaped the systemd guard", f)
 		}
 	})
 

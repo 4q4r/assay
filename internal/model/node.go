@@ -213,6 +213,18 @@ func PoolTag(cc string, seq int) string {
 	return fmt.Sprintf("pool-%s-%02d", strings.ToLower(cc), seq)
 }
 
+// GeoIdentity is the canonical cold-base record identity:
+// scheme (verbatim) | lowercased host | port. Every consumer — the store
+// upsert join, the rank select join, the prune orphan rules — must key
+// records through THIS function (W7 M2: hoisted from triplicated inline
+// copies in store/rank/prune; the equivalence pin lives in
+// internal/store/geo_identity_equivalence_test.go). The scheme is
+// deliberately not case-normalized: that is the historical on-disk key
+// semantics, and changing it would silently re-key the cold base.
+func GeoIdentity(g *GeoRecord) string {
+	return fmt.Sprintf("%s|%s|%d", g.Scheme, strings.ToLower(g.Host), g.Port)
+}
+
 // CountryBalancerTag renders the per-country balancer tag: pool_<cc>.
 func CountryBalancerTag(cc string) string {
 	return "pool_" + strings.ToLower(cc)

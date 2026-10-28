@@ -6,8 +6,6 @@ package rank
 
 import (
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"public_vpn/internal/config"
@@ -49,11 +47,11 @@ func collectCandidates(
 ) []candidate {
 	geoByKey := map[string]*model.GeoRecord{}
 	for _, g := range geo {
-		geoByKey[g.Scheme+"|"+strings.ToLower(g.Host)+"|"+strconv.Itoa(g.Port)] = g
+		geoByKey[model.GeoIdentity(g)] = g
 	}
 	var cands []candidate
 	for _, n := range nodes {
-		g, ok := geoByKey[n.Scheme+"|"+strings.ToLower(n.Host)+"|"+strconv.Itoa(n.Port)]
+		g, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
 		if !ok || !g.Alive || g.Country == "" {
 			continue
 		}

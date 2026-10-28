@@ -12,8 +12,6 @@
 package prune
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
 	"public_vpn/internal/model"
@@ -36,15 +34,9 @@ type Report struct {
 	RemovedIdentity []string
 }
 
-// Identity is the cold-base record identity (store.GeoIdentity scheme, kept
-// local so prune does not import store).
-func Identity(g *model.GeoRecord) string {
-	return fmt.Sprintf("%s|%s|%d", g.Scheme, strings.ToLower(g.Host), g.Port)
-}
-
 // Select partitions records into (kept, removed) under the pruning rules.
-// filteredIdentities carries the identities of the just-filtered node set —
-// the same scheme|host|port key rank's candidate lookup builds.
+// filteredIdentities carries model.GeoIdentity keys of the just-filtered node
+// set — the same identity key rank's candidate lookup builds.
 func Select(
 	records []*model.GeoRecord,
 	filteredIdentities map[string]bool,
@@ -53,7 +45,7 @@ func Select(
 	var kept, removed []*model.GeoRecord
 	var report Report
 	for _, r := range records {
-		id := Identity(r)
+		id := model.GeoIdentity(r)
 		switch {
 		case ruleDead(r, opts):
 			removed = append(removed, r)
@@ -90,7 +82,7 @@ func ruleDead(r *model.GeoRecord, opts Options) bool {
 // ruleStaleOrphan: rank's ttl freshness refuses the record AND the node is no
 // longer in the filtered set — rank can never select it again on this data.
 func ruleStaleOrphan(r *model.GeoRecord, filteredIdentities map[string]bool, opts Options) bool {
-	if filteredIdentities[Identity(r)] {
+	if filteredIdentities[model.GeoIdentity(r)] {
 		return false
 	}
 	return !rank.AliveDataFresh(r.LastProbe, opts.TTL, opts.Now)
