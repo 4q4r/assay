@@ -1,6 +1,6 @@
-// Package cli wires the publicvpn command tree (W1–W3 scope): fetch, parse,
-// filter, probe, geo, select, render, activate, status. The maintain command
-// (W4) exists and fails loudly — no fake success paths.
+// Package cli wires the publicvpn command tree: the W1–W3 stages (fetch,
+// parse, filter, probe, geo, select, render, activate, status) and the W4
+// maintenance surface (maintain wave with stats poll + pruning).
 package cli
 
 import (
@@ -12,8 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 )
-
-const notImplemented = "not implemented in W1–W3"
 
 // New builds the root command.
 func New() *cobra.Command {
@@ -40,7 +38,7 @@ func New() *cobra.Command {
 		newRenderCommand(&cfgPath),
 		newActivateCommand(&cfgPath),
 		newStatusCommand(&cfgPath),
-		newMaintainCommand(),
+		newMaintainCommand(&cfgPath),
 	)
 	return root
 }

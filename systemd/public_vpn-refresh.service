@@ -1,0 +1,12 @@
+[Unit]
+Description=publicvpn refresh wave (fetch/parse/filter/probe/geo/stats/prune/select/render/activate-if-changed)
+Documentation=file://%h/projects/public_vpn/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/public_vpn
+# The wave reuses the repo config.toml (single source of truth, no env vars).
+ExecStart=%h/projects/public_vpn/publicvpn maintain -c %h/projects/public_vpn/config.toml
+# A wave touches the network (sources, probes) and the live xray config only
+# through the -test gate; never restart the client — the binary prints the
+# restart hint for the owner instead.

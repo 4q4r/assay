@@ -1,0 +1,12 @@
+[Unit]
+Description=publicvpn refresh wave timer (every 6 hours, catch-up on wake)
+
+[Timer]
+# DESIGN.md §4.9: refresh wave every 6 hours.
+OnCalendar=*-*-* 00/6:00:00
+# Run the missed wave after the machine wakes from sleep or boots late.
+Persistent=true
+Unit=public_vpn-refresh.service
+
+[Install]
+WantedBy=timers.target

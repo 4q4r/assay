@@ -1,0 +1,11 @@
+[Unit]
+Description=publicvpn weekly speedtest timer (Monday 00:00, catch-up on wake)
+
+[Timer]
+# DESIGN.md §4.9: speedtest wave weekly ("weekly" = Monday 00:00:00).
+OnCalendar=weekly
+Persistent=true
+Unit=public_vpn-speedtest.service
+
+[Install]
+WantedBy=timers.target

@@ -17,17 +17,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMaintainFailsLoudNotImplemented(t *testing.T) {
-	// W4 scope: the command exists but must fail LOUDLY — no fake success.
+func TestMaintainWithoutConfigFailsLoud(t *testing.T) {
+	// W4: maintain is the real refresh wave now; it still fails loud when the
+	// single source of truth (config.toml) is missing — no fake success paths.
 	root := cli.New()
 	buf := &bytes.Buffer{}
 	root.SetOut(buf)
 	root.SetErr(buf)
-	root.SetArgs([]string{"maintain"})
+	root.SetArgs([]string{"-c", filepath.Join(t.TempDir(), "nope.toml"), "maintain"})
 	err := root.Execute()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not implemented in W1–W3")
-	assert.Contains(t, err.Error(), "W4", "points at the owning wave")
+	assert.Contains(t, err.Error(), "config not found")
+}
+
+// TestStatusShowsFoldedTraffic pins the W4 status addition: the geo line
+// carries the total BytesUp/BytesDown the stats stage has folded into the
+// cold base.
+func TestStatusShowsFoldedTraffic(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+data_dir = %q
+[sources.dummy]
+repo = "owner/repo"
+discovery = "github-contents"
+include = ["vless.txt"]
+`, dir)), 0o600))
+	geoBase := filepath.Join(dir, "geo-base.jsonl")
+	require.NoError(t, os.WriteFile(geoBase, []byte(
+		`{"tag":"pool-de-01","scheme":"vless","host":"de.example.com","port":443,"alive":true,"country":"de","bytes_up":1000,"bytes_down":2000}`+"\n"+
+			`{"tag":"pool-nl-01","scheme":"vless","host":"nl.example.com","port":443,"alive":false,"country":"nl","bytes_up":10,"bytes_down":20}`+"\n",
+	), 0o600))
+
+	root := cli.New()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"-c", cfgPath, "status"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "traffic folded: 1010 up / 2020 down bytes")
 }
 
 func TestMissingConfigFailsLoud(t *testing.T) {

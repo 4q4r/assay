@@ -285,6 +285,12 @@
       "tag": "pool-us-01"
     }
   ],
+  "policy": {
+    "system": {
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
   "routing": {
     "balancers": [
       {
@@ -451,5 +457,6 @@
         "type": "field"
       }
     ]
-  }
+  },
+  "stats": {}
 }

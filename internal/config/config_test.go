@@ -252,6 +252,50 @@ stats_port = 80
 	})
 }
 
+// TestMaintainSectionParsesAndDefaults pins the W4 [maintain] section:
+// prune_dead_after defaults to 48h when absent, parses Go durations when set,
+// rejects negatives loudly, and unknown keys inside the section fail the
+// strict decode (owner convention).
+func TestMaintainSectionParsesAndDefaults(t *testing.T) {
+	write := func(content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	base := `data_dir = "/tmp/publicvpn-maintain"
+[sources.s]
+repo = "owner/repo"
+discovery = "github-contents"
+include = ["vless.txt"]
+`
+
+	t.Run("absent section defaults to 48h", func(t *testing.T) {
+		cfg, err := config.Load(write(base))
+		require.NoError(t, err)
+		assert.Equal(t, 48*time.Hour, cfg.Maintain.PruneDeadAfter.Duration,
+			"maintain.prune_dead_after must default to 48h (DESIGN §4.9)")
+	})
+
+	t.Run("explicit value parses", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[maintain]\nprune_dead_after = \"72h\"\n"))
+		require.NoError(t, err)
+		assert.Equal(t, 72*time.Hour, cfg.Maintain.PruneDeadAfter.Duration)
+	})
+
+	t.Run("negative value fails loud", func(t *testing.T) {
+		_, err := config.Load(write(base + "\n[maintain]\nprune_dead_after = \"-1h\"\n"))
+		require.Error(t, err, "a negative prune window is a config error, not 'never prune'")
+		assert.Contains(t, err.Error(), "prune_dead_after")
+	})
+
+	t.Run("unknown key fails strict decode", func(t *testing.T) {
+		_, err := config.Load(write(base + "\n[maintain]\nprune_dead_aftr = \"48h\"\n"))
+		require.Error(t, err, "unknown keys inside [maintain] must fail the strict decode (owner convention)")
+		assert.Contains(t, err.Error(), "strict mode")
+	})
+}
+
 // TestFilterSourceCapConfigParsesAndValidates pins the [filter] section:
 // source_cap defaults to unlimited (0) and negative values fail validation
 // (review finding 6).

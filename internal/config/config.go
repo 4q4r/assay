@@ -102,6 +102,13 @@ type ActivateConfig struct {
 	BackupDir string `toml:"backup_dir"`
 }
 
+// MaintainConfig controls the W4 maintenance wave (DESIGN.md §4.9).
+type MaintainConfig struct {
+	// PruneDeadAfter removes a geo-base record that is not alive and whose
+	// last_probe is older than this window (default 48h).
+	PruneDeadAfter Duration `toml:"prune_dead_after"`
+}
+
 // Config is the pipeline configuration root.
 type Config struct {
 	DataDir  string            `toml:"data_dir"`
@@ -113,6 +120,7 @@ type Config struct {
 	Select   SelectConfig      `toml:"select"`
 	Render   RenderConfig      `toml:"render"`
 	Activate ActivateConfig    `toml:"activate"`
+	Maintain MaintainConfig    `toml:"maintain"`
 }
 
 // Duration wraps time.Duration for TOML string values like "30s", "24h".
@@ -161,6 +169,7 @@ func applyDefaults(c *Config) {
 	applySelectDefaults(&c.Select)
 	applyRenderDefaults(&c.Render)
 	applyActivateDefaults(&c.Activate)
+	applyMaintainDefaults(&c.Maintain)
 }
 
 func applyFetchDefaults(f *FetchConfig) {
@@ -259,6 +268,12 @@ func applyActivateDefaults(a *ActivateConfig) {
 	}
 }
 
+func applyMaintainDefaults(m *MaintainConfig) {
+	if m.PruneDeadAfter.Duration == 0 {
+		m.PruneDeadAfter.Duration = 48 * time.Hour
+	}
+}
+
 func validate(c *Config) error {
 	if err := validateBasics(c); err != nil {
 		return err
@@ -275,7 +290,17 @@ func validate(c *Config) error {
 	if err := validateGeo(c.Geo); err != nil {
 		return err
 	}
+	if err := validateMaintain(c.Maintain); err != nil {
+		return err
+	}
 	return validateRender(c.Render)
+}
+
+func validateMaintain(m MaintainConfig) error {
+	if m.PruneDeadAfter.Duration < 0 {
+		return fmt.Errorf("maintain.prune_dead_after must be >= 0 (0 = default 48h), got %s", m.PruneDeadAfter.Duration)
+	}
+	return nil
 }
 
 func validateFilter(f FilterConfig) error {
