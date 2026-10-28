@@ -43,13 +43,11 @@ func installOpts(t *testing.T, ex *fakeExecutor) (Options, string, string) {
 	require.NoError(t, os.MkdirAll(filepath.Join(run, "systemd"), 0o755))
 	t.Setenv("XDG_RUNTIME_DIR", run)
 	return Options{
-		BinDir:            binDir,
-		UnitDir:           unitDir,
-		RunningBinary:     stubBinary(t),
-		ConfigPath:        filepath.Join(home, "config.toml"),
-		RefreshInterval:   6 * time.Hour,
-		SpeedtestInterval: 168 * time.Hour,
-		Exec:              ex,
+		BinDir:        binDir,
+		UnitDir:       unitDir,
+		RunningBinary: stubBinary(t),
+		ConfigPath:    filepath.Join(home, "config.toml"),
+		Exec:          ex,
 	}, binDir, unitDir
 }
 
@@ -68,8 +66,9 @@ func TestInstallCopiesBinaryAtomicallyAndExecutable(t *testing.T) {
 	running, err := os.ReadFile(opts.RunningBinary)
 	require.NoError(t, err)
 	assert.Equal(t, running, content, "the copy must be byte-identical to the running image")
-	assert.True(t, res.TimersActive)
-	assert.Len(t, res.UnitPaths, 4, "full install renders all four units")
+	assert.True(t, res.ServiceActive)
+	assert.Equal(t, []string{filepath.Join(opts.UnitDir, WatchService)}, res.UnitPaths,
+		"the W10 install renders exactly the daemon unit")
 }
 
 // TestInstallReRunIsSelfUpgrade pins the idempotent re-install: a changed
@@ -88,77 +87,79 @@ func TestInstallReRunIsSelfUpgrade(t *testing.T) {
 	assert.Equal(t, "#!/bin/sh\nexit 1\n", string(content), "re-install replaces the binary (self-upgrade)")
 }
 
-// TestInstallRendersUnitFilesFromConfigIntervals pins the rendered unit
-// content: ExecStart carries the installed binary + the config path; timers
-// carry OnBootSec + OnUnitActiveSec=<configured interval> (no OnCalendar —
-// arbitrary durations must be expressible).
-func TestInstallRendersUnitFilesFromConfigIntervals(t *testing.T) {
+// TestInstallRendersWatchUnit pins the rendered unit content: ExecStart
+// carries the installed binary + the config path, Restart=always (the W10
+// daemon contract), and NO interval rendering — the daemon reads the
+// schedule from the config live.
+func TestInstallRendersWatchUnit(t *testing.T) {
 	ex := &fakeExecutor{}
 	opts, binDir, unitDir := installOpts(t, ex)
-	opts.RefreshInterval = 90 * time.Minute
-	opts.SpeedtestInterval = 7 * 24 * time.Hour
 	res, err := Install(opts)
 	require.NoError(t, err)
-	require.Len(t, res.UnitPaths, 4)
+	require.Len(t, res.UnitPaths, 1)
 
-	service, err := os.ReadFile(filepath.Join(unitDir, RefreshService))
+	service, err := os.ReadFile(filepath.Join(unitDir, WatchService))
 	require.NoError(t, err)
 	s := string(service)
-	assert.Contains(t, s, "ExecStart="+filepath.Join(binDir, "publicvpn")+" maintain -c "+opts.ConfigPath)
-	assert.Contains(t, s, "Type=oneshot")
+	assert.Contains(t, s, "ExecStart="+filepath.Join(binDir, "publicvpn")+" watch -c "+opts.ConfigPath)
+	assert.Contains(t, s, "Type=notify")
+	assert.Contains(t, s, "WatchdogSec=300")
+	assert.Contains(t, s, "Restart=always")
 	assert.NotContains(t, s, "{{", "template placeholders must all be rendered")
 	assert.NotContains(t, s, "systemctl", "units never invoke systemctl themselves")
+	assert.NotContains(t, s, "OnUnitActiveSec", "the daemon era has no timers — the schedule lives in the config")
+	for _, legacy := range LegacyUnitNames() {
+		assert.NotContains(t, s, legacy, "no legacy unit may leak into the daemon unit")
+	}
 
-	timer, err := os.ReadFile(filepath.Join(unitDir, RefreshTimer))
-	require.NoError(t, err)
-	tr := string(timer)
-	assert.Contains(t, tr, "OnBootSec=2min")
-	assert.Contains(t, tr, "OnUnitActiveSec=90m", "config interval renders as OnUnitActiveSec")
-	assert.Contains(t, tr, "Persistent=true")
-	assert.Contains(t, tr, "Unit=public_vpn-refresh.service")
-	assert.NotRegexp(t, `(?m)^OnCalendar=`, tr, "arbitrary durations require OnBootSec/OnUnitActiveSec, not an OnCalendar directive")
-	assert.NotContains(t, tr, "{{")
-
-	speedService, err := os.ReadFile(filepath.Join(unitDir, SpeedtestService))
-	require.NoError(t, err)
-	assert.Contains(t, string(speedService),
-		"ExecStart="+filepath.Join(binDir, "publicvpn")+" maintain --speedtest -c "+opts.ConfigPath)
-
-	speedTimer, err := os.ReadFile(filepath.Join(unitDir, SpeedtestTimer))
-	require.NoError(t, err)
-	st := string(speedTimer)
-	assert.Contains(t, st, "OnUnitActiveSec=168h")
-	assert.Contains(t, st, "OnBootSec=20min")
-	assert.NotContains(t, st, "{{")
-
-	// Executor sequence: reload, then enable --now both timers — nothing else
-	// (install-only test; the uninstall sequence is pinned in
-	// TestUninstallDisablesAndRemoves below).
+	// Executor sequence: reload, then enable --now the daemon — nothing else
+	// on a fresh host (the legacy cleanup path is pinned separately below).
 	require.Len(t, ex.calls, 2)
 	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[0])
-	assert.Equal(t, []string{"--user", "enable", "--now", RefreshTimer, SpeedtestTimer}, ex.calls[1])
+	assert.Equal(t, []string{"--user", "enable", "--now", WatchService}, ex.calls[1])
 }
 
-// TestInstallIsIdempotent pins the supported period-change flow: re-running
-// install rewrites the units (new interval) and re-runs the same two systemctl
-// steps — no duplicates, no drift.
+// TestInstallCleansUpLegacyTimerUnits pins the W5→W10 migration: an install
+// over an old timer-era deployment disables the legacy timers and REMOVES
+// their unit files, then arms the daemon — waves fire from exactly one
+// scheduler afterwards.
+func TestInstallCleansUpLegacyTimerUnits(t *testing.T) {
+	ex := &fakeExecutor{}
+	opts, _, unitDir := installOpts(t, ex)
+	require.NoError(t, os.MkdirAll(unitDir, 0o750))
+	for _, name := range LegacyUnitNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(unitDir, name), []byte("[Unit]\n"), 0o644))
+	}
+	res, err := Install(opts)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, LegacyUnitNames(), res.LegacyCleaned)
+	for _, name := range LegacyUnitNames() {
+		_, err := os.Stat(filepath.Join(unitDir, name))
+		assert.True(t, os.IsNotExist(err), "legacy unit %s must be removed", name)
+	}
+	require.Len(t, ex.calls, 3)
+	assert.Equal(t, []string{"--user", "disable", "--now", RefreshTimer, SpeedtestTimer}, ex.calls[0],
+		"the legacy timers are disabled BEFORE the daemon is armed")
+	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[1])
+	assert.Equal(t, []string{"--user", "enable", "--now", WatchService}, ex.calls[2])
+}
+
+// TestInstallIsIdempotent pins re-install: same unit rewritten, the same
+// systemctl steps re-run — no duplicates, no drift, no second enable shape.
 func TestInstallIsIdempotent(t *testing.T) {
 	ex := &fakeExecutor{}
 	opts, _, unitDir := installOpts(t, ex)
 	_, err := Install(opts)
 	require.NoError(t, err)
 
-	opts.RefreshInterval = 5 * time.Hour
 	opts.Exec = ex
 	_, err = Install(opts)
 	require.NoError(t, err)
 
-	timer, err := os.ReadFile(filepath.Join(unitDir, RefreshTimer))
+	watch, err := os.ReadFile(filepath.Join(unitDir, WatchService))
 	require.NoError(t, err)
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=5h$`, string(timer))
-	assert.NotRegexp(t, `(?m)^OnUnitActiveSec=6h$`, string(timer), "the old period must not survive")
+	assert.NotContains(t, string(watch), "{{")
 	assert.Len(t, ex.calls, 4, "exactly reload+enable per install run")
-	require.NoError(t, os.RemoveAll(filepath.Join(unitDir, "timers.target.wants")))
 }
 
 func TestInstallNoSystemdCopiesBinaryOnly(t *testing.T) {
@@ -210,30 +211,59 @@ func TestUninstallDisablesAndRemoves(t *testing.T) {
 	_, err := Install(opts)
 	require.NoError(t, err)
 
-	// The enable step created wants-symlinks in the real flow; uninstall does
-	// not manage them (systemd removes them on disable) — model that here.
 	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex})
 	require.NoError(t, err)
-	assert.True(t, res.DisabledTimers)
-	assert.Len(t, res.RemovedUnits, 4)
-	assert.Empty(t, res.MissingUnits)
-	for _, name := range UnitNames() {
+	assert.Equal(t, []string{WatchService}, res.DisabledUnits)
+	assert.Equal(t, []string{WatchService}, res.RemovedUnits)
+	assert.ElementsMatch(t, LegacyUnitNames(), res.MissingUnits,
+		"the legacy names are reported absent, not errors")
+	for _, name := range AllKnownUnitNames() {
 		_, err := os.Stat(filepath.Join(unitDir, name))
 		assert.True(t, os.IsNotExist(err), "%s must be removed", name)
 	}
 	require.Len(t, ex.calls, 4) // install: reload+enable, uninstall: disable + daemon-reload (I-2)
-	assert.Equal(t, []string{"--user", "disable", "--now", RefreshTimer, SpeedtestTimer}, ex.calls[2])
+	assert.Equal(t, []string{"--user", "disable", "--now", WatchService}, ex.calls[2])
 	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[3],
 		"I-2: the manager must reload after the unit files are gone or it keeps ghost not-found entries")
 }
 
+// TestUninstallCleansLegacyUnits pins the uninstall migration surface: an
+// old timer-era deployment (no daemon) is torn down completely — the legacy
+// disable command runs, all five unit files go away.
+func TestUninstallCleansLegacyUnits(t *testing.T) {
+	ex := &fakeExecutor{}
+	_, unitDir := func() (string, string) {
+		home := t.TempDir()
+		run := filepath.Join(home, "run")
+		require.NoError(t, os.MkdirAll(filepath.Join(run, "systemd"), 0o755))
+		t.Setenv("XDG_RUNTIME_DIR", run)
+		return home, filepath.Join(home, ".config", "systemd", "user")
+	}()
+	require.NoError(t, os.MkdirAll(unitDir, 0o750))
+	for _, name := range LegacyUnitNames() {
+		require.NoError(t, os.WriteFile(filepath.Join(unitDir, name), []byte("[Unit]\n"), 0o644))
+	}
+
+	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex})
+	require.NoError(t, err)
+	assert.Equal(t, LegacyUnitNames(), res.DisabledUnits)
+	assert.ElementsMatch(t, LegacyUnitNames(), res.RemovedUnits,
+		"a legacy-only deployment removes exactly the four timer units")
+	assert.Equal(t, []string{WatchService}, res.MissingUnits, "the daemon unit was never installed here")
+	require.Len(t, ex.calls, 2)
+	assert.Equal(t, []string{"--user", "disable", "--now", RefreshTimer, SpeedtestTimer}, ex.calls[0])
+	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[1])
+}
+
 func TestUninstallWithoutInstallIsClean(t *testing.T) {
 	ex := &fakeExecutor{}
-	_, unitDir := "", t.TempDir()
+	unitDir := t.TempDir()
 	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex})
 	require.NoError(t, err)
 	assert.Empty(t, res.RemovedUnits)
-	assert.Len(t, res.MissingUnits, 4, "absent units are reported, not errors")
+	assert.Len(t, res.MissingUnits, len(AllKnownUnitNames()), "absent units are reported, not errors")
+	assert.True(t, res.SkippedDisable, "nothing on disk = nothing disabled")
+	assert.Empty(t, ex.calls, "no systemctl call when no unit is present")
 }
 
 func TestUninstallPurgeRemovesConfigAndDataOnly(t *testing.T) {
@@ -263,30 +293,14 @@ func TestUninstallPurgeRemovesConfigAndDataOnly(t *testing.T) {
 	assert.NoError(t, err, "everything outside config+data stays untouched")
 }
 
-func TestSpanAndParseSpanRoundTrip(t *testing.T) {
-	for _, d := range []time.Duration{
-		6 * time.Hour, 168 * time.Hour, 5 * time.Minute, 90 * time.Minute,
-		45 * time.Second, 24 * 30 * time.Hour,
-	} {
-		span := Span(d)
-		parsed, err := ParseSpan(span)
-		require.NoError(t, err, "span %q", span)
-		assert.Equal(t, d, parsed, "round-trip %s", d)
-	}
-	// systemd-style input the installer never writes but status must read.
-	for span, want := range map[string]time.Duration{
-		"5min":  5 * time.Minute,
-		"1h30m": 90 * time.Minute,
-		"2d":    48 * time.Hour,
-		"1w":    168 * time.Hour,
-		"30s":   30 * time.Second,
-	} {
-		got, err := ParseSpan(span)
-		require.NoError(t, err, "span %q", span)
-		assert.Equal(t, want, got, "span %q", span)
-	}
-	for _, bad := range []string{"", "6", "h", "6x", "6h5"} {
-		_, err := ParseSpan(bad)
-		assert.Error(t, err, "span %q must be rejected", bad)
-	}
+// TestSpanDisplayRoundTrip pins the display formatter used by status (the
+// read-back parse side is gone with the timers — the daemon reads the
+// config, not the unit).
+func TestSpanDisplayRoundTrip(t *testing.T) {
+	assert.Equal(t, "1h", Span(1*time.Hour))
+	assert.Equal(t, "168h", Span(168*time.Hour))
+	assert.Equal(t, "5m", Span(5*time.Minute))
+	assert.Equal(t, "90m", Span(90*time.Minute))
+	assert.Equal(t, "45s", Span(45*time.Second))
+	assert.Equal(t, "0", Span(0))
 }

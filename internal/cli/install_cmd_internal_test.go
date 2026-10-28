@@ -38,10 +38,6 @@ func writeWaveConfig(t *testing.T, dir string, refresh, speedtest time.Duration)
 	speedSpan := (config.Duration{Duration: speedtest}).String()
 	body := fmt.Sprintf(`
 data_dir = %q
-[sources.dummy]
-repo = "owner/repo"
-discovery = "github-contents"
-include = ["vless.txt"]
 
 [maintain]
 refresh_interval = %q
@@ -68,24 +64,22 @@ func TestRunInstallEndToEnd(t *testing.T) {
 		exec:    ex,
 	}))
 	out := buf.String()
-	assert.Contains(t, out, "timers active:    refresh every 8h, speedtest every 240h (OnUnitActiveSec)")
+	assert.Contains(t, out, "daemon active:    publicvpn watch (Restart=always)")
+	assert.Contains(t, out, "journalctl --user -u public_vpn-watch.service -f")
 
 	// Exact allowed command set, in order.
 	require.Len(t, ex.calls, 2)
 	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[0])
-	assert.Equal(t, []string{"--user", "enable", "--now", install.RefreshTimer, install.SpeedtestTimer}, ex.calls[1])
+	assert.Equal(t, []string{"--user", "enable", "--now", install.WatchService}, ex.calls[1])
 
-	// Unit content rendered from the CONFIG intervals.
-	timer, err := os.ReadFile(filepath.Join(unitDir, install.RefreshTimer))
+	// Unit content: the daemon ExecStart + live-config note; no timers.
+	service, err := os.ReadFile(filepath.Join(unitDir, install.WatchService))
 	require.NoError(t, err)
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=8h$`, string(timer))
-	speedTimer, err := os.ReadFile(filepath.Join(unitDir, install.SpeedtestTimer))
-	require.NoError(t, err)
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=240h$`, string(speedTimer))
-
-	service, err := os.ReadFile(filepath.Join(unitDir, install.RefreshService))
-	require.NoError(t, err)
-	assert.Contains(t, string(service), "maintain -c "+cfgPath)
+	assert.Contains(t, string(service), "watch -c "+cfgPath)
+	assert.Contains(t, string(service), "Restart=always")
+	assert.NotContains(t, string(service), "{{")
+	_, err = os.Stat(filepath.Join(unitDir, install.RefreshTimer))
+	assert.True(t, os.IsNotExist(err), "the timer era is over — no timer units are installed")
 }
 
 // I-1 pins (W5 fix round): systemd ExecStart= splits argv on whitespace and
@@ -159,10 +153,10 @@ func TestRunInstallAcceptsWhitespaceUnitDir(t *testing.T) {
 		exec:    ex,
 	}), "a whitespace unit dir is harmless — install must accept it")
 
-	// The four units landed in the whitespace dir, rendered as usual.
-	timer, err := os.ReadFile(filepath.Join(unitDir, install.RefreshTimer))
+	// The daemon unit lands in the whitespace dir, rendered as usual.
+	service, err := os.ReadFile(filepath.Join(unitDir, install.WatchService))
 	require.NoError(t, err)
-	assert.Regexp(t, `(?m)^OnUnitActiveSec=6h$`, string(timer))
+	assert.Contains(t, string(service), "Restart=always")
 	for _, name := range install.UnitNames() {
 		_, err := os.Stat(filepath.Join(unitDir, name))
 		require.NoError(t, err, "unit %s must be written into the whitespace dir", name)
@@ -170,7 +164,7 @@ func TestRunInstallAcceptsWhitespaceUnitDir(t *testing.T) {
 	// The exact allowlisted systemctl sequence is unchanged.
 	require.Len(t, ex.calls, 2)
 	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[0])
-	assert.Equal(t, []string{"--user", "enable", "--now", install.RefreshTimer, install.SpeedtestTimer}, ex.calls[1])
+	assert.Equal(t, []string{"--user", "enable", "--now", install.WatchService}, ex.calls[1])
 }
 
 func TestRunInstallNoSystemdSkipsUnits(t *testing.T) {
@@ -199,7 +193,7 @@ func TestRunUninstallDisablesAndRemoves(t *testing.T) {
 	require.NoError(t, runUninstall(buf, mustLoad(t, cfgPath), cfgPath,
 		uninstallOptions{unitDir: unitDir, exec: ex}))
 	require.Len(t, ex.calls, 4) // install: reload+enable, uninstall: disable + daemon-reload (I-2)
-	assert.Equal(t, []string{"--user", "disable", "--now", install.RefreshTimer, install.SpeedtestTimer}, ex.calls[2])
+	assert.Equal(t, []string{"--user", "disable", "--now", install.WatchService}, ex.calls[2])
 	assert.Equal(t, []string{"--user", "daemon-reload"}, ex.calls[3], "I-2: post-removal reload flushes ghost units")
 	assert.Contains(t, buf.String(), "user data kept")
 	for _, name := range install.UnitNames() {
@@ -251,12 +245,10 @@ func TestStatusShowsInstallState(t *testing.T) {
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
 		installOptions{binDir: binDir, unitDir: unitDir, exec: ex}))
 
-	// The enable step is faked, so create the wants-symlinks it would create.
-	wants := filepath.Join(unitDir, "timers.target.wants")
+	// The enable step is faked, so create the wants-symlink it would create.
+	wants := filepath.Join(unitDir, "default.target.wants")
 	require.NoError(t, os.MkdirAll(wants, 0o755))
-	for _, name := range []string{install.RefreshTimer, install.SpeedtestTimer} {
-		require.NoError(t, os.Symlink(filepath.Join(unitDir, name), filepath.Join(wants, name)))
-	}
+	require.NoError(t, os.Symlink(filepath.Join(unitDir, install.WatchService), filepath.Join(wants, install.WatchService)))
 
 	status := &bytes.Buffer{}
 	cmd := &cobra.Command{}
@@ -265,17 +257,17 @@ func TestStatusShowsInstallState(t *testing.T) {
 	out := status.String()
 	assert.Contains(t, out, "install:")
 	assert.Contains(t, out, "binary:    "+filepath.Join(binDir, "publicvpn"))
-	assert.Contains(t, out, "units:     4/4 present")
-	assert.Contains(t, out, "timers:    2/2 enabled")
-	assert.Contains(t, out, "refresh:   configured 6h0m0s, installed 6h0m0s")
-	assert.Contains(t, out, "speedtest: configured 168h0m0s, installed 168h0m0s")
-	assert.NotContains(t, out, "MISMATCH")
+	assert.Contains(t, out, install.WatchService+" present")
+	assert.Contains(t, out, "service:   enabled (wants symlink)")
+	assert.Contains(t, out, "waves: refresh 6h, speedtest 168h (read live from the config)",
+		"the wave periods render from the config (read live)")
+	assert.NotContains(t, out, "MISMATCH", "the daemon era has no installed-period drift class")
 
-	// Drift the configured refresh period: status must flag the mismatch.
-	drifted := writeWaveConfig(t, home, 9*time.Hour, 168*time.Hour)
+	// Legacy units on disk get the migration hint.
+	require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.RefreshTimer), []byte("[Unit]\n"), 0o644))
 	status.Reset()
-	require.NoError(t, runStatus(cmd, mustLoad(t, drifted), drifted))
-	assert.Contains(t, status.String(), "MISMATCH", "config drift after install must be flagged")
+	require.NoError(t, runStatus(cmd, mustLoad(t, cfgPath), cfgPath))
+	assert.Contains(t, status.String(), "LEGACY:", "old timer units must be flagged for migration")
 	assert.Contains(t, status.String(), "re-run `publicvpn install")
 }
 

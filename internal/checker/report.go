@@ -409,6 +409,14 @@ func flagEmoji(cc string) string {
 	return string(first) + string(second)
 }
 
+// FlagEmoji is the exported flag renderer for the sibling display command
+// (`publicvpn list`); there is ONE emoji mapping in the repo.
+func FlagEmoji(cc string) string { return flagEmoji(cc) }
+
+// FormatMS is the exported millisecond cell formatter for `publicvpn list`
+// (same compact spellings as the check report: —, <1ms, 45ms).
+func FormatMS(ms float64) string { return fmtMS(ms) }
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a

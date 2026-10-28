@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"public_vpn/internal/config"
 	"public_vpn/internal/fetch"
 	"public_vpn/internal/model"
+	"public_vpn/internal/plugins"
 	"public_vpn/internal/store"
 
 	"github.com/spf13/cobra"
@@ -22,12 +25,13 @@ import (
 // (review finding 7 — max_passed was a lying knob pre-fix, declared in TOML
 // but never copied into probe.Options).
 func TestProbeOptionsWiresConfig(t *testing.T) {
+	noSpeedtest := false
 	cfg := &config.Config{
 		Probe: config.ProbeConfig{
 			MaxPassed:           7,
 			Threads:             11,
 			CheckPreset:         "global",
-			Speedtest:           true,
+			Speedtest:           &noSpeedtest,
 			URLSuccessThreshold: 0.9,
 		},
 	}
@@ -36,8 +40,12 @@ func TestProbeOptionsWiresConfig(t *testing.T) {
 	assert.Equal(t, 7, opts.MaxPassed, "probe.max_passed must reach the wave")
 	assert.Equal(t, 11, opts.Threads)
 	assert.Equal(t, "global", opts.CheckPreset, "config preset used when no flag")
-	assert.True(t, opts.Speedtest, "config speedtest=true holds without a flag")
+	assert.False(t, opts.Speedtest, "explicit speedtest=false holds without a flag")
 	assert.InDelta(t, 0.9, opts.URLSuccessThreshold, 0.0001)
+
+	cfg.Probe.Speedtest = nil
+	opts = probeOptions(cfg, false, "")
+	assert.True(t, opts.Speedtest, "nil speedtest defaults to ON (W10 owner ruling)")
 
 	cfg.Probe.CheckPreset = ""
 	opts = probeOptions(cfg, false, "cloudflare")
@@ -93,6 +101,72 @@ func TestRunParseSourceOrderIsDeterministic(t *testing.T) {
 		"the stable order is source-id ascending")
 }
 
+// TestPluginRunTimeoutAbandonsHangingPlugin pins the I-1 layered fix: a
+// plugin whose Lua VM spins forever (`while true do end` — gopher-lua
+// v1.1.2 has no hook/budget API to interrupt it, verified against the module
+// source) must not hang the wave. The plugin run is bounded by
+// [plugins].run_timeout: the wave abandons the hung plugin LOUD and
+// continues with the healthy ones. The honest trade-off (abandoned
+// goroutine + LState leak, one per wave for a persistently hanging plugin)
+// is documented at runAllPlugins — this test pins the wave-completes
+// contract, the healthy-plugin output, and the abandonment log.
+func TestPluginRunTimeoutAbandonsHangingPlugin(t *testing.T) {
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "config.toml")
+	content := "data_dir = \"" + dir + "\"\n\n[plugins]\nrun_timeout = \"1s\"\n"
+	require.NoError(t, os.WriteFile(tomlPath, []byte(content), 0o600))
+	cfg, err := config.Load(tomlPath)
+	require.NoError(t, err)
+
+	reg := plugins.NewRegistry()
+	reg.Set(&plugins.Plugin{ID: "healthy", Path: "healthy.lua", Code: []byte(`
+		return function()
+			return { publicvpn.node{ raw = "vless://a@h:1?s=1" }, publicvpn.node{ raw = "vless://b@h:2?s=1" } }
+		end`)})
+	reg.Set(&plugins.Plugin{ID: "hung", Path: "hung.lua", Code: []byte(`
+		return function() repeat until false end`)})
+
+	out := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(out)
+	require.NoError(t, runFetchWith(cmd, cfg, reg), "the wave must complete despite the hung plugin")
+
+	text := out.String()
+	require.Contains(t, text, "plugin hung", "the abandonment must be plugin-attributed:\n"+text)
+	require.Contains(t, text, "exceeded 1s — abandoned",
+		"the abandonment must be loud and name the bound:\n"+text)
+	require.Contains(t, text, "plugin healthy    ok: 2 nodes", "healthy plugins still run:\n"+text)
+
+	// The manifest carries only the healthy source; the healthy nodes reach
+	// the pipeline, the hung plugin contributes nothing.
+	require.NoError(t, runParse(func() *cobra.Command {
+		c := &cobra.Command{}
+		c.SetOut(&bytes.Buffer{})
+		return c
+	}(), cfg))
+	nodes, err := os.ReadFile(filepath.Join(dir, "nodes.jsonl"))
+	require.NoError(t, err)
+	require.Equal(t, 2, strings.Count(string(nodes), `"source":"healthy`),
+		"the healthy plugin's nodes must reach the pipeline: %s", nodes)
+	require.NotContains(t, string(nodes), "hung", "the hung plugin must contribute nothing")
+}
+
+// TestPluginRunTimeoutResolution pins the knob's three states: unset → the
+// 120s default; explicit 0s → unbounded (owner ruling: no artificial floor);
+// an explicit value passes through verbatim.
+func TestPluginRunTimeoutResolution(t *testing.T) {
+	cfg := &config.Config{}
+	require.Equal(t, config.DefaultPluginRunTimeout, pluginRunTimeout(cfg),
+		"unset run_timeout resolves to the 120s default")
+
+	cfg.Plugins.RunTimeout = &config.Duration{}
+	require.Equal(t, time.Duration(0), pluginRunTimeout(cfg),
+		"explicit 0s = unbounded (no artificial floor)")
+
+	cfg.Plugins.RunTimeout = &config.Duration{Duration: 7 * time.Second}
+	require.Equal(t, 7*time.Second, pluginRunTimeout(cfg), "explicit value passes through")
+}
+
 // TestRenderKnobsReachRenderedOutputEndToEnd pins the C-1 seam: every render
 // knob must cross config.Load → runRender → the rendered file. This crosses
 // the FULL seam (TOML on disk → real loader → production runRender → written
@@ -125,9 +199,6 @@ func TestRenderKnobsReachRenderedOutputEndToEnd(t *testing.T) {
 	content := `
 data_dir = "` + dir + `"
 
-[sources.s]
-repo = "o/r"
-discovery = "github-contents"
 
 [render]
 template = "` + tmpl + `"

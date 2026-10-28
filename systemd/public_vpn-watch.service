@@ -1,0 +1,27 @@
+[Unit]
+Description=publicvpn watch daemon (plugin hot-reload watchdog + scheduled maintain waves)
+
+[Service]
+# sd_notify(3) contract: the daemon sends READY=1 once wired and pings
+# WATCHDOG=1 every WatchdogSec/2 (read from WATCHDOG_USEC). A wedged daemon
+# stops pinging → systemd kills it at the deadline and Restart=always brings
+# it back. The pinger runs on its own goroutine, so WatchdogSec does NOT need
+# to cover wave duration (a full wave with speedtests may legitimately run
+# for hours): 300s only has to detect a genuinely dead RUNTIME. Flat 300s
+# = worst-case detection in 5 minutes + a 5s restart — fast, unattended
+# recovery, immune to wave length.
+Type=notify
+WatchdogSec=300
+# The wave reuses the pipeline config file (single source of truth, no env
+# vars). Rendered by `publicvpn install` from this template — do not edit the
+# installed copy by hand. The daemon reads [maintain].refresh_interval and
+# [plugins].dir live: a config change needs only a restart, never a re-install.
+ExecStart={{ .BinaryPath }} watch -c {{ .ConfigPath }}
+# A daemon crash restarts automatically; waves themselves are serialized by
+# the scheduler and touch the live xray config only through the -test gate.
+# The daemon never restarts the client — it prints the restart hint instead.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
