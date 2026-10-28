@@ -1,6 +1,7 @@
 package parse_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
@@ -26,6 +27,9 @@ func buildMixed(n int) string {
 				fmt.Fprintln(&b, "tuic://uuid@h.example.com:443?congestion_control=bbr")
 			case 15:
 				fmt.Fprintln(&b, "ss://YWVzLTI1Ni1nY206cHc@ss.example.com:443#ss")
+			case 19:
+				fmt.Fprintf(&b, "ss://%s@ssb%d.example.com:8388?sni=s.example.com&type=tcp&plugin=obfs-local%%3Bobfs%%3Dhttp#ss-%d\n",
+					base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:benchpw")), i, i)
 			case 23:
 				fmt.Fprintln(&b, "this line is not a link at all")
 			}

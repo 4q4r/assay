@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -103,6 +104,9 @@ func (n *Node) Link() string {
 	if n.Scheme == "vmess" {
 		return n.vmessLink()
 	}
+	if n.Scheme == "ss" {
+		return n.ssLink()
+	}
 	frag := ""
 	if n.Fragment != "" {
 		frag = "#" + url.PathEscape(n.Fragment)
@@ -123,6 +127,30 @@ func (n *Node) vmessLink() string {
 	}
 	raw, _ := json.Marshal(payload)
 	return "vmess://" + base64.StdEncoding.EncodeToString(raw)
+}
+
+// ssLink rebuilds a SIP002 link: ss://base64url(method:password)@host:port.
+// method/password are excluded from the query (they are the userinfo); every
+// other param re-encodes verbatim.
+func (n *Node) ssLink() string {
+	q := url.Values{}
+	keys := make([]string, 0, len(n.Params))
+	for k := range n.Params {
+		if k == "method" || k == "password" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		q.Set(k, n.Params[k])
+	}
+	userinfo := base64.RawURLEncoding.EncodeToString([]byte(n.UUID))
+	frag := ""
+	if n.Fragment != "" {
+		frag = "#" + url.PathEscape(n.Fragment)
+	}
+	return "ss://" + userinfo + "@" + net.JoinHostPort(n.Host, strconv.Itoa(n.Port)) + "?" + q.Encode() + frag
 }
 
 // GeoRecord is the DESIGN.md §5 cold-base record. The JSON field set is a

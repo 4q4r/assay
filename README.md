@@ -7,12 +7,12 @@
 *Fetch, probe, geo-enrich, rank, render, and maintain a pool of third-party public proxy nodes — explicitly routed, never your default route.*
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-178%2B-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-268%2B-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
 [![xray-core](https://img.shields.io/badge/xray--core-26.3.27-red?style=for-the-badge)](https://github.com/XTLS/Xray-core)
-[![Pipeline](https://img.shields.io/badge/pipeline-W1%E2%80%93W4-blue?style=for-the-badge)](DESIGN.md)
+[![Pipeline](https://img.shields.io/badge/pipeline-W1%E2%80%93W5-blue?style=for-the-badge)](DESIGN.md)
 [![Lint](https://img.shields.io/badge/golangci--lint-0%20issues-success?style=for-the-badge)](.golangci.yml)
 
-[🚀 Quick Start](#-quick-start) · [🗺️ Pipeline](#️-pipeline) · [🧭 maintain](#-what-happens-on-maintain) · [🔒 Security](#-security-model) · [⚙️ Configuration](#️-configuration) · [📖 Design](DESIGN.md)
+[🚀 Quick Start](#-quick-start) · [🗺️ Pipeline](#️-pipeline) · [🧭 maintain](#-what-happens-on-maintain) · [📦 install](#-self-install--uninstall) · [🔒 Security](#-security-model) · [⚙️ Configuration](#️-configuration) · [📖 Design](DESIGN.md)
 
 </div>
 
@@ -22,11 +22,13 @@
 
 - [✨ What It Does](#-what-it-does)
 - [🗺️ Pipeline](#️-pipeline)
+- [🔌 Link & Transport Support](#-link--transport-support)
 - [🧭 What Happens on `maintain`](#-what-happens-on-maintain)
 - [📂 Project Structure](#-project-structure)
 - [🚀 Requirements](#-requirements)
 - [⚡ Quick Start](#-quick-start)
-- [⏱️ Timers (systemd user units)](#️-timers-systemd-user-units)
+- [📦 Self-install / uninstall](#-self-install--uninstall)
+- [⏱️ Timer Periods (configurable)](#️-timer-periods-configurable)
 - [🔒 Security Model](#-security-model)
 - [⚠️ Landmine Warnings](#️-landmine-warnings)
 - [⚙️ Configuration](#️-configuration)
@@ -38,6 +40,25 @@
 `publicvpn` is a single-binary Go pipeline that keeps a **cold base** (`geo-base.jsonl`: country / city / ASN / ISP per node) of hundreds of third-party public proxy nodes and promotes a small **active core** (20–25, expandable to 40 for city coverage) into your xray client config. Every pool outbound carries the owner-mandated hardening (`sockopt.tcpMaxSeg: 1440`, TLS fingerprint `firefox`), every link parameter passes through **1:1** — nothing is rewritten behind your back.
 
 **The pool never becomes the default route.** It participates only in routing rules you explicitly configure (`[render.pool_routes]`); everything else — including the catch-all — stays on your own nodes.
+
+## 🔌 Link & Transport Support
+
+The render surface targets **your pinned core (xray 26.3.27)** — every field name and every "removed" verdict below is verified against both the real binary (`xray run -test`) and the tagged Xray-core source. Links carrying a transport this core cannot express **fail the render loud with the param named** — never a silent rewrite (L9).
+
+| Link `type=` | Rendered as | Notes |
+| :-- | :-- | :-- |
+| `tcp` / `raw` | `tcp` + `tcpSettings` | `headerType=http` renders the http-obfs request block (`host`/`path` from the link); other header types refused loud |
+| `ws` / `websocket` | `ws` + `wsSettings` | `path`, independent `host` (the deprecated `headers.Host` spelling is not emitted), `ed` appended into the path query (that is where the core reads it), `ehs` accepted only as the fixed `Sec-WebSocket-Protocol` |
+| `httpupgrade` | `httpupgradeSettings` | `path`, `host`, same `ed`-in-path mechanics |
+| `grpc` | `grpcSettings` | `serviceName`; `mode=multi` → `multiMode` (deprecated transport — the core warns but accepts) |
+| `kcp` / `mkcp` | `kcp` (maximally bare — **no `kcpSettings` block is rendered at all**) | **`seed`/`headerType` are build-fatal on 26.3.27** — the mKCP header/seed feature was removed (migrated upstream to finalmask/mkcp-original/mkcp-aes128gcm), so a link carrying either key fails the render loud; any other kcp-namespaced param lands in the drop report |
+| `xhttp` / `splithttp` | `xhttp` + `xhttpSettings` | `mode`, `path`, `host`, and an `extra` JSON-object passthrough (validated) |
+| `http` / `h2` / `h3` | **refused loud** | the HTTP/2 transport was removed from 26.3.27 (→ XHTTP stream-one) |
+| `quic` | **refused loud** | removed from 26.3.27 (→ XHTTP stream-one H3) |
+
+Security layers: `none` (no TLS settings rendered), `tls` (`sni`→`serverName`, `alpn`, `fp` overridden to `firefox`), `reality` (`pbk`/`sid`/`spx`/`pqv`→`mldsa65Verify`, fingerprint `firefox`; only with `tcp`/`xhttp`/`grpc` — the core's own restriction, enforced at render time).
+
+Protocols: `vless`, `vmess` (incl. the JSON vocabulary: `net`/`type`/`host`/`path`/`scy`/`aid`, header datum preserved), `trojan`, and **`ss`** — parsed always, **accepted only when allowlisted** in `[filter].protocols` (default `vless,vmess,trojan`; ss is opt-in). Shadowsocks renders as a `shadowsocks` outbound (`servers[0]` with `method`/`password` 1:1); SIP003 **plugin params cannot render** — the 26.3.27 shadowsocks outbound has no plugin support — so an ss link carrying `plugin=` fails the render loud.
 
 ## 🗺️ Pipeline
 
@@ -60,8 +81,8 @@ flowchart LR
 | Stage | Binary | What it owns |
 | :-- | :-- | :-- |
 | 🌐 fetch | `publicvpn fetch` | dynamic GitHub source discovery (repo ids + manifests, **no pinned URLs**), cached downloads |
-| 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan`, normalize, dedupe by identity hash |
-| 🛡️ filter | `publicvpn filter` | keep `reality\|tls` only, drop `allowInsecure`, drop private hosts, per-source caps |
+| 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss`, normalize, dedupe by identity hash |
+| 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
 | 🩺 probe | `publicvpn probe` | out-of-band `xray-knife`: liveness, RTT, tunnel exit IP (D8), optional `-S` speedtest |
 | 🌍 geo | `publicvpn geo` | ip-api.com batch enrichment of exit IPs (rate-capped, L6) |
 | 📊 stats | `maintain` sub-step | `xray api statsquery` poll → per-outbound uplink/downlink into the cold base |
@@ -93,21 +114,22 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 public_vpn/
 ├── cmd/publicvpn/          # main.go — cobra root wiring
 ├── internal/
-│   ├── cli/                # command tree + maintain orchestration (stage seam)
+│   ├── cli/                # command tree + maintain orchestration (stage seam) + install/uninstall commands
 │   ├── config/             # strict-decode TOML (unknown keys fail loud), no env vars
 │   ├── model/              # Node, GeoRecord (§5 cold-base schema), tag contracts (D5/D6)
 │   ├── fetch/              # D9 dynamic discovery + cached downloads (L5 proxy-stripped)
-│   ├── parse/              # base64/link decoding → normalized Node
-│   ├── filter/             # ingest security filter
+│   ├── parse/              # base64/link decoding (vless/vmess/trojan/ss) → normalized Node
+│   ├── filter/             # ingest security filter (protocols allowlist + insecure policy)
 │   ├── probe/              # xray-knife out-of-band runner (L5)
 │   ├── geo/                # ip-api batch enrichment (L6 rate caps)
 │   ├── stats/              # W4 statsquery poll + byte folding (L7-tolerant)
 │   ├── prune/              # W4 dead/ttl-stale-orphan rules (reuses rank freshness)
 │   ├── rank/               # select stage: ranking, caps D7, pool tags
-│   ├── render/             # W3 renderer: outbounds, balancers, Plan A observatory, L1 gate
+│   ├── render/             # W3/W5 renderer: full transport surface, balancers, Plan A observatory, L1 gate
 │   ├── activate/           # -test gate + backup + atomic replace (never restarts)
+│   ├── install/            # W5 self-install: binary copy, unit rendering, allowlisted systemctl seam
 │   └── store/              # JSONL cold base, probe log, selection — all writes atomic
-├── systemd/                # user timer units (repo files only — you install them)
+├── systemd/                # unit TEMPLATES (single source of truth, go:embed'd by install) + embed.go
 ├── config.toml             # the single source of truth
 └── DESIGN.md               # full design: decisions D1–D11, landmines, resource budget
 ```
@@ -130,26 +152,44 @@ public_vpn/
 7. **`publicvpn select`** — rank and cap the active set.
 8. **`publicvpn render`** — render the full client config into `rendered/config.json`.
 9. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then restart your client when you are ready (`systemctl --user restart xray-raw.service` — the binary prints this hint, it never restarts by itself).
-10. **`publicvpn maintain`** — from now on, one command (or the shipped timers) does the whole wave, activating only on real diffs.
+10. **`publicvpn maintain`** — from now on, one command (or the timers installed by `publicvpn install`) does the whole wave, activating only on real diffs.
 
-## ⏱️ Timers (systemd user units)
+## 📦 Self-install / uninstall
 
-`systemd/` ships the refresh timer (every 6 h) and the weekly speedtest timer as **repo files** — nothing is installed or enabled for you:
+`publicvpn install` turns the machine you run it on into a maintained node:
+
+1. **Binary** — copies the RUNNING binary (`os.Executable`) to `--bin-dir` (default `~/.local/bin`) as `publicvpn`: atomic write (temp → fsync → rename), mode `0755`. Re-running after a rebuild **is** the self-upgrade flow.
+2. **Units** — renders the four systemd user units from the repo templates (`systemd/`, single source of truth via `go:embed`) into `--unit-dir` (default `~/.config/systemd/user`). `ExecStart` points at the installed binary and the `--config` path you passed; the timers carry your `[maintain]` intervals as `OnBootSec` + `OnUnitActiveSec` (arbitrary durations — deliberately **not** `OnCalendar`).
+3. **Activation** — exactly two `systemctl --user` calls, pinned to an internal allowlist (no `restart`, no other units, ever): `daemon-reload`, then `enable --now public_vpn-refresh.timer public_vpn-speedtest.timer`.
 
 ```bash
-cp systemd/public_vpn-*.service systemd/public_vpn-*.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now public_vpn-refresh.timer public_vpn-speedtest.timer
+go build -o publicvpn ./cmd/publicvpn
+./publicvpn install -c /absolute/path/to/config.toml   # config is required: the units embed its path
 ```
 
-Full install steps and a journald cheatsheet live in [systemd/README.md](systemd/README.md).
+- **install never creates or moves config files** — the units reference the path you pass; keep that file in place.
+- **No user systemd session?** install fails loud with an actionable message; pass `--no-systemd` to copy the binary only (timers skipped, documented in the output).
+- **`publicvpn uninstall`** — the symmetric teardown: `disable --now` both timers → remove the four unit files → report. User data (config, data dir, installed binary) is **kept by default**; `--purge` (explicit, destructive) also removes the config file and `[data_dir]` — and nothing else, in particular nothing xray-raw.
+- **`publicvpn status`** — extended with the install state: installed binary, unit files present, timers enabled (read-only filesystem inspection), and configured-vs-installed timer periods with a `MISMATCH` flag. **Default dirs only:** this detection reads `~/.local/bin` and `~/.config/systemd/user` — an install made with custom `--bin-dir`/`--unit-dir` paths is **not tracked** (`status` keeps no state file, by design); check those locations directly.
+
+## ⏱️ Timer Periods (configurable)
+
+```toml
+[maintain]
+refresh_interval = "6h"     # refresh wave recheck (default 6h, floor 5m)
+speedtest_interval = "168h" # speedtest wave recheck (default 168h = weekly, floor 5m)
+```
+
+**Changing a period is a supported flow:** edit the config, re-run `publicvpn install -c <config>` — install is idempotent (re-renders the units with the new `OnUnitActiveSec`, daemon-reloads, re-enables). `publicvpn status` tells you when the installed units drifted from the config. Values below the 5-minute floor fail config validation loud.
 
 ## 🔒 Security Model
 
 - **Every node operator is a man-in-the-middle by design.** They see your DNS queries, inner SNI, timing, and traffic volumes. REALITY's `pbk` proves the operator to you — it proves nothing about the operator to you.
 - **Disposable traffic only.** The pool exists for geo-diversity: scraping, region checks, location-specific services. Logins, banking, and anything identity-bearing stay off it — your own nodes remain the default transport for everything else.
 - **The trust wall is structural, not advisory.** Pool traffic reaches only `[render.pool_routes]` destinations; the template's existing rules (RU-direct, SMTP-block, torrent-direct) keep precedence, so the pool can never carry them even by mistake.
-- **Ingest hygiene is a hard filter.** `allowInsecure=1` links, non-TLS transports, and private/loopback hosts never reach the cold base; forward-secrecy transports (`reality`/`tls`) only.
+- **Ingest hygiene is a hard filter.** `allowInsecure=1` links, non-TLS transports, private/loopback hosts, and any scheme outside `[filter].protocols` never reach the cold base; forward-secrecy transports (`reality`/`tls`) only. `allow_insecure` defaults to **false** — the knob exists for explicit opt-in, but note this pinned core *removed* the `allowInsecure` feature entirely (→ `pinnedPeerCertSha256`), so an admitted link merely loses the param with a loud report entry.
+- **PSK-only shadowsocks stays opt-in and second-class.** Plain `ss` (no TLS layer) is dropped by the security stance even when allowlisted; ss links carrying SIP003 `plugin=` params fail the render loud because this core cannot express them. Prefer `reality`/`tls` transports for pool nodes.
+- **Fingerprint `firefox` only where a fingerprint can exist.** The client-side uTLS override applies to `tls`/`reality` settings; `security=none` has no TLS handshake, so an `fp` param there is reported in the drop report, not consumed.
 - **The `-test` gate is unconditional.** A config that fails validation never replaces the live file — a crash-looping client is the one failure mode this pipeline refuses to create.
 - **Credentials stay local.** The rendered config and pipeline state are written `0600`; the repository ships no secrets and no pinned node URLs.
 
@@ -169,13 +209,13 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 | :-- | :-- | :-- |
 | `[sources.*]` | upstream feeds (D9) | `repo`, `discovery`, `include`, `enabled` |
 | `[fetch]` | download behavior | `timeout`, `retries`, `concurrency`, `cache_max_age` |
-| `[filter]` | ingest security | `source_cap` (per-source cap per wave) |
+| `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss opt-in), `allow_insecure` (default `false`) |
 | `[probe]` | xray-knife wave | `path`, `threads`, `url`, `speedtest`, `check_preset`, `max_passed` |
 | `[geo]` | ip-api enrichment | `endpoint`, `batch_size`, `per_minute`, `ttl` |
 | `[select]` | ranking caps (D7) | `per_country_cap`, `soft_cap`, `city_expand_threshold`, `ceiling` |
 | `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes` |
 | `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir` |
-| `[maintain]` | W4 maintenance wave | `prune_dead_after` (default `48h`) |
+| `[maintain]` | W4/W5 maintenance | `prune_dead_after` (default `48h`), `refresh_interval` (default `6h`), `speedtest_interval` (default `168h`) |
 
 ## ✅ Testing
 
@@ -185,7 +225,7 @@ go test -race -count=1 ./...  # race detector
 golangci-lint run             # strict gate: 0 issues, caps disabled
 ```
 
-The suite covers every stage with hermetic fixtures: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression, and pure content assertions on the systemd units.
+The suite covers every stage with hermetic fixtures: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), and the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics.
 
 ## 🗺️ Roadmap
 

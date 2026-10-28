@@ -213,7 +213,10 @@ func runFilter(cmd *cobra.Command, cfg *config.Config, sourceCapFlag int) error 
 	if sourceCap == 0 {
 		sourceCap = cfg.Filter.SourceCap
 	}
-	opts := []filter.Option{}
+	opts := []filter.Option{
+		filter.WithProtocols(cfg.Filter.Protocols),
+		filter.WithAllowInsecure(cfg.Filter.AllowInsecure),
+	}
 	if sourceCap > 0 {
 		opts = append(opts, filter.WithSourceCap(sourceCap))
 	}
@@ -233,6 +236,8 @@ func classifyDrop(reason string) string {
 	switch {
 	case strings.Contains(reason, "insecure"):
 		return "insecure"
+	case strings.Contains(reason, "allowlist"):
+		return "scheme-not-allowed"
 	case strings.Contains(reason, "private/loopback"):
 		return "private"
 	case strings.Contains(reason, "duplicate"):
@@ -789,17 +794,25 @@ func newStatusCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Pipeline state summary (read-only)",
+		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
+selection, render) plus the install state: installed binary, unit files,
+timers, and configured-vs-installed timer periods.
+
+Install detection reads the DEFAULT directories only — ~/.local/bin for the
+binary and ~/.config/systemd/user for the units — because publicvpn keeps no
+state file by design. An install made with custom --bin-dir/--unit-dir paths
+is NOT tracked here; inspect those locations directly.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := load(*cfgPath)
 			if err != nil {
 				return err
 			}
-			return runStatus(cmd, cfg)
+			return runStatus(cmd, cfg, *cfgPath)
 		},
 	}
 }
 
-func runStatus(cmd *cobra.Command, cfg *config.Config) error {
+func runStatus(cmd *cobra.Command, cfg *config.Config, cfgPath string) error {
 	p := newPaths(cfg)
 	out := cmd.OutOrStdout()
 
@@ -811,6 +824,7 @@ func runStatus(cmd *cobra.Command, cfg *config.Config) error {
 	printGeoStatus(out, p)
 	printSelectionStatus(out, p)
 	printRenderStatus(out, p)
+	printInstallStatus(out, cfg, cfgPath)
 	return nil
 }
 
