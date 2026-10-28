@@ -28,6 +28,7 @@
 - [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer)
 - [👀 Pool inventory (`list`)](#-pool-inventory-list)
 - [🌍 Site check (`check`)](#-site-check-check)
+- [🛰️ Exit-geo self-report (W11)](#️-exit-geo-self-report-w11)
 - [📂 Project Structure](#-project-structure)
 - [🚀 Requirements](#-requirements)
 - [⚡ Quick Start](#-quick-start)
@@ -89,7 +90,7 @@ flowchart LR
 | 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
 | 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
 | 🩺 probe | `publicvpn probe` | out-of-band `xray-knife`: liveness, RTT, tunnel exit IP (D8), optional `-S` speedtest |
-| 🌍 geo | `publicvpn geo` | ip-api.com batch enrichment of exit IPs (rate-capped, L6) |
+| 🌍 geo | `publicvpn geo` | **W11 per-node self-report**: every alive node asks ip-api through its own tunnel (exit-truth geo; the old aggregate batch clamp is retired) |
 | 📊 stats | `maintain` sub-step | `xray api statsquery` poll → per-outbound uplink/downlink into the cold base |
 | ✂️ prune | `maintain` sub-step | dead/ttl-stale-orphan removal with a `.bak-<ts>` backup |
 | 🏆 select | `publicvpn select` | rank (alive → checks → speed), per-country cap K, soft cap N with city expansion (D7) |
@@ -104,7 +105,7 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 2. **parse** — decode the cached bodies into normalized node records.
 3. **filter** — apply the ingest security filter; the survivors are the wave's reference set.
 4. **probe** — out-of-band xray-knife liveness + exit-IP discovery (skipped by `--skip-probe`).
-5. **geo** — batch-enrich the fresh exit IPs via ip-api (skipped together with probe).
+5. **geo** — per-node in-tunnel self-report: every alive node asks ip-api through its own tunnel (fallback = DoH view; skipped together with probe).
 6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent.
 7. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
 8. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
@@ -215,6 +216,16 @@ For picky sites that open only from specific countries/cities/ASNs, `check` answ
 | `--no-color` | off | deprecated-friendly alias for `--color=never` (wins over a conflicting `--color`) |
 | `--save` | *(none)* | write the JSON report under the data dir (relative path) or at an absolute path |
 
+## 🛰️ Exit-geo self-report (W11)
+
+The geo stage asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
+
+1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID).
+2. Through that instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
+3. **Why the old limit disappeared in principle:** the batch era POSTed exit-IP groups from this box's one source IP against a 15 requests/min clamp. The self-report's requests originate from thousands of DISTINCT node exit IPs — each carries its own 45 req/min single-endpoint budget, and those budgets never pool. The retired batch knobs (`[geo].endpoint`, `[geo].batch_size`, `[geo].per_minute`) fail config load with a loud migration error naming the replacement. A small politeness pacing (≈10 request starts/s across the wave) remains — courtesy toward nodes and the DoH endpoint, not a rate-limit honor. ip-api's free tier stays **HTTP-only, non-commercial** — personal use of public geo data satisfies it.
+4. **Fallback chain (never a dropped node):** a self-report that resets, times out, returns non-200 or `status=fail` retries as the through-tunnel **DoH view**: `o-o.myaddr.l.google.com` TXT via `[geo].doh_url` (default `https://dns.google/resolve`) reveals the exit network's own DNS resolver IP, and the ip-api single-IP lookup of THAT IP rides the same tunnel — still a per-node source, so the aggregate limit stays gone on the fallback path too. If both hops fail (some exits block plain HTTP wholesale), the node keeps its record, stays usable, its previous geo evidence is preserved (store blank-fold), and the **unknown** class is reported loud in the wave log. Honest limitation: for exits behind big anycast public resolvers the fallback describes the resolver-operator's network — that is exactly what the provenance marker below makes visible.
+5. **Provenance in the cold base:** every record carries `geo_source` — `self-report` (the node's own answer), `doh-fallback` (the indirect DoH view), or empty (no evidence) — so evidence quality is always visible next to the fields it describes. A self-report whose `query` IP differs from the probe wave's exit IP (exit churn) wins the record with the freshest tunnel truth and prints a loud churn line.
+
 ## 📂 Project Structure
 
 ```text
@@ -230,7 +241,7 @@ public_vpn/
 │   ├── parse/              # base64/link decoding (vless/vmess/trojan/ss) → normalized Node
 │   ├── filter/             # ingest security filter (protocols allowlist + insecure policy)
 │   ├── probe/              # xray-knife out-of-band runner (L5)
-│   ├── geo/                # ip-api batch enrichment (L6 rate caps)
+│   ├── geo/                # W11 per-node self-report (through-tunnel ip-api, DoH fallback)
 │   ├── checker/            # W8 site-to-location check: temp xray instances, socks5h client, blockpage classifier, geo summary
 │   ├── stats/              # W4 statsquery poll + byte folding (L7-tolerant)
 │   ├── prune/              # W4 dead/ttl-stale-orphan rules (reuses rank freshness)
@@ -258,7 +269,7 @@ public_vpn/
 3. **`publicvpn parse`** — decode the cached bodies into normalized node records.
 4. **`publicvpn filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
 5. **`publicvpn probe`** — out-of-band liveness + exit-IP wave (add `--speedtest` for the weekly-style throughput measurement).
-6. **`publicvpn geo`** — enrich the exit IPs into the cold base.
+6. **`publicvpn geo`** — per-node self-report of the exit geo into the cold base.
 7. **`publicvpn select`** — rank and cap the active set.
 8. **`publicvpn render`** — render the full client config into `rendered/config.json`.
 9. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then restart your client when you are ready (`systemctl --user restart xray-raw.service` — the binary prints this hint, it never restarts by itself).
@@ -318,7 +329,7 @@ speedtest_interval = "168h" # speedtest wave recheck (default 168h = weekly, flo
 - **L1 — never render an observatory with an empty selector.** On xray-core 26.3.27 (pre-#6666) it busy-loops a CPU core; the renderer hard-refuses that shape on any pool state.
 - **L4 — DNS goes through NSS.** Hostname resolution uses the system resolver; direct-to-public-DNS probing is dead on split-brain setups and must not be reintroduced.
 - **L5 — strip proxy env on every network call.** The ambient `http_proxy` points at your own client; an unstripped fetch, probe, or stats dial silently tunnels through the very VPN it is measuring.
-- **L6 — respect ip-api's free tier.** HTTP-only endpoint, ≤100 IPs per batch, ≤15 batch requests/min; ignoring the rate headers risks a 1-hour ban for the whole pipeline.
+- **L6 — the ip-api aggregate clamp is retired (W11).** The batch-era clamp (≤100 IPs/POST, ≤15 batch requests/min, honor `X-Rl` or risk a 1-hour ban) applied to lookups made from THIS box's single source IP. The W11 self-report asks ip-api from EVERY node through its own tunnel — thousands of distinct source IPs, each with its own 45 req/min single-endpoint budget that never pools — so the aggregate limit is gone in principle. The retired `[geo]` batch knobs (`endpoint`, `batch_size`, `per_minute`) fail config load with a loud migration error. A small politeness pacing (~10 request starts/s across the wave) remains — courtesy, not a rate-limit honor. The free tier stays **HTTP-only and non-commercial** (personal use, public geo data — satisfied).
 - The full list (L1–L12) with rationale lives in [DESIGN.md §8](DESIGN.md).
 
 ## ⚙️ Configuration
@@ -332,7 +343,7 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 | `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
 | `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss + hysteria2 opt-in), `allow_insecure` (default `false`) |
 | `[probe]` | xray-knife wave | `path`, `threads`, `url`, `speedtest` (**default `true` since W10** — every wave carries `-S`; `false` opts out), `check_preset`, `max_passed`, `skip_fresh_within` (skip re-probing fresh-passed nodes, `0s` = probe everything) |
-| `[geo]` | ip-api enrichment | `endpoint`, `batch_size`, `per_minute`, `ttl` |
+| `[geo]` | W11 self-report (automatic — no knob) | `doh_url` (DoH fallback endpoint, default `https://dns.google/resolve`), `ttl`, `timeout`; the batch-era `endpoint`/`batch_size`/`per_minute` are removed and fail load loud |
 | `[select]` | ranking caps (D7) | `per_country_cap`, `soft_cap`, `city_expand_threshold`, `ceiling`, `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`) |
 | `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes`, `pool_inbound_tags` (validated against template inbounds — missing tag fails the render loud), `observatory_interval` (verbatim string, default `"60s"`), `tcp_max_seg` (mandatory on every pool outbound), `tls_fingerprint` (default `firefox`), `balancer_tolerance` (default `0.2`) |
 | `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir`, `test_timeout` (`0s` = no deadline), `service_name`, `backup_keep` (N newest, `0` = unlimited) |

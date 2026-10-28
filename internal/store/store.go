@@ -128,6 +128,12 @@ func mergeGeoRecord(byIdentity map[string]*model.GeoRecord, r *model.GeoRecord) 
 	if r.ISP == "" {
 		r.ISP = prev.ISP
 	}
+	if r.GeoSource == "" {
+		// Provenance follows the fields it describes: when the wave left the
+		// geo fields blank (no evidence), the surviving fields keep pointing
+		// at the wave that produced them.
+		r.GeoSource = prev.GeoSource
+	}
 	if r.LastProbe == "" {
 		// The incoming wave carries no probe outcome: previous probe telemetry
 		// must survive intact. Overwriting Alive/RTT/Speed here would zero a

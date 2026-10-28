@@ -38,9 +38,7 @@ url_success_threshold = 1.0
 db_path = "xray-knife.db"
 
 [geo]
-endpoint = "http://ip-api.com/batch"
-batch_size = 100
-per_minute = 15
+doh_url = "https://dns.google/resolve"
 ttl = "24h"
 
 [select]
@@ -81,9 +79,8 @@ xray_bin = "/usr/bin/xray"
 	assert.False(t, *cfg.Probe.Speedtest, "explicit speedtest=false is honored")
 	assert.False(t, cfg.Probe.IsSpeedtest())
 
-	assert.Equal(t, 100, cfg.Geo.BatchSize)
-	assert.Equal(t, 15, cfg.Geo.PerMinute)
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
+	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "explicit doh_url from the full config")
 
 	assert.Equal(t, 4, cfg.Select.PerCountryCap)
 	assert.Equal(t, 25, cfg.Select.SoftCap)
@@ -116,9 +113,7 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, "~/.local/bin/xray-knife", cfg.Probe.Path)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 20, cfg.Probe.Threads)
-	assert.Equal(t, "http://ip-api.com/batch", cfg.Geo.Endpoint)
-	assert.Equal(t, 100, cfg.Geo.BatchSize)
-	assert.Equal(t, 15, cfg.Geo.PerMinute)
+	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
 	assert.Equal(t, 3, cfg.Select.PerCountryCap)
 	assert.Equal(t, 25, cfg.Select.SoftCap)
@@ -197,19 +192,44 @@ ceiling = 10
 		require.Error(t, err)
 	})
 
-	t.Run("geo endpoint must be http (ip-api free tier is HTTP-only)", func(t *testing.T) {
+	t.Run("removed [geo] batch keys fail loud naming the exact keys and the replacement", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.toml")
 		content := `
 data_dir = "/tmp/x"
 
-
 [geo]
-endpoint = "https://ip-api.com/batch"
+endpoint = "http://ip-api.com/batch"
+batch_size = 100
+per_minute = 15
+ttl = "24h"
 `
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 		_, err := config.Load(path)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "http")
+		msg := err.Error()
+		// The loud migration must name EVERY dead key and the replacement.
+		assert.Contains(t, msg, "geo.endpoint")
+		assert.Contains(t, msg, "geo.batch_size")
+		assert.Contains(t, msg, "geo.per_minute")
+		assert.Contains(t, msg, "removed")
+		assert.Contains(t, msg, "self-report", "the replacement (per-node in-tunnel self-report) must be named")
+		assert.Contains(t, msg, "[geo].doh_url", "the surviving fallback knob must be named")
+		assert.Contains(t, msg, "Delete the dead key(s)", "the owner must be told exactly what to do")
+	})
+
+	t.Run("geo.doh_url must be https (DoH is a TLS protocol)", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		content := `
+data_dir = "/tmp/x"
+
+[geo]
+doh_url = "http://dns.google/resolve"
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		_, err := config.Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "https")
+		assert.Contains(t, err.Error(), "geo.doh_url")
 	})
 
 	t.Run("stats port must be unprivileged", func(t *testing.T) {

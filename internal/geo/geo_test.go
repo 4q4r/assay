@@ -2,12 +2,12 @@ package geo_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,353 +21,530 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/time/rate"
 )
 
-func ipAPIHandler(t *testing.T, calls *atomic.Int32, remaining *atomic.Int32) http.HandlerFunc {
+// ipAPIDouble is a test double for the ip-api single-IP endpoint. It serves
+// the DOCUMENTED response shapes (see testdata/, pinned from
+// http://ip-api.com/docs/api:json) and records the requests it saw: the
+// self-report contract (GET, no ip parameter, configured UA) is asserted on
+// the wire, not against a mock.
+type ipAPIDouble struct {
+	srv     *httptest.Server
+	mu      sync.Mutex
+	methods []string
+	paths   []string
+	uagents []string
+	// failMode shapes the NO-PARAM (self-report) hop only; the
+	// parameterized resolver lookup always serves the healthy body unless
+	// blanket is set (the plain-HTTP-blocked exit class).
+	failMode atomic.Int32 // 0 = serve, 1 = 503, 2 = reset, 3 = status-fail
+	blanket  atomic.Bool
+	body     []byte
+}
+
+func newIPAPIDouble(t *testing.T, body []byte) *ipAPIDouble {
 	t.Helper()
-	return func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		var reqs []string
-		if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
-			t.Errorf("decode batch request: %v", err)
+	d := &ipAPIDouble{body: body}
+	d.srv = httptest.NewServer(http.HandlerFunc(d.handle))
+	t.Cleanup(d.srv.Close)
+	return d
+}
+
+func (d *ipAPIDouble) handle(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	d.methods = append(d.methods, r.Method)
+	d.paths = append(d.paths, r.URL.Path)
+	d.uagents = append(d.uagents, r.Header.Get("User-Agent"))
+	d.mu.Unlock()
+
+	noParam := r.URL.Path == "/json/" || r.URL.Path == "/json"
+	// failMode shapes the self-report hop (no-param) — or everything when
+	// blanket is set (the plain-HTTP-blocked exit class).
+	if noParam || d.blanket.Load() {
+		switch d.failMode.Load() {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case 2:
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_ = conn.Close() // reset: accept + close without any response
+			return
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"fail","message":"reserved range","query":"203.0.113.77"}`))
 			return
 		}
-		if len(reqs) > 100 {
-			t.Errorf("batch of %d exceeds the 100-IP free-tier cap", len(reqs))
-		}
-		out := make([]map[string]any, 0, len(reqs))
-		for _, ip := range reqs {
-			out = append(out, map[string]any{
-				"status":      "success",
-				"query":       ip,
-				"countryCode": "NL",
-				"country":     "Netherlands",
-				"city":        "Amsterdam",
-				"isp":         "LeaseWeb Netherlands B.V.",
-				"as":          "AS60781 LeaseWeb Netherlands B.V.",
-				"asname":      "LeaseWeb",
-				"proxy":       true,
-				"hosting":     true,
-			})
-		}
-		w.Header().Set("X-Rl", strconv.Itoa(int(remaining.Load())))
-		w.Header().Set("X-Ttl", "60")
-		_ = json.NewEncoder(w).Encode(out)
 	}
-}
-
-func TestBatchEnrichmentMapsFields(t *testing.T) {
-	var calls atomic.Int32
-	remaining := atomic.Int32{}
-	remaining.Store(14)
-	srv := httptest.NewServer(ipAPIHandler(t, &calls, &remaining))
-	t.Cleanup(srv.Close)
-
-	cl := geo.NewClient(config.GeoConfig{
-		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		BatchSize: 100,
-		PerMinute: 15,
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, "")
-	resp, err := cl.Enrich(context.Background(), []string{"5.6.7.8"})
-	require.NoError(t, err)
-	require.Len(t, resp, 1)
-	assert.Equal(t, "NL", resp[0].CountryCode)
-	assert.Equal(t, "Amsterdam", resp[0].City)
-	assert.Equal(t, "AS60781", resp[0].ASN(), "asn = the AS number token of the as field")
-	assert.Equal(t, "LeaseWeb", resp[0].ASName)
-	assert.True(t, resp[0].Proxy)
-	assert.True(t, resp[0].Hosting)
-	assert.Equal(t, 1, int(calls.Load()))
-}
-
-// TestUserAgentFromConfig pins the geo arm of [http].user_agent: the batch
-// request carries the configured UA verbatim, and the empty value falls back
-// to today's exact default string (behavior preservation).
-func TestUserAgentFromConfig(t *testing.T) {
-	var mu sync.Mutex
-	got := ""
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		got = r.Header.Get("User-Agent")
-		mu.Unlock()
-		w.Header().Set("X-Rl", "14")
-		w.Header().Set("X-Ttl", "60")
-		_, _ = w.Write([]byte(`[{"query":"5.6.7.8","status":"success","countryCode":"NL"}]`))
-	}))
-	t.Cleanup(srv.Close)
-	cfg := config.GeoConfig{
-		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		BatchSize: 100,
-		PerMinute: 15,
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}
-
-	cl := geo.NewClient(cfg, "geo-agent/2")
-	_, err := cl.Enrich(context.Background(), []string{"5.6.7.8"})
-	require.NoError(t, err)
-	assert.Equal(t, "geo-agent/2", got, "the configured UA must ride the batch request")
-
-	_, err = geo.NewClient(cfg, "").Enrich(context.Background(), []string{"5.6.7.8"})
-	require.NoError(t, err)
-	assert.Equal(t, config.DefaultUserAgent, got, "empty UA must fall back to today's exact default")
-}
-
-func TestBatchingSplitsOver100IPs(t *testing.T) {
-	var calls atomic.Int32
-	remaining := atomic.Int32{}
-	remaining.Store(14)
-	srv := httptest.NewServer(ipAPIHandler(t, &calls, &remaining))
-	t.Cleanup(srv.Close)
-
-	// Test seam (review finding 3): the injected limiter keeps this behavior
-	// test free of real 4s waits; the clamp itself is unit-tested in
-	// TestBatchIntervalClampsToFreeTier.
-	cl := geo.NewClientWithLimiter(config.GeoConfig{
-		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		BatchSize: 100,
-		PerMinute: 900,
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, rate.NewLimiter(rate.Inf, 1), "")
-	ips := make([]string, 0, 250)
-	for i := range 250 {
-		ips = append(ips, fmt.Sprintf("10.%d.%d.1", i/256%256, i%256))
-	}
-	resp, err := cl.Enrich(context.Background(), ips)
-	require.NoError(t, err)
-	assert.Len(t, resp, 250)
-	assert.Equal(t, int32(3), calls.Load(), "250 IPs at batch 100 = 3 requests")
-}
-
-// TestClientSpacesBatchesThroughLimiter pins the real spacing contract: every
-// batch waits on the injected limiter before its request, so server-side
-// arrivals are spaced by the limiter's interval. A fast-but-real interval
-// keeps the assertion honest without paying the production 4s (finding 3).
-func TestClientSpacesBatchesThroughLimiter(t *testing.T) {
-	const interval = 40 * time.Millisecond
-	var stamps atomicSlice
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var reqs []string
-		_ = json.NewDecoder(r.Body).Decode(&reqs)
-		if len(reqs) > 0 {
-			stamps.append(time.Now())
-		}
+	// The parameterized hop reports the queried IP in its query field.
+	if !noParam {
+		ip := strings.TrimPrefix(r.URL.Path, "/json/")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[]"))
-	}))
-	t.Cleanup(srv.Close)
+		_, _ = fmt.Fprintf(w, `{"status":"success","country":"Netherlands","countryCode":"NL",`+
+			`"city":"Amsterdam","isp":"LeaseWeb","as":"AS60781 LeaseWeb","asname":"LEASEWEB",`+
+			`"proxy":false,"hosting":true,"query":%q}`, ip)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(d.body)
+}
 
-	cl := geo.NewClientWithLimiter(config.GeoConfig{
-		Endpoint:  srv.URL,
-		BatchSize: 1,
-		PerMinute: 900, // irrelevant: the limiter is injected below
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, rate.NewLimiter(rate.Every(interval), 1), "")
-	_, err := cl.Enrich(context.Background(), []string{"a", "b", "c", "d"}) // 4 batches of 1
+func (d *ipAPIDouble) saw() ([]string, []string, []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.methods...), append([]string(nil), d.paths...), append([]string(nil), d.uagents...)
+}
+
+func (d *ipAPIDouble) URL() string { return d.srv.URL }
+
+// documentedSingleSuccess is the FULL documented default field set of the
+// ip-api single-IP endpoint (testdata fixture pinned from the primary docs).
+func documentedSingleSuccess(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "ip-api-single-success.json"))
 	require.NoError(t, err)
+	return b
+}
 
-	got := stamps.all()
-	require.Len(t, got, 4)
-	for i := 1; i < len(got); i++ {
-		gap := got[i].Sub(got[i-1])
-		// Lower bound tolerates server-side timestamp jitter (~1ms class);
-		// an unhonored limiter would show ~0 gaps, far below any jitter.
-		assert.GreaterOrEqual(t, gap, interval-15*time.Millisecond,
-			"batch %d arrived before the limiter interval elapsed", i)
-		assert.Less(t, gap, time.Second, "no dead waiting: the injected interval is honored, not multiplied")
+// fakeInstance is the Factory seam's product: a SocksInstance whose Addr is a
+// real in-process SOCKS5 server relaying to the test doubles. Close counts —
+// the piggyback pin asserts exactly one Close per node.
+type fakeInstance struct {
+	addr   string
+	closed *atomic.Int32
+}
+
+func (f fakeInstance) Addr() string { return f.addr }
+func (f fakeInstance) Close() error {
+	f.closed.Add(1)
+	return nil
+}
+
+// newTestFactory returns a Factory spawning one fake instance backed by the
+// given socks server, plus the spawn counter (the piggyback pin).
+func newTestFactory(socks *socksServer) (geo.Factory, *atomic.Int32, *atomic.Int32) {
+	var spawns, closes atomic.Int32
+	f := func(context.Context, *model.Node) (geo.SocksInstance, error) {
+		spawns.Add(1)
+		return fakeInstance{addr: socks.Addr(), closed: &closes}, nil
 	}
+	return f, &spawns, &closes
 }
 
-// atomicSlice collects timestamps from handler goroutines.
-type atomicSlice struct {
-	mu sync.Mutex
-	v  []time.Time
-}
-
-func (s *atomicSlice) append(t time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.v = append(s.v, t)
-}
-
-func (s *atomicSlice) all() []time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]time.Time(nil), s.v...)
-}
-
-func Test429AbortsLoudlyNeverRetries(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusTooManyRequests)
+// dohDouble answers the o-o.myaddr.l.google.com TXT probe with a fixed
+// resolver IP (the dns.google/resolve JSON shape, Type 16 = TXT).
+func dohDouble(t *testing.T, resolverIP string) *httptest.Server {
+	t.Helper()
+	ans := fmt.Sprintf(`{"Status":0,"Answer":[{"name":"o-o.myaddr.l.google.com.","type":16,"TTL":60,"data":%q}]}`,
+		`"`+resolverIP+`"`)
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-json")
+		_, _ = w.Write([]byte(ans))
 	}))
-	t.Cleanup(srv.Close)
-	cl := geo.NewClient(config.GeoConfig{
-		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		BatchSize: 100,
-		PerMinute: 15,
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, "")
-	ips := make([]string, 0, 150)
-	for i := range 150 {
-		ips = append(ips, fmt.Sprintf("10.0.0.%d", i+1))
-	}
-	_, err := cl.Enrich(context.Background(), ips)
-	require.Error(t, err, "L6: a 429 means imminent 1h ban — abort the wave, never retry into it")
-	assert.Equal(t, int32(1), calls.Load(), "no request may follow a 429")
-	assert.Contains(t, err.Error(), "429")
 }
 
-func TestFailedStatusEntriesAreSkipped(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var reqs []string
-		_ = json.NewDecoder(r.Body).Decode(&reqs)
-		out := []map[string]any{
-			{"status": "fail", "query": reqs[0], "message": "private range"},
-			{
-				"status": "success", "query": reqs[1], "countryCode": "DE", "city": "Berlin",
-				"isp": "Netcup", "as": "AS197540 netcup GmbH", "asname": "netcup", "proxy": false, "hosting": true,
-			},
-		}
-		_ = json.NewEncoder(w).Encode(out)
-	}))
-	t.Cleanup(srv.Close)
-	cl := geo.NewClient(config.GeoConfig{
-		Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		BatchSize: 100,
-		PerMinute: 15,
-		Timeout:   config.Duration{Duration: 5 * time.Second},
-	}, "")
-	resp, err := cl.Enrich(context.Background(), []string{"192.168.0.1", "8.8.8.8"})
-	require.NoError(t, err)
-	require.Len(t, resp, 1, "failed lookups are skipped")
-	assert.Equal(t, "8.8.8.8", resp[0].Query)
-	assert.Equal(t, "DE", resp[0].CountryCode)
+// node builds a filter-passing vless node (alive-probe eligible shape).
+func node(id, host string) *model.Node {
+	return model.NewNode("s", "vless", "u-"+id, host, 443, map[string]string{"security": "tls", "type": "tcp"})
 }
 
-// TestPartialProbeWaveLeavesUnprobedRecordsUntouched pins the partial-wave
-// contract: a geo wave that follows a partial probe wave (--limit small) over
-// a pre-populated cold base must leave unprobed records' alive/rtt/speed/
-// last_probe exactly as they were — never Alive=false with zeroed metrics
-// under a stale last_probe (fix-round-1 finding #1).
-func TestPartialProbeWaveLeavesUnprobedRecordsUntouched(t *testing.T) {
-	dir := t.TempDir()
-	geoBase := filepath.Join(dir, "geo-base.jsonl")
+// liveProbe is a probe result marking the node alive with the given exit IP.
+func liveProbe(n *model.Node, exitIP string) store.ProbeResult {
+	return store.ProbeResult{
+		Key: n.Key, Host: n.Host, Alive: true, Status: "passed", ExitIP: exitIP,
+		RTTMs: 42, CheckedAt: time.Now().UTC(),
+	}
+}
 
-	nodes := []*model.Node{
-		model.NewNode("s", "vless", "u1", "one.example.com", 443, map[string]string{"security": "tls", "type": "tcp"}),
-		model.NewNode("s", "vless", "u2", "two.example.com", 443, map[string]string{"security": "tls", "type": "tcp"}),
-		model.NewNode("s", "vless", "u3", "three.example.com", 443, map[string]string{"security": "tls", "type": "tcp"}),
-	}
-	stale := "2026-10-20T00:00:00Z"
-	base := make([]*model.GeoRecord, 0, len(nodes))
-	for i, n := range nodes {
-		base = append(base, &model.GeoRecord{
-			Source: n.Source, Scheme: n.Scheme, Host: n.Host, Port: n.Port,
-			IP: fmt.Sprintf("5.6.7.%d", i+1), Country: "nl", City: "Amsterdam",
-			FirstSeen: stale, LastSeen: stale,
-			LastProbe: stale, RTTMs: float64(100 + i), SpeedBPS: 1000 + int64(i), Alive: true,
-		})
-	}
-	require.NoError(t, store.UpsertGeo(geoBase, base))
-	before, err := store.ReadGeo(geoBase)
-	require.NoError(t, err)
-	beforeByKey := map[string]*model.GeoRecord{}
-	for _, r := range before {
-		beforeByKey[model.GeoIdentity(r)] = r
-	}
-
-	// Partial probe wave: only the FIRST node was probed (probe --limit 1
-	// preceded this geo wave); the other two are absent from the probe map.
-	var calls, remaining atomic.Int32
-	remaining.Store(14)
-	srv := httptest.NewServer(ipAPIHandler(t, &calls, &remaining))
-	t.Cleanup(srv.Close)
-	probeByKey := map[string]store.ProbeResult{
-		nodes[0].Key: {Key: nodes[0].Key, Alive: true, ExitIP: "9.9.9.9", RTTMs: 55, CheckedAt: time.Now().UTC()},
-	}
-	_, err = geo.Run(context.Background(), geo.Input{
+// baseInput builds a valid geo Input whose self-report rides the given
+// endpoint double (the test seam replacing the production constant URL).
+func baseInput(dir string, nodes []*model.Node, probes map[string]store.ProbeResult, f geo.Factory, selfURL string) geo.Input {
+	return geo.Input{
 		DataDir:    dir,
 		Nodes:      nodes,
-		ProbeByKey: probeByKey,
+		ProbeByKey: probes,
 		Cfg: config.GeoConfig{
-			Endpoint:  srv.URL,
-			BatchSize: 100,
-			PerMinute: 15,
-			Timeout:   config.Duration{Duration: 5 * time.Second},
+			TTL:     config.Duration{Duration: 24 * time.Hour},
+			Timeout: config.Duration{Duration: 5 * time.Second},
+			DoHURL:  "https://dns.google/resolve",
 		},
-	})
-	require.NoError(t, err)
-
-	after, err := store.ReadGeo(geoBase)
-	require.NoError(t, err)
-	require.Len(t, after, 3)
-	for _, r := range after {
-		was, ok := beforeByKey[model.GeoIdentity(r)]
-		require.True(t, ok, "identity %s must survive", model.GeoIdentity(r))
-		if r.Host == "one.example.com" {
-			continue // probed node: fresh values expected
-		}
-		assert.Equal(t, was.Alive, r.Alive, "unprobed %s: alive must stay byte-identical", r.Host)
-		assert.Equal(t, was.RTTMs, r.RTTMs, "unprobed %s: rtt_ms must stay byte-identical", r.Host) //nolint:testifylint // byte-identical is the contract: exact bit equality is the pin
-		assert.Equal(t, was.SpeedBPS, r.SpeedBPS, "unprobed %s: speed_bps must stay byte-identical", r.Host)
-		assert.Equal(t, was.LastProbe, r.LastProbe, "unprobed %s: last_probe must stay byte-identical", r.Host)
-		assert.True(t, r.Alive, "unprobed %s must not be flipped dead by an absent probe entry", r.Host)
+		UserAgent: "geo-agent/11",
+		Factory:   f,
+		SelfURL:   selfURL,
+		Sleep:     func(context.Context, time.Duration) error { return nil },
 	}
 }
 
-func TestGeoStageJoinsProbeExitIPsIntoGeoBase(t *testing.T) {
+// TestSelfReportParsesDocumentedSingleIPShape pins the core of the redesign
+// end to end: the node's tunnel (real in-process SOCKS5) carries a GET to the
+// ip-api single-IP endpoint with NO ip parameter; the response is the
+// documented SINGLE JSON OBJECT (the batch era answered with an ARRAY) and
+// every consumed field maps into the geo record with self-report provenance.
+func TestSelfReportParsesDocumentedSingleIPShape(t *testing.T) {
+	body := documentedSingleSuccess(t)
+	api := newIPAPIDouble(t, body)
+	socks := newSocksServer(t)
+	f, spawns, closes := newTestFactory(socks)
+
+	n := node("1", "one.example.com")
 	dir := t.TempDir()
-	// geo stage input: filtered nodes + probe results with exit IPs.
-	n1 := model.NewNode("s", "vless", "u1", "one.example.com", 443, map[string]string{"security": "tls", "type": "tcp"})
-	n2 := model.NewNode("s", "vless", "u2", "two.example.com", 443, map[string]string{"security": "tls", "type": "tcp"})
-	require.NoError(t, store.WriteNodes(filepath.Join(dir, "filtered.jsonl"), []*model.Node{n1, n2}))
+	in := baseInput(dir, []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
 
-	var calls, remaining atomic.Int32
-	remaining.Store(14)
-	srv := httptest.NewServer(ipAPIHandler(t, &calls, &remaining))
-	t.Cleanup(srv.Close)
-	probeByKey := map[string]store.ProbeResult{
-		n1.Key: {Key: n1.Key, Alive: true, ExitIP: "5.6.7.8", RTTMs: 120, CheckedAt: time.Now().UTC()},
-		n2.Key: {Key: n2.Key, Alive: false, CheckedAt: time.Now().UTC()},
-	}
-
-	records, err := geo.Run(context.Background(), geo.Input{
-		DataDir:    dir,
-		Nodes:      []*model.Node{n1, n2},
-		ProbeByKey: probeByKey,
-		Cfg: config.GeoConfig{
-			Endpoint:  "http://" + strings.TrimPrefix(srv.URL, "http://"),
-			BatchSize: 100,
-			PerMinute: 900,
-			Timeout:   config.Duration{Duration: 5 * time.Second},
-		},
-	})
+	records, summary, err := geo.Run(context.Background(), in)
 	require.NoError(t, err)
-	require.Len(t, records, 2)
-	var enriched, dead *model.GeoRecord
-	for _, r := range records {
-		if r.Host == "one.example.com" {
-			enriched = r
-		}
-		if r.Host == "two.example.com" {
-			dead = r
-		}
-	}
-	require.NotNil(t, enriched)
-	require.NotNil(t, dead)
-	assert.Equal(t, "5.6.7.8", enriched.IP)
-	assert.Equal(t, "nl", enriched.Country, "country stored lowercase for tags")
-	assert.Equal(t, "Amsterdam", enriched.City)
-	assert.Equal(t, "AS60781", enriched.ASN)
-	assert.True(t, enriched.Alive)
-	assert.False(t, dead.Alive, "dead node keeps its record with alive=false")
-	assert.Empty(t, dead.IP, "no probe = no exit IP = no geo lookup for it")
+	require.Len(t, records, 1)
+	rec := records[0]
 
-	// geo-base.jsonl was persisted.
+	// Wire contract: GET, no ip parameter, the configured pipeline UA.
+	methods, paths, uagents := api.saw()
+	require.Len(t, methods, 1)
+	assert.Equal(t, http.MethodGet, methods[0], "self-report is a GET (the batch era POSTed)")
+	assert.True(t, strings.HasSuffix(paths[0], "/json/"),
+		"no ip parameter: ip-api answers who is asking, got path %q", paths[0])
+	assert.Equal(t, "geo-agent/11", uagents[0])
+	assert.Equal(t, int32(1), socks.Connects.Load(), "exactly one tunnel request rides the instance")
+	assert.Equal(t, int32(1), spawns.Load(), "piggyback: ONE instance per node, no second spawn")
+	assert.Equal(t, int32(1), closes.Load(), "the instance is closed exactly once")
+
+	// Field mapping from the documented shape.
+	assert.Equal(t, "de", rec.Country, "country stored lowercase for tags")
+	assert.Equal(t, "Frankfurt am Main", rec.City)
+	assert.Equal(t, "AS51167", rec.ASN, "asn = the AS-number token of the composite as field")
+	assert.Equal(t, "CONTABO", rec.ASName)
+	assert.Equal(t, "Contabo GmbH", rec.ISP)
+	assert.False(t, rec.ProxyFlag)
+	assert.True(t, rec.HostingFlag)
+	assert.Equal(t, "203.0.113.77", rec.IP, "the self-report's query IP is the freshest through-tunnel exit truth")
+	assert.Equal(t, "self-report", rec.GeoSource, "provenance: evidence quality is visible in the cold base")
+
+	// Summary classes.
+	assert.Equal(t, 1, summary.Eligible)
+	assert.Equal(t, 1, summary.SelfReport)
+	assert.Equal(t, 0, summary.DoHFallback)
+	assert.Equal(t, 0, summary.Unknown)
+
+	// The record persisted with its provenance marker.
 	persisted, err := store.ReadGeo(filepath.Join(dir, "geo-base.jsonl"))
 	require.NoError(t, err)
-	assert.Len(t, persisted, 2)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, "self-report", persisted[0].GeoSource)
+}
+
+// TestFallbackLookupStartIsPacedLikeSelfReport pins the politeness pacing
+// across the FULL fallback chain with the injected clock: every external
+// request start takes a pacer slot — the self-report, the DoH TXT probe, AND
+// the fallback resolver lookup. A node riding the whole fallback path must
+// consume exactly three slots: the priming self-report slot sleeps nothing,
+// and both later starts (DoH, fallback lookup) each wait out the default
+// pacing — a lookup whose start slips past the pacer would let the wave's
+// bounded workers bypass the politeness contract exactly where the request
+// mix is heaviest.
+func TestFallbackLookupStartIsPacedLikeSelfReport(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	api.failMode.Store(1) // the self-report 503s; the fallback path runs
+	doh := dohDouble(t, "198.51.100.9")
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+
+	n := node("1", "one.example.com")
+	dir := t.TempDir()
+	in := baseInput(dir, []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in.Cfg.DoHURL = doh.URL
+	now := time.Unix(1700000000, 0)
+	in.Now = func() time.Time { return now }
+	var waits []time.Duration
+	in.Sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		now = now.Add(d) // the fake clock advances by exactly the slept amount
+		return nil
+	}
+
+	records, summary, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.Equal(t, "doh-fallback", records[0].GeoSource,
+		"the pin is only meaningful when the fallback path actually ran")
+	assert.Equal(t, 1, summary.DoHFallback)
+
+	// The wave issued both ip-api requests (self-report + resolver lookup)
+	// and paced the two later request starts: the DoH probe AND the fallback
+	// lookup. The priming self-report slot never sleeps. (Single node = one
+	// worker: the pacer, the sleeper, and this slice are one goroutine.)
+	require.Len(t, waits, 2,
+		"both the DoH probe start and the fallback lookup start must be paced")
+	assert.Equal(t, geo.DefaultSelfReportPacing, waits[0],
+		"the DoH probe start waits out the default pacing")
+	assert.Equal(t, geo.DefaultSelfReportPacing, waits[1],
+		"the fallback lookup start is paced like the self-report's slot")
+
+	methods, paths, _ := api.saw()
+	require.Len(t, methods, 2)
+	assert.True(t, strings.HasSuffix(paths[1], "/json/198.51.100.9"),
+		"the second ip-api request is the resolver lookup, got path %q", paths[1])
+}
+
+// TestSelfReportFailureClassesFallBackToDoH drives the fallback chain for
+// every failure class the redesign names: transport reset, HTTP error, and
+// ip-api status=fail. The DoH hop reveals the exit network's resolver IP
+// (o-o.myaddr.l.google.com TXT through the tunnel), and the ip-api lookup of
+// THAT IP rides the same tunnel — still a per-node source, so the aggregate
+// limit stays gone on the fallback path too.
+func TestSelfReportFailureClassesFallBackToDoH(t *testing.T) {
+	for name, mode := range map[string]int32{
+		"connection-reset":  2,
+		"http-503":          1,
+		"ipapi-status-fail": 3,
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newIPAPIDouble(t, documentedSingleSuccess(t))
+			api.failMode.Store(mode) // the no-param self-report hop fails; the resolver lookup is served
+			doh := dohDouble(t, "198.51.100.9")
+			socks := newSocksServer(t)
+			f, spawns, _ := newTestFactory(socks)
+
+			n := node("1", "one.example.com")
+			dir := t.TempDir()
+			in := baseInput(dir, []*model.Node{n},
+				map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+			in.Cfg.DoHURL = doh.URL
+
+			records, summary, err := geo.Run(context.Background(), in)
+			require.NoError(t, err)
+			require.Len(t, records, 1)
+			rec := records[0]
+			assert.Equal(t, "doh-fallback", rec.GeoSource)
+			assert.Equal(t, "nl", rec.Country)
+			assert.Equal(t, "AS60781", rec.ASN)
+			assert.Equal(t, "Amsterdam", rec.City)
+			assert.Equal(t, "203.0.113.77", rec.IP,
+				"fallback evidence describes the RESOLVER network — the record keeps the probe's exit IP")
+			assert.Equal(t, int32(1), spawns.Load(), "piggyback: the fallback reuses the SAME instance")
+			assert.Equal(t, 0, summary.SelfReport)
+			assert.Equal(t, 1, summary.DoHFallback)
+			assert.Equal(t, 0, summary.Unknown)
+		})
+	}
+}
+
+// TestPlainHTTPBlockedExitEndsUnknown pins the honest terminal class of the
+// fallback: an exit that blocks plain HTTP wholesale defeats BOTH the
+// self-report and the fallback's ip-api lookup — the node lands in the
+// unknown class (documented limitation; DoH-over-HTTPS itself still works,
+// so a future pure-HTTPS geo fallback could rescue this class).
+func TestPlainHTTPBlockedExitEndsUnknown(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	api.failMode.Store(2) // reset — and blanket across ALL ip-api paths
+	api.blanket.Store(true)
+	doh := dohDouble(t, "198.51.100.9")
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+
+	n := node("1", "one.example.com")
+	dir := t.TempDir()
+	in := baseInput(dir, []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in.Cfg.DoHURL = doh.URL
+	var log strings.Builder
+	in.Progress = &log
+
+	records, summary, err := geo.Run(context.Background(), in)
+	require.NoError(t, err, "unknown geo is a classified outcome, not a wave failure")
+	require.Len(t, records, 1)
+	rec := records[0]
+	assert.True(t, rec.Alive, "the node stays usable — missing geo never flips liveness")
+	assert.Empty(t, rec.Country, "no geo evidence: fields stay empty for a node that never had any")
+	assert.Empty(t, rec.GeoSource, "provenance empty = unknown")
+	assert.Equal(t, "203.0.113.77", rec.IP, "the probe's exit IP remains the D8 anchor")
+	assert.Equal(t, 1, summary.Unknown)
+	assert.Contains(t, log.String(), "UNKNOWN geo", "the wave log names the class loudly")
+}
+
+// TestPreviousGeoSurvivesUnknownWave pins the evidence-preservation rule: a
+// node with geo from a PREVIOUS wave whose current self-report fails keeps
+// its previous geo fields and their provenance (the store blank-folds), so a
+// transient failure never erases good evidence.
+func TestPreviousGeoSurvivesUnknownWave(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	api.failMode.Store(2)
+	api.blanket.Store(true)
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+
+	n := node("1", "one.example.com")
+	dir := t.TempDir()
+	stale := "2026-10-20T00:00:00Z"
+	prev := &model.GeoRecord{
+		Source: n.Source, Scheme: n.Scheme, Host: n.Host, Port: n.Port,
+		IP: "203.0.113.77", Country: "de", City: "Frankfurt am Main",
+		ASN: "AS51167", ASName: "CONTABO", ISP: "Contabo GmbH",
+		GeoSource: "self-report",
+		FirstSeen: stale, LastSeen: stale, LastProbe: stale,
+		RTTMs: 50, SpeedBPS: 1000, Alive: true,
+	}
+	require.NoError(t, store.UpsertGeo(filepath.Join(dir, "geo-base.jsonl"), []*model.GeoRecord{prev}))
+
+	in := baseInput(dir, []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in.Cfg.DoHURL = "http://127.0.0.1:1/resolve" // dead DoH endpoint
+
+	records, summary, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	rec := records[0]
+	assert.Equal(t, 1, summary.Unknown)
+	assert.Equal(t, "de", rec.Country, "previous geo survives a fully-failed wave (store blank-fold)")
+	assert.Equal(t, "self-report", rec.GeoSource, "provenance keeps pointing at the wave that produced the fields")
+	assert.True(t, rec.Alive)
+}
+
+// TestExitIPChurnIsReportedLoudly pins the cross-check: when the self-report
+// sees a DIFFERENT exit IP than the probe wave did (exit churn between the
+// waves), the freshest through-tunnel truth wins the record and the wave log
+// names the churn.
+func TestExitIPChurnIsReportedLoudly(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t)) // fixture query = 203.0.113.77
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+
+	n := node("1", "one.example.com")
+	dir := t.TempDir()
+	in := baseInput(dir, []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "198.51.100.1")}, f, api.URL()+"/json/")
+	var log strings.Builder
+	in.Progress = &log
+
+	records, summary, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	rec := records[0]
+	assert.Equal(t, "203.0.113.77", rec.IP, "the self-report's query IP is the freshest exit truth")
+	assert.Equal(t, 1, summary.Churn, "the churn is counted for the wave log")
+	assert.Contains(t, log.String(), "exit-ip churn", "the wave log names the churn loudly")
+}
+
+// TestDeadNodeNeverGetsAnInstance pins the eligibility gate: nodes whose
+// latest probe outcome is dead (or lacks an exit IP) spawn NO temp instance —
+// the self-report rides ALIVE tunnels only.
+func TestDeadNodeNeverGetsAnInstance(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	socks := newSocksServer(t)
+	f, spawns, _ := newTestFactory(socks)
+
+	alive := node("a", "alive.example.com")
+	dead := node("d", "dead.example.com")
+	noExit := node("e", "noexit.example.com")
+	dir := t.TempDir()
+	in := baseInput(dir, []*model.Node{alive, dead, noExit}, map[string]store.ProbeResult{
+		alive.Key:  liveProbe(alive, "203.0.113.77"),
+		dead.Key:   {Key: dead.Key, Host: dead.Host, Alive: false, CheckedAt: time.Now().UTC()},
+		noExit.Key: {Key: noExit.Key, Host: noExit.Host, Alive: true, CheckedAt: time.Now().UTC()},
+	}, f, api.URL()+"/json/")
+
+	records, summary, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 3)
+	assert.Equal(t, int32(1), spawns.Load(), "only the alive node with an exit IP spawns an instance")
+	assert.Equal(t, 1, summary.Eligible)
+	assert.Equal(t, 1, summary.SelfReport)
+	for _, rec := range records {
+		switch rec.Host {
+		case "dead.example.com":
+			assert.False(t, rec.Alive, "dead node keeps its record with alive=false")
+			assert.Empty(t, rec.GeoSource)
+		case "noexit.example.com":
+			assert.True(t, rec.Alive, "alive without exit IP stays alive — geo just has no evidence")
+			assert.Empty(t, rec.Country)
+		}
+	}
+}
+
+// TestSameIdentityEachTunnelSelfReports — two distinct node keys sharing one
+// cold-base identity (same server, different credentials) run their OWN
+// self-reports (different credentials → different tunnels → possibly
+// different exits); the merge applies them in the deterministic (identity,
+// key) order, so the surviving record never depends on arrival order.
+func TestSameIdentityEachTunnelSelfReports(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	socks := newSocksServer(t)
+	f, spawns, _ := newTestFactory(socks)
+
+	na := model.NewNode("s", "vless", "uuid-a", "dupe.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	nb := model.NewNode("s", "vless", "uuid-b", "dupe.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	require.NotEqual(t, na.Key, nb.Key)
+	dir := t.TempDir()
+	in := baseInput(dir, []*model.Node{na, nb}, map[string]store.ProbeResult{
+		na.Key: liveProbe(na, "203.0.113.77"),
+		nb.Key: liveProbe(nb, "203.0.113.77"),
+	}, f, api.URL()+"/json/")
+
+	_, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), spawns.Load(), "each node's tunnel self-reports its own exit")
+	persisted, err := store.ReadGeo(filepath.Join(dir, "geo-base.jsonl"))
+	require.NoError(t, err)
+	require.Len(t, persisted, 1, "the store keeps one record per identity")
+	assert.Equal(t, "self-report", persisted[0].GeoSource)
+}
+
+// TestRunRequiresFactory pins the loud wiring contract: the geo wave without
+// the temp-instance factory is a configuration error, never a silent no-op.
+func TestRunRequiresFactory(t *testing.T) {
+	n := node("1", "one.example.com")
+	in := baseInput(t.TempDir(), []*model.Node{n},
+		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, nil, "http://127.0.0.1:1/json/")
+	in.Factory = nil
+	_, _, err := geo.Run(context.Background(), in)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "factory")
+}
+
+// TestTunnelClientProxyNilL5 pins the L5 guard on the PRODUCTION client
+// builder: the transport's Proxy is hard nil — the owner's ambient
+// http_proxy must never hijack a self-report through the live client — and a
+// live ambient proxy demonstrably sees zero requests.
+func TestTunnelClientProxyNilL5(t *testing.T) {
+	cl, err := geo.NewTunnelClient("127.0.0.1:59999", 5*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, cl)
+	tp, ok := cl.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Nil(t, tp.Proxy, "L5: the tunnel client must never consult the environment proxy")
+
+	// Behavioral proof: an ambient proxy recorder sees NOTHING while the
+	// request lands on the real target through the tunnel.
+	var proxyHits atomic.Int32
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		proxyHits.Add(1)
+	}))
+	t.Cleanup(proxySrv.Close)
+	t.Setenv("http_proxy", proxySrv.URL)
+	t.Setenv("HTTP_PROXY", proxySrv.URL)
+
+	body := documentedSingleSuccess(t)
+	api := newIPAPIDouble(t, body)
+	socks := newSocksServer(t)
+	cl, err = geo.NewTunnelClient(socks.Addr(), 5*time.Second)
+	require.NoError(t, err)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, api.URL()+"/json/", nil)
+	require.NoError(t, err)
+	req.Header.Set("User-Agent", "ua/1")
+	resp, err := cl.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(body), string(got))
+	assert.Equal(t, int32(0), proxyHits.Load(), "L5: zero requests may touch the ambient proxy")
 }
