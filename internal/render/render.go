@@ -43,11 +43,95 @@ type Result struct {
 }
 
 // materialParams are link parameters that change transport behavior when they
-// cannot be rendered (early-data sizing). Their silent loss must fail the
-// render, not warn (review finding 5).
+// cannot be rendered: early-data sizing, and the xhttp `extra` JSON-object
+// passthrough (hardening fields like noGRPCHeader/xmux live there). Their
+// silent loss must fail the render, not warn (review finding 5; W5 M-2 adds
+// extra).
 var materialParams = map[string]bool{
 	"ed":         true,
 	"early-data": true,
+	"extra":      true,
+}
+
+// networkAliases maps every link spelling of a renderable transport onto its
+// canonical xray network name (TransportProtocol.Build normalizes the same
+// set; verified against Xray-core v26.3.27 source and `xray run -test`).
+// Canonical xray network names the renderer emits.
+const (
+	networkTCP         = "tcp"
+	networkWS          = "ws"
+	networkHTTPUpgrade = "httpupgrade"
+	networkGRPC        = "grpc"
+	networkKCP         = "kcp"
+	networkXHTTP       = "xhttp"
+)
+
+// networkAliases maps every link spelling of a renderable transport onto its
+// canonical xray network name (TransportProtocol.Build normalizes the same
+// set; verified against Xray-core v26.3.27 source and `xray run -test`).
+var networkAliases = map[string]string{
+	"tcp": networkTCP, "raw": networkTCP,
+	"ws": networkWS, "websocket": networkWS,
+	"httpupgrade": networkHTTPUpgrade,
+	"grpc":        networkGRPC,
+	"kcp":         networkKCP, "mkcp": networkKCP,
+	"xhttp": networkXHTTP, "splithttp": networkXHTTP,
+}
+
+// removedNetworks are transports the 26.3.27 core REJECTS at config build
+// (PrintRemovedFeatureError) — rendering them would fail the -test gate, so
+// the renderer refuses them loud with the migration note instead.
+var removedNetworks = map[string]string{
+	"http": "the HTTP/2 transport was removed from xray 26.3.27 (migrated to XHTTP stream-one H2 & H3)",
+	"h2":   "the HTTP/2 transport was removed from xray 26.3.27 (migrated to XHTTP stream-one H2 & H3)",
+	"h3":   "the H3 transport was removed from xray 26.3.27 (migrated to XHTTP stream-one H3)",
+	"quic": "the QUIC transport was removed from xray 26.3.27 (migrated to XHTTP stream-one H3)",
+}
+
+// realityNetworks mirrors the core's REALITY restriction ("REALITY only
+// supports RAW, XHTTP and gRPC for now" — StreamConfig.Build).
+var realityNetworks = map[string]bool{networkTCP: true, networkXHTTP: true, networkGRPC: true}
+
+// wsEarlyDataHeader is the FIXED early-data header of the xray websocket
+// transport (dialer.go: header.Set("Sec-WebSocket-Protocol", ...)); xray has
+// no config field for it, so an ehs link param may only carry this value.
+const wsEarlyDataHeader = "Sec-WebSocket-Protocol"
+
+// tcpHTTPObfuscation renders the canonical http-obfs request header block for
+// tcp type=http links (host/path from the link; the standard header set every
+// major client emits — validated with `xray run -test` on 26.3.27).
+func tcpHTTPObfuscation(host, path string) map[string]any {
+	// The canonical http-obfs UA string (v2ray-family default, byte-exact).
+	const ua = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/53.0.2785.143 Safari/537.36"
+	headers := map[string]any{
+		"User-Agent":      []any{ua},
+		"Accept-Encoding": []any{"gzip, deflate"},
+		"Connection":      []any{"keep-alive"},
+		"Pragma":          "no-cache",
+	}
+	if host != "" {
+		headers["Host"] = []any{host}
+	}
+	request := map[string]any{"version": "1.1", "method": "GET", "path": []any{path}}
+	if path == "" {
+		request["path"] = []any{"/"}
+	}
+	return map[string]any{"type": "http", "request": map[string]any{
+		"version": request["version"], "method": request["method"],
+		"path": request["path"], "headers": headers,
+	}}
+}
+
+// appendEarlyData appends ed=<n> to a ws/httpupgrade path exactly the way the
+// core consumes it (both transports parse the ed query parameter OUT of the
+// configured path — WebSocketConfig.Build / HttpUpgradeConfig.Build).
+func appendEarlyData(path, ed string) string {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "ed=" + ed
 }
 
 // Config carries the render knobs.
@@ -488,7 +572,7 @@ func buildOutbound(n *model.Node, tag string) (map[string]any, []string, error) 
 			if materialParams[k] {
 				return nil, nil, fmt.Errorf(
 					"render: outbound %s (%s): link param %q=%q is not renderable for security=%q network=%q "+
-						"and changes behavior (early-data) — refusing the silent drop (L9)",
+						"and changes transport behavior — refusing the silent drop (L9)",
 					tag, n.Host, k, n.Params[k], stream["security"], stream["network"])
 			}
 			dropped = append(dropped, k)
@@ -497,23 +581,43 @@ func buildOutbound(n *model.Node, tag string) (map[string]any, []string, error) 
 	sort.Strings(dropped)
 	return map[string]any{
 		"tag":            tag,
-		"protocol":       n.Scheme,
+		"protocol":       protocolName(n.Scheme),
 		"settings":       settings,
 		"streamSettings": stream,
 	}, dropped, nil
 }
 
+// protocolName maps the link scheme onto the xray outbound protocol name
+// (the ss share scheme renders as protocol "shadowsocks").
+func protocolName(scheme string) string {
+	if scheme == "ss" {
+		return "shadowsocks"
+	}
+	return scheme
+}
+
 // buildStreamSettings renders network/security/sockopt; security-specific
-// settings (tls/reality) and network-specific settings (ws/xhttp/grpc/http)
-// carry the link's own params verbatim. Every param consulted is recorded in
-// consumed so unrendered params surface in the drop report.
+// settings (tls/reality) and network-specific settings (ws/xhttp/grpc/http-
+// upgrade/kcp/tcp-header) carry the link's own params verbatim. Every param
+// consulted is recorded in consumed so unrendered params surface in the drop
+// report.
 func buildStreamSettings(n *model.Node, consumed map[string]bool) (map[string]any, error) {
+	network, err := networkOf(n, consumed)
+	if err != nil {
+		return nil, err
+	}
+	security := securityOf(n, consumed)
+	if security == "reality" && !realityNetworks[network] {
+		return nil, fmt.Errorf(
+			"render: outbound with security=reality requires network tcp/xhttp/grpc (core restriction), got %q — "+
+				"the param cannot render, refusing the silent drop (L9)", network)
+	}
 	stream := map[string]any{
-		"network":  networkOf(n, consumed),
-		"security": securityOf(n, consumed),
+		"network":  network,
+		"security": security,
 		"sockopt":  map[string]any{"tcpMaxSeg": tcpMaxSeg},
 	}
-	switch stream["security"] {
+	switch security {
 	case "tls":
 		stream["tlsSettings"] = buildTLSSettings(n.Params, consumed)
 	case "reality":
@@ -523,7 +627,9 @@ func buildStreamSettings(n *model.Node, consumed map[string]bool) (map[string]an
 		}
 		stream["realitySettings"] = rs
 	}
-	applyNetworkSettings(stream, n.Params, consumed)
+	if err := applyNetworkSettings(stream, n.Params, consumed); err != nil {
+		return nil, err
+	}
 	return stream, nil
 }
 
@@ -540,6 +646,12 @@ func buildTLSSettings(p map[string]string, consumed map[string]bool) map[string]
 		consumed["alpn"] = true
 		tls["alpn"] = strings.Split(v, ",")
 	}
+	// allowInsecure/insecure are deliberately NOT consumed: this core removed
+	// the feature (config build errors; migrated to pinnedPeerCertSha256), so
+	// the params cannot render. Leaving them unconsumed surfaces them in the
+	// DroppedParams report — reachable only when [filter].allow_insecure
+	// admitted the link (denial in filter, capability-limitation surfaced in
+	// renderer).
 	return tls
 }
 
@@ -570,46 +682,189 @@ func buildRealitySettings(p map[string]string, consumed map[string]bool) (map[st
 	return rs, nil
 }
 
-func applyNetworkSettings(stream map[string]any, p map[string]string, consumed map[string]bool) {
+// applyNetworkSettings renders the transport-specific settings block for the
+// outbound's network. Behavior per network (all verified against Xray-core
+// v26.3.27 source + `xray run -test` on the real binary):
+//   - tcp: headerType=http renders the http-obfs request block; seed-style
+//     header types other than http/none are refused loud;
+//   - ws / httpupgrade: path, host (the independent field — headers.Host is
+//     deprecated upstream), ed appended into the path query (the core parses
+//     it out of the path), ehs only as the fixed Sec-WebSocket-Protocol;
+//   - grpc: serviceName, mode=multi → multiMode;
+//   - kcp: header/seed were REMOVED from the core (migrated to finalmask /
+//     mkcp-original / mkcp-aes128gcm) — links carrying them fail loud;
+//   - xhttp: mode/path/host plus an extra JSON-object passthrough;
+//   - http/h2/h3/quic/unknown: refused loud with the param named.
+func applyNetworkSettings(stream map[string]any, p map[string]string, consumed map[string]bool) error {
 	switch stream["network"] {
-	case "ws":
-		ws := map[string]any{}
-		if v := p["path"]; v != "" {
-			consumed["path"] = true
-			ws["path"] = v
-		}
-		if v := p["host"]; v != "" {
-			consumed["host"] = true
-			ws["headers"] = map[string]any{"Host": v}
-		}
-		stream["wsSettings"] = ws
-	case "xhttp":
-		xs := map[string]any{}
-		for _, k := range []string{"host", "path", "mode"} {
-			if v := p[k]; v != "" {
-				consumed[k] = true
-				xs[k] = v
-			}
-		}
-		stream["xhttpSettings"] = xs
-	case "grpc":
-		gs := map[string]any{}
-		if v := p["serviceName"]; v != "" {
-			consumed["serviceName"] = true
-			gs["serviceName"] = v
-		}
-		stream["grpcSettings"] = gs
+	case networkTCP:
+		return applyTCPSettings(stream, p, consumed)
+	case networkWS:
+		return applyWSSettings(stream, p, consumed)
+	case networkHTTPUpgrade:
+		return applyHTTPUpgradeSettings(stream, p, consumed)
+	case networkGRPC:
+		return applyGRPCSettings(stream, p, consumed)
+	case networkKCP:
+		return applyKCPSettings(p, consumed)
+	case networkXHTTP:
+		applyXHTTPSettings(stream, p, consumed)
+	}
+	return nil
+}
+
+func applyTCPSettings(stream map[string]any, p map[string]string, consumed map[string]bool) error {
+	headerType := strings.ToLower(p["headerType"])
+	consumed["headerType"] = true
+	switch headerType {
+	case "", "none":
+		return nil
 	case "http":
-		hs := map[string]any{}
-		if v := p["path"]; v != "" {
-			consumed["path"] = true
-			hs["path"] = v
+		stream["tcpSettings"] = map[string]any{"header": tcpHTTPObfuscation(p["host"], p["path"])}
+		consumed["host"] = true
+		consumed["path"] = true
+		return nil
+	default:
+		return fmt.Errorf(
+			"render: tcp header type %q is not renderable (xray supports none|http) — "+
+				"refusing the silent drop of param headerType=%q (L9)", headerType, p["headerType"])
+	}
+}
+
+func applyWSSettings(stream map[string]any, p map[string]string, consumed map[string]bool) error {
+	ws := map[string]any{}
+	if v := p["path"]; v != "" {
+		consumed["path"] = true
+		ws["path"] = v
+	}
+	if v := p["ed"]; v != "" {
+		consumed["ed"] = true
+		base := ws["path"]
+		if base == "" {
+			base = "/"
 		}
-		if v := p["host"]; v != "" {
-			consumed["host"] = true
-			hs["host"] = strings.Split(v, ",")
+		ws["path"] = appendEarlyData(base.(string), v)
+	}
+	if v := p["ehs"]; v != "" {
+		consumed["ehs"] = true
+		if v != wsEarlyDataHeader {
+			return fmt.Errorf(
+				"render: ws earlyDataHeaderName %q is not renderable — the xray websocket transport always uses "+
+					"the fixed %q header (no config field); a different value would change semantics, refusing (L9)",
+				v, wsEarlyDataHeader)
 		}
-		stream["httpSettings"] = hs
+	}
+	if v := p["host"]; v != "" {
+		consumed["host"] = true
+		ws["host"] = v
+	}
+	if len(ws) > 0 {
+		stream["wsSettings"] = ws
+	}
+	return nil
+}
+
+func applyHTTPUpgradeSettings(stream map[string]any, p map[string]string, consumed map[string]bool) error {
+	hu := map[string]any{}
+	if v := p["path"]; v != "" {
+		consumed["path"] = true
+		hu["path"] = v
+	}
+	if v := p["ed"]; v != "" {
+		consumed["ed"] = true
+		base := hu["path"]
+		if base == "" {
+			base = "/"
+		}
+		hu["path"] = appendEarlyData(base.(string), v)
+	}
+	if v := p["ehs"]; v != "" {
+		consumed["ehs"] = true
+		if v != wsEarlyDataHeader {
+			return fmt.Errorf(
+				"render: httpupgrade earlyDataHeaderName %q is not renderable — the core always uses %q; refusing (L9)",
+				v, wsEarlyDataHeader)
+		}
+	}
+	if v := p["host"]; v != "" {
+		consumed["host"] = true
+		hu["host"] = v
+	}
+	if len(hu) > 0 {
+		stream["httpupgradeSettings"] = hu
+	}
+	return nil
+}
+
+func applyGRPCSettings(stream map[string]any, p map[string]string, consumed map[string]bool) error {
+	gs := map[string]any{}
+	if v := p["serviceName"]; v != "" {
+		consumed["serviceName"] = true
+		gs["serviceName"] = v
+	}
+	if v := p["mode"]; v != "" {
+		consumed["mode"] = true
+		switch strings.ToLower(v) {
+		case "multi":
+			gs["multiMode"] = true
+		case "gun":
+			// gun is the default (multiMode=false) — the datum renders as the
+			// absence of multiMode.
+		default:
+			return fmt.Errorf(
+				"render: grpc mode %q is not renderable (xray grpc modes: gun|multi) — refusing the silent drop (L9)", v)
+		}
+	}
+	if len(gs) > 0 {
+		stream["grpcSettings"] = gs
+	}
+	return nil
+}
+
+// applyKCPSettings consumes nothing: mKCP header obfuscation and seed were
+// REMOVED from the 26.3.27 core (config build errors: "The feature mkcp
+// header & seed has been removed and migrated to finalmask/udp header-* &
+// mkcp-original & mkcp-aes128gcm") — a link carrying them cannot be expressed
+// by this core and must fail loud instead of rendering a silently different
+// transport.
+func applyKCPSettings(p map[string]string, _ map[string]bool) error {
+	for _, k := range []string{"seed", "headerType"} {
+		if v := p[k]; v != "" {
+			return fmt.Errorf(
+				"render: mKCP param %s=%q is not renderable — the feature was removed from xray 26.3.27 "+
+					"(migrated to finalmask/udp header-* & mkcp-original & mkcp-aes128gcm), refusing the silent drop (L9)",
+				k, v)
+		}
+	}
+	return nil
+}
+
+func applyXHTTPSettings(stream map[string]any, p map[string]string, consumed map[string]bool) {
+	xs := map[string]any{}
+	for _, k := range []string{"host", "path", "mode"} {
+		if v := p[k]; v != "" {
+			consumed[k] = true
+			xs[k] = v
+		}
+	}
+	if v := p["extra"]; v != "" {
+		var extra map[string]any
+		// A nil map after a successful unmarshal means the JSON value was
+		// `null` — still not an object, still behavior-changing material:
+		// leave it unconsumed so materialParams fails the render loud (M-2).
+		if err := json.Unmarshal([]byte(v), &extra); err == nil && extra != nil {
+			consumed["extra"] = true
+			// Parsed into a map so the deterministic sorted-key marshal
+			// applies; a JSON object passthrough is what xhttpSettings.extra
+			// expects (json.RawMessage field in the core's SplitHTTPConfig).
+			xs["extra"] = extra
+		}
+		// An extra value that is not a JSON object stays unconsumed → it
+		// fails the render loud via materialParams (M-2), it is never
+		// silently dropped.
+	}
+	if len(xs) > 0 {
+		stream["xhttpSettings"] = xs
 	}
 }
 
@@ -622,9 +877,41 @@ func buildDialSettings(n *model.Node, consumed map[string]bool) (map[string]any,
 		return buildTrojanDial(n), nil
 	case "vmess":
 		return buildVMESSDial(n, consumed)
+	case "ss":
+		return buildSSDial(n, consumed)
 	default:
 		return nil, fmt.Errorf("render: unsupported scheme %q", n.Scheme)
 	}
+}
+
+// buildSSDial renders the shadowsocks outbound (verified against Xray-core
+// v26.3.27 infra/conf/shadowsocks.go: servers[0] carries method/password;
+// there are NO plugin/pluginOpts fields — a SIP003 plugin param on the link
+// cannot be expressed by this core and fails loud instead of rendering a
+// silently different transport). Method and password are auth material: an
+// empty one fails the render (M-f precedent).
+func buildSSDial(n *model.Node, consumed map[string]bool) (map[string]any, error) {
+	if v := n.Params["plugin"]; v != "" {
+		return nil, fmt.Errorf(
+			"render: shadowsocks outbound %s: link param %q=%q is not renderable — the xray 26.3.27 "+
+				"shadowsocks outbound has no SIP003 plugin support (no plugin/pluginOpts config fields), "+
+				"and dropping the plugin would silently change the transport; refusing (L9)", n.Host, "plugin", v)
+	}
+	method := n.Params["method"]
+	consumed["method"] = true
+	password := n.Params["password"]
+	consumed["password"] = true
+	if method == "" || password == "" {
+		return nil, fmt.Errorf(
+			"render: shadowsocks outbound %s: method/password missing from the link record — "+
+				"auth material, refusing to render an empty credential (L9)", n.Host)
+	}
+	return map[string]any{"servers": []any{map[string]any{
+		"address":  n.Host,
+		"port":     n.Port,
+		"method":   method,
+		"password": password,
+	}}}, nil
 }
 
 func buildVLESSDial(n *model.Node, consumed map[string]bool) map[string]any {
@@ -677,21 +964,34 @@ func buildVMESSDial(n *model.Node, consumed map[string]bool) (map[string]any, er
 	}}}, nil
 }
 
-func networkOf(n *model.Node, consumed map[string]bool) string {
-	if v := n.Params["type"]; v != "" {
-		consumed["type"] = true
-		// vmess links carry the network in "net" with type deduped to the
-		// same value at parse time — mark both consumed so the identical
-		// datum is not reported as dropped.
-		consumed["net"] = true
-		return v
+// networkOf resolves the link's transport into a canonical renderable
+// network name. Spellings outside the renderable set fail loud with the
+// param named — removed transports (http/h2/h3/quic on 26.3.27) carry their
+// upstream migration note, unknown values a plain unsupported error (L9: the
+// network choice IS transport behavior; a silent fallback would change it).
+func networkOf(n *model.Node, consumed map[string]bool) (string, error) {
+	raw := n.Params["type"]
+	if raw == "" {
+		raw = n.Params["net"]
 	}
-	if v := n.Params["net"]; v != "" {
-		consumed["net"] = true
-		consumed["type"] = true
-		return v
+	consumed["type"] = true
+	consumed["net"] = true
+	if raw == "" {
+		return networkTCP, nil
 	}
-	return "tcp"
+	canonical, ok := networkAliases[strings.ToLower(raw)]
+	if !ok {
+		if reason, removed := removedNetworks[strings.ToLower(raw)]; removed {
+			return "", fmt.Errorf(
+				"render: outbound (host %s): link param type=%q is not renderable — %s, "+
+					"refusing the silent drop (L9)", n.Host, raw, reason)
+		}
+		return "", fmt.Errorf(
+			"render: outbound %s: link param type=%q names a transport the renderer does not support "+
+				"(supported: tcp/raw, ws/websocket, httpupgrade, grpc, kcp/mkcp, xhttp/splithttp) — refusing (L9)",
+			n.Host, raw)
+	}
+	return canonical, nil
 }
 
 func securityOf(n *model.Node, consumed map[string]bool) string {

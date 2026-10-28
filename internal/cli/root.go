@@ -39,6 +39,8 @@ func New() *cobra.Command {
 		newActivateCommand(&cfgPath),
 		newStatusCommand(&cfgPath),
 		newMaintainCommand(&cfgPath),
+		newInstallCommand(&cfgPath),
+		newUninstallCommand(&cfgPath),
 	)
 	return root
 }

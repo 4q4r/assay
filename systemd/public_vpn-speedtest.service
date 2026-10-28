@@ -1,10 +1,9 @@
 [Unit]
 Description=publicvpn weekly speedtest wave (maintain with -S throughput probe)
-Documentation=file://%h/projects/public_vpn/README.md
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/projects/public_vpn
 # Same wave as the refresh timer, plus the slow -S throughput measurement in
-# the probe stage (xray-knife --speedtest). Slow by design — weekly cadence.
-ExecStart=%h/projects/public_vpn/publicvpn maintain --speedtest -c %h/projects/public_vpn/config.toml
+# the probe stage (xray-knife --speedtest). Slow by design. Rendered by
+# `publicvpn install` from this template.
+ExecStart={{ .BinaryPath }} maintain --speedtest -c {{ .ConfigPath }}

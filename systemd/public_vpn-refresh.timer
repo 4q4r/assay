@@ -1,10 +1,15 @@
 [Unit]
-Description=publicvpn refresh wave timer (every 6 hours, catch-up on wake)
+Description=publicvpn refresh wave timer (configured recheck period, catch-up on wake)
 
 [Timer]
-# DESIGN.md §4.9: refresh wave every 6 hours.
-OnCalendar=*-*-* 00/6:00:00
-# Run the missed wave after the machine wakes from sleep or boots late.
+# Recheck period from [maintain].refresh_interval, rendered by
+# `publicvpn install`. OnUnitActiveSec re-arms the timer N after each
+# COMPLETED run, so waves never overlap and arbitrary durations (90m, 6h,
+# 10d) are supported — OnCalendar cannot express a config-driven interval.
+# OnBootSec fires the first wave shortly after boot.
+OnBootSec=2min
+OnUnitActiveSec={{ .RefreshInterval }}
+# Replay a missed wave after the machine wakes from sleep or boots late.
 Persistent=true
 Unit=public_vpn-refresh.service
 

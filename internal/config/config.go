@@ -43,6 +43,17 @@ type FilterConfig struct {
 	// SourceCap limits how many nodes one source may contribute per wave.
 	// 0 = unlimited. The --source-cap CLI flag overrides it when set.
 	SourceCap int `toml:"source_cap"`
+	// Protocols is the scheme allowlist (acceptance policy). Default
+	// vless,vmess,trojan; ss is opt-in (PSK-only shadowsocks is weak — the
+	// reality/tls security requirement below still applies on top).
+	Protocols []string `toml:"protocols"`
+	// AllowInsecure admits links carrying allowInsecure/insecure=1|true
+	// instead of dropping them. Default false (denial in filter). The
+	// renderer has no allowInsecure capability on core 26.3.27 — the feature
+	// was removed upstream (migrated to pinnedPeerCertSha256) — so an
+	// admitted link only loses the param (rendered as a loud drop-report
+	// entry, never silently).
+	AllowInsecure bool `toml:"allow_insecure"`
 }
 
 // ProbeConfig controls the xray-knife probe wave (out-of-band only).
@@ -110,7 +121,19 @@ type MaintainConfig struct {
 	// PruneDeadAfter removes a geo-base record that is not alive and whose
 	// last_probe is older than this window (default 48h).
 	PruneDeadAfter Duration `toml:"prune_dead_after"`
+	// RefreshInterval is the refresh-wave recheck period. install renders it
+	// into the refresh timer as OnUnitActiveSec (default 6h, floor 5m);
+	// re-running install after a config change applies the new period.
+	RefreshInterval Duration `toml:"refresh_interval"`
+	// SpeedtestInterval is the speedtest-wave recheck period (default 168h,
+	// floor 5m) — rendered into the speedtest timer's OnUnitActiveSec.
+	SpeedtestInterval Duration `toml:"speedtest_interval"`
 }
+
+// IntervalFloor is the minimum recheck period for both maintenance waves:
+// faster loops would hammer the sources, the probe origin, and the live
+// client for no selection benefit.
+const IntervalFloor = 5 * time.Minute
 
 // Config is the pipeline configuration root.
 type Config struct {
@@ -167,12 +190,23 @@ func Load(path string) (*Config, error) {
 
 func applyDefaults(c *Config) {
 	applyFetchDefaults(&c.Fetch)
+	applyFilterDefaults(&c.Filter)
 	applyProbeDefaults(&c.Probe)
 	applyGeoDefaults(&c.Geo)
 	applySelectDefaults(&c.Select)
 	applyRenderDefaults(&c.Render)
 	applyActivateDefaults(&c.Activate)
 	applyMaintainDefaults(&c.Maintain)
+}
+
+// defaultProtocols is the protocol acceptance allowlist applied when
+// [filter].protocols is unset (ss is opt-in — PSK-only shadowsocks is weak).
+var defaultProtocols = []string{"vless", "vmess", "trojan"}
+
+func applyFilterDefaults(f *FilterConfig) {
+	if len(f.Protocols) == 0 {
+		f.Protocols = append([]string(nil), defaultProtocols...)
+	}
 }
 
 func applyFetchDefaults(f *FetchConfig) {
@@ -275,6 +309,12 @@ func applyMaintainDefaults(m *MaintainConfig) {
 	if m.PruneDeadAfter.Duration == 0 {
 		m.PruneDeadAfter.Duration = 48 * time.Hour
 	}
+	if m.RefreshInterval.Duration == 0 {
+		m.RefreshInterval.Duration = 6 * time.Hour
+	}
+	if m.SpeedtestInterval.Duration == 0 {
+		m.SpeedtestInterval.Duration = 168 * time.Hour
+	}
 }
 
 func validate(c *Config) error {
@@ -303,12 +343,32 @@ func validateMaintain(m MaintainConfig) error {
 	if m.PruneDeadAfter.Duration < 0 {
 		return fmt.Errorf("maintain.prune_dead_after must be >= 0 (0 = default 48h), got %s", m.PruneDeadAfter.Duration)
 	}
+	for name, d := range map[string]Duration{
+		"maintain.refresh_interval":   m.RefreshInterval,
+		"maintain.speedtest_interval": m.SpeedtestInterval,
+	} {
+		if d.Duration < IntervalFloor {
+			return fmt.Errorf("%s must be >= %s (too-fast rechecks hammer sources, probes, and the client), got %s",
+				name, IntervalFloor, d.Duration)
+		}
+	}
 	return nil
+}
+
+// parseableSchemes are the schemes the parser can normalize; the filter
+// allowlist may only reference these.
+var parseableSchemes = map[string]bool{
+	"vless": true, "vmess": true, "trojan": true, "ss": true,
 }
 
 func validateFilter(f FilterConfig) error {
 	if f.SourceCap < 0 {
 		return fmt.Errorf("filter.source_cap must be >= 0 (0 = unlimited), got %d", f.SourceCap)
+	}
+	for _, p := range f.Protocols {
+		if !parseableSchemes[p] {
+			return fmt.Errorf("filter.protocols: scheme %q is not parseable (allowed: vless, vmess, trojan, ss)", p)
+		}
 	}
 	return nil
 }
