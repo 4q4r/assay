@@ -1,0 +1,35 @@
+site check — https://nyaa.si
+nodes tested: 5 · attempts: 3/node · timeout: 15s
+dns view: doh-via-exit — dns.google/resolve queried through each node
+node           loc     city          asn/isp                   ok     statuses       tls   rtt      ttfb      avg      speed      resolved         note
+pool-nl-01     🇳🇱 NL   Amsterdam     60404 OpenIT              3/3    200            1.3   45ms     210ms     480ms    1.2MB/s    104.21.8.12
+pool-us-05     🇺🇸 US   Dallas        AS20473 The Constant Co…  2/3    200,403        1.3   120ms    380ms     640ms    800KB/s    23.20.3.4        partial
+pool-de-02     🇩🇪 DE   Frankfurt     AS24940 Hetzner Online    0/3    403            1.3   —        —         —        —          —                blocked: error code: 10…
+pool-jp-09     🇯🇵 JP   Tokyo         AS9371 Sakura Internet    0/3    —              —     —        —         —        —          —                no http answer (dial-fa…
+pool-ru-07     🇷🇺 RU   Moscow        AS47241 OOO Network       0/0    —              —     —        —         —        —          —                instance-failed: xray e…
+
+geo summary — countries
+loc     nodes  ok       success  median   avg      speed
+🇳🇱 NL   1      3/3      100%     470ms    470ms    1.2MB/s
+🇺🇸 US   1      2/3      67%      610ms    610ms    800KB/s
+🇩🇪 DE   1      0/3      0%       —        —        —
+🇯🇵 JP   1      0/3      0%       —        —        —
+🇷🇺 RU   1      0/0      0%       —        —        —
+
+geo summary — cities
+city                        nodes  ok       success  median   avg      speed
+🇳🇱 NL Amsterdam             1      3/3      100%     470ms    470ms    1.2MB/s
+🇺🇸 US Dallas                1      2/3      67%      610ms    610ms    800KB/s
+🇩🇪 DE Frankfurt             1      0/3      0%       —        —        —
+🇯🇵 JP Tokyo                 1      0/3      0%       —        —        —
+🇷🇺 RU Moscow                1      0/0      0%       —        —        —
+
+recommendation — best locations for matching rules (https://nyaa.si)
+1. 🇳🇱 NL — 100% ok (3/3 attempts) — median 470ms — 1.2MB/s
+2. 🇺🇸 US — 67% ok (2/3 attempts) — median 610ms — 800KB/s
+cities:
+  🇳🇱 Amsterdam — 100% ok (3/3) — median 470ms
+  🇺🇸 Dallas — 67% ok (2/3) — median 610ms
+
+
+hint: probe data is 31h old (geo.ttl 24h) — run `publicvpn maintain` (probe + geo) for freshness

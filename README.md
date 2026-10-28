@@ -7,7 +7,7 @@
 *Fetch, probe, geo-enrich, rank, render, and maintain a pool of third-party public proxy nodes — explicitly routed, never your default route.*
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-379-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-419-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
 [![xray-core](https://img.shields.io/badge/xray--core-26.3.27-red?style=for-the-badge)](https://github.com/XTLS/Xray-core)
 [![Pipeline](https://img.shields.io/badge/pipeline-W1%E2%80%93W5-blue?style=for-the-badge)](DESIGN.md)
 [![Lint](https://img.shields.io/badge/golangci--lint-0%20issues-success?style=for-the-badge)](.golangci.yml)
@@ -24,6 +24,7 @@
 - [🗺️ Pipeline](#️-pipeline)
 - [🔌 Link & Transport Support](#-link--transport-support)
 - [🧭 What Happens on `maintain`](#-what-happens-on-maintain)
+- [🌍 Site check (`check`)](#-site-check-check)
 - [📂 Project Structure](#-project-structure)
 - [🚀 Requirements](#-requirements)
 - [⚡ Quick Start](#-quick-start)
@@ -109,6 +110,33 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 
 `--no-activate` stops after the render+diff. `--speedtest` adds the slow throughput measurement to the probe stage (that is the weekly timer's wave).
 
+## 🌍 Site check (`check`)
+
+```bash
+publicvpn check nyaa.si https://speed.cloudflare.com/__down?bytes=25000000 --top 10
+publicvpn check nyaa.si --countries NL,DE --attempts 3 --save reports/nyaa.json
+```
+
+For picky sites that open only from specific countries/cities/ASNs, `check` answers **"в каких странах/городах лучше держать матчинг-рулы"**: it drives the URL through EVERY pool node — each through its own **temporary single-node xray instance** (managed binary, socks inbound on a free `127.0.0.1:18xxx` port, the node's outbound built by the same `render.BuildOutbound` the live renderer uses **with the same hardening** — `tcp_max_seg` emitted mandatorily and the TLS fingerprint applied, straight from `[render]`) — and ranks the pool by how well each location actually serves the site. Resolution happens at the **exit** (`socks5h` semantics: hostnames ride the tunnel, never pre-resolved locally), and a supplementary `dns.google/resolve` query **through the tunnel** reports the IPs the exit's resolver sees (labeled `doh-via-exit`).
+
+- **Per-attempt diagnostics** via `httptrace`: connect, TLS handshake (explicit probe, negotiated version reported), TTFB, total ms, bytes, avg speed — plus the full redirect chain and final URL.
+- **Blockpages are classified, never silently successful**: `403/451/429/5xx` → `blocked-http`; a tiny 2xx body carrying a known block signature (Cloudflare `error code: 1015/1020`, Imperva, "Access Denied"…) → `blocked-page`. A node failing TLS for the target is a **distinct failure class** (`tls-fail`).
+- **Geo summary + recommendation**: per-URL table over nodes, then country and city groups with success rate / median / avg ms / avg speed, and an explicit **recommendation block** — best countries/cities for matching rules for THIS url (feed the winners into `[render.pool_routes]`).
+- **Read-only by construction**: the cold base and the live client are never touched, nothing is rendered or activated, all dialing is out-of-band. Liveness comes from the last probe wave — a staleness hint prints when the data is older than `[geo].ttl`.
+
+| Flag | Default | Meaning |
+| :-- | :-- | :-- |
+| `--countries` | *(all)* | comma-separated ISO codes to filter the pool |
+| `--limit` | `0` (all alive, ceiling 60) | max nodes to test |
+| `--attempts` | `3` | HTTP attempts per node per URL |
+| `--timeout` | `15s` | per-request timeout |
+| `--top` | `10` | geo-summary/recommendation rows per block |
+| `--concurrency` | `4` | parallel temp xray instances (each is a full process — keep modest) |
+| `--with-dead` | off | include nodes not alive in the last probe |
+| `--color` | `auto` | `auto` (colorize only on a terminal) / `always` / `never`; `NO_COLOR` forces auto off |
+| `--no-color` | off | deprecated-friendly alias for `--color=never` (wins over a conflicting `--color`) |
+| `--save` | *(none)* | write the JSON report under the data dir (relative path) or at an absolute path |
+
 ## 📂 Project Structure
 
 ```text
@@ -123,6 +151,7 @@ public_vpn/
 │   ├── filter/             # ingest security filter (protocols allowlist + insecure policy)
 │   ├── probe/              # xray-knife out-of-band runner (L5)
 │   ├── geo/                # ip-api batch enrichment (L6 rate caps)
+│   ├── checker/            # W8 site-to-location check: temp xray instances, socks5h client, blockpage classifier, geo summary
 │   ├── stats/              # W4 statsquery poll + byte folding (L7-tolerant)
 │   ├── prune/              # W4 dead/ttl-stale-orphan rules (reuses rank freshness)
 │   ├── rank/               # select stage: ranking, caps D7, pool tags
@@ -229,7 +258,7 @@ go test -race -count=1 ./...  # race detector
 golangci-lint run             # strict gate: 0 issues, caps disabled
 ```
 
-The suite covers every stage with hermetic fixtures: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), and the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics.
+The suite covers every stage with hermetic fixtures: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics — and the W8 check matrix: URL normalization, blockpage classifier, aggregation/ranking math, a golden report (`--no-color`), an in-process SOCKS5 server pinning the **remote-DNS (`socks5h`) contract** behaviorally, engine integration (filters, limits, throttling, verdict classes, staleness hint), and a `live`-tagged real-xray temp-instance lifecycle test (`go test -tags live ./internal/checker/`).
 
 ## 🗺️ Roadmap
 
