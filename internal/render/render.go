@@ -17,8 +17,11 @@ import (
 	"public_vpn/internal/model"
 )
 
-// PoolRoute is one owner-configured routing rule into a pool balancer (D2:
-// the pool only carries explicitly routed traffic).
+// PoolRoute is one owner-configured routing rule into the pool (D2: the pool
+// only carries explicitly routed traffic). Balancer is the route TARGET: a
+// rendered `pool_*` balancer tag, or a direct `pool-<cc>-NN` outbound tag
+// (D5: a single-node city renders no city balancer). Render refuses any other
+// target loud (D6 namespace wall).
 type PoolRoute struct {
 	Balancer string   `toml:"balancer"`
 	Domains  []string `toml:"domains"`
@@ -129,7 +132,7 @@ func Render(in Input) (Result, error) {
 		"enableConcurrency": true,
 	}
 
-	if err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers); err != nil {
+	if err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers, byTag); err != nil {
 		return Result{}, err
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
@@ -183,6 +186,13 @@ func stripPoolRouting(m map[string]any) {
 		for _, r := range raw {
 			if rm, isMap := r.(map[string]any); isMap {
 				if bt, _ := rm["balancerTag"].(string); strings.HasPrefix(bt, poolBalancerPrefix) {
+					continue
+				}
+				// Direct-tag pool routes emit outboundTag=pool-<cc>-NN; in a
+				// previously rendered template only pool routes can carry a
+				// pool- outboundTag, so the same prefix rule keeps re-renders
+				// idempotent for them too.
+				if ot, _ := rm["outboundTag"].(string); strings.HasPrefix(ot, poolOutboundPrefix) {
 					continue
 				}
 			}
@@ -385,37 +395,54 @@ func addBalancers(m map[string]any, sel *model.Selection) []string {
 }
 
 // addPoolRules inserts owner-configured pool routes after the last
-// user-traffic rule and before the catch-all (DESIGN.md §4.7).
-func addPoolRules(m map[string]any, routes []PoolRoute, renderedBalancers []string) error {
+// user-traffic rule and before the catch-all (DESIGN.md §4.7). A route target
+// is either a rendered pool_* balancer (emitted as balancerTag) or a rendered
+// pool-<cc>-NN outbound tag (emitted as outboundTag — D5 single-node city);
+// anything else fails loud (D6 namespace wall, unknown target).
+func addPoolRules(
+	m map[string]any, routes []PoolRoute, renderedBalancers []string, renderedOutbounds map[string]bool,
+) error {
 	if len(routes) == 0 {
 		return nil
 	}
-	valid := map[string]bool{}
+	validBalancer := map[string]bool{}
 	for _, b := range renderedBalancers {
-		valid[b] = true
+		validBalancer[b] = true
 	}
 	routing, _ := m["routing"].(map[string]any)
 	rules := toAnySlice(routing["rules"])
 
 	var poolRules []any
 	for _, route := range routes {
-		if !strings.HasPrefix(route.Balancer, poolBalancerPrefix) {
-			return fmt.Errorf("render: pool route balancer %q must be a pool_ balancer (namespace wall D6)", route.Balancer)
-		}
-		if !valid[route.Balancer] {
-			return fmt.Errorf("render: pool route references balancer %q which was not rendered (no live nodes there?)",
-				route.Balancer)
-		}
 		domains := make([]any, len(route.Domains))
 		for i, d := range route.Domains {
 			domains[i] = d
 		}
-		poolRules = append(poolRules, map[string]any{
-			"type":        "field",
-			"inboundTag":  []any{"socks-in", "http-in"},
-			"domain":      domains,
-			"balancerTag": route.Balancer,
-		})
+		rule := map[string]any{
+			"type":       "field",
+			"inboundTag": []any{"socks-in", "http-in"},
+			"domain":     domains,
+		}
+		switch {
+		case strings.HasPrefix(route.Balancer, poolBalancerPrefix):
+			if !validBalancer[route.Balancer] {
+				return fmt.Errorf("render: pool route references balancer %q which was not rendered (no live nodes there?)",
+					route.Balancer)
+			}
+			rule["balancerTag"] = route.Balancer
+		case strings.HasPrefix(route.Balancer, poolOutboundPrefix):
+			if !renderedOutbounds[route.Balancer] {
+				return fmt.Errorf(
+					"render: pool route references outbound tag %q which was not rendered (no live node there?)",
+					route.Balancer)
+			}
+			rule["outboundTag"] = route.Balancer
+		default:
+			return fmt.Errorf(
+				"render: pool route target %q must be a pool_ balancer or a pool-<cc>-NN outbound tag (namespace wall D6)",
+				route.Balancer)
+		}
+		poolRules = append(poolRules, rule)
 	}
 
 	// Insert before the catch-all class: every rule of the trailing balancerTag
@@ -594,7 +621,7 @@ func buildDialSettings(n *model.Node, consumed map[string]bool) (map[string]any,
 	case "trojan":
 		return buildTrojanDial(n), nil
 	case "vmess":
-		return buildVMESSDial(n, consumed), nil
+		return buildVMESSDial(n, consumed)
 	default:
 		return nil, fmt.Errorf("render: unsupported scheme %q", n.Scheme)
 	}
@@ -621,13 +648,21 @@ func buildTrojanDial(n *model.Node) map[string]any {
 	}}}
 }
 
-func buildVMESSDial(n *model.Node, consumed map[string]bool) map[string]any {
+func buildVMESSDial(n *model.Node, consumed map[string]bool) (map[string]any, error) {
 	aid := 0
 	if v := n.Params["aid"]; v != "" {
-		consumed["aid"] = true
-		if parsed, err := strconv.Atoi(v); err == nil {
-			aid = parsed
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			// aid is auth-adjacent material: a value we cannot parse must fail
+			// the render loud (L9) — silently rendering alterId 0 would break
+			// the handshake in the field. Consumed only on success, so an
+			// unplaced aid can never vanish from the reporting path.
+			return nil, fmt.Errorf(
+				"render: vmess outbound %s: link param %q=%q is not a number — refusing silent alterId 0 (L9)",
+				n.Host, "aid", v)
 		}
+		consumed["aid"] = true
+		aid = parsed
 	}
 	security := n.Params["scy"]
 	if security == "" {
@@ -639,7 +674,7 @@ func buildVMESSDial(n *model.Node, consumed map[string]bool) map[string]any {
 		"address": n.Host,
 		"port":    n.Port,
 		"users":   []any{map[string]any{"id": n.UUID, "alterId": aid, "security": security}},
-	}}}
+	}}}, nil
 }
 
 func networkOf(n *model.Node, consumed map[string]bool) string {

@@ -79,8 +79,11 @@ type SelectConfig struct {
 	Ceiling             int `toml:"ceiling"`
 }
 
-// PoolRoute is one owner-configured routing rule that steers traffic into a
-// pool balancer (D2 trust wall: pool participates only in explicit routes).
+// PoolRoute is one owner-configured routing rule that steers traffic into the
+// pool (D2 trust wall: pool participates only in explicit routes). Balancer
+// is the route target: a rendered `pool_*` balancer tag or a direct
+// `pool-<cc>-NN` outbound tag (D5 single-node city); render refuses any other
+// target loud (D6).
 type PoolRoute struct {
 	Balancer string   `toml:"balancer"`
 	Domains  []string `toml:"domains"`

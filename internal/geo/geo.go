@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -112,8 +113,29 @@ func mergeGeoRecords(in Input, byIP map[string]Response, ipByNode map[string]str
 		prevByKey[store.GeoIdentity(e)] = e
 	}
 	now := time.Now().UTC()
+	// Same-identity records (scheme|host|port) can arrive from distinct node
+	// keys (the same server advertised with different credentials/params).
+	// Apply their probes in stable (identity, node key) order so the outcome
+	// that survives the store's last-write merge never depends on the
+	// caller's arrival order — identical inputs always yield the same winner
+	// (M-b).
+	nodes := make([]*model.Node, len(in.Nodes))
+	copy(nodes, in.Nodes)
+	sort.Slice(nodes, func(i, j int) bool {
+		a, b := nodes[i], nodes[j]
+		if a.Scheme != b.Scheme {
+			return a.Scheme < b.Scheme
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		return a.Key < b.Key
+	})
 	records := make([]*model.GeoRecord, 0, len(in.ProbeByKey))
-	for _, n := range in.Nodes {
+	for _, n := range nodes {
 		pr, ok := in.ProbeByKey[n.Key]
 		if !ok {
 			// Partial probe wave: the node has no probe outcome in the map,
