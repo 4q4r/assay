@@ -107,7 +107,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	}
 	factory := opts.factoryOverride
 	if factory == nil {
-		factory = newXrayFactory(opts.XrayBin, opts.WorkDir, opts.Render)
+		factory = NewXrayFactory(opts.XrayBin, opts.WorkDir, opts.Render)
 	}
 
 	perNode := runPool(ctx, opts, factory, pool, targets)

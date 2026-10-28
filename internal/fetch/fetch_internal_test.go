@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,13 +18,16 @@ func TestBoundedReturnsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled before the fan-out starts: every worker skips
 
-	ran := 0
+	// bounded's per-job select races a cancelled ctx against a free
+	// semaphore slot, so several workers CAN still run — concurrently. The
+	// counter is atomic or the -race detector flags the test itself.
+	var ran atomic.Int64
 	err := bounded(ctx, 4, []int{1, 2, 3}, func(int) error {
-		ran++
+		ran.Add(1)
 		return nil
 	})
 	require.ErrorIs(t, err, context.Canceled, "cancelled fan-out must be loud, not nil")
-	assert.LessOrEqual(t, ran, 3, "every job that ran must still be accounted for by the error")
+	assert.LessOrEqual(t, ran.Load(), int64(3), "every job that ran must still be accounted for by the error")
 }
 
 // TestBoundedPropagatesFirstError keeps the existing first-error contract

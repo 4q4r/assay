@@ -75,13 +75,22 @@ skip_fresh_within = "0s"            # skip re-probing nodes whose latest result 
                                     # semi-passed/stale nodes are always re-probed)
 
 [geo]
-endpoint = "http://ip-api.com/batch"  # L6: free tier is HTTP-only, non-commercial
-batch_size = 100                      # ≤100 IPs per request
-per_minute = 15                       # ≤15 batch requests/min; a 429 risks a 1h ban
-ttl = "24h"                           # alive-data freshness: records whose last_probe is
-                                      # older are not selectable until re-probed
-                                      # (W4 maintain extends this into physical pruning)
-timeout = "15s"
+# W11 self-report design: every alive node asks ip-api THROUGH ITS OWN
+# TUNNEL — GET http://ip-api.com/json/ (no ip parameter = the service answers
+# "who is asking") — so the response IS that node's exit geo, observed
+# through its own tunnel. Requests originate from thousands of DISTINCT node
+# IPs, so ip-api's per-source budget never pools and the old aggregate batch
+# clamp (endpoint/batch_size/per_minute — retired with a loud migration
+# error) is gone in principle. The self-report is automatic: no knob.
+doh_url = "https://dns.google/resolve" # DoH endpoint the fallback queries THROUGH the
+                                       # tunnel (o-o.myaddr TXT → the exit network's
+                                       # resolver IP → ip-api single-IP lookup through
+                                       # the same tunnel); must be https
+ttl = "24h"                            # alive-data freshness: records whose last_probe is
+                                       # older are not selectable until re-probed
+                                       # (W4 maintain extends this into physical pruning)
+timeout = "15s"                        # bounds ONE through-tunnel HTTP request (self-report
+                                       # and each fallback hop alike)
 
 [select]
 per_country_cap = 3        # K: nodes per country (design guidance 3–5)
