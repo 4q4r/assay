@@ -464,6 +464,7 @@
         "tag": "best_rtt"
       },
       {
+        "fallbackTag": "block",
         "selector": [
           "pool-nl-"
         ],
@@ -477,6 +478,7 @@
         "tag": "pool_nl"
       },
       {
+        "fallbackTag": "block",
         "selector": [
           "pool-nl-01",
           "pool-nl-02",

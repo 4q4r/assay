@@ -176,6 +176,27 @@ const (
 	poolBalancerPrefix = "pool_"
 )
 
+// blockOutboundTag is the blackhole outbound, present in every template.
+//
+// SECURITY INVARIANT (owner ruling, W9): every pool_* balancer emitted by the
+// renderer is pinned to fallbackTag "block", and this is deliberately NOT a
+// configuration knob. Semantics, verified against the tagged xray-core
+// v26.3.27 source: app/router/balancing.go — Balancer.PickOutbound returns
+// the fallbackTag WITHOUT error when the strategy yields an empty pick (log
+// line "fallback to [<tag>], due to empty tag returned"); strategy_leastload.go
+// qualifies only nodes that are Alive, within maxRTT, and covered by the
+// observatory — zero qualified nodes (all pool nodes down or uncovered) means
+// an empty pick. The picked "block" outbound (proxy/blackhole) interrupts the
+// link, so the connection dies in place and nothing exits the machine. There
+// is no error loop: one deterministic pick per routed connection, and the
+// empty-tag error branch is only reachable without a fallbackTag. A
+// configurable fallback could be set to direct (or removed) and reopen the
+// naked-exit hole — traffic routed to a location silently leaving from the
+// machine's real IP — so the value is hard-coded here, never plumbed from
+// config. Template balancers (best_rtt) are passthrough content and keep
+// their own fallback semantics byte-identical.
+const blockOutboundTag = "block"
+
 // Render produces the complete xray config JSON (one document, no merge
 // stacking — L3). Output is byte-deterministic: maps marshal with sorted keys.
 // Link parameters that cannot be rendered are reported in the result — never
@@ -460,6 +481,8 @@ func ensureStatsAndPolicy(m map[string]any) {
 // addBalancers renders pool_<cc> for every country in the selection and
 // pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). tolerance is
 // the [render].balancer_tolerance knob, applied to BOTH balancer layers.
+// Every pool balancer is pinned to fallbackTag blockOutboundTag (see that
+// const for the security invariant and the verified xray semantics).
 // Returns the rendered balancer tags.
 func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []string {
 	routing, _ := m["routing"].(map[string]any)
@@ -488,8 +511,9 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 		tags := make([]any, 0, 1)
 		tags = append(tags, poolOutboundPrefix+cc+"-")
 		existing = append(existing, map[string]any{
-			"tag":      tag,
-			"selector": tags,
+			"tag":         tag,
+			"selector":    tags,
+			"fallbackTag": blockOutboundTag, // security invariant, see blockOutboundTag
 			"strategy": map[string]any{
 				"type": "leastLoad",
 				"settings": map[string]any{
@@ -521,8 +545,9 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 			}
 			ctag := model.CityBalancerTag(cc, city)
 			existing = append(existing, map[string]any{
-				"tag":      ctag,
-				"selector": selectors,
+				"tag":         ctag,
+				"selector":    selectors,
+				"fallbackTag": blockOutboundTag, // security invariant, see blockOutboundTag
 				"strategy": map[string]any{
 					"type": "leastLoad",
 					"settings": map[string]any{
