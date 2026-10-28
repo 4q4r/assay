@@ -1,0 +1,101 @@
+# Strict golangci-lint gate (firefox-vpn-client PR#1 precedent): everything on,
+# caps zeroed, zero issues required. v2 config schema. Every disable below is a
+# documented decision, not a suppression of real findings.
+version: "2"
+
+run:
+  timeout: 10m
+
+linters:
+  default: all
+  disable:
+    # Whitespace/statement-layout pedantry — fights dense, table-driven code
+    # without catching defects (firefox-vpn-client precedent: wsl disabled).
+    - wsl
+    - wsl_v5
+    - nlreturn
+    # Name-length pedantry (i, cc, id are idiomatic here).
+    - varnamelen
+    # Demands t.Parallel() on every test — not this repo's contract.
+    - paralleltest
+    # Full-struct-literal demands; zero-value omission is idiomatic.
+    - exhaustruct
+    - exhaustruct_v5
+    # Import-policy linter with no policy declared — no dependency is banned.
+    - depguard
+    - gomodguard
+    - gomodguard_v2  # both generations: no module policy is declared in this repo
+    # Demands error-wrapping at every call boundary — noisy by design.
+    - wrapcheck
+    # Bans inline `if err := ...; err != nil` — idiomatic Go uses it.
+    - noinlineerr
+    # Bans dynamic errors (fmt.Errorf) — the pipeline's error contract uses it.
+    - err113
+    # JSON-tag naming convention enforcement — the §5 cold-base schema fixes
+    # our tag spelling (snake_case by design).
+    - tagliatelle
+    # Package-level test helpers and seam vars are deliberate.
+    - gochecknoglobals
+    # Magic-number detection — config-driven code carries legit constants.
+    - mnd
+    # Constructor-before-method ordering pedantry.
+    - funcorder
+    # JSON error-checking pedantry in test fixtures.
+    - errchkjson
+    # nil,nil returns are the documented "missing file = empty state" contract.
+    - nilnil
+    # Render walks a JSON tree it built itself; shapes are pinned by golden
+    # tests, so `, ok`-guards on every assertion would only mask defects.
+    - forcetypeassert
+
+  settings:
+    cyclop:
+      max-complexity: 15
+    funlen:
+      lines: 150
+      statements: 90
+    lll:
+      line-length: 120
+    nestif:
+      min-complexity: 12
+    gocognit:
+      min-complexity: 30
+    gosec:
+      excludes:
+        - G404  # math/rand: test jitter only
+        - G304  # file paths come from the owner's config.toml by design
+        # G306 is NOT excluded: every pipeline artifact is written 0600 on
+        # purpose — the rendered config and state files carry node credentials
+        # (review finding 11; the old "no secrets on disk" justification was
+        # factually wrong). The owner's live config keeps its own mode.
+    goconst:
+      min-len: 3
+      min-occurrences: 6
+    errcheck:
+      check-blank: false
+
+  exclusions:
+    rules:
+      # Test files: long tables, big fixtures, direct error ignores.
+      - path: _test\.go
+        linters:
+          - funlen
+          - lll
+          - cyclop
+          - dupl
+          - gosec
+          - goconst
+          - gocognit
+
+issues:
+  # Zero-tolerance: no silent caps hiding findings (ert lint-baseline lesson).
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    # gofumpt formatting is owned by the standalone gofumpt v0.12.0 binary
+    # (gate 1) — the same version golangci bundles, but the two disagree on
+    # stdlib/module import grouping when run through different entrypoints,
+    # so only ONE of them may own the format.
