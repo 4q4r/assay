@@ -385,6 +385,61 @@ func TestRenderIsDeterministicForGoldenRegression(t *testing.T) {
 	}
 }
 
+// TestPoolRouteDirectOutboundTagRendersOutboundTag pins the D5 spec surface:
+// a single-node city has no city balancer, so a pool route may target the
+// direct `pool-<cc>-NN` outbound tag — rendered as `outboundTag`, never
+// `balancerTag` (final-review finding M-a).
+func TestPoolRouteDirectOutboundTagRendersOutboundTag(t *testing.T) {
+	n, sn := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp"})
+	m := doRender(t, []*model.Node{n}, &model.Selection{Nodes: []model.SelectedNode{sn}},
+		render.PoolRoute{Balancer: "pool-de-01", Domains: []string{"geosite:netflix"}})
+
+	rules := m["routing"].(map[string]any)["rules"].([]any)
+	var direct map[string]any
+	for _, r := range rules {
+		rm := r.(map[string]any)
+		if ot, _ := rm["outboundTag"].(string); ot == "pool-de-01" {
+			direct = rm
+		}
+	}
+	require.NotNil(t, direct, "direct-tag pool route must render a rule with outboundTag=pool-de-01")
+	assert.Nil(t, direct["balancerTag"], "a direct-tag rule must not carry balancerTag")
+	assert.Equal(t, []any{"socks-in", "http-in"}, direct["inboundTag"])
+	assert.Equal(t, []any{"geosite:netflix"}, direct["domain"])
+
+	// The outbound itself was rendered and the rule precedes the catch-all.
+	poolOutbound(t, m, "pool-de-01")
+	last := rules[len(rules)-1].(map[string]any)
+	assert.Equal(t, "best_rtt", last["balancerTag"], "catch-all stays last")
+	assert.NotEqual(t, direct, last, "the direct-tag rule sits before the catch-all")
+}
+
+// TestPoolRouteDirectOutboundTagIsIdempotent pins the strip side of the
+// direct-tag surface: re-rendering from a previous output must not duplicate
+// the outboundTag rule (re-render idempotency, same contract as balancerTag
+// rules).
+func TestPoolRouteDirectOutboundTagIsIdempotent(t *testing.T) {
+	n, sn := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp"})
+	byKey := map[string]*model.Node{n.Key: n}
+	sel := &model.Selection{Nodes: []model.SelectedNode{sn}}
+	cfg := renderCfg([]render.PoolRoute{{Balancer: "pool-de-01", Domains: []string{"geosite:netflix"}}})
+
+	first, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: cfg})
+	require.NoError(t, err)
+	second, err := render.Render(render.Input{Template: first.Config, Selection: sel, NodesByKey: byKey, Cfg: cfg})
+	require.NoError(t, err)
+
+	var m2 map[string]any
+	require.NoError(t, json.Unmarshal(second.Config, &m2))
+	count := 0
+	for _, r := range m2["routing"].(map[string]any)["rules"].([]any) {
+		if ot, _ := r.(map[string]any)["outboundTag"].(string); ot == "pool-de-01" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "re-render must not duplicate the direct-tag pool rule")
+}
+
 func TestUnknownPoolRouteBalancerIsLoud(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	byKey := map[string]*model.Node{}
@@ -399,7 +454,11 @@ func TestUnknownPoolRouteBalancerIsLoud(t *testing.T) {
 	assert.Contains(t, err.Error(), "pool_fr")
 }
 
-func TestNonPoolBalancerRouteRejected(t *testing.T) {
+// TestUnknownPoolRouteDirectTagIsLoud pins the loud failure for a direct-tag
+// target that was not rendered (no live node there): the error must name the
+// tag and the not-rendered reason (M-a), not fall through to the namespace
+// message.
+func TestUnknownPoolRouteDirectTagIsLoud(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
@@ -407,9 +466,27 @@ func TestNonPoolBalancerRouteRejected(t *testing.T) {
 	}
 	_, err := render.Render(render.Input{
 		Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
-		Cfg: renderCfg([]render.PoolRoute{{Balancer: "best_rtt", Domains: []string{"domain:x.com"}}}),
+		Cfg: renderCfg([]render.PoolRoute{{Balancer: "pool-de-09", Domains: []string{"domain:x.com"}}}),
 	})
-	require.Error(t, err, "pool routes may only target pool_ balancers (D6 namespace wall)")
+	require.Error(t, err, "routing to an outbound tag that was not rendered = dead rule — fail loud")
+	assert.Contains(t, err.Error(), "pool-de-09")
+	assert.Contains(t, err.Error(), "not rendered")
+}
+
+func TestNonPoolBalancerRouteRejected(t *testing.T) {
+	for _, target := range []string{"best_rtt", "proxy-0", "direct"} {
+		nodes, sel := twoCountrySelection(t)
+		byKey := map[string]*model.Node{}
+		for _, n := range nodes {
+			byKey[n.Key] = n
+		}
+		_, err := render.Render(render.Input{
+			Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
+			Cfg: renderCfg([]render.PoolRoute{{Balancer: target, Domains: []string{"domain:x.com"}}}),
+		})
+		require.Error(t, err, "pool routes may only target pool_ balancers or pool- outbound tags (D6 namespace wall), got target %q", target)
+		assert.Contains(t, err.Error(), target, "the offending target must be named")
+	}
 }
 
 func TestSelectionNodeMissingIsLoud(t *testing.T) {
@@ -556,6 +633,49 @@ func TestMaterialEarlyDataParamFailsLoud(t *testing.T) {
 		assert.Contains(t, err.Error(), `"ed"`, "the offending param must be named")
 		assert.Contains(t, err.Error(), network)
 	}
+}
+
+// TestVMESSUnparseableAidFailsLoud pins the M-f gate: aid is auth-adjacent
+// link material — a value Atoi cannot parse must fail the render with the L9
+// rationale, never silently coerce to alterId 0 (final-review finding M-f).
+func TestVMESSUnparseableAidFailsLoud(t *testing.T) {
+	n := model.NewNode("s", "vmess", "vmess-uuid-1", "de1.example.com", 2053,
+		map[string]string{"type": "tcp", "security": "tls", "sni": "donor.example", "aid": "abc"})
+	sn := model.SelectedNode{Tag: "pool-de-01", Key: n.Key, Country: "de", City: "Frankfurt"}
+	_, err := render.Render(render.Input{
+		Template:   testTemplate(t),
+		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
+		NodesByKey: map[string]*model.Node{n.Key: n},
+		Cfg:        renderCfg(nil),
+	})
+	require.Error(t, err, "unparseable aid must fail the render, not silently become alterId 0")
+	assert.Contains(t, err.Error(), `"aid"`, "the offending param must be named")
+	assert.Contains(t, err.Error(), "abc")
+}
+
+// TestVMESSParsedAidRendersAndConsumes guards the success path: a numeric aid
+// renders as alterId verbatim and is consumed — it must not leak into the
+// DroppedParams report (M-f: consumed only on successful placement).
+func TestVMESSParsedAidRendersAndConsumes(t *testing.T) {
+	n := model.NewNode("s", "vmess", "vmess-uuid-1", "de1.example.com", 2053,
+		map[string]string{"type": "tcp", "security": "tls", "sni": "donor.example", "aid": "64"})
+	sn := model.SelectedNode{Tag: "pool-de-01", Key: n.Key, Country: "de", City: "Frankfurt"}
+	res, err := render.Render(render.Input{
+		Template:   testTemplate(t),
+		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
+		NodesByKey: map[string]*model.Node{n.Key: n},
+		Cfg:        renderCfg(nil),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, res.DroppedParams, "a parsed aid is consumed — no drop report")
+	ob := poolOutbound(t, func() map[string]any {
+		t.Helper()
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(res.Config, &m))
+		return m
+	}(), "pool-de-01")
+	user := ob["settings"].(map[string]any)["vnext"].([]any)[0].(map[string]any)["users"].([]any)[0].(map[string]any)
+	assert.InDelta(t, 64, user["alterId"], 0.001, "aid renders as alterId verbatim (L9)")
 }
 
 // TestPoolRulesGoBeforeAllTrailingBalancerRules pins the insertion point: the

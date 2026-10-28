@@ -94,9 +94,6 @@ func backupTarget(target, backupDir string) (string, error) {
 
 // atomicReplace copies the rendered file into the target's directory under a
 // temp name (same filesystem → rename is atomic), preserves the original
-// mode, and renames over the target.
-// atomicReplace copies the rendered file into the target's directory under a
-// temp name (same filesystem → rename is atomic), preserves the original
 // mode, and renames over the target. Paths come from the owner's config.
 func atomicReplace(src, dst string) error {
 	dir := filepath.Dir(dst)

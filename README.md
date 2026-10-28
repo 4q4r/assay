@@ -121,14 +121,16 @@ public_vpn/
 
 ## ⚡ Quick Start
 
-1. **Create `config.toml`** — start from the repo default: set `data_dir`, review `[sources.*]` (D9 discovery means only repo ids live here), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing).
+1. **Create `config.toml`** — start from the repo default: set `data_dir`, review `[sources.*]` (D9 discovery means only repo ids live here), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5).
 2. **`publicvpn fetch`** — discover and cache the source files.
-3. **`publicvpn probe`** — out-of-band liveness + exit-IP wave (add `--speedtest` for the weekly-style throughput measurement).
-4. **`publicvpn geo`** — enrich the exit IPs into the cold base.
-5. **`publicvpn select`** — rank and cap the active set.
-6. **`publicvpn render`** — render the full client config into `rendered/config.json`.
-7. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then restart your client when you are ready (`systemctl --user restart xray-raw.service` — the binary prints this hint, it never restarts by itself).
-8. **`publicvpn maintain`** — from now on, one command (or the shipped timers) does the whole wave, activating only on real diffs.
+3. **`publicvpn parse`** — decode the cached bodies into normalized node records.
+4. **`publicvpn filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
+5. **`publicvpn probe`** — out-of-band liveness + exit-IP wave (add `--speedtest` for the weekly-style throughput measurement).
+6. **`publicvpn geo`** — enrich the exit IPs into the cold base.
+7. **`publicvpn select`** — rank and cap the active set.
+8. **`publicvpn render`** — render the full client config into `rendered/config.json`.
+9. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then restart your client when you are ready (`systemctl --user restart xray-raw.service` — the binary prints this hint, it never restarts by itself).
+10. **`publicvpn maintain`** — from now on, one command (or the shipped timers) does the whole wave, activating only on real diffs.
 
 ## ⏱️ Timers (systemd user units)
 

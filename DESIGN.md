@@ -44,8 +44,8 @@ Default enabled: `matin`, `epodonios`, `radikal`, `haker`. `tvc` optional. **D9:
 ## 4. Pipeline
 
 ```
-fetch → parse → filter → resolve+geo → probe → select → render → activate
-                                              ↑______________ maintain (timers: refresh 6h, speedtest weekly, stats poll)
+fetch → parse → filter → probe → geo → select → render → activate
+                                          ↑______________ maintain (timers: refresh 6h, speedtest weekly, stats poll)
 ```
 
 1. **fetch** — curl each enabled source (cache, timeouts, retries). All network calls run with `env -u http_proxy -u https_proxy` (ambient-proxy landmine L5).
@@ -85,7 +85,7 @@ fetch → parse → filter → resolve+geo → probe → select → render → a
 - Link hygiene at ingest: drop `allowInsecure=1`, drop PSK-only protocols, prefer forward-secrecy transports (reality/tls) — mirrors 0xRadikal's SECURE criterion.
 - Trust extends into the future: feeds can swap endpoints any hour → every wave re-filters and re-probes; nodes failing twice get pruned.
 - Footprint: bulk probing = a fan-out of foreign-IP TLS dials from the home RU IP. Default = local but throttled (concurrency + probes/min caps); VPS mode (run probe stage on an own server, sync results) as an optional flag.
-- Source fetches over HTTPS (raw.githubusercontent / gitverse mirror) with pinned URLs in the source registry.
+- Source fetches over HTTPS (raw.githubusercontent / gitverse mirror): the registry stores repo ids + a discovery method, and fetch resolves the current raw paths at every wave (D9 dynamic discovery — no pinned URLs).
 
 ## 8. Landmines
 

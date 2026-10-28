@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -138,7 +139,16 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 	var all []*model.Node
 	totalRejected, totalMalformed := 0, 0
 	kindCounts := map[string]int{}
-	for id, files := range manifest.Sources {
+	// Stable source order: manifest.Sources is a Go map, and its iteration
+	// order is randomized. The node file order feeds dedup/cap/tag decisions
+	// downstream, so identical inputs must always parse identically (M-b).
+	sourceIDs := make([]string, 0, len(manifest.Sources))
+	for id := range manifest.Sources {
+		sourceIDs = append(sourceIDs, id)
+	}
+	sort.Strings(sourceIDs)
+	for _, id := range sourceIDs {
+		files := manifest.Sources[id]
 		res := &parse.Result{RejectedKinds: map[string]int{}}
 		for _, f := range files {
 			body, err := os.ReadFile(filepath.Join(p.cacheDir, id, fetch.SafePath(f.Path)))
