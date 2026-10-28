@@ -1,5 +1,12 @@
 # publicvpn — sanitized EXAMPLE configuration (defaults + schema comments).
 #
+# OPTIONAL — the CLI works without it: with no -c and no config at
+# ~/.config/publicvpn/config.toml every data stage runs configless on the
+# built-in defaults (data_dir = ~/.local/share/publicvpn). A config file is
+# required for render/activate ([render].template / [activate].target) and
+# for the daemon's render path (`publicvpn install` wires the config path
+# into the watch unit).
+#
 # This file documents every knob with its default value. Copy it to a private
 # `config.toml` (gitignored — operational values never belong in git) and fill
 # in your real paths. NOTHING here identifies a specific deployment.

@@ -30,15 +30,16 @@ func newListCommand(cfgPath *string) *cobra.Command {
 		Use:   "list",
 		Short: "Pool inventory by location: countries (with --cities: cities), counts, alive, median RTT",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := load(*cfgPath)
+			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
+			reportConfigSource(cmd.OutOrStdout(), res)
 			color, err := resolveColor("auto", noColor, cmd.OutOrStdout())
 			if err != nil {
 				return err
 			}
-			return runList(cmd.OutOrStdout(), cfg, listOptions{cities: cities, all: all, color: color})
+			return runList(cmd.OutOrStdout(), res.Config, listOptions{cities: cities, all: all, color: color})
 		},
 	}
 	cmd.Flags().BoolVar(&cities, "cities", false,
