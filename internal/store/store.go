@@ -168,6 +168,46 @@ func ReadGeo(path string) ([]*model.GeoRecord, error) {
 	return recs, sc.Err()
 }
 
+// WriteGeo atomically rewrites the cold store with the given records (W4
+// prune path: same temp+rename discipline as every other store write).
+func WriteGeo(path string, records []*model.GeoRecord) error {
+	return writeJSONL(path, len(records), func(i int) (any, error) {
+		return records[i], nil
+	})
+}
+
+// RewriteGeoWithBackup backs the pre-prune store up next to itself as
+// <name>.bak-<ts> (0600) and then atomically rewrites it with the pruned
+// records. A missing store has nothing to back up: the backup path is empty
+// and only the write happens.
+func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time) (string, error) {
+	backupPath := ""
+	if _, err := os.Stat(path); err == nil {
+		bp, err := backupFile(path, now)
+		if err != nil {
+			return "", fmt.Errorf("backup before prune rewrite: %w", err)
+		}
+		backupPath = bp
+	}
+	if err := WriteGeo(path, records); err != nil {
+		return "", err
+	}
+	return backupPath, nil
+}
+
+// backupFile copies path to <path>.bak-<YYYYMMDD-HHMMSS> in the same
+// directory (the activate-stage backup convention, applied to stores).
+func backupFile(path string, now time.Time) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	dst := path + ".bak-" + now.UTC().Format("20060102-150405")
+	//nolint:gosec // G703: the store path comes from the owner's config.toml —
+	// the config file IS the trust root (same class as the activate-stage backup)
+	return dst, os.WriteFile(dst, data, 0o600)
+}
+
 // WriteSelection persists the select-stage manifest.
 func WriteSelection(path string, sel *model.Selection) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {

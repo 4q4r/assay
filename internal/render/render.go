@@ -81,6 +81,7 @@ func Render(in Input) (Result, error) {
 		return Result{}, err
 	}
 	ensureAPIStats(m, in.Cfg.StatsPort)
+	ensureStatsAndPolicy(m)
 
 	poolCount := len(in.Selection.Nodes)
 	if poolCount == 0 {
@@ -273,6 +274,34 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 		"outboundTag": "api",
 	}
 	routing["rules"] = append([]any{apiRule}, rules...)
+}
+
+// ensureStatsAndPolicy makes the traffic counters the W4 stats stage polls
+// actually exist. Two hard prerequisites, verified against Xray-core source:
+//   - without a "stats" object the core registers stats.NoopManager and
+//     GetOrRegisterCounter returns nil — no counters ever;
+//   - without policy.system.statsOutboundUplink/Downlink the outbound
+//     handler's getStatCounter never registers the per-tag counters.
+//
+// The owner's live template carries neither, so the emission is additive and
+// unconditional (the api/stats block it feeds is unconditional since W3),
+// preserving any policy fields the template already carries.
+func ensureStatsAndPolicy(m map[string]any) {
+	if _, ok := m["stats"]; !ok {
+		m["stats"] = map[string]any{}
+	}
+	policy, ok := m["policy"].(map[string]any)
+	if !ok {
+		policy = map[string]any{}
+		m["policy"] = policy
+	}
+	system, ok := policy["system"].(map[string]any)
+	if !ok {
+		system = map[string]any{}
+		policy["system"] = system
+	}
+	system["statsOutboundUplink"] = true
+	system["statsOutboundDownlink"] = true
 }
 
 // addBalancers renders pool_<cc> for every country in the selection and

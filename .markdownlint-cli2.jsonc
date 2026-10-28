@@ -1,0 +1,12 @@
+{
+  // README per the owner's README standard: shields badge rows wrapped in
+  // <div align="center"> and long badge/link lines (cindex precedent).
+  // MD051: GitHub anchors strip emoji, markdownlint cannot validate them.
+  // MD036: the centered bold tagline is part of the README style.
+  "config": {
+    "MD013": false,
+    "MD033": false,
+    "MD036": false,
+    "MD051": false
+  }
+}

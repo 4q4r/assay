@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,8 +19,10 @@ import (
 	"public_vpn/internal/model"
 	"public_vpn/internal/parse"
 	"public_vpn/internal/probe"
+	"public_vpn/internal/prune"
 	"public_vpn/internal/rank"
 	"public_vpn/internal/render"
+	"public_vpn/internal/stats"
 	"public_vpn/internal/store"
 
 	"github.com/spf13/cobra"
@@ -554,6 +557,224 @@ func selectionSize(path string) int {
 	return len(sel.Nodes)
 }
 
+func newMaintainCommand(cfgPath *string) *cobra.Command {
+	var opts maintainOptions
+	cmd := &cobra.Command{
+		Use:   "maintain",
+		Short: "One refresh wave: fetch → parse → filter → probe → geo → stats → prune → select → render → activate",
+		Long: `Runs the full maintenance wave (DESIGN.md §4.9): the W1–W3 pipeline stages
+in order, then the W4 stats poll (outbound traffic → geo-base) and dead-node
+pruning, and finally activates ONLY when the rendered config differs from the
+live one and passes the -test gate (L10). An unchanged render is a clear
+"no changes" no-op — the live config is never rewritten without a diff.
+
+Flags:
+  --no-activate  render and diff only; never touch the live config
+  --skip-probe   reselect from the cold base without probing (geo is skipped
+                 too — it consumes fresh probe exit IPs; rank's geo.ttl
+                 freshness gate drops stale-alive records on its own)
+  --speedtest    run the probe wave with -S throughput measurement (weekly
+                 speedtest timer)`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := load(*cfgPath)
+			if err != nil {
+				return err
+			}
+			return runMaintain(cmd.OutOrStdout(), cfg, opts, defaultMaintainStages(opts))
+		},
+	}
+	cmd.Flags().BoolVar(&opts.noActivate, "no-activate", false,
+		"render and diff only; never activate even when the render differs")
+	cmd.Flags().BoolVar(&opts.skipProbe, "skip-probe", false,
+		"reselect from the cold base without probing (skips probe and geo)")
+	cmd.Flags().BoolVar(&opts.speedtest, "speedtest", false,
+		"run the probe wave with throughput measurement (weekly speedtest wave)")
+	return cmd
+}
+
+// maintainOptions carries the maintain command's flags into the wave.
+type maintainOptions struct {
+	noActivate bool
+	skipProbe  bool
+	speedtest  bool
+}
+
+// maintainStages is the wave's seam: each pipeline stage as a function, so
+// orchestration is testable without network/tooling. Production stages are
+// the W1–W3 runners — the wave reuses them 1:1, never duplicating logic.
+type maintainStages struct {
+	fetch    func(*cobra.Command, *config.Config) error
+	parse    func(*cobra.Command, *config.Config) error
+	filter   func(*cobra.Command, *config.Config) error
+	probe    func(*cobra.Command, *config.Config) error
+	geo      func(*cobra.Command, *config.Config) error
+	stats    func(*cobra.Command, *config.Config) error
+	prune    func(*cobra.Command, *config.Config) error
+	selectS  func(*cobra.Command, *config.Config) error
+	render   func(*cobra.Command, *config.Config) error
+	activate func(*cobra.Command, *config.Config) error
+}
+
+// defaultMaintainStages wires the real runners. filter runs with the config
+// cap (no CLI override inside the wave); probe runs full-set with speedtest
+// only when the wave carries it.
+func defaultMaintainStages(opts maintainOptions) *maintainStages {
+	return &maintainStages{
+		fetch:    runFetch,
+		parse:    runParse,
+		filter:   func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
+		probe:    func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, "") },
+		geo:      runGeo,
+		stats:    runStatsStage,
+		prune:    runPruneStage,
+		selectS:  runSelect,
+		render:   runRender,
+		activate: runActivateStage,
+	}
+}
+
+// runMaintain executes one maintenance wave. Stage failures fail the wave
+// loud — except the stats poll, which is accounting, not correctness: an
+// unreachable API inbound (first run before the owner ever activated) must
+// not block the refresh, so it surfaces as a loud warning line instead.
+func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages) error {
+	// The wave's stages print through their own writer; give them a command
+	// shim bound to w so the seam stays signature-compatible with the W1–W3
+	// runners.
+	cmd := &cobra.Command{}
+	cmd.SetOut(w)
+
+	outf(w, "maintain: refresh wave starting (probe=%t, speedtest=%t, activate=%t)\n",
+		!opts.skipProbe, opts.speedtest, !opts.noActivate)
+
+	run := func(name string, stage func(*cobra.Command, *config.Config) error) error {
+		if err := stage(cmd, cfg); err != nil {
+			return fmt.Errorf("maintain stage %s: %w", name, err)
+		}
+		return nil
+	}
+	if err := run("fetch", stages.fetch); err != nil {
+		return err
+	}
+	if err := run("parse", stages.parse); err != nil {
+		return err
+	}
+	if err := run("filter", stages.filter); err != nil {
+		return err
+	}
+	if !opts.skipProbe {
+		if err := run("probe", stages.probe); err != nil {
+			return err
+		}
+		if err := run("geo", stages.geo); err != nil {
+			return err
+		}
+	}
+	if err := stages.stats(cmd, cfg); err != nil {
+		outf(w, "WARNING: stats poll unavailable: %v (continuing — traffic accounting is not correctness)\n", err)
+	}
+	if err := run("prune", stages.prune); err != nil {
+		return err
+	}
+	if err := run("select", stages.selectS); err != nil {
+		return err
+	}
+	if err := run("render", stages.render); err != nil {
+		return err
+	}
+	if opts.noActivate {
+		outln(w, "maintain: --no-activate — live config not touched")
+		return nil
+	}
+	if err := stages.activate(cmd, cfg); err != nil {
+		return fmt.Errorf("maintain stage activate: %w", err)
+	}
+	return nil
+}
+
+// runStatsStage polls the live client's StatsService and folds the per-tag
+// deltas into the geo-base (W4 accounting; package stats owns the contract).
+func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
+	p := newPaths(cfg)
+	records, err := store.ReadGeo(p.geoBase)
+	if err != nil {
+		return err
+	}
+	res, err := stats.Run(context.Background(), stats.Options{
+		BinPath: config.ExpandHome(cfg.Activate.XrayBin),
+		Server:  fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort),
+		Pattern: "outbound>>>pool-",
+		Timeout: 10 * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	updated, totalUp, totalDown := stats.Fold(records, res.Deltas)
+	if updated > 0 {
+		if err := store.WriteGeo(p.geoBase, records); err != nil {
+			return err
+		}
+	}
+	outf(cmd.OutOrStdout(), "stats: polled at %s — %d pool counters, %d records updated (+%d up / +%d down bytes)\n",
+		res.PolledAt, res.RawCounters, updated, totalUp, totalDown)
+	return nil
+}
+
+// runPruneStage removes dead/ttl-stale-orphan records from the geo-base and
+// reports the wave's filter set as "still referenced" (package prune owns the
+// rules). A pruning pass that removes anything leaves a .bak-<ts> backup of
+// the pre-prune store next to it.
+func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
+	p := newPaths(cfg)
+	records, err := store.ReadGeo(p.geoBase)
+	if err != nil {
+		return err
+	}
+	filtered, err := store.ReadNodes(p.filtered)
+	if err != nil {
+		return err
+	}
+	referenced := make(map[string]bool, len(filtered))
+	for _, n := range filtered {
+		referenced[prune.Identity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})] = true
+	}
+	kept, removed, report := prune.Select(records, referenced, prune.Options{
+		DeadAfter: cfg.Maintain.PruneDeadAfter.Duration,
+		TTL:       cfg.Geo.TTL.Duration,
+		Now:       time.Now().UTC(),
+	})
+	if len(removed) == 0 {
+		outf(cmd.OutOrStdout(), "prune: nothing to remove (%d records checked, dead_after=%s ttl=%s)\n",
+			len(records), cfg.Maintain.PruneDeadAfter.Duration, cfg.Geo.TTL.Duration)
+		return nil
+	}
+	backupPath, err := store.RewriteGeoWithBackup(p.geoBase, kept, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	outf(cmd.OutOrStdout(), "prune: removed %d records (%d dead_after, %d ttl-stale orphans), %d kept → backup %s\n",
+		len(removed), report.RemovedDead, report.RemovedStale, report.Kept, orNone(backupPath))
+	return nil
+}
+
+// runActivateStage is the activate-if-changed gate: an unchanged render is a
+// no-op with a clear line (the live config is never rewritten without a
+// diff); a differing render goes through the W3 activate path (-test gate →
+// backup → atomic replace).
+func runActivateStage(cmd *cobra.Command, cfg *config.Config) error {
+	p := newPaths(cfg)
+	rendered, err := os.ReadFile(p.rendered)
+	if err != nil {
+		return fmt.Errorf("no rendered config (%s) — the render stage must run before activation", p.rendered)
+	}
+	live, err := os.ReadFile(config.ExpandHome(cfg.Activate.Target))
+	if err == nil && bytes.Equal(rendered, live) {
+		outln(cmd.OutOrStdout(), "no changes — the live config already matches the rendered pool; nothing activated")
+		return nil
+	}
+	return runActivate(cmd, cfg, "", true)
+}
+
 func newStatusCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -634,6 +855,7 @@ func printGeoStatus(out io.Writer, p paths) {
 		return
 	}
 	alive, countries := 0, map[string]bool{}
+	var up, down int64
 	for _, r := range recs {
 		if r.Alive {
 			alive++
@@ -641,8 +863,11 @@ func printGeoStatus(out io.Writer, p paths) {
 		if r.Country != "" {
 			countries[r.Country] = true
 		}
+		up += r.BytesUp
+		down += r.BytesDown
 	}
-	outf(out, "geo:      %d records, %d alive, %d countries\n", len(recs), alive, len(countries))
+	outf(out, "geo:      %d records, %d alive, %d countries, traffic folded: %d up / %d down bytes\n",
+		len(recs), alive, len(countries), up, down)
 }
 
 func printSelectionStatus(out io.Writer, p paths) {
@@ -679,15 +904,4 @@ func countLines(path string) (int, error) {
 		}
 	}
 	return n, nil
-}
-
-func newMaintainCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "maintain",
-		Short: "Timed maintenance waves (refresh/speedtest/stats poll) — NOT IMPLEMENTED in W1–W3",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return fmt.Errorf("%s: maintain (timers, stats pruning, README) is wave W4 per DESIGN.md §11 — nothing executed",
-				notImplemented)
-		},
-	}
 }

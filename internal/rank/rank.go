@@ -57,7 +57,7 @@ func collectCandidates(
 		if !ok || !g.Alive || g.Country == "" {
 			continue
 		}
-		if maxAliveAge > 0 && !aliveDataFresh(g.LastProbe, maxAliveAge, time.Now()) {
+		if maxAliveAge > 0 && !AliveDataFresh(g.LastProbe, maxAliveAge, time.Now()) {
 			continue
 		}
 		c := candidate{node: n, rec: g}
@@ -71,10 +71,11 @@ func collectCandidates(
 	return cands
 }
 
-// aliveDataFresh reports whether the record's last_probe timestamp is present
+// AliveDataFresh reports whether the record's last_probe timestamp is present
 // and within maxAge of now. Unparseable or missing timestamps carry no fresh
-// liveness evidence.
-func aliveDataFresh(lastProbe string, maxAge time.Duration, now time.Time) bool {
+// liveness evidence. Exported for the W4 prune stage, which must reuse rank's
+// exact freshness semantics (never a divergent copy).
+func AliveDataFresh(lastProbe string, maxAge time.Duration, now time.Time) bool {
 	if lastProbe == "" {
 		return false
 	}
