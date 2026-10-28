@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -52,6 +53,43 @@ type Delta struct {
 	Up   int64
 	Down int64
 }
+
+// Class is how a stats-stage failure must surface in the maintain wave
+// (W7 item 9): INFO = an expected first-run shape, never a warning;
+// WARNING = the endpoint misbehaved (accounting-only, wave continues);
+// LOUD = fold/write data loss, which FAILS the wave.
+type Class int
+
+// Stats-stage failure classes (W7 item 9).
+const (
+	// ClassInfo marks an expected first-run shape: the wave prints an INFO
+	// line and continues; the exit status is unaffected.
+	ClassInfo Class = iota
+	// ClassWarning marks an accounting-only failure: the wave prints the
+	// "stats poll unavailable" line and continues (today's behavior).
+	ClassWarning
+	// ClassLoud marks traffic data loss: the wave FAILS.
+	ClassLoud
+)
+
+// ClassifiedError carries a stats-stage failure together with its class.
+// runMaintain switches on the class: INFO prints an INFO line, WARNING
+// prints today's "stats poll unavailable" line, LOUD propagates as a real
+// wave failure (data loss is never silent).
+type ClassifiedError struct {
+	Class Class
+	Err   error
+}
+
+// NewClassified wraps err into a ClassifiedError of the given class.
+func NewClassified(class Class, err error) *ClassifiedError {
+	return &ClassifiedError{Class: class, Err: err}
+}
+
+func (e *ClassifiedError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the cause to errors.Is/errors.As.
+func (e *ClassifiedError) Unwrap() error { return e.Err }
 
 // Result reports what one poll observed.
 type Result struct {
@@ -195,4 +233,73 @@ func dropProxyEnv(env []string) []string {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// TargetHasAPI reports whether the activate target carries the api/stats
+// shape this stage polls — the same shape render emits (ensureAPIStats:
+// an `api` block, an `api-in` inbound on the configured stats port, and the
+// stats/policy blocks that make the counters exist). We render the target,
+// so reading it back is the honest first-run probe: a target without the
+// shape means the owner has never activated a rendered config yet, and the
+// poll cannot succeed no matter how it is retried. A target that does not
+// exist yet is the same first-run shape (false, nil); a target that exists
+// but cannot be read is an error — it must not silently read as "first run".
+func TargetHasAPI(targetPath string, statsPort int) (bool, error) {
+	raw, err := os.ReadFile(targetPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read activate target %s: %w", targetPath, err)
+	}
+	var m struct {
+		API      *json.RawMessage `json:"api"`
+		Stats    *json.RawMessage `json:"stats"`
+		Inbounds []struct {
+			Tag    string `json:"tag"`
+			Listen string `json:"listen"`
+			Port   int    `json:"port"`
+		} `json:"inbounds"`
+		Policy struct {
+			System struct {
+				StatsOutboundUplink   bool `json:"statsOutboundUplink"`
+				StatsOutboundDownlink bool `json:"statsOutboundDownlink"`
+			} `json:"system"`
+		} `json:"policy"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false, fmt.Errorf("decode activate target %s: %w", targetPath, err)
+	}
+	if m.API == nil || m.Stats == nil {
+		return false, nil
+	}
+	if !m.Policy.System.StatsOutboundUplink || !m.Policy.System.StatsOutboundDownlink {
+		return false, nil
+	}
+	for _, inb := range m.Inbounds {
+		if inb.Tag == "api-in" && inb.Port == statsPort {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// EndpointReachable reports whether the loopback stats endpoint accepts TCP
+// connections. A connection REFUSED is the signature of "the service is not
+// (yet) running the rendered config" — the expected state between an
+// activation and its manual restart, classified INFO. The probe is a direct
+// dial (no proxy env is ever honored by net.Dial), so landmine L5 cannot
+// skew it.
+func EndpointReachable(ctx context.Context, addr string) bool {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		// Every dial error — not just REFUSED — maps to the first-run INFO
+		// verdict upstream. That is acceptable because the stats stage only
+		// ever dials 127.0.0.1, so any failure here means "not listening
+		// yet", never a network or routing problem.
+		return false
+	}
+	_ = conn.Close()
+	return true
 }

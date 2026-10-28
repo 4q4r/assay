@@ -49,9 +49,11 @@ type Result struct {
 // silent loss must fail the render, not warn (review finding 5; W5 M-2 adds
 // extra).
 var materialParams = map[string]bool{
-	"ed":         true,
-	"early-data": true,
-	"extra":      true,
+	"ed":            true,
+	"early-data":    true,
+	"extra":         true,
+	"obfs":          true, // hysteria2 salamander/gecko obfs — no xray equivalent (W7 item 10)
+	"obfs-password": true, // ditto; dropping either silently changes the wire format
 }
 
 // networkAliases maps every link spelling of a renderable transport onto its
@@ -190,13 +192,6 @@ func Render(in Input) (Result, error) {
 	ensureStatsAndPolicy(m)
 
 	poolCount := len(in.Selection.Nodes)
-	if poolCount == 0 {
-		// L1/L2: nothing pool-related may render; the template passes through.
-		b, err := json.MarshalIndent(m, "", "  ")
-		return Result{Config: b}, err
-	}
-
-	cfg := normalizeKnobs(in.Cfg)
 
 	byTag := map[string]bool{}
 	for _, o := range toAnySlice(m["outbounds"]) {
@@ -207,41 +202,60 @@ func Render(in Input) (Result, error) {
 		}
 	}
 
+	cfg := normalizeKnobs(in.Cfg)
+
 	var dropped []ParamWarning
-	for _, sn := range in.Selection.Nodes {
-		n, ok := in.NodesByKey[sn.Key]
-		if !ok {
-			return Result{}, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
+	renderedBalancers := []string{}
+	if poolCount > 0 {
+		for _, sn := range in.Selection.Nodes {
+			n, ok := in.NodesByKey[sn.Key]
+			if !ok {
+				return Result{}, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
+			}
+			ob, unparsed, err := buildOutbound(n, sn.Tag, cfg)
+			if err != nil {
+				return Result{}, err
+			}
+			if len(unparsed) > 0 {
+				dropped = append(dropped, ParamWarning{Tag: sn.Tag, Host: n.Host, Params: unparsed})
+			}
+			if byTag[sn.Tag] {
+				return Result{}, fmt.Errorf("render: outbound tag %q already exists in template (namespace collision)", sn.Tag)
+			}
+			m["outbounds"] = append(toAnySlice(m["outbounds"]), ob)
+			byTag[sn.Tag] = true
 		}
-		ob, unparsed, err := buildOutbound(n, sn.Tag, cfg)
-		if err != nil {
-			return Result{}, err
+
+		renderedBalancers = addBalancers(m, in.Selection, cfg.BalancerTolerance)
+
+		// Plan A: legacy observatory covering exactly the pool namespace. The
+		// burstObservatory (Germans) is untouched — verified coexistence.
+		// probeInterval is a verbatim passthrough of the observatory_interval
+		// knob; the L1 empty-selector refusal above is untouched by it.
+		m["observatory"] = map[string]any{
+			"subjectSelector":   []any{poolOutboundPrefix},
+			"probeInterval":     cfg.ObservatoryInterval,
+			"enableConcurrency": true,
 		}
-		if len(unparsed) > 0 {
-			dropped = append(dropped, ParamWarning{Tag: sn.Tag, Host: n.Host, Params: unparsed})
-		}
-		if byTag[sn.Tag] {
-			return Result{}, fmt.Errorf("render: outbound tag %q already exists in template (namespace collision)", sn.Tag)
-		}
-		m["outbounds"] = append(toAnySlice(m["outbounds"]), ob)
-		byTag[sn.Tag] = true
 	}
 
-	renderedBalancers := addBalancers(m, in.Selection, cfg.BalancerTolerance)
-
-	// Plan A: legacy observatory covering exactly the pool namespace. The
-	// burstObservatory (Germans) is untouched — verified coexistence.
-	// probeInterval is a verbatim passthrough of the observatory_interval
-	// knob; the L1 empty-selector refusal above is untouched by it.
-	m["observatory"] = map[string]any{
-		"subjectSelector":   []any{poolOutboundPrefix},
-		"probeInterval":     cfg.ObservatoryInterval,
-		"enableConcurrency": true,
-	}
-
+	// [render].pool_routes are validated on EVERY render regardless of pool
+	// state (W7 hoist — it used to sit behind the empty-pool early return).
+	// With an empty pool no pool balancer/outbound exists, so any configured
+	// route target fails loud right here: the owner learns about the typo
+	// immediately instead of the rule silently falling through to the
+	// template's catch-all (D2). Zero routes (default config) is a no-op, so
+	// empty-pool renders stay byte-identical.
 	if err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers, byTag, cfg.PoolInboundTags); err != nil {
 		return Result{}, err
 	}
+
+	if poolCount == 0 {
+		// L1/L2: nothing pool-related may render; the template passes through.
+		b, err := json.MarshalIndent(m, "", "  ")
+		return Result{Config: b}, err
+	}
+
 	b, err := json.MarshalIndent(m, "", "  ")
 	return Result{Config: b, DroppedParams: dropped}, err
 }
@@ -376,9 +390,9 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 	apiIn := map[string]any{
 		"tag":      "api-in",
 		"listen":   "127.0.0.1",
-		"port":     statsPort,
+		keyPort:    statsPort,
 		"protocol": "dokodemo-door",
-		"settings": map[string]any{"address": "127.0.0.1"},
+		"settings": map[string]any{keyAddress: "127.0.0.1"},
 	}
 	replaced := false
 	inbounds := toAnySlice(m["inbounds"])
@@ -643,6 +657,13 @@ func templateInboundTags(m map[string]any) tagSet {
 	return set
 }
 
+// Repeated dial-block vocabulary as constants (goconst): the xray outbound
+// settings keys every protocol dial shares.
+const (
+	keyAddress = "address"
+	keyPort    = "port"
+)
+
 // buildOutbound converts one node into a complete xray outbound. Auth and
 // transport params are copied 1:1 from the link (L9); only sockopt.tcpMaxSeg
 // and the client TLS fingerprint are owner-mandated overrides (values from
@@ -681,10 +702,15 @@ func buildOutbound(n *model.Node, tag string, cfg Config) (map[string]any, []str
 }
 
 // protocolName maps the link scheme onto the xray outbound protocol name
-// (the ss share scheme renders as protocol "shadowsocks").
+// (the ss share scheme renders as protocol "shadowsocks"; the hysteria2
+// share scheme renders as protocol "hysteria" — the core's hysteria2 client,
+// version == 2, verified against 26.3.27).
 func protocolName(scheme string) string {
 	if scheme == "ss" {
 		return "shadowsocks"
+	}
+	if scheme == "hysteria2" {
+		return "hysteria"
 	}
 	return scheme
 }
@@ -695,6 +721,14 @@ func protocolName(scheme string) string {
 // consulted is recorded in consumed so unrendered params surface in the drop
 // report.
 func buildStreamSettings(n *model.Node, consumed map[string]bool, cfg Config) (map[string]any, error) {
+	// hysteria2 is scheme-driven, not param-driven: the transport is ALWAYS
+	// hysteria (QUIC) and security is ALWAYS tls — the QUIC dialer errors
+	// "tls config is nil" at runtime otherwise (dialer.go Dial), while -test
+	// would happily pass a no-TLS variant. Rendered below, bypassing the
+	// param-driven network/security resolution.
+	if n.Scheme == "hysteria2" {
+		return buildHysteria2StreamSettings(n, consumed, cfg), nil
+	}
 	network, err := networkOf(n, consumed)
 	if err != nil {
 		return nil, err
@@ -726,6 +760,28 @@ func buildStreamSettings(n *model.Node, consumed map[string]bool, cfg Config) (m
 	return stream, nil
 }
 
+// buildHysteria2StreamSettings renders the verified hysteria2 construct
+// (W7 item 10; probes 8/10b/11 passed `xray run -test` on 26.3.27):
+//
+//	{"network": "hysteria", "security": "tls",
+//	 "hysteriaSettings": {"version": 2, "auth": <credential>},
+//	 "tlsSettings": {...}}
+//
+// NO sockopt: tcpMaxSeg is TCP-gated in the core (isTCPSocket,
+// transport/internet/sockopt_linux.go) and this transport dials UDP — the
+// emission would be inert noise, and hysteria2 is not stream-based.
+// The auth credential is the link's userinfo (may be empty — the official
+// URI spec marks it optional; never fabricated).
+func buildHysteria2StreamSettings(n *model.Node, consumed map[string]bool, cfg Config) map[string]any {
+	tls := buildTLSSettings(n.Params, consumed, cfg.TLSFingerprint)
+	return map[string]any{
+		"network":          "hysteria",
+		"security":         "tls",
+		"hysteriaSettings": map[string]any{"version": 2, "auth": n.UUID},
+		"tlsSettings":      tls,
+	}
+}
+
 func buildTLSSettings(p map[string]string, consumed map[string]bool, fingerprint string) map[string]any {
 	tls := map[string]any{"fingerprint": fingerprint}
 	// The link's own fp is the same datum (TLS fingerprint) with a mandated
@@ -738,6 +794,18 @@ func buildTLSSettings(p map[string]string, consumed map[string]bool, fingerprint
 	if v := p["alpn"]; v != "" {
 		consumed["alpn"] = true
 		tls["alpn"] = strings.Split(v, ",")
+	}
+	// pinSHA256 (hysteria2) → pinnedPeerCertSha256: the SAME datum (hex or
+	// OpenSSL colon-hex, core strips colons, must decode to 32 bytes). An
+	// invalid value fails the xray -test gate loud.
+	if v := p["pinsha256"]; v != "" {
+		consumed["pinsha256"] = true
+		tls["pinnedPeerCertSha256"] = v
+	}
+	// ech → echConfigList: the same base64 ECH-config-list datum.
+	if v := p["ech"]; v != "" {
+		consumed["ech"] = true
+		tls["echConfigList"] = v
 	}
 	// allowInsecure/insecure are deliberately NOT consumed: this core removed
 	// the feature (config build errors; migrated to pinnedPeerCertSha256), so
@@ -972,9 +1040,25 @@ func buildDialSettings(n *model.Node, consumed map[string]bool) (map[string]any,
 		return buildVMESSDial(n, consumed)
 	case "ss":
 		return buildSSDial(n, consumed)
+	case "hysteria2":
+		return buildHysteria2Dial(n)
 	default:
 		return nil, fmt.Errorf("render: unsupported scheme %q", n.Scheme)
 	}
+}
+
+// buildHysteria2Dial renders the verified outbound settings shape:
+// {"version": 2, "address": H, "port": P} (infra/conf/hysteria.go:
+// HysteriaClientConfig — version MUST be 2, address+port are flat). The
+// empty-host guard is defensive: a record with a lost host would hit the
+// core's own nil-pointer PANIC (HysteriaClientConfig.Build → Address.Build,
+// probed 2026-10-28: SIGSEGV) — the renderer refuses loud instead.
+func buildHysteria2Dial(n *model.Node) (map[string]any, error) {
+	if n.Host == "" {
+		return nil, errors.New(
+			"render: hysteria2 outbound has an empty host — refusing: the core's own builder panics on a nil address (L9)")
+	}
+	return map[string]any{"version": 2, keyAddress: n.Host, keyPort: n.Port}, nil
 }
 
 // buildSSDial renders the shadowsocks outbound (verified against Xray-core
@@ -1000,8 +1084,8 @@ func buildSSDial(n *model.Node, consumed map[string]bool) (map[string]any, error
 				"auth material, refusing to render an empty credential (L9)", n.Host)
 	}
 	return map[string]any{"servers": []any{map[string]any{
-		"address":  n.Host,
-		"port":     n.Port,
+		keyAddress: n.Host,
+		keyPort:    n.Port,
 		"method":   method,
 		"password": password,
 	}}}, nil
@@ -1014,16 +1098,16 @@ func buildVLESSDial(n *model.Node, consumed map[string]bool) map[string]any {
 		user["flow"] = v
 	}
 	return map[string]any{"vnext": []any{map[string]any{
-		"address": n.Host,
-		"port":    n.Port,
-		"users":   []any{user},
+		keyAddress: n.Host,
+		keyPort:    n.Port,
+		"users":    []any{user},
 	}}}
 }
 
 func buildTrojanDial(n *model.Node) map[string]any {
 	return map[string]any{"servers": []any{map[string]any{
-		"address":  n.Host,
-		"port":     n.Port,
+		keyAddress: n.Host,
+		keyPort:    n.Port,
 		"password": n.UUID,
 	}}}
 }
@@ -1051,9 +1135,9 @@ func buildVMESSDial(n *model.Node, consumed map[string]bool) (map[string]any, er
 		consumed["scy"] = true
 	}
 	return map[string]any{"vnext": []any{map[string]any{
-		"address": n.Host,
-		"port":    n.Port,
-		"users":   []any{map[string]any{"id": n.UUID, "alterId": aid, "security": security}},
+		keyAddress: n.Host,
+		keyPort:    n.Port,
+		"users":    []any{map[string]any{"id": n.UUID, "alterId": aid, "security": security}},
 	}}}, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -721,7 +722,12 @@ func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *
 		}
 	}
 	if err := stages.stats(cmd, cfg); err != nil {
-		outf(w, "WARNING: stats poll unavailable: %v (continuing — traffic accounting is not correctness)\n", err)
+		// W7 item 9: the stats stage classifies its own failures (see
+		// reportStatsFailure). Injected stages returning plain errors keep
+		// the WARNING behavior.
+		if fatal := reportStatsFailure(w, err); fatal != nil {
+			return fatal
+		}
 	}
 	if err := run("prune", stages.prune); err != nil {
 		return err
@@ -742,27 +748,88 @@ func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *
 	return nil
 }
 
+// reportStatsFailure surfaces one stats-stage failure by its class
+// (W7 item 9):
+//   - LOUD — a fold/write error into the geo-base: returned as a real wave
+//     failure, because traffic data loss is never silent;
+//   - INFO — an expected first-run shape (the live config has never carried
+//     the rendered api/stats block, or the endpoint refuses connections
+//     because the service was not restarted after activation): printed as an
+//     INFO line, never a warning;
+//   - WARNING (also the fallback for plain errors from injected stages) —
+//     today's accounting-only behavior: printed as the "stats poll
+//     unavailable" line, and the wave continues.
+func reportStatsFailure(w io.Writer, err error) error {
+	var ce *stats.ClassifiedError
+	switch {
+	case errors.As(err, &ce) && ce.Class == stats.ClassLoud:
+		return fmt.Errorf("maintain stage stats: %w", err)
+	case errors.As(err, &ce) && ce.Class == stats.ClassInfo:
+		outf(w, "INFO: %v\n", err)
+	default:
+		outf(w, "WARNING: stats poll unavailable: %v (continuing — traffic accounting is not correctness)\n", err)
+	}
+	return nil
+}
+
 // runStatsStage polls the live client's StatsService and folds the per-tag
 // deltas into the geo-base (W4 accounting; package stats owns the contract).
+// W7 item 9: every failure leaves this function CLASSIFIED —
+//   - INFO: the activate target lacks the rendered api/stats shape (we render
+//     it, so we read it back), or the loopback endpoint refuses connections
+//     (the service was not restarted since activation). The poll is skipped
+//     without exec'ing xray; the wave continues, exit status unaffected.
+//   - WARNING: the endpoint is reachable but the poll fails at the protocol
+//     level (or the store/target cannot be read) — today's accounting-only
+//     behavior.
+//   - LOUD: a fold/write failure into the geo-base. Returning it as a real
+//     error (not a warning) retires the old behavior where the generic
+//     "stats poll unavailable" line masked write failures — traffic data
+//     loss never passes silently.
 func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 	p := newPaths(cfg)
+	// Deliberate asymmetry: a geo-base READ failure is a WARNING (accounting
+	// skips this wave, destroys nothing), while the WRITE failure below is
+	// LOUD because freshly polled deltas would be discarded — never flip
+	// this read arm to LOUD and block node refresh on a transient store
+	// hiccup.
 	records, err := store.ReadGeo(p.geoBase)
 	if err != nil {
-		return err
+		return stats.NewClassified(stats.ClassWarning,
+			fmt.Errorf("read geo-base for stats folding: %w", err))
 	}
+	server := fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort)
+
+	target := config.ExpandHome(cfg.Activate.Target)
+	hasAPI, err := stats.TargetHasAPI(target, cfg.Render.StatsPort)
+	if err != nil {
+		return stats.NewClassified(stats.ClassWarning, err)
+	}
+	if !hasAPI {
+		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
+			"stats will be available after the first activation + service restart; "+
+				"skipping accounting this wave (target %s lacks the rendered api/stats shape)", target))
+	}
+	if !stats.EndpointReachable(context.Background(), server) {
+		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
+			"stats will be available after the first activation + service restart; "+
+				"skipping accounting this wave (%s connection refused — the service is not running the activated config)", server))
+	}
+
 	res, err := stats.Run(context.Background(), stats.Options{
 		BinPath: config.ExpandHome(cfg.Activate.XrayBin),
-		Server:  fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort),
+		Server:  server,
 		Pattern: "outbound>>>pool-",
 		Timeout: cfg.Maintain.StatsTimeout.Duration,
 	})
 	if err != nil {
-		return err
+		return stats.NewClassified(stats.ClassWarning, err)
 	}
 	updated, totalUp, totalDown := stats.Fold(records, res.Deltas)
 	if updated > 0 {
 		if err := store.WriteGeo(p.geoBase, records); err != nil {
-			return err
+			return stats.NewClassified(stats.ClassLoud,
+				fmt.Errorf("fold stats deltas into %s: %w — traffic accounting data would be lost", p.geoBase, err))
 		}
 	}
 	outf(cmd.OutOrStdout(), "stats: polled at %s — %d pool counters, %d records updated (+%d up / +%d down bytes)\n",
@@ -786,7 +853,7 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
 	}
 	referenced := make(map[string]bool, len(filtered))
 	for _, n := range filtered {
-		referenced[prune.Identity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})] = true
+		referenced[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})] = true
 	}
 	kept, removed, report := prune.Select(records, referenced, prune.Options{
 		DeadAfter: cfg.Maintain.PruneDeadAfter.Duration,

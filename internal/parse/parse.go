@@ -21,17 +21,22 @@ import (
 
 // Accepted schemes (xray-core client protocols only).
 const (
-	SchemeVLESS  = "vless"
-	SchemeVMESS  = "vmess"
-	SchemeTrojan = "trojan"
-	SchemeSS     = "ss"
+	SchemeVLESS     = "vless"
+	SchemeVMESS     = "vmess"
+	SchemeTrojan    = "trojan"
+	SchemeSS        = "ss"
+	SchemeHysteria2 = "hysteria2"
 )
 
 // rejectedSchemes are counted per kind. ss is PARSED (acceptance is a filter
-// policy — [filter].protocols, default vless,vmess,trojan); tuic/hy2 and the
-// rest are not xray-core client protocols at all.
+// policy — [filter].protocols, default vless,vmess,trojan); hysteria2 (and
+// its documented hy2:// alias) is PARSED the same way — the xray 26.3.27
+// core ships a real hysteria2 client (proxy/hysteria, version == 2 verified
+// against the binary and the tagged source, 2026-10-28). hysteria v1 links
+// stay rejected: the core refuses version != 2, and the v1 wire protocol is
+// a different protocol entirely.
 var rejectedSchemes = map[string]bool{
-	"tuic": true, "hy2": true, "hysteria": true, "hysteria2": true,
+	"tuic": true, "hysteria": true,
 	"ssr": true, "socks": true, "http": true, "https": true,
 }
 
@@ -47,7 +52,8 @@ type Result struct {
 // IsSupported reports whether a line starts with an accepted scheme.
 func IsSupported(line string) bool {
 	s := schemeOf(line)
-	return s == SchemeVLESS || s == SchemeVMESS || s == SchemeTrojan || s == SchemeSS
+	return s == SchemeVLESS || s == SchemeVMESS || s == SchemeTrojan || s == SchemeSS ||
+		s == SchemeHysteria2 || s == "hy2"
 }
 
 func schemeOf(line string) string {
@@ -124,9 +130,40 @@ func Link(source, line string) (*model.Node, error) {
 		return parseVMESS(source, line)
 	case SchemeSS:
 		return parseSS(source, line)
+	case "hy2", SchemeHysteria2:
+		// hy2:// is the documented alias of hysteria2:// — both normalize to
+		// the one scheme so the dedupe identity is shared.
+		return parseHysteria2(source, line)
 	default:
 		return nil, fmt.Errorf("unsupported scheme %q", scheme)
 	}
+}
+
+// parseHysteria2 normalizes a hysteria2:// / hy2:// share link (official URI
+// scheme, v2.hysteria.network/docs/developers/URI-Scheme):
+// [auth@]host:port?obfs&obfs-password&sni&insecure&pinSHA256&ech#name.
+// auth is OPTIONAL per the spec (unlike vless/trojan userinfo), so an empty
+// credential parses; the renderer passes it through 1:1. All query params
+// land in Params verbatim (L9) — obfs/obfs-password cannot be expressed by
+// the xray core and fail the RENDER loud (material transport behavior),
+// never the parse.
+func parseHysteria2(source, line string) (*model.Node, error) {
+	u, err := url.Parse(line)
+	if err != nil {
+		return nil, fmt.Errorf("parse uri: %w", err)
+	}
+	cred := ""
+	if u.User != nil {
+		cred = u.User.Username()
+	}
+	host, port, params, frag, err := linkTarget(u)
+	if err != nil {
+		return nil, err
+	}
+	n := model.NewNode(source, SchemeHysteria2, cred, host, port, params)
+	n.Fragment = frag
+	n.LastSeen = time.Now().UTC()
+	return n, nil
 }
 
 func parseUserinfoLink(source, scheme, line string) (*model.Node, error) {

@@ -276,7 +276,7 @@ func TestPartialProbeWaveLeavesUnprobedRecordsUntouched(t *testing.T) {
 	require.NoError(t, err)
 	beforeByKey := map[string]*model.GeoRecord{}
 	for _, r := range before {
-		beforeByKey[store.GeoIdentity(r)] = r
+		beforeByKey[model.GeoIdentity(r)] = r
 	}
 
 	// Partial probe wave: only the FIRST node was probed (probe --limit 1
@@ -305,8 +305,8 @@ func TestPartialProbeWaveLeavesUnprobedRecordsUntouched(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, after, 3)
 	for _, r := range after {
-		was, ok := beforeByKey[store.GeoIdentity(r)]
-		require.True(t, ok, "identity %s must survive", store.GeoIdentity(r))
+		was, ok := beforeByKey[model.GeoIdentity(r)]
+		require.True(t, ok, "identity %s must survive", model.GeoIdentity(r))
 		if r.Host == "one.example.com" {
 			continue // probed node: fresh values expected
 		}

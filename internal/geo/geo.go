@@ -113,7 +113,7 @@ func mergeGeoRecords(in Input, byIP map[string]Response, ipByNode map[string]str
 	}
 	prevByKey := map[string]*model.GeoRecord{}
 	for _, e := range existing {
-		prevByKey[store.GeoIdentity(e)] = e
+		prevByKey[model.GeoIdentity(e)] = e
 	}
 	now := time.Now().UTC()
 	// Same-identity records (scheme|host|port) can arrive from distinct node
@@ -152,7 +152,7 @@ func mergeGeoRecords(in Input, byIP map[string]Response, ipByNode map[string]str
 			Source: n.Source, Scheme: n.Scheme, Host: n.Host, Port: n.Port,
 			FirstSeen: now.Format(time.RFC3339), LastSeen: now.Format(time.RFC3339),
 		}
-		if prev, ok := prevByKey[store.GeoIdentity(rec)]; ok {
+		if prev, ok := prevByKey[model.GeoIdentity(rec)]; ok {
 			rec = prev
 			rec.LastSeen = now.Format(time.RFC3339)
 		}

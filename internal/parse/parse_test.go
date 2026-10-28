@@ -95,17 +95,15 @@ func TestParseVMESSURLForm(t *testing.T) {
 func TestRejectedSchemesAreCounted(t *testing.T) {
 	lines := []string{
 		"tuic://uuid@h:443?congestion_control=bbr",
-		"hy2://pw@h:443",
 		"hysteria://pw@h:443",
-		"hysteria2://pw@h:443",
 		"ssr://base64stuff",
 		"vless://u@ok.example.com:443?security=tls&type=tcp#ok",
 	}
 	res := parse.Lines("s", strings.Join(lines, "\n"))
 	require.Len(t, res.Nodes, 1)
-	assert.Equal(t, 5, res.Rejected, "tuic/hy2/hysteria/hysteria2/ssr are rejected")
+	assert.Equal(t, 3, res.Rejected, "tuic/hysteria-v1/ssr are rejected (W7 item 10: hysteria2/hy2 moved to parsed — the core has a real hysteria2 client)")
 	assert.Equal(t, "ok.example.com", res.Nodes[0].Host)
-	assert.Len(t, res.RejectedKinds, 5)
+	assert.Len(t, res.RejectedKinds, 3)
 }
 
 // TestSSIsParsedNotRejected pins the W5 policy shift: ss links are PARSED

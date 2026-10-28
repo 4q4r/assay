@@ -48,8 +48,8 @@ func TestMergeGeoRecordsSameIdentityWinnerIsOrderIndependent(t *testing.T) {
 	nb := model.NewNode("s", "vless", "uuid-b", "dupe.example.com", 443,
 		map[string]string{"security": "tls", "type": "tcp"})
 	require.NotEqual(t, na.Key, nb.Key, "distinct credentials → distinct node keys")
-	require.Equal(t, store.GeoIdentity(&model.GeoRecord{Scheme: na.Scheme, Host: na.Host, Port: na.Port}),
-		store.GeoIdentity(&model.GeoRecord{Scheme: nb.Scheme, Host: nb.Host, Port: nb.Port}),
+	require.Equal(t, model.GeoIdentity(&model.GeoRecord{Scheme: na.Scheme, Host: na.Host, Port: na.Port}),
+		model.GeoIdentity(&model.GeoRecord{Scheme: nb.Scheme, Host: nb.Host, Port: nb.Port}),
 		"both nodes share one cold-base identity")
 	now := time.Now().UTC()
 	probeByKey := map[string]store.ProbeResult{

@@ -43,16 +43,16 @@ Default enabled: `matin`, `epodonios`, `radikal`, `haker`. `tvc` optional. **D9:
 
 ## 4. Pipeline
 
-```
+```text
 fetch → parse → filter → probe → geo → select → render → activate
                                           ↑______________ maintain (timers: refresh 6h, speedtest weekly, stats poll)
 ```
 
 1. **fetch** — curl each enabled source (cache, timeouts, retries). All network calls run with `env -u http_proxy -u https_proxy` (ambient-proxy landmine L5).
-2. **parse** — base64-detect + decode; per-line URI parse; accept `vless|vmess|trojan` (drop `tuic|hy2|hysteria|ssr` — not xray-core; `ss` optional-off initially); normalize to internal record; dedupe key = hash(host, port, credential, transport params).
+2. **parse** — base64-detect + decode; per-line URI parse; accept `vless|vmess|trojan` always, with `ss` and `hysteria2`/`hy2` opt-in via `[filter].protocols` (hysteria-v1, tuic and ssr stay rejected as not-xray-core/removed); normalize to internal record; dedupe key = hash(host, port, credential, transport params).
 3. **filter** — keep `security=reality|tls` only; drop `allowInsecure=1|insecure=true`; drop private/loopback hosts; per-source caps.
-4. **resolve + geo (exit-IP based, D8)** — for each ALIVE node, discover its EXIT IP through the tunnel itself (an ip-echo request fetched VIA the node connection during the probe wave), never the advertised host (relay/frontend ≠ exit). Enrich exit IPs via `ip-api.com /batch` (POST ≤100 IPs, 15 req/min, fields incl. `countryCode,city,isp,as,asname,proxy,hosting`; honor `X-Rl`/`X-Ttl`; HTTP-only free tier, non-commercial ToS). DNS via NSS (`getent hosts`, NOT `dig @8.8.8.8` — split-brain landmine L4) is for dialing only, never for geo. Output: `geo-base.jsonl` (cold base), TTL 24 h.
-5. **probe (out-of-band, xray-knife ≥ v10.1.0)** — real-tunnel liveness + latency (`http`), throughput (`--speedtest`), optional site-panel grading (`--check-preset`, `--url-success-threshold`) to reject captive-portal fakes. Default origin = this machine, throttled; optional VPS mode (footprint, §7). Never inside the live client.
+4. **probe (out-of-band, xray-knife ≥ v10.1.0)** — real-tunnel liveness + latency (`http`), throughput (`--speedtest`), optional site-panel grading (`--check-preset`, `--url-success-threshold`) to reject captive-portal fakes. Default origin = this machine, throttled; optional VPS mode (footprint, §7). Never inside the live client.
+5. **resolve + geo (exit-IP based, D8)** — for each ALIVE node, discover its EXIT IP through the tunnel itself (an ip-echo request fetched VIA the node connection during the probe wave), never the advertised host (relay/frontend ≠ exit). Enrich exit IPs via `ip-api.com /batch` (POST ≤100 IPs, 15 req/min, fields incl. `countryCode,city,isp,as,asname,proxy,hosting`; honor `X-Rl`/`X-Ttl`; HTTP-only free tier, non-commercial ToS). DNS via NSS (`getent hosts`, NOT `dig @8.8.8.8` — split-brain landmine L4) is for dialing only, never for geo. Output: `geo-base.jsonl` (cold base), TTL 24 h.
 6. **select** — rank by alive → checks → speed; country count UNLIMITED (D7); per-country cap K (default 3–5, configurable — keeps one country from hogging); global soft cap N=20–25 that EXPANDS when ≥25 distinct cities exist among alive nodes (recommended ceiling 40, configurable — CPU math §6); city-diversity tie-break; survivors → active set, everything else stays cold with probe history.
 7. **render** — template (bootstrapped once from the live config) + pool outbounds + balancers + rules:
    - every pool outbound gets `sockopt.tcpMaxSeg: 1440` and `fingerprint: "firefox"` (client-side override on tls/reality settings);
@@ -121,6 +121,7 @@ No xray core upgrade (L11). No auto-restart of the live service. No changes to G
 - **W4** — timers, stats pruning, README (owner README standard: TOC, badges, mermaid).
 
 **Quality gates (owner mandate 2026-10-28, binding):** latest stable Go toolchain (never downgrade); latest versions of all dependencies, each chosen best-fit and justified; lint + format at ZERO errors/warnings (gofmt/gofumpt + golangci-lint strict, .golangci.yml all-enabled, firefox-vpn-client precedent); full test matrix — unit, integration (network stages: httptest mocks by default + live tests behind explicit guards), load/benchmark (parse/select/render at 10k+ nodes), and regression (golden-file tests for rendered xray config — unexpected render diff = failure). No version pinning beyond dependency resolution. `go build`, `go vet`, `go test ./...`, lint — all clean, verbatim outputs in the report.
+
 - All implementation via subagents; branch → PR → squash-merge (local repo until the owner authorizes a remote). **Language: Go single binary (D11, confirmed).**
 
 ## 12. Resolved owner inputs (round 2, 2026-10-28 — implementation authorized)
