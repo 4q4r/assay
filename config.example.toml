@@ -1,0 +1,178 @@
+# publicvpn — sanitized EXAMPLE configuration (defaults + schema comments).
+#
+# This file documents every knob with its default value. Copy it to a private
+# `config.toml` (gitignored — operational values never belong in git) and fill
+# in your real paths. NOTHING here identifies a specific deployment.
+#
+# INTENTIONAL PLACEHOLDERS (documented): [render].template and [activate].target
+# use ~/path/to/... placeholders. `status`, `fetch`, `parse`, `filter`, `probe`
+# and `geo` load this file as-is; `render`/`activate` fail LOUD until those two
+# paths point at a real xray client template/config. There are no active
+# [[render.pool_routes]] entries — routes are per-deployment operator policy
+# (see the commented example in [render] below).
+#
+# Stages: fetch → parse → filter → probe → geo → select → render → activate.
+
+data_dir = "~/.local/share/publicvpn"
+
+# ── Sources (D9: repo ids + discovery method, raw URLs are NEVER pinned —
+#    discovery resolves current paths every wave). All repos below are public
+#    GitHub config aggregators; enable whichever you want to ingest. ─────────
+[sources.matin]
+repo = "MatinGhanbari/v2ray-configs"
+discovery = "github-contents"
+include = [
+  "subscriptions/v2ray/super-sub.txt",
+  "subscriptions/v2ray/all_sub.txt",
+  "subscriptions/filtered/subs/vless.txt",
+]
+enabled = true
+
+[sources.epodonios]
+repo = "Epodonios/v2ray-configs"
+discovery = "github-contents"
+include = [
+  "Splitted-By-Protocol/vless.txt",
+  "Splitted-By-Protocol/trojan.txt",
+]
+enabled = true
+
+[sources.radikal]
+repo = "0xRadikal/Free-v2ray-Configs"
+discovery = "manifest"          # reads index.json and follows the file URLs it lists
+manifest = "index.json"
+include = ["secure/configs.txt"] # SECURE list = forward-secrecy pre-filter
+enabled = true
+
+# Example of a disabled source: re-verify the repo id before enabling (D9
+# means only this block changes, no code).
+[sources.haker]
+repo = "haker23378-netizen/free-vpn-telegram"
+discovery = "github-contents"
+include = ["vless.txt"]
+enabled = false
+
+[fetch]
+timeout = "30s"
+retries = 3
+concurrency = 4
+# github_token = "ghp_…"  # optional; raises api.github.com rate limits
+# api_base = "https://api.github.com"        # mirror support: GitHub API host
+# raw_base = "https://raw.githubusercontent.com"  # mirror support: raw host
+# cache_max_age = "6h"  # Gap-0 freshness: a cached source body younger than
+#                       # this skips the network fetch entirely ("cache fresh,
+#                       # skipping"). Explicit "0s" = always fetch.
+
+[filter]
+# Per-source node cap per wave. 0 = unlimited. The `--source-cap` CLI flag
+# overrides this value for one run when set (both 0 = unlimited).
+source_cap = 0
+# Protocol acceptance allowlist (parse normalizes all of these; the filter
+# decides). Default vless,vmess,trojan — ss is opt-in: PSK-only shadowsocks
+# is weak crypto by design, and the reality/tls security requirement below
+# still applies on top (a plain ss link is dropped regardless).
+# protocols = ["vless", "vmess", "trojan", "ss"]
+# allow_insecure = false (default) drops links carrying allowInsecure=1.
+# true admits them into the pipeline — but the renderer CANNOT render the
+# flag: xray 26.3.27 removed allowInsecure (migrated to
+# pinnedPeerCertSha256), so an admitted link only loses the param with a
+# loud drop-report entry.
+allow_insecure = false
+
+[probe]
+path = "~/.local/bin/xray-knife"   # out-of-band prober (never inside the live client)
+timeout = "10s"
+threads = 20
+url = "https://cloudflare.com/cdn-cgi/trace"  # response carries the tunnel exit IP (D8)
+speedtest = false                   # -S throughput wave: run explicitly, it is slow
+speedtest_timeout = "30s"
+check_preset = ""                   # optional panel grading: cloudflare|global|google|gstatic|streaming
+url_success_threshold = 1.0
+db_path = "xray-knife.db"           # isolated knife DB under data_dir (never the user default)
+max_passed = 0                      # stop the wave after N passed nodes (0 = probe all)
+skip_fresh_within = "0s"            # skip re-probing nodes whose latest result is `passed`
+                                    # and newer than this window (0s = probe everything; failed/
+                                    # semi-passed/stale nodes are always re-probed)
+
+[geo]
+endpoint = "http://ip-api.com/batch"  # L6: free tier is HTTP-only, non-commercial
+batch_size = 100                      # ≤100 IPs per request
+per_minute = 15                       # ≤15 batch requests/min; a 429 risks a 1h ban
+ttl = "24h"                           # alive-data freshness: records whose last_probe is
+                                      # older are not selectable until re-probed
+                                      # (W4 maintain extends this into physical pruning)
+timeout = "15s"
+
+[select]
+per_country_cap = 3        # K: nodes per country (design guidance 3–5)
+soft_cap = 25              # N: global soft cap
+city_expand_threshold = 25 # expand N when ≥ this many distinct cities are alive
+ceiling = 40               # expansion bound (CPU safety)
+tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance joins the band
+
+[render]
+template = "~/path/to/template.json"  # PLACEHOLDER — read-only structure reference to
+                                      # your xray client config; set before render/activate
+output_dir = "rendered"
+stats_port = 15490                            # api/stats inbound, bound to 127.0.0.1 only
+pool_inbound_tags = ["socks-in", "http-in"]   # tags every pool rule carries; each MUST exist
+                                              # among the template's inbounds or the render
+                                              # fails loud (no silent D2 fall-through)
+observatory_interval = "60s"                  # Plan-A pool observatory probeInterval — verbatim
+                                              # passthrough, deliberately unbounded (owner ruling)
+tcp_max_seg = 1440                            # emitted MANDATORILY on every pool outbound
+                                              # (anti-TSPU MSS clamp); value configurable,
+                                              # emission not. NO range validation.
+tls_fingerprint = "firefox"                   # uTLS fingerprint on tls/reality; NO allowlist —
+                                              # a bad value fails the xray -test gate loud
+balancer_tolerance = 0.2                      # leastLoad tolerance on country AND city balancers
+                                              # NOTE: 0.0 is indistinguishable from unset here (and for
+                                              # select.tie_band_rtt_tolerance) — the zero value IS the
+                                              # "fall back to the default" signal; use the documented
+                                              # defaults (0.2 / 1.2) explicitly, never 0.0.
+
+# Pool routes (D2 trust wall): ONLY these destinations may reach the pool —
+# no entries means the pool is built but carries nothing (catch-all stays on
+# your own trusted outbounds). Inserted after the private-IP direct rule,
+# before catch-all. The target (`balancer`) is either a rendered pool_ balancer
+# or a direct pool-<cc>-NN outbound tag (D5: single-node cities render no city
+# balancer); anything else fails the render loud (D6). Routes are operator
+# policy — this example ships none active.
+#[[render.pool_routes]]
+#balancer = "pool_de"       # or e.g. "pool-de-01" (direct outbound tag)
+#domains = ["geosite:netflix", "domain:example.com"]
+
+[activate]
+target = "~/path/to/client-config.json"  # PLACEHOLDER — live client config; activate
+                                         # does -test gate + date-stamped backup + atomic
+                                         # replace (NEVER auto-restarts the service)
+xray_bin = "/usr/bin/xray"                  # core binary used for the -test gate
+# asset_dir = ""                            # XRAY_LOCATION_ASSET for -test; default: template dir
+backup_dir = "backups"
+test_timeout = "30s"          # bounds the `xray run -test` child; explicit "0s" = no deadline
+service_name = "xray-client.service"  # unit named in the printed restart hint (never auto-restarted)
+backup_keep = 0               # retain only the N newest config backups (0 = unlimited)
+
+[maintain]
+# prune_dead_after: a geo-base record that is not alive and whose last_probe
+# is older than this is removed by the maintain wave's pruning pass.
+# Additionally, records that rank's geo.ttl freshness check already refuses
+# AND whose node no longer appears in the current filter set are removed
+# physically (stale-but-referenced records stay refreshable). Every pruning
+# pass leaves geo-base.jsonl.bak-<ts> next to the store.
+prune_dead_after = "48h"
+# Recheck periods for the systemd timers (`publicvpn install` renders them
+# as OnUnitActiveSec; floor 5m — anything lower fails config validation).
+# NOTE: the 5m floor applies ONLY to these two maintenance intervals (W5,
+# owner-approved). Every other knob is deliberately unbounded.
+# Changing a period = edit here, then re-run `publicvpn install -c <config>`
+# (idempotent; `publicvpn status` flags a configured-vs-installed mismatch).
+refresh_interval = "6h"      # refresh wave recheck (default 6h)
+speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly)
+stats_timeout = "10s"        # bounds one `xray api statsquery` exec
+prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)
+
+[http]
+# user_agent = "public_vpn (pipeline; contact: owner)"
+# THE pipeline User-Agent — every HTTP client (fetch discovery + downloads,
+# geo batch enrichment) sends exactly this string.
