@@ -67,14 +67,11 @@ func ReadNodes(path string) ([]*model.Node, error) {
 	return nodes, sc.Err()
 }
 
-// GeoIdentity is the cold-base record identity.
-func GeoIdentity(g *model.GeoRecord) string {
-	return fmt.Sprintf("%s|%s|%d", g.Scheme, strings.ToLower(g.Host), g.Port)
-}
-
 // UpsertGeo merges records into the cold store by identity. Existing fields
 // that later waves leave empty survive; first_seen and a previously assigned
-// tag are never clobbered.
+// tag are never clobbered. The merged set is written sorted by identity, so
+// two runs over identical logical data produce a byte-identical file (Go map
+// iteration order must never reach the disk).
 func UpsertGeo(path string, records []*model.GeoRecord) error {
 	existing, err := ReadGeo(path)
 	if err != nil {
@@ -82,15 +79,18 @@ func UpsertGeo(path string, records []*model.GeoRecord) error {
 	}
 	byIdentity := make(map[string]*model.GeoRecord, len(existing))
 	for _, e := range existing {
-		byIdentity[GeoIdentity(e)] = e
+		byIdentity[model.GeoIdentity(e)] = e
 	}
 	for _, r := range records {
-		byIdentity[GeoIdentity(r)] = mergeGeoRecord(byIdentity, r)
+		byIdentity[model.GeoIdentity(r)] = mergeGeoRecord(byIdentity, r)
 	}
 	merged := make([]*model.GeoRecord, 0, len(byIdentity))
 	for _, v := range byIdentity {
 		merged = append(merged, v)
 	}
+	sort.Slice(merged, func(i, j int) bool {
+		return model.GeoIdentity(merged[i]) < model.GeoIdentity(merged[j])
+	})
 	return writeJSONL(path, len(merged), func(i int) (any, error) {
 		return merged[i], nil
 	})
@@ -100,7 +100,7 @@ func UpsertGeo(path string, records []*model.GeoRecord) error {
 // values win, previous values survive where the wave left blanks, and
 // first_seen plus an assigned tag are immutable.
 func mergeGeoRecord(byIdentity map[string]*model.GeoRecord, r *model.GeoRecord) *model.GeoRecord {
-	prev, ok := byIdentity[GeoIdentity(r)]
+	prev, ok := byIdentity[model.GeoIdentity(r)]
 	if !ok {
 		return r
 	}

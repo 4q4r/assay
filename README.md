@@ -7,7 +7,7 @@
 *Fetch, probe, geo-enrich, rank, render, and maintain a pool of third-party public proxy nodes — explicitly routed, never your default route.*
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-268%2B-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-379-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
 [![xray-core](https://img.shields.io/badge/xray--core-26.3.27-red?style=for-the-badge)](https://github.com/XTLS/Xray-core)
 [![Pipeline](https://img.shields.io/badge/pipeline-W1%E2%80%93W5-blue?style=for-the-badge)](DESIGN.md)
 [![Lint](https://img.shields.io/badge/golangci--lint-0%20issues-success?style=for-the-badge)](.golangci.yml)
@@ -37,7 +37,7 @@
 
 ## ✨ What It Does
 
-`publicvpn` is a single-binary Go pipeline that keeps a **cold base** (`geo-base.jsonl`: country / city / ASN / ISP per node) of hundreds of third-party public proxy nodes and promotes a small **active core** (20–25, expandable to 40 for city coverage) into your xray client config. Every pool outbound carries the owner-mandated hardening (`sockopt.tcpMaxSeg: 1440`, TLS fingerprint `firefox`), every link parameter passes through **1:1** — nothing is rewritten behind your back.
+`publicvpn` is a single-binary Go pipeline that keeps a **cold base** (`geo-base.jsonl`: country / city / ASN / ISP per node) of hundreds of third-party public proxy nodes and promotes a small **active core** (20–25, expandable to 40 for city coverage) into your xray client config. Every stream-based pool outbound carries the owner-mandated hardening (`sockopt.tcpMaxSeg: 1440`, TLS fingerprint `firefox`; hysteria2 outbounds are QUIC/UDP and carry the fingerprint without the TCP-only clamp), every link parameter passes through **1:1** — nothing is rewritten behind your back.
 
 **The pool never becomes the default route.** It participates only in routing rules you explicitly configure (`[render.pool_routes]`); everything else — including the catch-all — stays on your own nodes.
 
@@ -55,10 +55,11 @@ The render surface targets **your pinned core (xray 26.3.27)** — every field n
 | `xhttp` / `splithttp` | `xhttp` + `xhttpSettings` | `mode`, `path`, `host`, and an `extra` JSON-object passthrough (validated) |
 | `http` / `h2` / `h3` | **refused loud** | the HTTP/2 transport was removed from 26.3.27 (→ XHTTP stream-one) |
 | `quic` | **refused loud** | removed from 26.3.27 (→ XHTTP stream-one H3) |
+| *(scheme)* `hysteria2` / `hy2` | `hysteria` outbound (version 2) + `hysteriaSettings` | a real hysteria2 client exists in 26.3.27 (verified against the binary + tagged source): `security=tls` renders unconditionally (the QUIC dialer refuses to run without it), the credential rides `hysteriaSettings.auth`, `sni`/`pinSHA256`/`ech` map 1:1 to `tlsSettings` (`pinnedPeerCertSha256`/`echConfigList`), fingerprint `firefox` applies, and **no `tcpMaxSeg`** renders (TCP-gated upstream; QUIC dials UDP). `obfs`/`obfs-password` (salamander) **fail the render loud** — the core has no salamander. Port-hopping links (`:123,5000-6000`) are malformed at parse. |
 
 Security layers: `none` (no TLS settings rendered), `tls` (`sni`→`serverName`, `alpn`, `fp` overridden to `firefox`), `reality` (`pbk`/`sid`/`spx`/`pqv`→`mldsa65Verify`, fingerprint `firefox`; only with `tcp`/`xhttp`/`grpc` — the core's own restriction, enforced at render time).
 
-Protocols: `vless`, `vmess` (incl. the JSON vocabulary: `net`/`type`/`host`/`path`/`scy`/`aid`, header datum preserved), `trojan`, and **`ss`** — parsed always, **accepted only when allowlisted** in `[filter].protocols` (default `vless,vmess,trojan`; ss is opt-in). Shadowsocks renders as a `shadowsocks` outbound (`servers[0]` with `method`/`password` 1:1); SIP003 **plugin params cannot render** — the 26.3.27 shadowsocks outbound has no plugin support — so an ss link carrying `plugin=` fails the render loud.
+Protocols: `vless`, `vmess` (incl. the JSON vocabulary: `net`/`type`/`host`/`path`/`scy`/`aid`, header datum preserved), `trojan`, **`ss`**, and **`hysteria2`** (with its documented `hy2://` alias) — parsed always, **accepted only when allowlisted** in `[filter].protocols` (default `vless,vmess,trojan`; ss and hysteria2 are opt-in). Shadowsocks renders as a `shadowsocks` outbound (`servers[0]` with `method`/`password` 1:1); SIP003 **plugin params cannot render** — the 26.3.27 shadowsocks outbound has no plugin support — so an ss link carrying `plugin=` fails the render loud. hysteria v1 links (`hysteria://`) stay rejected at parse: the core only speaks hysteria2 (version 2).
 
 ## 🗺️ Pipeline
 
@@ -81,7 +82,7 @@ flowchart LR
 | Stage | Binary | What it owns |
 | :-- | :-- | :-- |
 | 🌐 fetch | `publicvpn fetch` | dynamic GitHub source discovery (repo ids + manifests, **no pinned URLs**), cached downloads |
-| 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss`, normalize, dedupe by identity hash |
+| 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
 | 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
 | 🩺 probe | `publicvpn probe` | out-of-band `xray-knife`: liveness, RTT, tunnel exit IP (D8), optional `-S` speedtest |
 | 🌍 geo | `publicvpn geo` | ip-api.com batch enrichment of exit IPs (rate-capped, L6) |
@@ -100,7 +101,7 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 3. **filter** — apply the ingest security filter; the survivors are the wave's reference set.
 4. **probe** — out-of-band xray-knife liveness + exit-IP discovery (skipped by `--skip-probe`).
 5. **geo** — batch-enrich the fresh exit IPs via ip-api (skipped together with probe).
-6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. A poll failure is a loud warning, not a wave failure (accounting must not block node refresh).
+6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent.
 7. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
 8. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
 9. **render** — rebuild the full client config (template + pool + balancers + observatory, stats/policy ensured).
@@ -159,7 +160,7 @@ public_vpn/
 `publicvpn install` turns the machine you run it on into a maintained node:
 
 1. **Binary** — copies the RUNNING binary (`os.Executable`) to `--bin-dir` (default `~/.local/bin`) as `publicvpn`: atomic write (temp → fsync → rename), mode `0755`. Re-running after a rebuild **is** the self-upgrade flow.
-2. **Units** — renders the four systemd user units from the repo templates (`systemd/`, single source of truth via `go:embed`) into `--unit-dir` (default `~/.config/systemd/user`). `ExecStart` points at the installed binary and the `--config` path you passed; the timers carry your `[maintain]` intervals as `OnBootSec` + `OnUnitActiveSec` (arbitrary durations — deliberately **not** `OnCalendar`).
+2. **Units** — renders the four systemd user units from the repo templates (`systemd/`, single source of truth via `go:embed`) into `--unit-dir` (default `~/.config/systemd/user`). `ExecStart` points at the installed binary and the `--config` path you passed; the timers carry your `[maintain]` intervals as `OnBootSec` + `OnUnitActiveSec` (arbitrary durations — deliberately **not** `OnCalendar`). Path rules: `--bin-dir` and `--config` may **not** contain whitespace (systemd argv-splits `ExecStart=` — a whitespace path installs fine and dies at timer fire), while `--unit-dir` may (verified: `systemd-analyze verify` loads all four units identically from a whitespace path); remember that only the manager's real search path (default `~/.config/systemd/user`) is discovered by `daemon-reload` — a custom unit dir elsewhere needs `XDG_CONFIG_HOME` or symlinks.
 3. **Activation** — exactly two `systemctl --user` calls, pinned to an internal allowlist (no `restart`, no other units, ever): `daemon-reload`, then `enable --now public_vpn-refresh.timer public_vpn-speedtest.timer`.
 
 ```bash
@@ -210,7 +211,7 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 | `[sources.*]` | upstream feeds (D9) | `repo`, `discovery`, `include`, `enabled` |
 | `[fetch]` | download behavior | `timeout`, `retries`, `concurrency`, `cache_max_age` (freshness window, `0s` = always fetch), `api_base`/`raw_base` (mirrors) |
 | `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
-| `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss opt-in), `allow_insecure` (default `false`) |
+| `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss + hysteria2 opt-in), `allow_insecure` (default `false`) |
 | `[probe]` | xray-knife wave | `path`, `threads`, `url`, `speedtest`, `check_preset`, `max_passed`, `skip_fresh_within` (skip re-probing fresh-passed nodes, `0s` = probe everything) |
 | `[geo]` | ip-api enrichment | `endpoint`, `batch_size`, `per_minute`, `ttl` |
 | `[select]` | ranking caps (D7) | `per_country_cap`, `soft_cap`, `city_expand_threshold`, `ceiling`, `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`) |

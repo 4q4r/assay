@@ -567,9 +567,11 @@ func validateMaintain(m MaintainConfig) error {
 }
 
 // parseableSchemes are the schemes the parser can normalize; the filter
-// allowlist may only reference these.
+// allowlist may only reference these. hysteria2 parses like ss: OPT-IN via
+// [filter].protocols — the default acceptance list is unchanged.
 var parseableSchemes = map[string]bool{
 	"vless": true, "vmess": true, "trojan": true, "ss": true,
+	"hysteria2": true,
 }
 
 func validateFilter(f FilterConfig) error {
@@ -578,7 +580,7 @@ func validateFilter(f FilterConfig) error {
 	}
 	for _, p := range f.Protocols {
 		if !parseableSchemes[p] {
-			return fmt.Errorf("filter.protocols: scheme %q is not parseable (allowed: vless, vmess, trojan, ss)", p)
+			return fmt.Errorf("filter.protocols: scheme %q is not parseable (allowed: vless, vmess, trojan, ss, hysteria2)", p)
 		}
 	}
 	return nil

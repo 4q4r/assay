@@ -473,6 +473,47 @@ func TestUnknownPoolRouteDirectTagIsLoud(t *testing.T) {
 	assert.Contains(t, err.Error(), "not rendered")
 }
 
+// TestEmptyPoolStillValidatesPoolRoutes pins the W7 hoist: [render.pool_routes]
+// target validation runs on EVERY render regardless of pool state. With an
+// empty pool NO pool-prefixed target can exist — stripPoolArtifacts removed
+// every pool- outbound and no pool_ balancer is ever rendered — so a
+// configured route there is necessarily a typo or dead reference, and every
+// pool-prefixed target must fail loud naming it (the owner learns about the
+// mistake immediately instead of a silent D2 fall-through to the catch-all).
+// There is deliberately NO "valid target with an empty pool" success arm: the
+// template's own tags (direct/block/proxy-*) are namespace-walled for pool
+// routes, so no pool-namespaced target can resolve while the pool is empty.
+func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{"balancer target not rendered", "pool_de"},
+		{"direct tag target not rendered", "pool-de-01"},
+		{"namespace violation", "best_rtt"},
+		{"direct tag into the template", "proxy-0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := render.Render(render.Input{
+				Template:   testTemplate(t),
+				Selection:  &model.Selection{},
+				NodesByKey: map[string]*model.Node{},
+				Cfg:        renderCfg([]render.PoolRoute{{Balancer: tc.target, Domains: []string{"domain:x.com"}}}),
+			})
+			require.Error(t, err, "empty pool + route target %q must fail loud", tc.target)
+			assert.Contains(t, err.Error(), tc.target, "the loud failure must name the offending target")
+		})
+	}
+
+	t.Run("empty pool with zero routes is a no-op", func(t *testing.T) {
+		// The default config carries no pool_routes: the validation must be a
+		// no-op so empty-pool renders (and the goldens) stay byte-identical.
+		m := doRender(t, nil, &model.Selection{})
+		assert.NotNil(t, m)
+	})
+}
+
 func TestNonPoolBalancerRouteRejected(t *testing.T) {
 	for _, target := range []string{"best_rtt", "proxy-0", "direct"} {
 		nodes, sel := twoCountrySelection(t)

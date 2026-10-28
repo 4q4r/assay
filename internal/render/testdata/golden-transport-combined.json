@@ -415,6 +415,29 @@
         }
       },
       "tag": "pool-nl-08"
+    },
+    {
+      "protocol": "hysteria",
+      "settings": {
+        "address": "node9.example.com",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "hysteriaSettings": {
+          "auth": "pool-uuid-1",
+          "version": 2
+        },
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "echConfigList": "AEz+DQBIAAAg",
+          "fingerprint": "firefox",
+          "pinnedPeerCertSha256": "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+          "serverName": "hy.example"
+        }
+      },
+      "tag": "pool-nl-09"
     }
   ],
   "policy": {
@@ -462,7 +485,8 @@
           "pool-nl-05",
           "pool-nl-06",
           "pool-nl-07",
-          "pool-nl-08"
+          "pool-nl-08",
+          "pool-nl-09"
         ],
         "strategy": {
           "settings": {

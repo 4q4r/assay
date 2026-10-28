@@ -118,19 +118,55 @@ func xrayTest(in Input) error {
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
 	if err := cmd.Run(); err != nil {
-		// M-2 discrimination: an *exec.ExitError from the child's OWN exit
-		// (Exited() == true) is a real config failure even when the deadline
-		// fired in the same instant — report the exit status, never the
-		// "timed out" label. Only a kill (signaled, Exited() == false) or a
-		// non-exit error under an already-elapsed deadline is the timeout arm.
+		// M-2 discrimination, three classes (W7 residual: the old predicate
+		// read ANY non-own-exit error under an elapsed deadline as "timed
+		// out", which mislabeled a broken binary path as a hanging config):
+		//   - start failed — the child NEVER started (cmd.Process == nil):
+		//     exec.LookPath failure, fork/exec error (missing/non-executable
+		//     binary), or a deadline that expired before the spawn attempt
+		//     while the configured binary does not exist at all. Report the
+		//     actionable truth, never a timeout label.
+		//   - own exit — an *exec.ExitError with Exited() == true is a real
+		//     config failure even when the deadline fired in the same
+		//     instant; report the exit status, never the "timed out" label.
+		//   - timed out — a process that DID start and was then killed by
+		//     the deadline (or a wait error under an elapsed clock).
 		var exitErr *exec.ExitError
 		ownExit := errors.As(err, &exitErr) && exitErr.Exited()
-		if in.TestTimeout > 0 && ctx.Err() != nil && !ownExit {
+		switch {
+		case startFailure(err, in.XrayBin, cmd.Process != nil):
+			return fmt.Errorf("xray run -test -c %s: start failed (binary %s): %w\n%s",
+				in.RenderedPath, in.XrayBin, err, stderr.String())
+		case in.TestTimeout > 0 && ctx.Err() != nil && !ownExit:
 			return fmt.Errorf("xray run -test -c %s: timed out after %s\n%s", in.RenderedPath, in.TestTimeout, stderr.String())
 		}
 		return fmt.Errorf("xray run -test -c %s: %w\n%s", in.RenderedPath, err, stderr.String())
 	}
 	return nil
+}
+
+// startFailure reports whether the -test child never started because the
+// configured binary is missing or not executable. processStarted is
+// cmd.Process != nil after Run — false means no process ever existed.
+// Error-chain evidence (exec.Error from LookPath, fork/exec PathError
+// wrapping ErrNotExist/ErrPermission) decides when a spawn was ATTEMPTED;
+// when the deadline expired before the spawn attempt, Cmd.Start returns
+// ctx.Err() without ever probing the binary, so the path is stat'ed
+// directly to surface the broken-binary truth instead of a timeout label.
+func startFailure(err error, binPath string, processStarted bool) bool {
+	if processStarted {
+		return false
+	}
+	if _, isExecErr := errors.AsType[*exec.Error](err); isExecErr {
+		return true
+	}
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	if _, statErr := os.Stat(binPath); statErr != nil {
+		return errors.Is(statErr, os.ErrNotExist) || errors.Is(statErr, os.ErrPermission)
+	}
+	return false
 }
 
 func backupTarget(target, backupDir string) (string, error) {
