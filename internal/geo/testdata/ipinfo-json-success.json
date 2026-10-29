@@ -1,0 +1,12 @@
+{
+  "ip": "203.0.113.77",
+  "hostname": "static.77.113.0.203.clients.example.net",
+  "city": "Frankfurt am Main",
+  "region": "Hesse",
+  "country": "DE",
+  "loc": "50.1109,8.6821",
+  "org": "AS51167 Contabo GmbH",
+  "postal": "60313",
+  "timezone": "Europe/Berlin",
+  "readme": "https://ipinfo.io/missingauth"
+}

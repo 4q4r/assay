@@ -583,9 +583,9 @@ func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 		}
 	}
 	outf(cmd.OutOrStdout(),
-		"geo complete: %d eligible nodes — %d self-report, %d doh-fallback, %d unknown "+
+		"geo complete: %d eligible nodes — %d self-report, %d self-report-https, %d doh-fallback, %d unknown "+
 			"(nodes stay usable; geo preserved) → %s\n",
-		summary.Eligible, summary.SelfReport, summary.DoHFallback, summary.Unknown, p.geoBase)
+		summary.Eligible, summary.SelfReport, summary.SelfReportHTTPS, summary.DoHFallback, summary.Unknown, p.geoBase)
 	if summary.Churn > 0 {
 		outf(cmd.OutOrStdout(),
 			"WARNING: %d node(s) reported an exit IP different from the probe wave "+
@@ -634,9 +634,15 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 	if err := store.WriteSelection(p.selection, sel); err != nil {
 		return err
 	}
+	// Display label: unknown-geo nodes carry a raw empty country — shown as
+	// the pool_unknown pseudo-location they render under (W16).
 	byCountry := map[string]int{}
 	for _, n := range sel.Nodes {
-		byCountry[n.Country]++
+		label := n.Country
+		if label == "" {
+			label = "unknown"
+		}
+		byCountry[label]++
 	}
 	outf(cmd.OutOrStdout(), "select complete: %d active nodes (cap %d, %d alive cities), countries: %v → %s\n",
 		len(sel.Nodes), sel.CapApplied, sel.CitiesAlive, byCountry, p.selection)
@@ -1374,9 +1380,15 @@ func printSelectionStatus(out io.Writer, p paths) {
 		outln(out, "select:   empty")
 		return
 	}
+	// Display label: unknown-geo nodes carry a raw empty country — shown as
+	// the pool_unknown pseudo-location they render under (W16).
 	byCountry := map[string]int{}
 	for _, n := range sel.Nodes {
-		byCountry[n.Country]++
+		label := n.Country
+		if label == "" {
+			label = "unknown"
+		}
+		byCountry[label]++
 	}
 	outf(out, "select:   %d active (cap %d) %v\n", len(sel.Nodes), sel.CapApplied, byCountry)
 }

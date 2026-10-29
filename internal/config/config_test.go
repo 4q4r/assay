@@ -114,6 +114,7 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 20, cfg.Probe.Threads)
 	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
+	assert.Equal(t, "https://ipinfo.io/json", cfg.Geo.HTTPSURL, "https_url defaults to the keyless ipinfo.io/json self-geo endpoint")
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
 	assert.Equal(t, 3, cfg.Select.PerCountryCap)
 	assert.Equal(t, 25, cfg.Select.SoftCap)
@@ -230,6 +231,36 @@ doh_url = "http://dns.google/resolve"
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "https")
 		assert.Contains(t, err.Error(), "geo.doh_url")
+	})
+
+	t.Run("geo.https_url must be https (structural scheme check, not an allowlist)", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		content := `
+data_dir = "/tmp/x"
+
+[geo]
+https_url = "http://ipinfo.io/json"
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		_, err := config.Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "https")
+		assert.Contains(t, err.Error(), "geo.https_url")
+	})
+
+	t.Run("geo.https_url accepts ANY https endpoint verbatim (owner ruling: plain string knob, no allowlist)", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		content := `
+data_dir = "/tmp/x"
+
+[geo]
+https_url = "https://geo.self-hosted.example/internal/json"
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		cfg, err := config.Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, "https://geo.self-hosted.example/internal/json", cfg.Geo.HTTPSURL,
+			"the endpoint is a passthrough string — structural https check only")
 	})
 
 	t.Run("stats port must be unprivileged", func(t *testing.T) {

@@ -114,21 +114,28 @@ func (p ProbeConfig) IsSpeedtest() bool {
 	return p.Speedtest == nil || *p.Speedtest
 }
 
-// GeoConfig controls the geo stage (W11 self-report design): every alive
-// node asks ip-api THROUGH ITS OWN TUNNEL (`http://ip-api.com/json/` with no
-// ip parameter — the response IS that node's exit geo), so the requests
-// originate from thousands of distinct node IPs and ip-api's per-source
-// budget never pools — the old aggregate batch clamp (endpoint/batch_size/
-// per_minute, retired loud) is gone in principle. Nodes whose self-report
-// fails fall back to the through-tunnel DoH view (o-o.myaddr TXT → the exit
-// network's resolver IP → ip-api single-IP lookup through the same tunnel);
-// geo.doh_url configures the DoH endpoint.
+// GeoConfig controls the geo stage (W11 self-report design; W16 adds the
+// HTTPS third hop): every alive node asks geo endpoints THROUGH ITS OWN
+// TUNNEL, so the requests originate from thousands of distinct node IPs and
+// per-source budgets never pool — the old aggregate batch clamp
+// (endpoint/batch_size/per_minute, retired loud) is gone in principle. The
+// failure ladder per node: (1) HTTP ip-api self-report, (2) HTTPS self-geo
+// via [geo].https_url (default ipinfo.io/json), (3) the through-tunnel DoH
+// view (o-o.myaddr TXT → the exit network's resolver IP → ip-api single-IP
+// lookup through the same tunnel) via [geo].doh_url, (4) unknown.
 type GeoConfig struct {
 	// DoHURL is the DoH endpoint the fallback queries THROUGH the tunnel.
 	// Must be https (DoH is a TLS protocol — structural check, not a range
 	// bound). Default: DefaultDoHURL.
-	DoHURL string   `toml:"doh_url"`
-	TTL    Duration `toml:"ttl"`
+	DoHURL string `toml:"doh_url"`
+	// HTTPSURL is the hop-2 HTTPS self-geo endpoint: a keyless URL that
+	// answers "who is asking" over TLS (default ipinfo.io/json — free tier,
+	// rate-limited per source IP like ip-api, and every node is its own
+	// source). Structural https check only — ANY https endpoint is accepted
+	// verbatim (owner ruling: a plain string knob, no allowlist). Default:
+	// DefaultGeoHTTPSURL.
+	HTTPSURL string   `toml:"https_url"`
+	TTL      Duration `toml:"ttl"`
 	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
 	// (self-report and each fallback hop alike).
 	Timeout Duration `toml:"timeout"`
@@ -285,6 +292,12 @@ const (
 	// fallback queries through the tunnel (the same endpoint the checker's
 	// doh-via-exit view uses — one DoH host across the pipeline).
 	DefaultDoHURL = "https://dns.google/resolve"
+	// DefaultGeoHTTPSURL is the [geo].https_url default (the W16 hop-2
+	// HTTPS self-geo): ipinfo.io/json is keyless, serves the caller's own
+	// geo over TLS, and is free-tier rate-limited per source IP — the same
+	// no-aggregate-limit argument as the W11 self-report (every node is its
+	// own source). Field surface verified live 2026-10-29.
+	DefaultGeoHTTPSURL = "https://ipinfo.io/json"
 	// DefaultPluginRunTimeout bounds one plugin's whole fetch run (the
 	// [plugins].run_timeout default): generous enough for a nested
 	// multi-subscription fetch, small enough that a hung plugin wastes one
@@ -492,6 +505,9 @@ func applyProbeDefaults(p *ProbeConfig) {
 func applyGeoDefaults(g *GeoConfig) {
 	if g.DoHURL == "" {
 		g.DoHURL = DefaultDoHURL
+	}
+	if g.HTTPSURL == "" {
+		g.HTTPSURL = DefaultGeoHTTPSURL
 	}
 	if g.TTL.Duration == 0 {
 		g.TTL.Duration = 24 * time.Hour
@@ -750,6 +766,12 @@ func validateGeo(g GeoConfig) error {
 	// Structural scheme check, not a range bound.
 	if !strings.HasPrefix(g.DoHURL, "https://") {
 		return fmt.Errorf("geo.doh_url must use https (DoH is a TLS protocol), got %q", g.DoHURL)
+	}
+	// The W16 hop-2 endpoint rides TLS by definition (the rung's whole point
+	// is an HTTPS self-geo). Structural scheme check ONLY — any https URL is
+	// accepted verbatim (owner ruling: no allowlist, plain string knob).
+	if !strings.HasPrefix(g.HTTPSURL, "https://") {
+		return fmt.Errorf("geo.https_url must use https (the self-geo endpoint answers over TLS), got %q", g.HTTPSURL)
 	}
 	return nil
 }

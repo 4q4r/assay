@@ -141,11 +141,61 @@ func TestSelectIsDeterministic(t *testing.T) {
 	assert.Equal(t, s1.CapApplied, s2.CapApplied)
 }
 
-func TestNodeWithoutCountryIsExcluded(t *testing.T) {
+// TestUnknownGeoNodeIsAdmittedUnderUnknownCapGroup pins the W16 flip (owner
+// item 14a): an alive node with NO geo evidence is admitted into the active
+// selection — "unknown" acts as a cap group like a country (D7 K applies),
+// the D5 tag grammar stays intact with the xx pseudo-code (pool-xx-NN), and
+// SelectedNode.Country mirrors resolved geo presence (raw empty string — the
+// balancer grouping is a render-time concern).
+func TestUnknownGeoNodeIsAdmittedUnderUnknownCapGroup(t *testing.T) {
 	f := newFixture()
-	f.add(t, "", "Nowhere", true, 3, 1_000_000, 100)
+	f.add(t, "", "", true, 3, 1_000_000, 100)
 	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 0)
-	assert.Empty(t, sel.Nodes, "no country = no pool-<cc> tag possible = excluded")
+	require.Len(t, sel.Nodes, 1, "unknown geo never drops a usable node from the selection")
+	assert.Equal(t, "pool-xx-01", sel.Nodes[0].Tag, "unknown-geo nodes keep the D5 grammar with the xx pseudo-code")
+	assert.Empty(t, sel.Nodes[0].Country, "Selection carries the raw empty country — grouping is render-time")
+	assert.Empty(t, sel.Nodes[0].City, "no geo evidence: city stays empty too")
+}
+
+// TestUnknownGeoNodesShareOneCapGroup pins the cap semantics: the unknown
+// group is capped by K exactly like a country, and known countries are
+// unaffected by unknown nodes competing for the global cap.
+func TestUnknownGeoNodesShareOneCapGroup(t *testing.T) {
+	f := newFixture()
+	for i := range 5 {
+		f.add(t, "", "", true, 3, int64(2_000_000+i), 100)
+	}
+	f.add(t, "de", "Berlin", true, 3, 1_000_000, 100)
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 0)
+	unknown, de := 0, 0
+	var unknownTags []string
+	for _, sn := range sel.Nodes {
+		switch sn.Country {
+		case "":
+			unknown++
+			unknownTags = append(unknownTags, sn.Tag)
+		case "de":
+			de++
+		}
+	}
+	assert.Equal(t, 3, unknown, "K=3 caps the unknown group like a country")
+	assert.Equal(t, 1, de, "known countries are unaffected")
+	assert.Equal(t, []string{"pool-xx-01", "pool-xx-02", "pool-xx-03"}, unknownTags,
+		"stable NN sequence inside the unknown group")
+}
+
+// TestUnknownGeoNodesDoNotInflateCityDiversity pins the D7 expansion input:
+// unknown-geo nodes carry no city, so they must not widen the soft cap
+// through the city-diversity expansion.
+func TestUnknownGeoNodesDoNotInflateCityDiversity(t *testing.T) {
+	f := newFixture()
+	for i := range 6 {
+		f.add(t, "", "", true, 3, int64(3_000_000+i), 100)
+	}
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 0)
+	assert.Equal(t, 0, sel.CitiesAlive, "unknown nodes contribute no city diversity")
+	assert.Equal(t, 25, sel.CapApplied, "soft cap holds — no expansion from unknown nodes")
+	assert.Len(t, sel.Nodes, 3, "the unknown group is capped by K like a country")
 }
 
 func TestDeadNodeDoesNotRank(t *testing.T) {
