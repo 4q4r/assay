@@ -70,6 +70,8 @@ func TestRunInstallEndToEnd(t *testing.T) {
 		binDir:  binDir,
 		unitDir: unitDir,
 		exec:    ex,
+		// explicit-path install: the unit embeds -c <path>
+		embedsConfig: true,
 	}))
 	out := buf.String()
 	assert.Contains(t, out, "daemon active:    publicvpn watch (Restart=always)")
@@ -105,7 +107,7 @@ func TestRunInstallRejectsWhitespaceInBinDir(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	err := runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
-		binDir: binDir, unitDir: unitDir, exec: ex,
+		binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true,
 	})
 	require.Error(t, err, "a whitespace bin dir would render a broken ExecStart")
 	assert.Contains(t, err.Error(), "--bin-dir")
@@ -127,7 +129,7 @@ func TestRunInstallRejectsWhitespaceInConfigPath(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	err := runInstall(buf, mustLoad(t, tabbed), tabbed, installOptions{
-		binDir: binDir, unitDir: unitDir, exec: ex,
+		binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true,
 	})
 	require.Error(t, err, "a whitespace config path would render a broken ExecStart")
 	assert.Contains(t, err.Error(), "--config")
@@ -156,9 +158,10 @@ func TestRunInstallAcceptsWhitespaceUnitDir(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
-		binDir:  filepath.Join(home, "bin"),
-		unitDir: unitDir,
-		exec:    ex,
+		binDir:       filepath.Join(home, "bin"),
+		unitDir:      unitDir,
+		exec:         ex,
+		embedsConfig: true, // explicit-path install: -c embedded
 	}), "a whitespace unit dir is harmless — install must accept it")
 
 	// The daemon unit lands in the whitespace dir, rendered as usual.
@@ -181,9 +184,10 @@ func TestRunInstallNoSystemdSkipsUnits(t *testing.T) {
 	ex := &fakeCtl{}
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
-		binDir:    filepath.Join(home, "bin"),
-		noSystemd: true,
-		exec:      ex,
+		binDir:       filepath.Join(home, "bin"),
+		noSystemd:    true,
+		exec:         ex,
+		embedsConfig: true, // explicit-path install
 	}))
 	assert.Empty(t, ex.calls)
 	assert.Contains(t, buf.String(), "--no-systemd")
@@ -195,7 +199,7 @@ func TestRunUninstallDisablesAndRemoves(t *testing.T) {
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
-		installOptions{binDir: filepath.Join(home, "bin"), unitDir: unitDir, exec: ex}))
+		installOptions{binDir: filepath.Join(home, "bin"), unitDir: unitDir, exec: ex, embedsConfig: true}))
 
 	buf := &bytes.Buffer{}
 	require.NoError(t, runUninstall(buf, mustLoad(t, cfgPath), cfgPath,
@@ -280,7 +284,7 @@ func TestStatusFlagsStaleInstalledBinary(t *testing.T) {
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
-		installOptions{binDir: binDir, unitDir: unitDir, exec: ex}))
+		installOptions{binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true}))
 
 	// A freshly installed binary is a copy of the running one: no drift.
 	status := &bytes.Buffer{}
@@ -321,7 +325,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
-		installOptions{binDir: binDir, unitDir: unitDir, exec: ex}))
+		installOptions{binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true}))
 
 	// The enable step is faked, so create the wants-symlink it would create.
 	wants := filepath.Join(unitDir, "default.target.wants")

@@ -1,0 +1,35 @@
+# publicvpn default configuration — materialized by `publicvpn install`
+# (W13-deploy deploy layout). This file IS the default config: without -c
+# every command resolves to it first (one file wins whole — nothing is ever
+# merged). A re-install NEVER overwrites it; `publicvpn uninstall --purge`
+# removes it along with the data dir. Edit in place.
+
+data_dir = "{{ .DataDir }}"
+
+[probe]
+# Throughput measurement per probe wave — default OFF (round-8 owner
+# ruling, «Только спидтест выключи»: refresh waves are probe-only). The
+# dedicated weekly speedtest wave ([maintain].speedtest_interval) carries
+# the -S semantics regardless; set true to speedtest on EVERY wave.
+# speedtest = true
+
+[maintain]
+refresh_interval = "1h"
+# Speedtest wave recheck — default 168h (weekly, floor 5m). "0s" disables
+# the speedtest wave entirely (refresh waves stay probe-only).
+# speedtest_interval = "168h"
+
+[render]
+# Pool render template. Unset → the file-loaded default applies
+# (~/projects/xray-raw/config.json — the owner's live client layout); set
+# your own template path here. Until render has a readable template the
+# stage fails loud at its boundary.
+# template = "/path/to/xray-template.json"
+
+[activate]
+# Live xray config the gated render result replaces. Unset → the
+# file-loaded default applies (~/projects/xray-raw/config.json); set your
+# own live-config path here. Until activate.target exists the stage fails
+# loud at its boundary — the data stages (fetch → parse → filter → probe →
+# geo → select) keep running meanwhile.
+# target = "/path/to/live-xray-config.json"

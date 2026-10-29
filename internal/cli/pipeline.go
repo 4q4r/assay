@@ -1221,7 +1221,7 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 		// lost, the working stages keep running.
 		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
 			"configless mode: no activate.target — stats accounting unavailable "+
-				"(provide -c or a config at %s to enable the poll)", config.HomeConfigDisplay))
+				"(provide -c or a config at %s to enable the poll)", config.ShareConfigDisplay))
 	}
 	hasAPI, err := stats.TargetHasAPI(target, cfg.Render.StatsPort)
 	if err != nil {

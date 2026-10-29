@@ -29,7 +29,11 @@ TimeoutStopSec=1800
 # vars). Rendered by `publicvpn install` from this template — do not edit the
 # installed copy by hand. The daemon reads [maintain].refresh_interval and
 # [plugins].dir live: a config change needs only a restart, never a re-install.
-ExecStart={{ .BinaryPath }} watch -c {{ .ConfigPath }}
+# An explicit-config install embeds `-c <path>`; the W13-deploy default-
+# location install renders a plain `watch` — the daemon then reads the
+# default config (~/.local/share/publicvpn/config.toml, which install
+# materializes when absent).
+ExecStart={{ .BinaryPath }} watch{{ if .ConfigPath }} -c {{ .ConfigPath }}{{ end }}
 # A daemon crash restarts automatically; waves themselves are serialized by
 # the scheduler and touch the live xray config only through the -test gate.
 # The daemon never restarts the client — it prints the restart hint instead.

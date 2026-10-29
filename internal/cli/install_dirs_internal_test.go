@@ -33,9 +33,10 @@ func TestInstallRelativeExplicitResolvesAgainstInjectedCWD(t *testing.T) {
 
 	res, err := resolveInstallPath("./config.toml")
 	require.NoError(t, err)
-	assert.Equal(t, config.SourceExplicit, res.Source, "the explicit -c wins")
-	assert.Equal(t, cfgPath, res.Path,
+	assert.Equal(t, config.SourceExplicit, res.res.Source, "the explicit -c wins")
+	assert.Equal(t, cfgPath, res.res.Path,
 		"a relative explicit -c under install resolves against the injected cwd")
+	assert.Empty(t, res.materializePath, "an explicit -c never materializes anything")
 }
 
 // TestStatusHonorsBinAndUnitDirs pins round-7 item 11: printInstallStatus
@@ -91,6 +92,51 @@ func TestStatusDefaultDirsUnchanged(t *testing.T) {
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	assert.Contains(t, out.String(), "binary:    "+filepath.Join(defBin, "publicvpn"),
 		"defaults must stay the install defaults")
+}
+
+// TestStatusWaveLineSpeedtestDisabled pins the status surface of the
+// round-8 disable: with [maintain].speedtest_interval = "0s" the service
+// line reports "speedtest disabled" instead of a period; the default
+// config still reports the 168h period.
+func TestStatusWaveLineSpeedtestDisabled(t *testing.T) {
+	mkUnit := func(t *testing.T, home string) {
+		t.Helper()
+		binDir := filepath.Join(home, ".local", "bin")
+		unitDir := filepath.Join(home, ".config", "systemd", "user")
+		require.NoError(t, os.MkdirAll(binDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "publicvpn"), []byte("#!/bin/sh\n"), 0o755))
+		require.NoError(t, os.MkdirAll(unitDir, 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(unitDir, "default.target.wants"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.WatchService), []byte("[Unit]\n"), 0o644))
+		require.NoError(t, os.Symlink(filepath.Join(unitDir, install.WatchService),
+			filepath.Join(unitDir, "default.target.wants", install.WatchService)))
+	}
+
+	t.Run("disabled via explicit 0s", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		mkUnit(t, home)
+		cfgPath := writeWaveConfig(t, home, time.Hour, 0)
+		cmd := newStatusCommand(&cfgPath)
+		out := &bytes.Buffer{}
+		cmd.SetOut(out)
+		require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
+		text := out.String()
+		assert.Contains(t, text, "speedtest disabled", "0s must surface as disabled:\n%s", text)
+		assert.NotContains(t, text, "speedtest 0s")
+	})
+
+	t.Run("default keeps the weekly period", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		mkUnit(t, home)
+		cfgPath := writeWaveConfig(t, home, time.Hour, 168*time.Hour)
+		cmd := newStatusCommand(&cfgPath)
+		out := &bytes.Buffer{}
+		cmd.SetOut(out)
+		require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
+		assert.Contains(t, out.String(), "speedtest 168h")
+	})
 }
 
 // TestReportConfigSourcePrintsWarnings pins the CLI surface of the XDG

@@ -118,9 +118,12 @@ type ProbeConfig struct {
 	URL      string `toml:"url"`
 	// Speedtest opts every wave's probe into the throughput measurement: a
 	// sample download from SpeedtestURL through the node's temp instance →
-	// bytes/time → speed_bps. W10 owner ruling: default TRUE (speed data on
-	// every wave; the dedicated speedtest_interval wave remains for deeper
-	// runs). nil = unset → true; an explicit false turns it off.
+	// bytes/time → speed_bps. ROUND-8 OWNER RULING (supersedes the W10
+	// default-ON): the default is FALSE — refresh waves are probe-only.
+	// «Только спидтест выключи». nil = unset → false; an explicit true keeps
+	// speed-testing every wave; the dedicated weekly speedtest wave
+	// ([maintain].speedtest_interval) carries -S semantics regardless of
+	// this knob.
 	Speedtest *bool `toml:"speedtest"`
 	// SpeedtestURL is the sample the speedtest downloads (default: the
 	// Cloudflare 25 MB down endpoint).
@@ -132,10 +135,12 @@ type ProbeConfig struct {
 	SkipFreshWithin Duration `toml:"skip_fresh_within"`
 }
 
-// IsSpeedtest resolves the speedtest default: on unless explicitly
-// disabled (W10 owner ruling — the former false default flipped).
+// IsSpeedtest resolves the speedtest default: OFF unless explicitly enabled
+// (round-8 owner ruling «Только спидтест выключи» — supersedes the former
+// W10 true default). The dedicated weekly speedtest wave is unaffected: the
+// scheduler passes -S explicitly for it (probeOptions ORs the wave flag).
 func (p ProbeConfig) IsSpeedtest() bool {
-	return p.Speedtest == nil || *p.Speedtest
+	return p.Speedtest != nil && *p.Speedtest
 }
 
 // GeoConfig controls the geo stage (W11 self-report design; W16 adds the
@@ -254,9 +259,14 @@ type MaintainConfig struct {
 	// W10, floor 5m). install is unaffected — the watch daemon reads the
 	// config live, so a period change needs no re-install.
 	RefreshInterval Duration `toml:"refresh_interval"`
-	// SpeedtestInterval is the speedtest-wave recheck period (default 168h,
-	// floor 5m) — rendered into the speedtest timer's OnUnitActiveSec.
-	SpeedtestInterval Duration `toml:"speedtest_interval"`
+	// SpeedtestInterval is the speedtest-wave recheck period — a TRI-STATE
+	// pointer (round-8): absent (nil) → DefaultSpeedtestInterval (168h, the
+	// weekly wave exists and carries -S); an explicit "0s" → 0 = the
+	// speedtest wave is DISABLED entirely (the scheduler never schedules
+	// one — the owner's «выключи» made real at the schedule level); a
+	// positive value below the 5m floor fails loud. Negative values are
+	// structurally invalid.
+	SpeedtestInterval *Duration `toml:"speedtest_interval"`
 	// StatsTimeout bounds one `xray api statsquery` exec — the single knob
 	// behind BOTH the pipeline's stage timeout and the stats package's inner
 	// fallback guard (the old 5s/10s inconsistency is gone). Default 10s;
@@ -278,6 +288,28 @@ type MaintainConfig struct {
 // is the approved premise), explicit false = manual-restart semantics.
 func (m MaintainConfig) AutoRestartEnabled() bool {
 	return m.AutoRestart == nil || *m.AutoRestart
+}
+
+// DefaultSpeedtestInterval is the speedtest-wave default: weekly (168h).
+const DefaultSpeedtestInterval = 168 * time.Hour
+
+// SpeedtestWavePeriod resolves the schedule-level speedtest-wave period:
+// nil (unset — a hand-built struct without defaults) and an explicit "0s"
+// both resolve to 0 = no speedtest wave; a loaded/configless config always
+// carries the materialized DefaultSpeedtestInterval for the absent case
+// (applyMaintainDefaults). Zero-alloc view over the pointer.
+func (m MaintainConfig) SpeedtestWavePeriod() time.Duration {
+	if m.SpeedtestInterval == nil {
+		return 0
+	}
+	return m.SpeedtestInterval.Duration
+}
+
+// SpeedtestWaveEnabled reports whether the speedtest wave exists on the
+// schedule: false for nil (unset) and explicit "0s", true for any positive
+// period (a loaded config without the key materializes 168h here).
+func (m MaintainConfig) SpeedtestWaveEnabled() bool {
+	return m.SpeedtestWavePeriod() > 0
 }
 
 // HTTPConfig carries settings shared by every pipeline HTTP client (fetch
@@ -679,8 +711,11 @@ func applyMaintainDefaults(m *MaintainConfig) {
 	if m.RefreshInterval.Duration == 0 {
 		m.RefreshInterval.Duration = DefaultRefreshInterval
 	}
-	if m.SpeedtestInterval.Duration == 0 {
-		m.SpeedtestInterval.Duration = 168 * time.Hour
+	// SpeedtestInterval is tri-state: nil (absent) materializes the weekly
+	// default; an explicit "0s" STAYS 0 = the speedtest wave is disabled
+	// (round-8 owner ruling — the schedule-level «выключи»).
+	if m.SpeedtestInterval == nil {
+		m.SpeedtestInterval = &Duration{Duration: DefaultSpeedtestInterval}
 	}
 	if m.StatsTimeout.Duration == 0 {
 		m.StatsTimeout.Duration = DefaultStatsTimeout
@@ -780,13 +815,20 @@ func validateMaintain(m MaintainConfig) error {
 	if m.PruneDeadAfter.Duration < 0 {
 		return fmt.Errorf("maintain.prune_dead_after must be >= 0 (0 = default 48h), got %s", m.PruneDeadAfter.Duration)
 	}
-	for name, d := range map[string]Duration{
-		"maintain.refresh_interval":   m.RefreshInterval,
-		"maintain.speedtest_interval": m.SpeedtestInterval,
-	} {
-		if d.Duration < IntervalFloor {
-			return fmt.Errorf("%s must be >= %s (too-fast rechecks hammer sources, probes, and the client), got %s",
-				name, IntervalFloor, d.Duration)
+	if m.RefreshInterval.Duration < IntervalFloor {
+		return fmt.Errorf("maintain.refresh_interval must be >= %s (too-fast rechecks hammer sources, probes, "+
+			"and the client), got %s", IntervalFloor, m.RefreshInterval.Duration)
+	}
+	// speedtest_interval (tri-state, round-8): 0 = the wave is DISABLED —
+	// the floor does not apply to the explicit disable; any positive value
+	// below the floor stays loud. Negative values are structurally invalid.
+	if m.SpeedtestInterval != nil {
+		if err := validateNonNegative("maintain.speedtest_interval", m.SpeedtestInterval.Duration); err != nil {
+			return err
+		}
+		if d := m.SpeedtestInterval.Duration; d > 0 && d < IntervalFloor {
+			return fmt.Errorf("maintain.speedtest_interval must be >= %s or exactly 0s (0 = no speedtest wave), got %s",
+				IntervalFloor, d)
 		}
 	}
 	// W6: sign correctness only. stats_timeout carries no floor — an owner

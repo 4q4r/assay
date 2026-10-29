@@ -44,7 +44,7 @@ func TestProbeOptionsWiresConfig(t *testing.T) {
 
 	cfg.Probe.Speedtest = nil
 	opts = probeOptions(cfg, false)
-	assert.True(t, opts.Speedtest, "nil speedtest defaults to ON (W10 owner ruling)")
+	assert.False(t, opts.Speedtest, "nil speedtest defaults OFF (round-8 owner ruling — refresh waves are probe-only)")
 
 	opts = probeOptions(cfg, true)
 	assert.True(t, opts.Speedtest, "the CLI flag forces the speedtest even when the config disables it")

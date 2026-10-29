@@ -2,20 +2,24 @@
 
 This file is the **single source of truth** for the publicvpn systemd user
 unit. It is a Go text template — `publicvpn install` embeds it (`go:embed`),
-renders the placeholders (binary path, config path), writes it to
+renders the placeholders (binary path, optional config path), writes it to
 `~/.config/systemd/user/`, and enables the daemon. You normally never touch
 systemd yourself:
 
 ```bash
 go build -o publicvpn ./cmd/publicvpn
-./publicvpn install -c /absolute/path/to/config.toml
+./publicvpn install   # canonical (W13-deploy): plain `watch` ExecStart — no -c,
+                      # the daemon reads ~/.local/share/publicvpn/config.toml
+                      # (install materializes it when absent)
+./publicvpn install -c /absolute/path/to/config.toml   # explicit: the unit embeds -c
 ```
 
 - `public_vpn-watch.service` — the long-running **watch daemon** (W10):
   fsnotify watchdog on the plugins dir (new provider = new .lua file, no
   rebuild) plus the wave scheduler — refresh waves every
   `[maintain].refresh_interval` (default 1h), speedtest waves every
-  `[maintain].speedtest_interval`, stats poll inside every wave,
+  `[maintain].speedtest_interval` (default 168h; `"0s"` disables the
+  speedtest wave entirely — round-8), stats poll inside every wave,
   activate-if-changed behind the `-test` gate. `Restart=always` brings a
   crashed daemon back in 5s. `WatchdogSec=300` catches a wedged runtime;
   `TimeoutStopSec=1800` (W17) makes a stop or restart of the daemon WAIT for
