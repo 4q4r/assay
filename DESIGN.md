@@ -111,7 +111,7 @@ fetch → parse → filter → probe → geo → select → render → activate
 
 ## 10. Non-goals
 
-No xray core upgrade (L11). No auto-restart of the live service. No changes to Germans / fox-proxy / routing rules 1–6 / Remnawave-panel side. No GUI. No `ss`/`tuic`/`hy2` initially. The pool never becomes the default route.
+No xray core upgrade (L11). No auto-restart of the live service. No changes to Germans / fox-proxy / routing rules 1–6 / Remnawave-panel side. No GUI. No protocol allowlist expansion beyond `[filter].protocols`: `ss` and `hysteria2`/`hy2` are opt-in there (hysteria-v1, `tuic` and `ssr` stay rejected — not-xray-core / removed from the core). The pool never becomes the default route.
 
 ## 11. Implementation outline (only after design approval)
 

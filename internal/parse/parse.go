@@ -1,8 +1,10 @@
 // Package parse turns raw fetched source bodies into normalized nodes.
-// It accepts vless/vmess/trojan/ss links, rejects schemes outside xray-core
-// (tuic/hy2/hysteria/hysteria2/ssr), and never fails fatally on malformed
-// lines — they are counted and reported. Protocol acceptance is a FILTER
-// policy ([filter].protocols allowlist): parse normalizes everything it can.
+// It accepts vless/vmess/trojan/ss links plus hysteria2 (and its documented
+// hy2:// alias — core-verified against xray 26.3.27), rejects schemes
+// outside xray-core (tuic, hysteria v1, ssr, socks/http/https), and never
+// fails fatally on malformed lines — they are counted and reported.
+// Protocol acceptance is a FILTER policy ([filter].protocols allowlist, ss
+// and hysteria2 opt-in): parse normalizes everything it can.
 package parse
 
 import (

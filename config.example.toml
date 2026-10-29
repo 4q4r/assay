@@ -36,6 +36,12 @@ data_dir = "~/.local/share/publicvpn"
 #                       # abandoned loud and the wave continues with the
 #                       # healthy sources (the abandoned run leaks by
 #                       # design — see the README Security Model).
+# max_consecutive_failures = 5  # plugin circuit breaker: N consecutive
+#                               # failures (run-timeout abandonment or loud
+#                               # run error) auto-disable the plugin — loud
+#                               # line, excluded from future waves; a
+#                               # successful run or a file edit resets and
+#                               # re-enables. 0 = unlimited (breaker off).
 
 [fetch]
 timeout = "30s"

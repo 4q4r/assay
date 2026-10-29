@@ -113,7 +113,8 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 		UserAgent:   cfg.HTTP.UserAgent,
 	}, out)
 
-	collected, failed, hinted, totalNodes := runAllPlugins(out, engine, snapshot, pluginRunTimeout(cfg))
+	collected, failed, hinted, totalNodes := runAllPlugins(out, engine, snapshot, pluginRunTimeout(cfg),
+		pluginMaxFailures(cfg), reg)
 	if failed == len(snapshot) {
 		return fmt.Errorf("all %d attempted plugins failed; nothing fetched", failed)
 	}
@@ -152,6 +153,18 @@ func pluginRunTimeout(cfg *config.Config) time.Duration {
 	return cfg.Plugins.RunTimeout.Duration
 }
 
+// pluginMaxFailures resolves [plugins].max_consecutive_failures for the
+// circuit breaker: the knob's explicit 0 means UNLIMITED (breaker off —
+// owner ruling, same no-floor class as run_timeout "0s"); nil (unset,
+// after config.Load defaults) means DefaultMaxConsecutiveFailures. This
+// helper only guards direct struct construction (tests).
+func pluginMaxFailures(cfg *config.Config) int {
+	if cfg.Plugins.MaxConsecutiveFailures == nil {
+		return config.DefaultMaxConsecutiveFailures
+	}
+	return *cfg.Plugins.MaxConsecutiveFailures
+}
+
 // runAllPlugins executes every snapshot plugin, grouping the returned nodes
 // by their effective source id. Per-plugin failures are LOUD and non-fatal —
 // one bad provider must not kill the wave.
@@ -169,8 +182,17 @@ func pluginRunTimeout(cfg *config.Config) time.Duration {
 // watchdog (public_vpn-watch.service: Type=notify + WatchdogSec) and the
 // operator removing the offending .lua. runTimeout <= 0 = unbounded (owner
 // ruling: an explicit "0s" is legitimate).
+//
+// Circuit breaker (round-7 item 6): every FAILURE event (a run-timeout
+// abandonment or a loud run error) feeds the registry's consecutive-failure
+// counter; a SUCCESS resets it. On hitting maxFailures (> 0) the plugin is
+// AUTO-DISABLED — loud line here, excluded from subsequent wave snapshots,
+// listed in the wave's breaker summary. maxFailures <= 0 = unlimited: the
+// breaker never fires. The state lives in the registry (see Registry docs):
+// per-wave in one-shot runs, persistent across waves in the watch daemon.
 func runAllPlugins(
 	out io.Writer, engine *plugins.Engine, snapshot []*plugins.Plugin, runTimeout time.Duration,
+	maxFailures int, reg *plugins.Registry,
 ) ([]pluginLinks, int, int, int) {
 	collected := []pluginLinks{}
 	failed, hinted, total := 0, 0, 0
@@ -183,10 +205,20 @@ func runAllPlugins(
 				// detection signal for the operator to fix or remove the
 				// file.
 				outf(out, "plugin %-10s exceeded %s — abandoned\n", pl.ID, runTimeout)
-				continue
+			} else {
+				outf(out, "plugin %-10s FAILED: %v\n", pl.ID, err)
 			}
-			outf(out, "plugin %-10s FAILED: %v\n", pl.ID, err)
+			// Breaker bookkeeping: this failure is one MORE consecutive
+			// event; tripping the limit disables the plugin loud.
+			if reg != nil && reg.RecordFailure(pl.ID, maxFailures) {
+				outf(out, "plugin %-10s DISABLED after %d consecutive failures "+
+					"(breaker limit %d) — excluded from future waves; edit the file to re-enable\n",
+					pl.ID, maxFailures, maxFailures)
+			}
 			continue
+		}
+		if reg != nil {
+			reg.RecordSuccess(pl.ID) // a healthy run resets the counter
 		}
 		for _, n := range nodes {
 			if n.Scheme != "" || n.Host != "" || n.Port != 0 {
@@ -196,6 +228,16 @@ func runAllPlugins(
 		collected = append(collected, pluginLinks{plugin: pl.ID, nodes: nodes})
 		total += len(nodes)
 		outf(out, "plugin %-10s ok: %d nodes\n", pl.ID, len(nodes))
+	}
+	if reg != nil {
+		if disabled := reg.DisabledPlugins(); len(disabled) > 0 {
+			// The breaker status surface: every wave names the plugins the
+			// breaker currently keeps offline (one-shot runs list them too —
+			// they were disabled by earlier waves in the daemon, or by THIS
+			// wave).
+			outf(out, "breaker: %d plugin(s) disabled — %s (a file edit reloads and re-enables)\n",
+				len(disabled), strings.Join(disabled, ", "))
+		}
 	}
 	return collected, failed, hinted, total
 }
@@ -1268,19 +1310,23 @@ func runActivateStage(cmd *cobra.Command, cfg *config.Config, wiring *restartWir
 }
 
 func newStatusCommand(cfgPath *string) *cobra.Command {
-	return &cobra.Command{
+	var (
+		binDir  string
+		unitDir string
+	)
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Pipeline state summary (read-only)",
 		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
 selection, render) plus the install state: installed binary, unit files,
-timers, and configured-vs-installed timer periods. The resolved config
-source is printed as the config line (explicit -c, home default, cwd
+enablement, and the wave periods read live from the config. The resolved
+config source is printed as the config line (explicit -c, home default, cwd
 default, or configless built-in defaults).
 
-Install detection reads the DEFAULT directories only — ~/.local/bin for the
-binary and ~/.config/systemd/user for the units — because publicvpn keeps no
-state file by design. An install made with custom --bin-dir/--unit-dir paths
-is NOT tracked here; inspect those locations directly.`,
+Install detection reads the directories given via --bin-dir / --unit-dir
+(defaults identical to ` + "`install`" + `: ~/.local/bin and
+~/.config/systemd/user). An install made with custom paths is tracked by
+passing the same values here — publicvpn keeps no state file by design.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
@@ -1289,6 +1335,11 @@ is NOT tracked here; inspect those locations directly.`,
 			return runStatus(cmd, res)
 		},
 	}
+	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin",
+		"directory to inspect for the installed publicvpn binary (same default as install)")
+	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
+		"systemd user unit directory to inspect (same default as install)")
+	return cmd
 }
 
 func runStatus(cmd *cobra.Command, res *config.Resolved) error {
@@ -1304,8 +1355,24 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 	printGeoStatus(out, p)
 	printSelectionStatus(out, p)
 	printRenderStatus(out, p)
-	printInstallStatus(out, res.Config, res.Path)
+	binDir, unitDir := statusInstallDirs(cmd)
+	printInstallStatus(out, res.Config, res.Path, binDir, unitDir)
 	return nil
+}
+
+// statusInstallDirs reads the status command's --bin-dir/--unit-dir values
+// (round-7 item 11), falling back to the install defaults when the flags
+// are absent — direct runStatus callers with a bare cobra command get the
+// documented default behavior.
+func statusInstallDirs(cmd *cobra.Command) (string, string) {
+	binDir, unitDir := "~/.local/bin", "~/.config/systemd/user"
+	if f := cmd.Flags().Lookup("bin-dir"); f != nil {
+		binDir = f.Value.String()
+	}
+	if f := cmd.Flags().Lookup("unit-dir"); f != nil {
+		unitDir = f.Value.String()
+	}
+	return config.ExpandHome(binDir), config.ExpandHome(unitDir)
 }
 
 func printFetchStatus(out io.Writer, p paths) {

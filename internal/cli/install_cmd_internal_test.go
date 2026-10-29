@@ -349,22 +349,23 @@ func TestStatusShowsInstallState(t *testing.T) {
 	assert.Contains(t, status.String(), "re-run `publicvpn install")
 }
 
-// TestStatusHelpDocumentsDefaultDirDetection pins the M-1 caveat in the
-// user-facing help: status detects installs at the DEFAULT dirs only, and
-// custom --bin-dir/--unit-dir installs are not tracked (no state file).
-func TestStatusHelpDocumentsDefaultDirDetection(t *testing.T) {
+// TestStatusHelpDocumentsDirFlags supersedes the old "DEFAULT directories
+// only" caveat (round-7 item 11): status now carries --bin-dir/--unit-dir
+// (same defaults as install) and custom-dir installs ARE tracked.
+func TestStatusHelpDocumentsDirFlags(t *testing.T) {
 	cfgPath := writeWaveConfig(t, t.TempDir(), 6*time.Hour, 168*time.Hour)
 	cmd := newStatusCommand(&cfgPath)
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
 	require.NoError(t, cmd.Help())
 	help := out.String()
-	assert.Contains(t, help, "DEFAULT directories only")
-	assert.Contains(t, help, "~/.local/bin")
-	assert.Contains(t, help, "~/.config/systemd/user")
 	assert.Contains(t, help, "--bin-dir")
 	assert.Contains(t, help, "--unit-dir")
-	assert.Contains(t, help, "state file")
+	assert.Contains(t, help, "~/.local/bin")
+	assert.Contains(t, help, "~/.config/systemd/user")
+	assert.Contains(t, help, "no state file", "the design rationale stays documented")
+	assert.NotContains(t, help, "NOT tracked",
+		"custom-dir installs are now tracked via the flags (the old caveat is gone)")
 }
 
 func mustLoad(t *testing.T, path string) *config.Config {

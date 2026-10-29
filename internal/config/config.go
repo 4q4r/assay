@@ -45,6 +45,17 @@ type PluginsConfig struct {
 	// legitimately slow plugin may take as long as it takes). Negative
 	// values are structurally invalid.
 	RunTimeout *Duration `toml:"run_timeout"`
+	// MaxConsecutiveFailures is the plugin circuit breaker (round-7 item 6,
+	// owner spec: «автоотключение неотвечающих плагинов, 5 ошибок по
+	// дефолту отключают его»): N consecutive FAILURE events (a run-timeout
+	// abandonment or a loud run error) auto-disable the plugin — it is
+	// excluded from subsequent waves and stays disabled until a successful
+	// run resets the counter or the file is edited (a watchdog reload =
+	// owner touched it = fresh chance). Nil = unset →
+	// DefaultMaxConsecutiveFailures (5); an explicit 0 means UNLIMITED —
+	// the breaker is OFF (same owner no-floor/ceiling ruling class as
+	// run_timeout "0s"). Negative values are structurally invalid.
+	MaxConsecutiveFailures *int `toml:"max_consecutive_failures"`
 }
 
 // FetchConfig controls the fetch-stage client shared by pipeline discovery
@@ -303,6 +314,10 @@ const (
 	// multi-subscription fetch, small enough that a hung plugin wastes one
 	// wave slot, not the whole schedule.
 	DefaultPluginRunTimeout = 120 * time.Second
+	// DefaultMaxConsecutiveFailures is the plugin circuit breaker default
+	// (round-7 item 6, owner spec): 5 consecutive failures auto-disable a
+	// plugin. 0 (explicit) = unlimited — the breaker is OFF.
+	DefaultMaxConsecutiveFailures = 5
 	// DefaultRefreshInterval is the W10 owner ruling: the refresh wave
 	// rechecks hourly (was 6h in the timer era).
 	DefaultRefreshInterval = time.Hour
@@ -442,6 +457,10 @@ func applyPluginsDefaults(c *Config) {
 	}
 	if c.Plugins.RunTimeout == nil {
 		c.Plugins.RunTimeout = &Duration{Duration: DefaultPluginRunTimeout}
+	}
+	if c.Plugins.MaxConsecutiveFailures == nil {
+		def := DefaultMaxConsecutiveFailures
+		c.Plugins.MaxConsecutiveFailures = &def
 	}
 }
 
@@ -667,6 +686,11 @@ func validate(c *Config) error {
 	}
 	if c.Plugins.RunTimeout != nil {
 		if err := validateNonNegative("plugins.run_timeout", c.Plugins.RunTimeout.Duration); err != nil {
+			return err
+		}
+	}
+	if c.Plugins.MaxConsecutiveFailures != nil {
+		if err := validateNonNegative("plugins.max_consecutive_failures", *c.Plugins.MaxConsecutiveFailures); err != nil {
 			return err
 		}
 	}
