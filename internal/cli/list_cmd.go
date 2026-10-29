@@ -334,16 +334,28 @@ func cityView(cs selectedStat, probeByKey map[string]store.ProbeResult) []select
 
 func groupCities(nodes []model.SelectedNode, probeByKey map[string]store.ProbeResult) []selectedStat {
 	byCity := map[string][]model.SelectedNode{}
+	// display: folded key → deterministic display spelling. The key folds
+	// case (model.CityKey — geo case variants of one city are ONE city);
+	// the shown name is the group's lowest-string variant (model.CityDisplay),
+	// stable across runs regardless of node order.
+	display := map[string]string{}
 	for _, n := range nodes {
 		city := strings.TrimSpace(n.City)
 		if city == "" {
 			city = "(unknown)"
 		}
-		byCity[city] = append(byCity[city], n)
+		k := model.CityKey(city)
+		if _, seen := byCity[k]; !seen {
+			byCity[k] = nil
+			display[k] = city
+		} else {
+			display[k] = model.CityDisplay(display[k], city)
+		}
+		byCity[k] = append(byCity[k], n)
 	}
 	out := make([]selectedStat, 0, len(byCity))
-	for city, group := range byCity {
-		st := selectedStat{flag: "· " + city, nodes: group}
+	for k, group := range byCity {
+		st := selectedStat{flag: "· " + display[k], nodes: group}
 		st.alive, st.median = aggregate(group, func(n model.SelectedNode) (bool, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
 				return pr.Alive, pr.RTTMs

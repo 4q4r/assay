@@ -208,3 +208,101 @@ func TestUnknownAndAllGoldenPassesXrayTest(t *testing.T) {
 	require.NoError(t, err, "xray run -test rejected the unknown+all render:\n%s", out)
 	assert.Contains(t, string(out), "Configuration OK")
 }
+
+// cityVariantSelection builds a two-node de selection whose cities are case
+// variants of the same real city — the geo-source shape the fold targets.
+func cityVariantSelection(t *testing.T, first, second string) ([]*model.Node, *model.Selection) {
+	t.Helper()
+	n1, s1 := mkSelected(t, "pool-de-01", "de", first, "de1.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	n2, s2 := mkSelected(t, "pool-de-02", "de", second, "de2.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	return []*model.Node{n1, n2}, &model.Selection{Nodes: []model.SelectedNode{s1, s2}}
+}
+
+// TestCityBalancerFoldsCaseVariants pins the M-b fix on the routing surface:
+// the city-balancer grouping folds case variants through model.CityKey, so a
+// geo source emitting "Frankfurt am Main" and "Frankfurt Am Main" forms ONE
+// bucket and the D5 >=2-node city balancer actually forms (raw-city grouping
+// yields two 1-node buckets and silently renders no balancer). The balancer
+// tag is composed from the group's deterministic display spelling
+// (model.CityDisplay, byte-wise min of the variants): whichever variant the
+// aggregator saw first, the tag is identical — CitySlug's lowercasing on top
+// of the folded display is idempotent, so the composition stays sane.
+func TestCityBalancerFoldsCaseVariants(t *testing.T) {
+	nodes, sel := cityVariantSelection(t, "Frankfurt am Main", "Frankfurt Am Main")
+	m := doRender(t, nodes, sel)
+
+	bal := balancerByTag(t, m, "pool_de_frankfurt_am_main")
+	require.NotNil(t, bal, "case-variant pair forms ONE city bucket; the >=2-node city balancer must form")
+	assert.Equal(t, []any{"pool-de-01", "pool-de-02"}, bal["selector"],
+		"the folded bucket carries both variants' outbounds")
+	assert.Equal(t, "block", bal["fallbackTag"], "security invariant: city balancer keeps the block fallback")
+
+	// One bucket, not two: exactly one city balancer exists for the group.
+	cityBalancers := 0
+	for _, b := range balancersOf(t, m) {
+		if tag, _ := b["tag"].(string); strings.HasPrefix(tag, "pool_de_") {
+			cityBalancers++
+		}
+	}
+	assert.Equal(t, 1, cityBalancers, "a case-variant pair is ONE city — no per-variant balancer")
+
+	// Order independence: flipped input renders the byte-identical config.
+	flippedNodes, flippedSel := cityVariantSelection(t, "Frankfurt Am Main", "Frankfurt am Main")
+	m2 := doRender(t, flippedNodes, flippedSel)
+	first, err := json.Marshal(m)
+	require.NoError(t, err)
+	second, err := json.Marshal(m2)
+	require.NoError(t, err)
+	assert.Equal(t, string(first), string(second),
+		"display determinism: input order must not change the render")
+}
+
+// TestCityVariantPairGoldenPassesXrayTest materializes (first run) and
+// byte-pins a golden render whose selection carries a case-variant city
+// pair — the folded-grouping output: exactly ONE city balancer over both
+// variants — and validates it against the REAL 26.3.27 binary (the
+// xray -test gate for the new surface).
+func TestCityVariantPairGoldenPassesXrayTest(t *testing.T) {
+	bin := "/usr/bin/xray"
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("xray binary not present at %s", bin)
+	}
+	nodes, sel := cityVariantSelection(t, "Frankfurt am Main", "Frankfurt Am Main")
+	byKey := map[string]*model.Node{}
+	for _, n := range nodes {
+		byKey[n.Key] = n
+	}
+	res, err := render.Render(render.Input{
+		Template:   testTemplate(t),
+		Selection:  sel,
+		NodesByKey: byKey,
+		Cfg:        renderCfg(nil),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, res.DroppedParams)
+
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(res.Config, &m))
+	require.NotNil(t, balancerByTag(t, m, "pool_de_frankfurt_am_main"),
+		"the golden render carries the folded city balancer")
+
+	goldenPath := filepath.Join("testdata", "golden-city-variant-pair.json")
+	golden, err := os.ReadFile(goldenPath)
+	if err == nil {
+		assert.Equal(t, string(golden), string(res.Config),
+			"render diverged from %s — if intentional, regenerate deliberately", goldenPath)
+	} else {
+		require.NoError(t, os.WriteFile(goldenPath, res.Config, 0o644), "first run materializes the golden")
+		golden = res.Config
+		t.Logf("materialized %s", goldenPath)
+	}
+
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "rendered.json")
+	require.NoError(t, os.WriteFile(cfgPath, golden, 0o644))
+	cmd := exec.CommandContext(context.Background(), bin, "run", "-test", "-c", cfgPath)
+	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+tmp)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "xray run -test rejected the city-variant-pair render:\n%s", out)
+	assert.Contains(t, string(out), "Configuration OK")
+}

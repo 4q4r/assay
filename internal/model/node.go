@@ -273,3 +273,38 @@ func CitySlug(city string) string {
 	}
 	return b.String()
 }
+
+// CityKey is the case-folded GROUPING key for city names: geo sources emit
+// case variants of the same city ("Frankfurt am Main" / "Frankfurt Am
+// Main") that are ONE city on every grouping surface (check geo summary,
+// list --cities table + --json, render city-balancer grouping, rank D7
+// caps + city-diversity tie-break). Grouping folds through this key;
+// DISPLAY never does — the shown spelling is the group's deterministic
+// lowest-string variant (CityDisplay), so output is stable across runs no
+// matter which variant a geo source hands out. This is a display/grouping
+// concern only: stored records (geo-base) keep their original spelling.
+// The render city-balancer TAG is still composed through CitySlug — fed
+// with the group's CityDisplay spelling, so the slug (CitySlug lowercases
+// again, idempotent on the folded display) is variant-independent.
+func CityKey(city string) string {
+	return strings.ToLower(strings.TrimSpace(city))
+}
+
+// CityDisplay picks the deterministic display spelling of a city group:
+// the lexicographically lowest (byte-wise) of the two trimmed variants.
+// Applied pairwise while folding rows into a group, it converges on the
+// group's lowest original casing — the same determinism convention the
+// render goldens pin (identical data in, byte-identical output out).
+func CityDisplay(a, b string) string {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	if b < a {
+		return b
+	}
+	return a
+}

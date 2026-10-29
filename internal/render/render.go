@@ -482,7 +482,8 @@ func ensureStatsAndPolicy(m map[string]any) {
 }
 
 // addBalancers renders pool_<cc> for every country in the selection and
-// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). W16 adds two
+// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5; the city
+// grouping folds case variants through model.CityKey, M-b). W16 adds two
 // balancers (owner item 14):
 //   - pool_unknown — the unknown-geo pseudo-location: rendered when ≥1 node
 //     with empty geo is in the selection; its selector is the xx pseudo-code
@@ -551,16 +552,26 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 
 		// City balancers where they make sense (>= 2 live nodes, D5). The
 		// unknown group carries no cities (no geo evidence — empty city
-		// fields), so this loop is naturally skipped for it.
+		// fields), so this loop is naturally skipped for it. The grouping
+		// key folds case (model.CityKey, M-b): a geo source emitting case
+		// variants of one city must form ONE bucket, or the >=2-node
+		// threshold silently never fires (two 1-node buckets). The tag is
+		// composed from the group's deterministic display spelling
+		// (model.CityDisplay, byte-wise min of the variants); CitySlug
+		// lowercases it again — idempotent on the folded display.
 		cityTags := map[string][]any{}
+		cityDisplay := map[string]string{}
 		var cities []string
 		for _, sn := range nodes {
 			if sn.City == "" {
 				continue
 			}
-			key := sn.City
+			key := model.CityKey(sn.City)
 			if _, seen := cityTags[key]; !seen {
 				cities = append(cities, key)
+				cityDisplay[key] = sn.City
+			} else {
+				cityDisplay[key] = model.CityDisplay(cityDisplay[key], sn.City)
 			}
 			cityTags[key] = append(cityTags[key], sn.Tag)
 		}
@@ -570,7 +581,7 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 			if len(selectors) < 2 {
 				continue // single-node city: explicit tag override, no balancer
 			}
-			ctag := model.CityBalancerTag(cc, city)
+			ctag := model.CityBalancerTag(cc, cityDisplay[city])
 			existing = append(existing, map[string]any{
 				keyTag:        ctag,
 				"selector":    selectors,

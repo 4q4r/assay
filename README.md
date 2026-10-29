@@ -200,7 +200,7 @@ publicvpn list                 # active core by country: flag, code+name, nodes,
 publicvpn list --cities --all  # + indented city sub-rows (D5 view) + the cold base section
 ```
 
-Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. Unknown-geo nodes in the selection render as their own `🏳 unknown` row, and the `balancers:` line names the routing targets the current selection will produce (W16: `pool_all`, country balancers, `pool_unknown` when present). Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
+Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. City names group **case-insensitively**: geo sources emit case variants of one city (`Frankfurt am Main` / `Frankfurt Am Main`), which fold into a single group displayed under its deterministic lowest-sorting spelling — the same folding applies to the `check` geo summary and to the selection semantics: the ≥2-node city-balancer threshold (D5) and the distinct-city counts behind the D7 cap expansion and diversity tie-break count folded cities, so a variant pair forms ONE city balancer and counts as one city. Unknown-geo nodes in the selection render as their own `🏳 unknown` row, and the `balancers:` line names the routing targets the current selection will produce (W16: `pool_all`, country balancers, `pool_unknown` when present). Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
 
 ### `--json` (machine-readable twin)
 
@@ -216,7 +216,7 @@ Read-only display over the data `status`/`check` already use (selection + probe 
 | `countries[].name` / `.flag` | string | English short name / flag emoji (`"unknown"` / `🏳` for the unknown group) |
 | `countries[].nodes` / `.alive` | int | node count / alive count (latest probe wave truth) |
 | `countries[].median_rtt_ms` | number | median RTT of nodes with a positive RTT (`0` when none) |
-| `countries[].cities[]` | array, `--cities` only | city sub-rows (`city`, `nodes`, `alive`, `median_rtt_ms`) — the exact rows the table renders (a single-city country gets none); omitted without `--cities` |
+| `countries[].cities[]` | array, `--cities` only | city sub-rows (`city`, `nodes`, `alive`, `median_rtt_ms`) — the exact rows the table renders (a single-city country gets none); omitted without `--cities`. `city` groups case-insensitively and shows the group's lowest-sorting original spelling |
 | `cold_base` | object, `--all` only | `{path, records, countries[]}` — the cold base grouped the same way |
 | `balancers[]` | array | the structured W16 routing targets (`pool_all` / `pool_<cc>` / `pool_unknown` with `nodes` counts) — the data behind the table's `balancers:` line, same aggregation |
 
