@@ -16,6 +16,7 @@ import (
 	"public_vpn/internal/plugins"
 
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -196,6 +197,63 @@ func waitArmed(t *testing.T, clock *fakeClock, n int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for arm %d", n)
+}
+
+// TestSchedulerSpeedtestDisabled pins the round-8 disable semantics:
+// speedtestInterval = 0 ([maintain].speedtest_interval = "0s") means NO
+// speedtest wave at all — the scheduler never schedules one, ticks past a
+// would-be speedtest instant run plain refreshes, and the armed line says
+// so. This is the owner's «выключи» made real at the schedule level.
+func TestSchedulerSpeedtestDisabled(t *testing.T) {
+	clock := newFakeClock()
+	waves := &waveRecorder{}
+	out := &syncWriter{}
+	sched := &waveScheduler{
+		cfg:               &config.Config{},
+		refreshInterval:   time.Hour,
+		speedtestInterval: 0, // disabled
+		deps:              watchDeps{now: clock.Now, after: clock.After},
+		out:               out,
+		runWave: func(_ *config.Config, opts maintainOptions, _ func() bool) error {
+			waves.record(opts)
+			return nil
+		},
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var ran []waveKind
+	go func() {
+		ran = sched.run(stop, nil)
+		close(done)
+	}()
+
+	waitForWaves(t, waves, 1) // initial refresh
+	waitArmed(t, clock, 1)
+	// Push the clock far past any would-be speedtest instant: with the wave
+	// disabled, every due tick is a plain refresh, forever.
+	clock.advance(1000 * time.Hour)
+	waitForWaves(t, waves, 2)
+	waitArmed(t, clock, 2)
+	clock.advance(time.Hour)
+	waitForWaves(t, waves, 3)
+	waitArmed(t, clock, 3)
+
+	close(stop)
+	<-done
+
+	for _, k := range ran {
+		if k == waveSpeedtest {
+			t.Fatalf("speedtest wave scheduled despite interval 0: %v", ran)
+		}
+	}
+	for i, opts := range waves.all() {
+		assert.False(t, opts.speedtest, "wave %d must be a probe-only refresh (speedtest disabled)", i)
+	}
+	text := out.String()
+	assert.Contains(t, text, "speedtest disabled",
+		"the armed line must name the disable explicitly:\n%s", text)
+	assert.Contains(t, text, "speedtest_interval",
+		"the armed line must name the knob that disables the wave:\n%s", text)
 }
 
 func TestSchedulerSurvivesWaveFailure(t *testing.T) {

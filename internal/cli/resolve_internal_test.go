@@ -39,11 +39,22 @@ func newHermeticEnv(t *testing.T) hermeticEnv {
 	return hermeticEnv{home: home, cwd: cwd}
 }
 
-func (h hermeticEnv) putHomeConfig(t *testing.T) string {
+func (h hermeticEnv) putShareConfig(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(h.home, ".local", "share", "publicvpn", "config.toml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+	require.NoError(t, os.WriteFile(p, []byte(fmt.Sprintf("data_dir = %q\n", filepath.Join(h.home, "share-data"))), 0o600))
+	return p
+}
+
+// putLegacyHomeConfig creates the DEPRECATED pre-W13 home location — the
+// one-release-cycle courtesy tier (found-if-exists with a loud move
+// warning).
+func (h hermeticEnv) putLegacyHomeConfig(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(h.home, ".config", "publicvpn", "config.toml")
 	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
-	require.NoError(t, os.WriteFile(p, []byte(fmt.Sprintf("data_dir = %q\n", filepath.Join(h.home, "home-data"))), 0o600))
+	require.NoError(t, os.WriteFile(p, []byte(fmt.Sprintf("data_dir = %q\n", filepath.Join(h.home, "legacy-data"))), 0o600))
 	return p
 }
 
@@ -68,62 +79,78 @@ func runStatusCapture(t *testing.T, args ...string) (string, error) {
 
 // TestCLIConfigSourceLinePrecedence pins the visibility contract through the
 // real command surface: every command prints the resolved config source, and
-// status shows the same provenance as a dedicated line.
+// status shows the same provenance as a dedicated line — including the
+// W13-deploy tier names (local-share default, legacy home default).
 func TestCLIConfigSourceLinePrecedence(t *testing.T) {
 	tests := []struct {
-		name      string
-		homeFile  bool
-		cwdFile   bool
-		explicit  bool
-		wantLine  string
-		noHomeCfg bool
+		name     string
+		share    bool
+		legacy   bool
+		cwdFile  bool
+		explicit bool
+		wantLine string
+		wantWarn string
 	}{
 		{
-			name:     "explicit -c",
-			homeFile: true, cwdFile: true, explicit: true,
+			name:  "explicit -c",
+			share: true, cwdFile: true, explicit: true,
 			wantLine: "config: explicit -c",
 		},
 		{
-			name:     "home default",
-			homeFile: true, cwdFile: true,
-			wantLine: "config: home default",
+			name:  "local-share default",
+			share: true, cwdFile: true,
+			wantLine: "config: local-share default",
+		},
+		{
+			name:   "legacy home default with the loud move warning",
+			legacy: true, cwdFile: true,
+			wantLine: "config: legacy home default",
+			wantWarn: "move it to ~/.local/share/publicvpn/config.toml",
 		},
 		{
 			name:     "cwd default",
-			homeFile: false, cwdFile: true,
+			cwdFile:  true,
 			wantLine: "config: cwd default",
 		},
 		{
 			name:     "configless",
-			homeFile: false, cwdFile: false,
 			wantLine: "config: configless (built-in defaults)",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newHermeticEnv(t)
-			if tt.homeFile {
-				env.putHomeConfig(t)
+			if tt.share {
+				env.putShareConfig(t)
+			}
+			if tt.legacy {
+				env.putLegacyHomeConfig(t)
 			}
 			if tt.cwdFile {
 				env.putCwdConfig(t)
 			}
 			args := []string{}
 			if tt.explicit {
-				args = append(args, "-c", env.putHomeConfig(t))
+				args = append(args, "-c", env.putShareConfig(t))
 			}
 			out, err := runStatusCapture(t, args...)
 			require.NoError(t, err)
 			assert.Contains(t, out, tt.wantLine)
-			// The data-dir line must always reflect the EFFECTIVE config:
-			// configless points at the XDG default under the injected HOME.
-			if tt.homeFile && !tt.explicit {
-				assert.Contains(t, out, filepath.Join(env.home, "home-data"))
+			if tt.wantWarn != "" {
+				assert.Contains(t, out, "warning:", "the deprecation warning prints loud:\n%s", out)
+				assert.Contains(t, out, tt.wantWarn, "the warning names the move:\n%s", out)
 			}
-			if tt.cwdFile && !tt.homeFile {
+			// The data-dir line must always reflect the EFFECTIVE config.
+			switch {
+			case tt.explicit:
+				assert.Contains(t, out, filepath.Join(env.home, "share-data"))
+			case tt.share:
+				assert.Contains(t, out, filepath.Join(env.home, "share-data"))
+			case tt.legacy:
+				assert.Contains(t, out, filepath.Join(env.home, "legacy-data"))
+			case tt.cwdFile:
 				assert.Contains(t, out, filepath.Join(env.cwd, "cwd-data"))
-			}
-			if !tt.homeFile && !tt.cwdFile {
+			default:
 				assert.Contains(t, out, filepath.Join(env.home, ".local", "share", "publicvpn"))
 			}
 		})
@@ -146,7 +173,7 @@ func TestConfiglessRenderBoundaryLoud(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "configless mode cannot render")
-	assert.Contains(t, err.Error(), config.HomeConfigDisplay)
+	assert.Contains(t, err.Error(), config.ShareConfigDisplay)
 }
 
 // TestConfiglessActivateBoundaryLoud: same contract for activate.
@@ -160,7 +187,7 @@ func TestConfiglessActivateBoundaryLoud(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "configless mode cannot activate")
-	assert.Contains(t, err.Error(), config.HomeConfigDisplay)
+	assert.Contains(t, err.Error(), config.ShareConfigDisplay)
 }
 
 // TestConfiglessActivateTargetFlagCannotBypassBoundary pins the I-1
@@ -179,7 +206,7 @@ func TestConfiglessActivateTargetFlagCannotBypassBoundary(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "configless mode cannot activate",
 		"the loud boundary message, not the render-first loop")
-	assert.Contains(t, err.Error(), config.HomeConfigDisplay)
+	assert.Contains(t, err.Error(), config.ShareConfigDisplay)
 	assert.NotContains(t, err.Error(), "run render first",
 		"--target must not drop configless runs into the misleading render-first loop")
 }
@@ -293,29 +320,123 @@ func TestWatchConfiglessBootStaysUp(t *testing.T) {
 	assert.Contains(t, out.String(), "watch: clean shutdown")
 }
 
-// TestInstallWithoutResolvableConfigLoud: install REQUIRES a config (the
-// unit embeds its path). With no explicit -c and no home default, install
-// fails loud with guidance — cwd alone is NOT enough for install.
-func TestInstallWithoutResolvableConfigLoud(t *testing.T) {
+// TestInstallDefaultLocationMaterializesConfig pins the W13-deploy
+// canonical user flow end to end at the cobra seam: install WITHOUT -c and
+// with NO config anywhere — exit 0, the default config materialized at the
+// local-share path (from the embedded configless defaults), the daemon unit
+// running plain `watch` (NO -c — the daemon reads the default location),
+// and the loud summary naming the config and the fill-me paths. A SECOND
+// install must report "kept" and never touch the file.
+func TestInstallDefaultLocationMaterializesConfig(t *testing.T) {
 	env := newHermeticEnv(t)
-	env.putCwdConfig(t) // cwd default deliberately present: install ignores it
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(env.home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(env.home, "run", "systemd"), 0o755))
+	// A cwd config present but deliberately IGNORED: install never embeds a
+	// cwd-relative path into a daemon unit.
+	env.putCwdConfig(t)
+
+	ex := &fakeCtl{}
+	orig := installExecutor
+	installExecutor = func() install.Executor { return ex }
+	t.Cleanup(func() { installExecutor = orig })
+
+	unitDir := filepath.Join(env.home, ".config", "systemd", "user")
+	binDir := filepath.Join(env.home, ".local", "bin")
+	cfgPath := filepath.Join(env.home, ".local", "share", "publicvpn", "config.toml")
+
+	run := func() string {
+		root := newTestRoot()
+		buf := &bytes.Buffer{}
+		root.SetOut(buf)
+		root.SetErr(buf)
+		root.SetArgs([]string{"install", "--bin-dir", binDir, "--unit-dir", unitDir})
+		require.NoError(t, root.Execute(), "output:\n%s", buf.String())
+		return buf.String()
+	}
+
+	out := run()
+	assert.Contains(t, out, "config created:   "+cfgPath, "summary names the materialized config:\n%s", out)
+	assert.Contains(t, out, "daemon config:    "+cfgPath+" (the daemon reads the default location — no -c in the unit)")
+	assert.Contains(t, out, "to activate:      fill [render].template and [activate].target")
+
+	// The materialized file: valid TOML that loads, data_dir = the local-share
+	// default, and the load passes strict decode (the embedded template must
+	// never carry dead keys).
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err, "the materialized default config must load clean")
+	assert.Equal(t, filepath.Join(env.home, ".local", "share", "publicvpn"), cfg.DataDir)
+	assert.False(t, cfg.Probe.IsSpeedtest(), "the materialized defaults carry the round-8 speedtest-off default")
+	info, err := os.Stat(cfgPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the materialized config is owner-only (token knobs exist)")
+
+	// The unit: plain `watch` ExecStart, no -c anywhere.
+	unitBytes, err := os.ReadFile(filepath.Join(unitDir, install.WatchService))
+	require.NoError(t, err)
+	assert.Contains(t, string(unitBytes), binDir+"/publicvpn watch\n", "ExecStart must be plain watch (no -c):\n"+string(unitBytes))
+	assert.NotContains(t, string(unitBytes), " -c ")
+
+	// Re-install: the share config now resolves as the default location —
+	// plain `watch` again (a no--c install NEVER flips to -c), the owner's
+	// file untouched.
+	require.NoError(t, os.WriteFile(cfgPath, []byte("data_dir = \""+filepath.Join(env.home, "d")+"\"\n"), 0o600))
+	out2 := run()
+	assert.Contains(t, out2, "config: local-share default "+cfgPath)
+	assert.Contains(t, out2, "daemon config:    "+cfgPath+" (the daemon reads the default location — no -c in the unit)")
+	assert.NotContains(t, out2, "config created:", "nothing to materialize on a re-install")
+	unitBytes2, err := os.ReadFile(filepath.Join(unitDir, install.WatchService))
+	require.NoError(t, err)
+	assert.Contains(t, string(unitBytes2), " watch\n")
+	assert.NotContains(t, string(unitBytes2), " -c ", "the unit must never flip to -c on a re-install")
+	cfg2, err := config.Load(cfgPath)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(env.home, "d"), cfg2.DataDir, "the owner's file survived the re-install byte-for-byte")
+}
+
+// TestInstallLegacyHomeLocationWinsWithWarning pins the one-release-cycle
+// courtesy at the cobra seam: with NO local-share config but a legacy
+// ~/.config/publicvpn/config.toml present, install uses it (the owner's
+// tuned config keeps working — no second config materialized over it) and
+// prints the loud deprecation warning; the unit embeds the legacy path.
+func TestInstallLegacyHomeLocationWinsWithWarning(t *testing.T) {
+	env := newHermeticEnv(t)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(env.home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(env.home, "run", "systemd"), 0o755))
+	legacyCfg := env.putLegacyHomeConfig(t)
+
+	ex := &fakeCtl{}
+	orig := installExecutor
+	installExecutor = func() install.Executor { return ex }
+	t.Cleanup(func() { installExecutor = orig })
+
+	unitDir := filepath.Join(env.home, ".config", "systemd", "user")
 	root := newTestRoot()
 	buf := &bytes.Buffer{}
 	root.SetOut(buf)
 	root.SetErr(buf)
-	root.SetArgs([]string{"install", "--no-systemd"})
-	err := root.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "install requires a config")
-	assert.Contains(t, err.Error(), config.HomeConfigDisplay)
+	root.SetArgs([]string{
+		"install",
+		"--bin-dir", filepath.Join(env.home, ".local", "bin"),
+		"--unit-dir", unitDir,
+	})
+	require.NoError(t, root.Execute(), "output:\n%s", buf.String())
+
+	assert.Contains(t, buf.String(), "config: legacy home default "+legacyCfg)
+	assert.Contains(t, buf.String(), "warning: legacy config location detected", "the deprecation warning is loud")
+	_, err := os.Stat(filepath.Join(env.home, ".local", "share", "publicvpn", "config.toml"))
+	assert.True(t, os.IsNotExist(err), "no materialization over a working legacy config")
+	unitBytes, err := os.ReadFile(filepath.Join(unitDir, install.WatchService))
+	require.NoError(t, err)
+	assert.Contains(t, string(unitBytes), legacyCfg, "the unit embeds the legacy config path")
 }
 
-// TestInstallHomeDefaultUnitCarriesResolvedPath: install with the home
-// default renders the daemon unit referencing the RESOLVED ABSOLUTE config
-// path.
-func TestInstallHomeDefaultUnitCarriesResolvedPath(t *testing.T) {
+// TestInstallShareDefaultUnitCarriesResolvedPath: install with the
+// local-share default present is a DEFAULT-LOCATION install — the unit
+// renders plain `watch` (NO -c: the daemon reads the default location,
+// which finds this exact file), and the summary names the resolved path.
+func TestInstallShareDefaultUnitCarriesResolvedPath(t *testing.T) {
 	env := newHermeticEnv(t)
-	homeCfg := env.putHomeConfig(t)
+	shareCfg := env.putShareConfig(t)
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(env.home, "run"))
 	// Hermetic user-session probe marker (install refuses without one).
 	require.NoError(t, os.MkdirAll(filepath.Join(env.home, "run", "systemd"), 0o755))
@@ -333,30 +454,41 @@ func TestInstallHomeDefaultUnitCarriesResolvedPath(t *testing.T) {
 	root.SetErr(buf)
 	root.SetArgs([]string{"install", "--bin-dir", binDir, "--unit-dir", unitDir})
 	require.NoError(t, root.Execute(), "output:\n%s", buf.String())
-	assert.Contains(t, buf.String(), "config: home default "+homeCfg)
+	assert.Contains(t, buf.String(), "config: local-share default "+shareCfg)
+	assert.Contains(t, buf.String(), "daemon config:    "+shareCfg+" (the daemon reads the default location — no -c in the unit)")
+	assert.NotContains(t, buf.String(), "config created:", "nothing materialized when the canonical config already exists")
 
-	// The UNIT FILE embeds the resolved absolute home config path.
+	// The UNIT renders plain watch — the daemon resolves the same file.
 	unitPath := filepath.Join(unitDir, "public_vpn-watch.service")
 	b, err := os.ReadFile(unitPath)
 	require.NoError(t, err, "unit file must be rendered; output:\n%s", buf.String())
-	assert.Contains(t, string(b), homeCfg, "the unit must embed the resolved home config path")
+	assert.Contains(t, string(b), " watch\n", "ExecStart must be plain watch for the default-location install")
+	assert.NotContains(t, string(b), " -c ")
 	assert.NotEmpty(t, ex.calls, "systemd enable flow must run through the executor seam")
 }
 
-// TestUninstallPurgeResolvesInstallStyle: --purge resolves the config the
-// same way install does (explicit → home default → loud; never the cwd
-// default — a purge must never depend on the caller's cwd).
+// TestUninstallPurgeResolvesInstallStyle: --purge never consults the cwd —
+// with no explicit -c and no config anywhere in the install-style chain, the
+// purge targets the CANONICAL local-share layout (the materialized default
+// config path + the data dir under it), never the caller's ./config.toml.
 func TestUninstallPurgeResolvesInstallStyle(t *testing.T) {
 	env := newHermeticEnv(t)
 	env.putCwdConfig(t)
+	cwdCfg := filepath.Join(env.cwd, "config.toml")
 	root := newTestRoot()
 	buf := &bytes.Buffer{}
 	root.SetOut(buf)
 	root.SetErr(buf)
 	root.SetArgs([]string{"uninstall", "--purge"})
-	err := root.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "install requires a config")
+	require.NoError(t, root.Execute(), "output:\n%s", buf.String())
+
+	shareCfg := filepath.Join(env.home, ".local", "share", "publicvpn", "config.toml")
+	assert.Contains(t, buf.String(), "purged:           "+shareCfg,
+		"the canonical local-share config is the purge target:\n%s", buf.String())
+	assert.Contains(t, buf.String(), "purged:           "+filepath.Join(env.home, ".local", "share", "publicvpn"),
+		"the local-share data dir goes with it")
+	_, err := os.Stat(cwdCfg)
+	assert.NoError(t, err, "the cwd config file is NEVER purged (cwd never consulted)")
 }
 
 // newTestRoot builds a fresh root command (each call gets its own flag

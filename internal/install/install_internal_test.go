@@ -177,6 +177,26 @@ func TestInstallNoSystemdCopiesBinaryOnly(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestInstallNoSystemdDefaultLocationMaterializes pins the W13-deploy
+// --no-systemd contract: without -c the default config is STILL
+// materialized (the deploy layout is not a systemd concern), the unit files
+// are skipped, and no systemctl interaction happens.
+func TestInstallNoSystemdDefaultLocationMaterializes(t *testing.T) {
+	ex := &fakeExecutor{}
+	opts, home, _ := installOpts(t, ex)
+	opts.NoSystemd = true
+	opts.ConfigPath = ""
+	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "publicvpn", "config.toml")
+	opts.DataDir = filepath.Join(home, ".local", "share", "publicvpn")
+	res, err := Install(opts)
+	require.NoError(t, err)
+	assert.True(t, res.SkippedUnits)
+	assert.Empty(t, ex.calls, "no systemd interaction under --no-systemd")
+	assert.Equal(t, opts.DefaultConfigPath, res.ConfigWritten, "the deploy layout materializes without systemd")
+	_, err = os.Stat(opts.DefaultConfigPath)
+	require.NoError(t, err)
+}
+
 func TestInstallWithoutSystemdSessionFailsLoud(t *testing.T) {
 	// installOpts hermetically points XDG_RUNTIME_DIR at a VALID session —
 	// override it with an empty dir to force the no-session branch.
@@ -189,14 +209,36 @@ func TestInstallWithoutSystemdSessionFailsLoud(t *testing.T) {
 	assert.Empty(t, ex.calls, "nothing executed when the session is missing")
 }
 
-func TestInstallRequiresConfigForUnits(t *testing.T) {
+// TestInstallDefaultLocationRendersPlainWatch pins the W13-deploy unit
+// contract at the package level: ConfigPath == "" is a default-location
+// install — the unit renders plain `watch` (NO -c; the daemon reads the
+// default config location), and an optional DefaultConfigPath materializes
+// the embedded default config (created once, kept afterwards).
+func TestInstallDefaultLocationRendersPlainWatch(t *testing.T) {
 	ex := &fakeExecutor{}
-	opts, _, _ := installOpts(t, ex)
+	opts, home, unitDir := installOpts(t, ex)
 	opts.ConfigPath = ""
-	_, err := Install(opts)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--config")
-	assert.Empty(t, ex.calls)
+	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "publicvpn", "config.toml")
+	opts.DataDir = filepath.Join(home, ".local", "share", "publicvpn")
+	res, err := Install(opts)
+	require.NoError(t, err)
+	assert.Empty(t, res.ConfigKept)
+	assert.Equal(t, opts.DefaultConfigPath, res.ConfigWritten)
+
+	watch, err := os.ReadFile(filepath.Join(unitDir, WatchService))
+	require.NoError(t, err)
+	assert.Contains(t, string(watch), " watch\n", "ExecStart must be plain watch (no -c)")
+	assert.NotContains(t, string(watch), " -c ")
+
+	// Re-install: the materialized config is KEPT, never overwritten.
+	opts2, _, _ := installOpts(t, ex)
+	opts2.ConfigPath = ""
+	opts2.DefaultConfigPath = opts.DefaultConfigPath
+	opts2.DataDir = opts.DataDir
+	res2, err := Install(opts2)
+	require.NoError(t, err)
+	assert.Empty(t, res2.ConfigWritten)
+	assert.Equal(t, opts.DefaultConfigPath, res2.ConfigKept)
 }
 
 func TestInstallWithoutExecutorIsLoud(t *testing.T) {

@@ -35,9 +35,11 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
     into the registry (a broken file keeps the previous version active with
     a loud error), removal disables the source on the fly;
   - refresh wave every [maintain].refresh_interval (default 1h) and
-    speedtest wave every [maintain].speedtest_interval — the same
-    fetch→…→activate stages as ` + "`publicvpn maintain`" + `, reusing the
-    one wave implementation; a speedtest-due tick covers the refresh;
+    speedtest wave every [maintain].speedtest_interval (default 168h; a
+    speedtest-due tick covers the refresh) — the same fetch→…→activate
+    stages as ` + "`publicvpn maintain`" + `, reusing the one wave
+    implementation; "0s" disables the speedtest wave entirely (round-8:
+    refresh waves stay probe-only — probe.speedtest defaults off);
   - the stats poll runs inside every wave (existing stage cadence);
   - broken-plugin waves continue with the healthy plugins (loud per-plugin
     errors); a single plugin run is additionally bounded by
@@ -124,6 +126,10 @@ var signalChannel = func() <-chan os.Signal {
 // moment it STARTED, so periods are exact regardless of wave duration
 // (a wave that outlives its interval fires the next due wave immediately —
 // catch-up, never drift). Waves never overlap: the loop is serial.
+//
+// speedtestInterval == 0 (round-8: [maintain].speedtest_interval = "0s")
+// DISABLES the speedtest wave entirely: the loop schedules refresh waves
+// only, forever — the owner's «выключи» made real at the schedule level.
 type waveScheduler struct {
 	cfg               *config.Config
 	refreshInterval   time.Duration
@@ -145,8 +151,14 @@ const (
 // OnBootSec role). Wave failures are loud but never kill the daemon — the
 // schedule re-arms and the next wave retries.
 func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKind {
-	outf(s.out, "watch: scheduler armed — refresh every %s, speedtest every %s\n",
-		s.refreshInterval, s.speedtestInterval)
+	speedtestEnabled := s.speedtestInterval > 0
+	if speedtestEnabled {
+		outf(s.out, "watch: scheduler armed — refresh every %s, speedtest every %s\n",
+			s.refreshInterval, s.speedtestInterval)
+	} else {
+		outf(s.out, "watch: scheduler armed — refresh every %s, speedtest disabled "+
+			"([maintain].speedtest_interval = 0s — no speedtest waves)\n", s.refreshInterval)
+	}
 	var ran []waveKind
 	// Re-arm anchor: the wave's START instant. Anchoring at completion let
 	// every wave's duration shift the whole schedule later (drift); from
@@ -158,9 +170,14 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 	ran = append(ran, waveRefresh)
 	nextRefresh := start.Add(s.refreshInterval)
 	nextSpeedtest := start.Add(s.speedtestInterval)
+	if !speedtestEnabled {
+		// Zero the anchor: the due computation below treats it as absent —
+		// no speedtest wave is ever scheduled.
+		nextSpeedtest = time.Time{}
+	}
 	for {
 		due := nextRefresh
-		if nextSpeedtest.Before(due) {
+		if !nextSpeedtest.IsZero() && nextSpeedtest.Before(due) {
 			due = nextSpeedtest
 		}
 		wait := max(due.Sub(s.deps.now()), 0)
@@ -172,7 +189,7 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 		}
 		now := s.deps.now()
 		refreshDue := !now.Before(nextRefresh)
-		speedtestDue := !now.Before(nextSpeedtest)
+		speedtestDue := !nextSpeedtest.IsZero() && !now.Before(nextSpeedtest)
 		switch {
 		case speedtestDue:
 			start := s.deps.now()
@@ -226,9 +243,10 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	between := shutdown.Load
 	stop := make(chan struct{})
 	sched := &waveScheduler{
-		cfg:               cfg,
-		refreshInterval:   cfg.Maintain.RefreshInterval.Duration,
-		speedtestInterval: cfg.Maintain.SpeedtestInterval.Duration,
+		cfg:             cfg,
+		refreshInterval: cfg.Maintain.RefreshInterval.Duration,
+		// Round-8 tri-state: nil/0 → the speedtest wave is disabled entirely.
+		speedtestInterval: cfg.Maintain.SpeedtestWavePeriod(),
 		runWave:           runWave,
 		deps:              deps,
 		out:               out,

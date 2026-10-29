@@ -41,45 +41,60 @@ func newInstallCommand(cfgPath *string) *cobra.Command {
 		noSystemd bool
 	)
 	cmd := &cobra.Command{
-		Use:   "install",
-		Short: "Self-install: copy the running binary and render + enable the watch daemon unit",
-		Long: `Copies the RUNNING binary (os.Executable) to --bin-dir as ` + "`publicvpn`" + `
-(atomic write, mode 0755; re-running after a rebuild = self-upgrade), then
-renders the watch-daemon unit from the repo template and enables it:
+		Use: "install",
+		Short: "Self-install: copy the running binary, materialize the default config (no -c)," +
+			" render + enable the watch daemon unit",
+		Long: `The canonical user deploy (W13-deploy): ONE command puts everything in
+the XDG local-share layout.
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now public_vpn-watch.service
+WITHOUT -c (the canonical flow):
+  1. copies the RUNNING binary (os.Executable) to --bin-dir as
+     ` + "`publicvpn`" + ` (atomic write, mode 0755; re-running after a rebuild =
+     self-upgrade);
+  2. materializes the default config at
+     ~/.local/share/publicvpn/config.toml — the same values a configless
+     run uses, written as TOML with full comments. An EXISTING file is
+     never overwritten (reported as "kept");
+  3. renders the watch-daemon unit with a plain ` + "`watch`" + ` ExecStart — NO -c:
+     the daemon reads the default config location;
+  4. enables it:
+       systemctl --user daemon-reload
+       systemctl --user enable --now public_vpn-watch.service
+  5. prints a loud summary — including what YOU still must fill:
+     [render].template and [activate].target in the materialized config.
+     Until those exist the render/activate stages fail loud at their
+     boundary; every data stage (fetch → parse → filter → probe → geo →
+     select) runs meanwhile.
+
+WITH -c <path>: the previous semantics verbatim — the unit embeds the
+resolved absolute path (a relative -c resolves against the current
+directory), the config is untouched where it is, and the daemon reads THAT
+file.
 
 The daemon (publicvpn watch) runs the plugin watchdog and the maintain-wave
 scheduler; [maintain].refresh_interval / [maintain].speedtest_interval and
 [plugins].dir are read from the config LIVE — changing them needs only a
 restart of the unit, never a re-install. Legacy W5 timer units
 (public_vpn-refresh/speedtest.*) still on disk are disabled and removed by
-this install: waves fire from exactly ONE scheduler. Config files are NEVER
-created or moved: the unit references the resolved --config path (explicit
--c wins; a relative -c resolves against the current directory and is
-embedded absolute — the same resolution scheme as every other command), so
-it must exist and stay in place.
+this install: waves fire from exactly ONE scheduler. The deprecated legacy
+config location (~/.config/publicvpn/config.toml) still wins when present —
+with a loud deprecation warning naming the move.
 
-Install REQUIRES a resolvable config (the unit embeds its path): an explicit
--c wins and must exist; otherwise the home default
-(~/.config/publicvpn/config.toml) is used when present; otherwise install
-fails loud with guidance. The CWD default (./config.toml) is deliberately
-NOT consulted — a daemon unit must reference a stable location, never the
-directory the operator happened to stand in.
-
---no-systemd installs the binary only (hosts without a systemd user session;
-the unit is skipped).`,
+--no-systemd installs the binary (and, without -c, materializes the default
+config) but skips all unit files — for hosts without a systemd user
+session.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveInstallPath(*cfgPath)
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res)
-			return runInstall(cmd.OutOrStdout(), res.Config, res.Path, installOptions{
-				binDir:    binDir,
-				unitDir:   unitDir,
-				noSystemd: noSystemd,
+			reportConfigSource(cmd.OutOrStdout(), res.res)
+			return runInstall(cmd.OutOrStdout(), res.res.Config, res.res.Path, installOptions{
+				binDir:          binDir,
+				unitDir:         unitDir,
+				noSystemd:       noSystemd,
+				embedsConfig:    res.embedsConfig,
+				materializePath: res.materializePath,
 			})
 		},
 	}
@@ -90,46 +105,85 @@ the unit is skipped).`,
 	return cmd
 }
 
+// prepareInstallPaths resolves the two paths that feed install.Options:
+// the absolute config path embedded into the unit (only for explicit-path
+// installs), and the unit dir. I-1: ExecStart= splits argv on whitespace and
+// never de-quotes, so a whitespace-bearing --bin-dir/--config renders a unit
+// that installs "successfully" but dies at timer-fire ("Command ... is not
+// executable") — both are refused here, before anything is copied or
+// written. A whitespace unit dir is harmless (never inside ExecStart=).
+func prepareInstallPaths(cfgPath, binDir string, opts installOptions) (string, string, error) {
+	var cfgAbs string
+	if opts.embedsConfig && cfgPath != "" {
+		if filepath.IsAbs(cfgPath) {
+			cfgAbs = cfgPath
+		} else if abs, absErr := filepath.Abs(cfgPath); absErr != nil {
+			return "", "", fmt.Errorf("resolve config path: %w", absErr)
+		} else {
+			cfgAbs = abs
+		}
+	}
+	if opts.noSystemd {
+		return "", cfgAbs, nil
+	}
+	if err := checkExecStartPath("--bin-dir", binDir); err != nil {
+		return "", "", err
+	}
+	if cfgAbs != "" {
+		if err := checkExecStartPath("--config", cfgAbs); err != nil {
+			return "", "", err
+		}
+	}
+	unitDir, err := absDir(config.ExpandHome(opts.unitDir))
+	if err != nil {
+		return "", "", err
+	}
+	return unitDir, cfgAbs, nil
+}
+
+// materializeDataDir resolves the data dir rendered into the materialized
+// config (the configless default = the local-share layout). A nil config
+// with a materialize target is API misuse — the data dir would render empty
+// and the file would fail validation at first load.
+func materializeDataDir(cfg *config.Config, opts installOptions) (string, error) {
+	if opts.materializePath == "" {
+		return "", nil
+	}
+	if cfg == nil || cfg.DataDir == "" {
+		return "", errors.New("install: materializing the default config needs a resolved data dir (configless resolution)")
+	}
+	return cfg.DataDir, nil
+}
+
 // installOptions carries the install flags (seam for tests).
 type installOptions struct {
 	binDir    string
 	unitDir   string
 	noSystemd bool
 	exec      install.Executor // nil = production SystemctlExecutor
+	// embedsConfig renders `watch -c <cfgPath>` (explicit -c / legacy-path
+	// installs); false renders plain `watch` (default-location installs).
+	embedsConfig bool
+	// materializePath is non-empty for the default-location install (no -c,
+	// no config anywhere in the install-style chain): install materializes
+	// the embedded default config there and the unit runs plain `watch`.
+	materializePath string
 }
 
-func runInstall(w io.Writer, _ *config.Config, cfgPath string, opts installOptions) error {
+func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOptions) error {
 	binDir, err := absDir(config.ExpandHome(opts.binDir))
 	if err != nil {
 		return err
 	}
-	unitDir := ""
-	cfgAbs := ""
-	if !opts.noSystemd {
-		// I-1: ExecStart= splits argv on whitespace and never de-quotes, so a
-		// whitespace-bearing path renders a unit that installs "successfully"
-		// but dies at timer-fire ("Command ... is not executable"). Refuse the
-		// path here, before the binary is copied or any unit is written.
-		if err := checkExecStartPath("--bin-dir", binDir); err != nil {
-			return err
-		}
-		if !filepath.IsAbs(cfgPath) {
-			cfgAbs, err = filepath.Abs(cfgPath)
-			if err != nil {
-				return fmt.Errorf("resolve config path: %w", err)
-			}
-		} else {
-			cfgAbs = cfgPath
-		}
-		if err := checkExecStartPath("--config", cfgAbs); err != nil {
-			return err
-		}
-		unitDir, err = absDir(config.ExpandHome(opts.unitDir))
-		if err != nil {
-			return err
-		}
+	unitDir, cfgAbs, err := prepareInstallPaths(cfgPath, binDir, opts)
+	if err != nil {
+		return err
 	}
 	running, err := resolveExecutable()
+	if err != nil {
+		return err
+	}
+	dataDir, err := materializeDataDir(cfg, opts)
 	if err != nil {
 		return err
 	}
@@ -138,22 +192,51 @@ func runInstall(w io.Writer, _ *config.Config, cfgPath string, opts installOptio
 		executor = installExecutor()
 	}
 	res, err := install.Install(install.Options{
-		BinDir:        binDir,
-		UnitDir:       unitDir,
-		RunningBinary: running,
-		ConfigPath:    cfgAbs,
-		NoSystemd:     opts.noSystemd,
-		Exec:          executor,
+		BinDir:            binDir,
+		UnitDir:           unitDir,
+		RunningBinary:     running,
+		ConfigPath:        cfgAbs,
+		DefaultConfigPath: opts.materializePath,
+		DataDir:           dataDir,
+		NoSystemd:         opts.noSystemd,
+		Exec:              executor,
 	})
 	if err != nil {
 		return err
 	}
 	outf(w, "installed binary: %s (copy of the running image, mode 0755)\n", res.BinaryPath)
+	if res.ConfigWritten != "" {
+		outf(w, "config created:   %s (materialized defaults — edit to configure; "+
+			"a re-install never overwrites it)\n", res.ConfigWritten)
+	}
+	if res.ConfigKept != "" {
+		outf(w, "config kept:      %s (already present — never overwritten)\n", res.ConfigKept)
+	}
 	if res.SkippedUnits {
 		outln(w, "systemd units skipped (--no-systemd): no timers installed; "+
 			"run the maintain wave manually or from your own scheduler")
 		return nil
 	}
+	printInstallSummary(w, cfg, cfgAbs, daemonCfg(opts, cfgPath), res)
+	outln(w, "journal: journalctl --user -u public_vpn-watch.service -f")
+	return nil
+}
+
+// daemonCfg resolves the default-location config display path: the
+// materialization target when one was passed, else the resolved canonical
+// file already present at the default location.
+func daemonCfg(opts installOptions, cfgPath string) string {
+	if opts.materializePath != "" {
+		return opts.materializePath
+	}
+	return cfgPath
+}
+
+// printInstallSummary is the loud post-install report: units, daemon,
+// legacy cleanup, and the config guidance — explicit-path installs name the
+// referenced file, default-location installs name where the daemon reads
+// its config and what the owner must fill to activate.
+func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs, daemonCfgPath string, res install.Result) {
 	for _, p := range res.UnitPaths {
 		outf(w, "unit written:     %s\n", p)
 	}
@@ -162,9 +245,15 @@ func runInstall(w io.Writer, _ *config.Config, cfgPath string, opts installOptio
 	for _, name := range res.LegacyCleaned {
 		outf(w, "legacy removed:   %s (W5 timer unit — the daemon replaced the timers)\n", name)
 	}
-	outf(w, "config reference: %s (install never creates or moves it — keep it in place)\n", cfgAbs)
-	outln(w, "journal: journalctl --user -u public_vpn-watch.service -f")
-	return nil
+	if cfgAbs != "" {
+		outf(w, "config reference: %s (install never creates or moves it — keep it in place)\n", cfgAbs)
+		return
+	}
+	outf(w, "daemon config:    %s (the daemon reads the default location — no -c in the unit)\n", daemonCfgPath)
+	if cfg != nil && cfg.Render.Template == "" && cfg.Activate.Target == "" {
+		outln(w, "to activate:      fill [render].template and [activate].target in the config above;")
+		outln(w, "                  until then render/activate fail loud at their stage boundary (data stages run)")
+	}
 }
 
 func newUninstallCommand(cfgPath *string) *cobra.Command {
@@ -184,29 +273,38 @@ reports. The installed binary and all user data are KEPT by default.
 --purge is DESTRUCTIVE and must be passed explicitly: it also removes the
 config file and the pipeline data dir ([data_dir]). It never touches
 anything outside those two paths — in particular nothing xray-raw. The
-config resolves the same way install does (explicit -c, else the home
-default; never the cwd default): a purge must never depend on the caller's
-working directory.`,
+config resolves the same way install does: explicit -c wins; the
+default-location layout (no -c) purges the canonical
+~/.local/share/publicvpn/config.toml plus the data dir under it; the
+deprecated legacy location still wins when present. The cwd default
+(./config.toml) is never consulted — a purge must never depend on the
+caller's working directory.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			var res *config.Resolved
+			var ir installResolution
 			if purge {
 				var err error
-				res, err = resolveInstallPath(*cfgPath)
+				ir, err = resolveInstallPath(*cfgPath)
 				if err != nil {
 					return fmt.Errorf("--purge needs the config: %w", err)
 				}
-				reportConfigSource(cmd.OutOrStdout(), res)
+				reportConfigSource(cmd.OutOrStdout(), ir.res)
 			}
 			var cfg *config.Config
-			if res != nil {
-				cfg = res.Config
+			if ir.res != nil {
+				cfg = ir.res.Config
 			}
-			// C-1: res is nil on the non-purge path — only --purge resolves a
+			// C-1: ir.res is nil on the non-purge path — only --purge resolves a
 			// config. cfgPath must stay "" there (runUninstall's purge branch
 			// is the only consumer), never a nil dereference.
 			var cfgPath string
-			if res != nil {
-				cfgPath = res.Path
+			if ir.res != nil {
+				cfgPath = ir.res.Path
+			}
+			// W13-deploy: the default-location install (--purge without -c)
+			// purges the canonical local-share config — the materialized
+			// default — plus the data dir (never the caller's cwd file).
+			if purge && cfgPath == "" {
+				cfgPath = ir.materializePath
 			}
 			return runUninstall(cmd.OutOrStdout(), cfg, cfgPath, uninstallOptions{
 				unitDir: unitDir,
@@ -366,9 +464,13 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 			}
 		}
 		if enabled {
+			speedtest := "disabled (speedtest_interval = 0s — no speedtest waves)"
+			if cfg.Maintain.SpeedtestWaveEnabled() {
+				speedtest = install.Span(cfg.Maintain.SpeedtestWavePeriod())
+			}
 			outln(out, "  service:   enabled (wants symlink) — waves: refresh "+
 				install.Span(cfg.Maintain.RefreshInterval.Duration)+", speedtest "+
-				install.Span(cfg.Maintain.SpeedtestInterval.Duration)+" (read live from the config)")
+				speedtest+" (read live from the config)")
 		} else {
 			outln(out, "  service:   not enabled — run `publicvpn install`")
 		}
@@ -386,7 +488,7 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 				present, cfgPath)
 		} else {
 			outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install` "+
-				"with a config (-c or %s) to migrate\n", present, config.HomeConfigDisplay)
+				"with a config (-c or %s) to migrate\n", present, config.ShareConfigDisplay)
 		}
 	}
 }

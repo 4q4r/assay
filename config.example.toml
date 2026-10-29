@@ -1,11 +1,17 @@
 # publicvpn — sanitized EXAMPLE configuration (defaults + schema comments).
 #
-# OPTIONAL — the CLI works without it: with no -c and no config at
-# ~/.config/publicvpn/config.toml every data stage runs configless on the
-# built-in defaults (data_dir = ~/.local/share/publicvpn). A config file is
-# required for render/activate ([render].template / [activate].target) and
-# for the daemon's render path (`publicvpn install` wires the config path
-# into the watch unit).
+# OPTIONAL — the CLI works without it: with no -c and no config at the
+# local-share default (~/.local/share/publicvpn/config.toml) every data
+# stage runs configless on the built-in defaults (data_dir =
+# ~/.local/share/publicvpn). A config file is required for
+# render/activate ([render].template / [activate].target).
+#
+# W13-deploy: `publicvpn install` WITHOUT -c is the canonical deploy — it
+# materializes a fully commented default config at
+# ~/.local/share/publicvpn/config.toml (never overwriting an existing file)
+# and the daemon unit runs plain `watch` (no -c). The deprecated legacy
+# location ~/.config/publicvpn/config.toml still wins when present, with a
+# loud move warning.
 #
 # This file documents every knob with its default value. Copy it to a private
 # `config.toml` (gitignored — operational values never belong in git) and fill
@@ -86,8 +92,10 @@ threads = 8                          # parallel temp-instance workers (each is a
 attempts = 3                         # HTTP GETs per node: all success = passed, some =
                                      # semi-passed, none = failed (skip_fresh_within is strict)
 url = "https://cloudflare.com/cdn-cgi/trace"  # the liveness target
-speedtest = true                     # W10 default ON: every wave carries a speed sample
-                                     # (explicit false turns it off). Slow by design.
+speedtest = false                    # default OFF since round-8 (owner ruling «Только спидтест выключи» —
+                                     # supersedes the W10 default ON): refresh waves are probe-only.
+                                     # The weekly speedtest wave ([maintain].speedtest_interval) carries
+                                     # -S regardless; set true to speedtest on EVERY wave. Slow by design.
 speedtest_url = "https://speed.cloudflare.com/__down?bytes=25000000"  # the sample:
                                      # downloaded through the node's tunnel → bytes/time → speed_bps
 speedtest_timeout = "30s"            # the download sample window
@@ -195,7 +203,10 @@ prune_dead_after = "48h"
 # daemon reads these from the config LIVE: a change needs only
 # `systemctl --user restart public_vpn-watch.service`, never a re-install.
 refresh_interval = "1h"      # refresh wave recheck (W10 default 1h — was 6h)
-speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly)
+speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly). "0s" DISABLES the
+                             # speedtest wave entirely (round-8: the owner's «выключи» at the schedule
+                             # level — the scheduler never schedules one; status reports `speedtest disabled`).
+                             # Positive values below the 5m floor still fail validation loud.
 stats_timeout = "10s"        # bounds one `xray api statsquery` exec
 prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)
 # auto_restart (W13, default TRUE): after a gated activation (-test gate →
