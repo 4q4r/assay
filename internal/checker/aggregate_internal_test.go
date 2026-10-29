@@ -100,3 +100,41 @@ func TestGroupByCity(t *testing.T) {
 	require.InDelta(t, 1.0, cities[0].SuccessRate, 0.0001)
 	require.Equal(t, "Rotterdam", cities[1].City)
 }
+
+// M-b pin: geo sources emit case variants of one city ("Frankfurt am Main"
+// vs "Frankfurt Am Main"); the grouping key folds case, the displayed City
+// is the deterministic lowest-string variant of the group, and the timing
+// buckets fold through the same key (the group median reads BOTH rows).
+func TestGroupByCityFoldsCaseVariants(t *testing.T) {
+	t.Parallel()
+	fra := mkRow("de-01", "de", "Frankfurt am Main", VerdictSuccess, VerdictSuccess)
+	fraAlt := mkRow("de-02", "de", "Frankfurt Am Main", VerdictSuccess, VerdictSuccess)
+	cities := GroupByCity([]*NodeResult{fra, fraAlt})
+	require.Len(t, cities, 1, "case variants of one city group into ONE city")
+	require.Equal(t, "Frankfurt Am Main", cities[0].City,
+		"display = lowest string variant of the group, deterministic")
+	require.Equal(t, 2, cities[0].Nodes, "counts merge across case variants")
+
+	// Order independence: whichever variant arrives first, the displayed
+	// spelling is the same lowest-string variant.
+	flipped := GroupByCity([]*NodeResult{fraAlt, fra})
+	require.Len(t, flipped, 1)
+	require.Equal(t, cities[0].City, flipped[0].City, "display is order-independent")
+
+	// fillTimings keys through the folded city too: the bucket's median is
+	// over BOTH rows (10ms + 30ms → 20ms), never the 0 of a missed lookup.
+	fast := &NodeResult{
+		Tag: "de-03", Country: "de", City: "Frankfurt am Main",
+		Attempts: []Attempt{{Verdict: VerdictSuccess, TotalMS: 10}},
+	}
+	fast.Aggregate()
+	slow := &NodeResult{
+		Tag: "de-04", Country: "de", City: "Frankfurt Am Main",
+		Attempts: []Attempt{{Verdict: VerdictSuccess, TotalMS: 30}},
+	}
+	slow.Aggregate()
+	timed := GroupByCity([]*NodeResult{fast, slow})
+	require.Len(t, timed, 1)
+	require.InDelta(t, 20.0, timed[0].MedianMS, 0.001,
+		"group median folds across case variants (median of [10,30])")
+}

@@ -258,3 +258,54 @@ func TestUnprobedAliveRecordIsStaleUnderTTL(t *testing.T) {
 	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 24*time.Hour)
 	assert.Empty(t, sel.Nodes, "alive without last_probe = no fresh evidence")
 }
+
+// TestCityCaseVariantsCountAsOneCity pins the M-b fix on the routing-
+// semantics surface: two case variants of one city count as ONE distinct
+// city toward D7 — model.CityKey is the distinctness unit for the caps
+// arithmetic and the city-diversity tie-break, never the raw spelling.
+func TestCityCaseVariantsCountAsOneCity(t *testing.T) {
+	f := newFixture()
+	f.add(t, "de", "Frankfurt am Main", true, 3, 5_000_000, 100)
+	f.add(t, "de", "Frankfurt Am Main", true, 3, 5_000_000, 100)
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 0)
+	require.Len(t, sel.Nodes, 2, "both variant nodes are alive and within K")
+	assert.Equal(t, 1, sel.CitiesAlive, "a case-variant pair is ONE alive city, not two")
+}
+
+// TestCapArithmeticFoldsCaseVariants pins the D7 caps arithmetic over a
+// variant-pair fixture: 24 distinct cities plus one case-variant pair reach
+// the expansion threshold as 25 folded cities (26 raw spellings), the cap
+// expands to exactly 25 — not 26 — and the pair competes for ONE slot of
+// the expanded cap.
+func TestCapArithmeticFoldsCaseVariants(t *testing.T) {
+	f := newFixture()
+	countries := []string{"us", "fr", "nl", "gb", "jp", "sg", "au", "ca", "br", "pl", "se", "ch", "at", "es", "it", "fi", "dk", "no", "ie", "be", "cz", "pt", "gr", "hu"}
+	for i, cc := range countries {
+		f.add(t, cc, fmt.Sprintf("City%02d", i), true, 3, int64(9_000_000-i*1000), 100)
+	}
+	f.add(t, "de", "Frankfurt am Main", true, 3, 1_000_000, 100) // variant pair ranks last:
+	f.add(t, "de", "Frankfurt Am Main", true, 3, 1_000_000, 100) // they compete for one slot
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(3), 0)
+	assert.Equal(t, 25, sel.CitiesAlive, "26 raw city spellings fold to 25 distinct cities")
+	assert.Equal(t, 25, sel.CapApplied, "the expansion triggers on the folded count: 25, not 26")
+	assert.Len(t, sel.Nodes, 25, "the variant pair fills ONE slot of the expanded cap")
+}
+
+// TestCityDiversityTieBreakFoldsCaseVariants pins the tie-break half of the
+// fold: within a metric tie-band the unrepresented-city preference counts
+// DISTINCT cities through the folded key — a case-variant pair of one city
+// does not burn both K slots on the same real city.
+func TestCityDiversityTieBreakFoldsCaseVariants(t *testing.T) {
+	f := newFixture()
+	f.add(t, "de", "Frankfurt am Main", true, 3, 5_000_000, 100)
+	f.add(t, "de", "Frankfurt Am Main", true, 3, 5_000_000, 100) // same real city as node 1
+	f.add(t, "de", "Munich", true, 3, 5_000_000, 100)
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(2), 0)
+	require.Len(t, sel.Nodes, 2)
+	cities := map[string]bool{}
+	for _, sn := range sel.Nodes {
+		cities[model.CityKey(sn.City)] = true
+	}
+	assert.Len(t, cities, 2,
+		"K=2 must cover two DISTINCT cities: the variant pair must not consume both slots")
+}
