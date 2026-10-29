@@ -82,17 +82,29 @@ skip_fresh_within = "0s"            # skip re-probing nodes whose latest result 
                                     # semi-passed/stale nodes are always re-probed)
 
 [geo]
-# W11 self-report design: every alive node asks ip-api THROUGH ITS OWN
-# TUNNEL — GET http://ip-api.com/json/ (no ip parameter = the service answers
-# "who is asking") — so the response IS that node's exit geo, observed
-# through its own tunnel. Requests originate from thousands of DISTINCT node
-# IPs, so ip-api's per-source budget never pools and the old aggregate batch
-# clamp (endpoint/batch_size/per_minute — retired with a loud migration
-# error) is gone in principle. The self-report is automatic: no knob.
+# W11 self-report design: every alive node asks geo endpoints THROUGH ITS
+# OWN TUNNEL — GET http://ip-api.com/json/ (no ip parameter = the service
+# answers "who is asking") — so the response IS that node's exit geo,
+# observed through its own tunnel. Requests originate from thousands of
+# DISTINCT node IPs, so per-source budgets never pool and the old aggregate
+# batch clamp (endpoint/batch_size/per_minute — retired with a loud migration
+# error) is gone in principle. The failure ladder per node (W16): HTTP
+# ip-api self-report → HTTPS self-geo ([geo].https_url) → DoH fallback →
+# unknown; every rung rides the SAME per-node temp instance and its request
+# start is paced like every external request of the wave.
 doh_url = "https://dns.google/resolve" # DoH endpoint the fallback queries THROUGH the
                                        # tunnel (o-o.myaddr TXT → the exit network's
                                        # resolver IP → ip-api single-IP lookup through
                                        # the same tunnel); must be https
+https_url = "https://ipinfo.io/json"   # W16 hop-2 HTTPS self-geo: a keyless endpoint
+                                       # that answers "who is asking" over TLS (rides
+                                       # the same per-node tunnel; free tier is per-source-
+                                       # IP limited — every node is its own source). Must
+                                       # be https; ANY https endpoint is accepted (plain
+                                       # string knob, no allowlist). Field honesty: the
+                                       # free tier has no ISP/proxy/hosting fields — they
+                                       # are stored empty with the self-report-https
+                                       # provenance marker
 ttl = "24h"                            # alive-data freshness: records whose last_probe is
                                        # older are not selectable until re-probed
                                        # (W4 maintain extends this into physical pruning)
@@ -131,11 +143,13 @@ balancer_tolerance = 0.2                      # leastLoad tolerance on country A
 # no entries means the pool is built but carries nothing (catch-all stays on
 # your own trusted outbounds). Inserted after the private-IP direct rule,
 # before catch-all. The target (`balancer`) is either a rendered pool_ balancer
-# or a direct pool-<cc>-NN outbound tag (D5: single-node cities render no city
-# balancer); anything else fails the render loud (D6). Routes are operator
+# (pool_<cc> country, pool_<cc>_<city> city, pool_unknown for unknown-geo
+# nodes, pool_all for the whole pool — W16) or a direct pool-<cc>-NN outbound
+# tag (D5: single-node cities render no city balancer; unknown-geo nodes are
+# pool-xx-NN); anything else fails the render loud (D6). Routes are operator
 # policy — this example ships none active.
 #[[render.pool_routes]]
-#balancer = "pool_de"       # or e.g. "pool-de-01" (direct outbound tag)
+#balancer = "pool_de"       # or "pool_all" / "pool_unknown" / "pool-de-01"
 #domains = ["geosite:netflix", "domain:example.com"]
 
 [activate]

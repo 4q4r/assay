@@ -1,7 +1,8 @@
 // Package rank implements the select stage (W2, D5/D7): rank alive nodes by
-// checks then speed (rtt as tiebreaker), enforce the per-country cap K, apply
-// the global soft cap N that expands to cover city diversity (bounded by the
-// ceiling), and assign flat pool-<cc>-NN tags.
+// checks then speed (rtt as tiebreaker), enforce the per-country cap K
+// (unknown-geo nodes share one "unknown" cap group — W16), apply the global
+// soft cap N that expands to cover city diversity (bounded by the ceiling),
+// and assign flat pool-<cc>-NN tags (cc=xx for unknown geo).
 package rank
 
 import (
@@ -40,8 +41,12 @@ type candidate struct {
 	total  int
 }
 
-// collectCandidates gathers alive, geo-tagged nodes (no country = no tag)
-// whose alive data is fresh under maxAliveAge (0 = no expiry).
+// collectCandidates gathers alive, geo-tagged nodes whose alive data is
+// fresh under maxAliveAge (0 = no expiry). W16: nodes with NO geo evidence
+// (empty country) are ADMITTED — the unknown-geo pseudo-location is a cap
+// group like a country (owner item 14a: "unknown" never drops a usable
+// node); their tags carry the xx pseudo-code and the pool_unknown balancer
+// groups them at render time.
 func collectCandidates(
 	nodes []*model.Node, geo []*model.GeoRecord, probeByKey map[string]store.ProbeResult, maxAliveAge time.Duration,
 ) []candidate {
@@ -52,7 +57,7 @@ func collectCandidates(
 	var cands []candidate
 	for _, n := range nodes {
 		g, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
-		if !ok || !g.Alive || g.Country == "" {
+		if !ok || !g.Alive {
 			continue
 		}
 		if maxAliveAge > 0 && !AliveDataFresh(g.LastProbe, maxAliveAge, time.Now()) {
@@ -185,7 +190,10 @@ func pickWithCityTieBreak(
 }
 
 // assignTags renders the selection with per-country stable NN sequences in
-// pick order.
+// pick order. W16: unknown-geo nodes (raw empty country) tag with the xx
+// pseudo-code — pool-xx-NN — keeping the D5 grammar intact; SelectedNode
+// carries the RAW country (""), so the renderer's grouping mirrors resolved
+// geo presence (pool_unknown), not a synthesized code.
 func assignTags(selected []candidate, capApplied int, all []candidate) *model.Selection {
 	seqByCountry := map[string]int{}
 	sel := &model.Selection{
@@ -195,8 +203,12 @@ func assignTags(selected []candidate, capApplied int, all []candidate) *model.Se
 	}
 	for _, c := range selected {
 		seqByCountry[c.rec.Country]++
+		tagCC := c.rec.Country
+		if tagCC == "" {
+			tagCC = model.UnknownCountryCode
+		}
 		sel.Nodes = append(sel.Nodes, model.SelectedNode{
-			Tag:     model.PoolTag(c.rec.Country, seqByCountry[c.rec.Country]),
+			Tag:     model.PoolTag(tagCC, seqByCountry[c.rec.Country]),
 			Key:     c.node.Key,
 			Country: c.rec.Country,
 			City:    c.rec.City,

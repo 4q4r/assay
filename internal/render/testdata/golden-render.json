@@ -362,6 +362,20 @@
           "type": "leastLoad"
         },
         "tag": "pool_us"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_all"
       }
     ],
     "domainMatcher": "hybrid",

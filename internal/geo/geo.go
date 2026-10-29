@@ -1,27 +1,39 @@
 // Package geo implements the exit-geo enrichment stage (W11 self-report
-// design): EVERY alive node asks ip-api THROUGH ITS OWN TUNNEL — a GET to
-// http://ip-api.com/json/ with no ip parameter, so ip-api answers "who is
-// asking" and the response IS that node's exit geo, observed through its own
-// tunnel (the strongest possible D8 exit-truth evidence).
+// design; W16 adds the HTTPS rung): EVERY alive node asks geo endpoints
+// THROUGH ITS OWN TUNNEL. The per-node failure ladder, every rung riding the
+// SAME temp socks instance:
+//
+//  1. HTTP ip-api self-report — GET http://ip-api.com/json/ with no ip
+//     parameter, so ip-api answers "who is asking" and the response IS that
+//     node's exit geo (the strongest possible D8 exit-truth evidence).
+//  2. HTTPS self-geo — GET [geo].https_url (default https://ipinfo.io/json),
+//     keyless and TLS-only: an exit that blocks plain HTTP wholesale (the
+//     class W11 could only offer the resolver-network DoH view) is rescued
+//     here. Provenance "self-report-https"; the field mapping is honest
+//     about the free tier (see applyReport).
+//  3. DoH fallback — o-o.myaddr.l.google.com TXT via [geo].doh_url reveals
+//     the exit network's own resolver IP; the ip-api single-IP lookup of
+//     THAT IP rides the same tunnel (indirect — the resolver network).
+//  4. Unknown — no geo evidence; geo fields stay untouched.
 //
 // Why the old aggregate limit disappears in principle: the batch era POSTed
 // groups of exit IPs from THIS box's single source IP against a 15 req/min
 // clamp (landmine L6). The self-report's requests originate from thousands
 // of DISTINCT node exit IPs — each carries its own per-source budget (45
-// req/min per source on the single endpoint), so the budget never pools. A
-// small politeness pacing (DefaultSelfReportPacing between external request
+// req/min per source on the ip-api single endpoint; ipinfo's free tier is
+// likewise limited per source IP), so the budget never pools. A small
+// politeness pacing (DefaultSelfReportPacing between external request
 // starts) remains: hourly waves have no reason to burst nodes or DoH.
 //
-// Failure classes fall back, never drop: a self-report that resets, times
-// out, or answers a non-200 / status=fail is retried as the through-tunnel
-// DoH view (o-o.myaddr.l.google.com TXT via [geo].doh_url reveals the exit
-// network's own resolver IP; the ip-api single-IP lookup of THAT IP rides the
-// same tunnel — still a per-node source). A node whose evidence fails
-// entirely stays in the cold base with geo fields untouched — missing geo
-// never drops a usable node; the class is reported loud in the wave log.
+// Failure classes fall back, never drop: each rung's transport reset,
+// timeout, non-200, or API-level failure advances the ladder. A node whose
+// evidence fails entirely stays in the cold base with geo fields untouched —
+// missing geo never drops a usable node; the class is reported loud in the
+// wave log.
 //
 // The ip-api free tier is HTTP-only and non-commercial — still satisfied:
-// personal use, public geo data, plain HTTP.
+// personal use, public geo data, plain HTTP. The ipinfo free tier is
+// keyless and personal-use (ToS) — same personal-use footing.
 package geo
 
 import (
@@ -55,15 +67,17 @@ const SelfReportURL = "http://ip-api.com/json/"
 
 // Geo field provenance markers (model.GeoRecord.GeoSource).
 const (
-	GeoSourceSelfReport  = "self-report"
-	GeoSourceDoHFallback = "doh-fallback"
+	GeoSourceSelfReport      = "self-report"
+	GeoSourceSelfReportHTTPS = "self-report-https"
+	GeoSourceDoHFallback     = "doh-fallback"
 )
 
 // Node report classes (the wave log groups by these).
 const (
-	ClassSelfReport  = GeoSourceSelfReport
-	ClassDoHFallback = GeoSourceDoHFallback
-	ClassUnknown     = "unknown"
+	ClassSelfReport      = GeoSourceSelfReport
+	ClassSelfReportHTTPS = GeoSourceSelfReportHTTPS
+	ClassDoHFallback     = GeoSourceDoHFallback
+	ClassUnknown         = "unknown"
 )
 
 // DefaultSelfReportPacing spaces external request starts across the wave
@@ -108,6 +122,32 @@ func (r Response) ASN() string {
 	return ""
 }
 
+// InfoResponse is the ipinfo.io /json answer (the hop-2 HTTPS self-geo).
+// Field surface verified LIVE 2026-10-29 against the keyless free endpoint:
+// ip / hostname / city / region / country (ISO alpha-2) / loc / org /
+// postal / timezone / readme. The free tier carries NO proxy/hosting flags
+// (ipinfo privacy detection is a paid product) and NO separate ISP field;
+// we consume only the fields the cold base stores.
+type InfoResponse struct {
+	IP      string `json:"ip"`
+	City    string `json:"city"`
+	Country string `json:"country"`
+	// Org is the composite network field ("AS24940 Hetzner Online GmbH").
+	Org string `json:"org"`
+}
+
+// ASNPair splits the composite org field into (as, asname) HONESTLY: ipinfo
+// has no separate asname field, so the org remainder IS the closest evidence
+// for both — the record comment in applyReport documents that class
+// difference wherever these values land.
+func (r InfoResponse) ASNPair() (string, string) {
+	f := strings.Fields(r.Org)
+	if len(f) == 0 {
+		return "", ""
+	}
+	return f[0], strings.Join(f[1:], " ")
+}
+
 // SocksInstance is one live temp SOCKS5 endpoint (structural mirror of the
 // checker's type: the production instance is a temp single-node xray).
 type SocksInstance interface {
@@ -126,23 +166,27 @@ type NodeReport struct {
 	// ProbeExitIP is the probe wave's observed exit (the D8 anchor the
 	// churn check compares against).
 	ProbeExitIP string
-	Geo         *Response // nil = no geo evidence this wave
-	Class       string    // ClassSelfReport | ClassDoHFallback | ClassUnknown
+	Geo         *Response // nil = no ip-api geo evidence this wave
+	// HTTPS carries the hop-2 ipinfo answer when that rung succeeded
+	// (Class SelfReportHTTPS); nil otherwise.
+	HTTPS *InfoResponse
+	Class string // ClassSelfReport | ClassSelfReportHTTPS | ClassDoHFallback | ClassUnknown
 	// Detail carries the failure chain for the loud wave log ("self-report:
-	// …; doh-fallback: …").
+	// …; https: …; doh-fallback: …").
 	Detail string
-	// Churn marks a self-report whose query IP differs from the probe
-	// wave's exit IP (exit churn between the waves — logged loud).
+	// Churn marks a self-report (either rung) whose reported IP differs from
+	// the probe wave's exit IP (exit churn between the waves — logged loud).
 	Churn bool
 }
 
 // Summary aggregates the wave's classes for the wave log.
 type Summary struct {
-	Eligible    int
-	SelfReport  int
-	DoHFallback int
-	Unknown     int
-	Churn       int
+	Eligible        int
+	SelfReport      int
+	SelfReportHTTPS int
+	DoHFallback     int
+	Unknown         int
+	Churn           int
 }
 
 // Input bundles the geo stage dependencies.
@@ -179,6 +223,7 @@ func Run(ctx context.Context, in Input) ([]*model.GeoRecord, Summary, error) {
 	reporter := &Reporter{
 		Factory:   in.Factory,
 		SelfURL:   in.SelfURL,
+		HTTPSURL:  in.Cfg.HTTPSURL,
 		DoHURL:    in.Cfg.DoHURL,
 		Timeout:   in.Cfg.Timeout.Duration,
 		UserAgent: in.UserAgent,
@@ -212,6 +257,8 @@ func summarize(reports []NodeReport, eligible int) Summary {
 		switch r.Class {
 		case ClassSelfReport:
 			s.SelfReport++
+		case ClassSelfReportHTTPS:
+			s.SelfReportHTTPS++
 		case ClassDoHFallback:
 			s.DoHFallback++
 		case ClassUnknown:
@@ -305,15 +352,19 @@ func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoReco
 	return records, nil
 }
 
-// applyReport folds one node's self-report outcome into its cold record.
-//   - self-report success: geo fields from the node's own answer; rec.IP
-//     takes the response's query IP (the freshest through-tunnel exit truth —
-//     it may have churned since the probe wave); provenance "self-report".
-//   - doh-fallback success: geo fields from the exit network's resolver
-//     network (indirect — the provenance marker says so); rec.IP keeps the
-//     probe's exit IP (the resolver IP is evidence, not the exit).
-//   - unknown: nothing is written — previous-wave geo survives via the
-//     store's blank-fold (missing geo never drops a usable node).
+// applyReport folds one node's ladder outcome into its cold record.
+//   - self-report success (hop 1): geo fields from the node's own ip-api
+//     answer; rec.IP takes the response's query IP (the freshest
+//     through-tunnel exit truth — it may have churned since the probe wave);
+//     provenance "self-report".
+//   - self-report-https success (hop 2): geo fields from the node's own
+//     ipinfo answer — see the field-mapping honesty note below; provenance
+//     "self-report-https".
+//   - doh-fallback success (hop 3): geo fields from the exit network's
+//     resolver network (indirect — the provenance marker says so); rec.IP
+//     keeps the probe's exit IP (the resolver IP is evidence, not the exit).
+//   - unknown (hop 4): nothing is written — previous-wave geo survives via
+//     the store's blank-fold (missing geo never drops a usable node).
 func applyReport(rec *model.GeoRecord, report *NodeReport, probeExitIP string) {
 	if report == nil {
 		return // not eligible this wave: nothing new to say
@@ -323,6 +374,33 @@ func applyReport(rec *model.GeoRecord, report *NodeReport, probeExitIP string) {
 	// override it).
 	if probeExitIP != "" {
 		rec.IP = probeExitIP
+	}
+	if report.Class == ClassSelfReportHTTPS {
+		if report.HTTPS == nil {
+			return // defensive: the class always carries the answer
+		}
+		g := report.HTTPS
+		rec.Country = strings.ToLower(g.Country)
+		rec.City = g.City
+		rec.ASN, rec.ASName = g.ASNPair()
+		// Field-mapping honesty (ipinfo vs ip-api): the free /json tier has
+		// no separate ISP field and NO proxy/hosting flags (ipinfo privacy
+		// detection is a paid product) — they are written EMPTY here: the
+		// freshest evidence wins wholesale, and the self-report-https
+		// provenance marker names exactly which class produced the fields,
+		// so a consumer never mistakes an empty flag for a measured
+		// "not a proxy". Unlike ip-api, ipinfo folds the network name into
+		// org: ASName is the org remainder, not a separate upstream field.
+		rec.ISP = ""
+		rec.ProxyFlag = false
+		rec.HostingFlag = false
+		rec.GeoSource = report.Class
+		if g.IP != "" {
+			// The https self-report's ip is the freshest through-tunnel exit
+			// truth — it wins over the probe-wave anchor (churn logged loud).
+			rec.IP = g.IP
+		}
+		return
 	}
 	if report.Geo == nil || report.Geo.Status != "success" {
 		return // unknown: leave every geo field untouched
@@ -344,12 +422,13 @@ func applyReport(rec *model.GeoRecord, report *NodeReport, probeExitIP string) {
 }
 
 // Reporter drives the per-node self-report wave: one temp instance per node
-// (the piggyback — self-report and every fallback hop ride the SAME socks
-// endpoint), politeness pacing between external request starts, loud per-node
-// class lines on Progress.
+// (the piggyback — every ladder rung rides the SAME socks endpoint),
+// politeness pacing between external request starts, loud per-node class
+// lines on Progress.
 type Reporter struct {
 	Factory   Factory
 	SelfURL   string // test seam; empty = SelfReportURL
+	HTTPSURL  string // the [geo].https_url knob; empty = config.DefaultGeoHTTPSURL
 	DoHURL    string
 	Timeout   time.Duration // per through-tunnel request
 	UserAgent string
@@ -430,8 +509,16 @@ func (r *Reporter) selfEndpoint() string {
 	return SelfReportURL
 }
 
-// reportNode drives one node: ONE temp instance (the piggyback) → paced
-// self-report → on failure the paced DoH fallback through the SAME instance.
+func (r *Reporter) httpsEndpoint() string {
+	if r.HTTPSURL != "" {
+		return r.HTTPSURL
+	}
+	return config.DefaultGeoHTTPSURL
+}
+
+// reportNode drives one node: ONE temp instance (the piggyback) → the paced
+// four-rung ladder: plain-HTTP ip-api self-report → HTTPS self-geo → DoH
+// fallback → unknown. Every rung rides the SAME instance.
 func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, probeExitIP string) NodeReport {
 	rep := NodeReport{Key: n.Key}
 	inst, err := r.Factory(ctx, n)
@@ -451,7 +538,7 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 		return rep
 	}
 
-	// Hop 1 — the self-report: the node asks ip-api who is asking.
+	// Rung 1 — the self-report: the node asks ip-api who is asking.
 	if err := p.wait(ctx); err != nil {
 		rep.Class = ClassUnknown
 		rep.Detail = fmt.Sprintf("canceled: %v", err)
@@ -468,7 +555,28 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 		return rep
 	}
 
-	// Hop 2 — the DoH fallback through the SAME instance: discover the exit
+	// Rung 2 — the HTTPS self-geo through the SAME instance: [geo].https_url
+	// (default ipinfo.io/json) answers "who is asking" over TLS — no
+	// plain-HTTP dependency, keyless, per-node source (ipinfo's free tier is
+	// rate-limited per source IP and every node is its own). The request
+	// start takes a pacer slot like every external request of the wave.
+	if err := p.wait(ctx); err != nil {
+		rep.Class = ClassUnknown
+		rep.Detail = "canceled during fallback"
+		r.logNode(n, rep)
+		return rep
+	}
+	info, infoErr := fetchHTTPSInfo(ctx, cl, r.httpsEndpoint(), r.userAgent())
+	if infoErr == nil && info != nil {
+		rep.HTTPS = info
+		rep.Class = ClassSelfReportHTTPS
+		rep.Churn = probeExitIP != "" && info.IP != probeExitIP
+		rep.Detail = fmt.Sprintf("self-report failed (%v); https self-geo ok", selfErr)
+		r.logNode(n, rep)
+		return rep
+	}
+
+	// Rung 3 — the DoH fallback through the SAME instance: discover the exit
 	// network's resolver IP, then look IT up via ip-api through the tunnel
 	// (still a per-node source — the aggregate limit stays gone). EVERY
 	// external request start takes a politeness slot: the DoH probe AND the
@@ -476,29 +584,31 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 	// pacer would let the bounded workers bypass the pacing exactly here.
 	rep.Class = ClassUnknown
 	if err := p.wait(ctx); err != nil {
-		rep.Detail = "canceled during fallback"
+		rep.Detail = fmt.Sprintf("canceled during fallback (self-report: %v; https: %v)", selfErr, infoErr)
 		r.logNode(n, rep)
 		return rep
 	}
 	resolver, dohErr := r.resolveExitResolver(ctx, cl)
 	if dohErr != nil {
-		rep.Detail = fmt.Sprintf("self-report: %v; doh-fallback: %v", selfErr, dohErr)
+		rep.Detail = fmt.Sprintf("self-report: %v; https: %v; doh-fallback: %v", selfErr, infoErr, dohErr)
 		r.logNode(n, rep)
 		return rep
 	}
 	if err := p.wait(ctx); err != nil {
-		rep.Detail = "canceled during fallback"
+		rep.Detail = fmt.Sprintf("canceled during fallback (self-report: %v; https: %v)", selfErr, infoErr)
 		r.logNode(n, rep)
 		return rep
 	}
 	lookupURL := strings.TrimSuffix(r.selfEndpoint(), "/") + "/" + url.PathEscape(resolver)
 	fb, lookupErr := fetchIPAPI(ctx, cl, lookupURL, r.userAgent())
 	if lookupErr != nil {
-		rep.Detail = fmt.Sprintf("self-report: %v; doh-fallback (resolver %s): %v", selfErr, resolver, lookupErr)
+		rep.Detail = fmt.Sprintf("self-report: %v; https: %v; doh-fallback (resolver %s): %v",
+			selfErr, infoErr, resolver, lookupErr)
 	} else {
 		rep.Geo = fb
 		rep.Class = ClassDoHFallback
-		rep.Detail = fmt.Sprintf("self-report failed (%v); doh fallback via resolver %s", selfErr, resolver)
+		rep.Detail = fmt.Sprintf("self-report failed (%v); https failed (%v); doh fallback via resolver %s",
+			selfErr, infoErr, resolver)
 	}
 	r.logNode(n, rep)
 	return rep
@@ -575,6 +685,37 @@ func fetchIPAPI(ctx context.Context, cl *http.Client, endpoint, userAgent string
 	return &out, nil
 }
 
+// fetchHTTPSInfo performs ONE GET against the [geo].https_url endpoint
+// (rung 2) through the tunnel and decodes the ipinfo.io /json shape. A
+// transport error and a non-200 status are the rung's failure classes for
+// the wave log; the returned InfoResponse is non-nil ONLY on success. The
+// response carries no API-level status field (unlike ip-api): HTTP 200 with
+// a decodable body IS the success contract, verified live 2026-10-29.
+func fetchHTTPSInfo(ctx context.Context, cl *http.Client, endpoint, userAgent string) (*InfoResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+	resp, err := cl.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("https self-geo: %s", resp.Status)
+	}
+	var out InfoResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode https self-geo response: %w", err)
+	}
+	if out.IP == "" && out.Country == "" {
+		return nil, errors.New("https self-geo response carries neither ip nor country")
+	}
+	return &out, nil
+}
+
 func (r *Reporter) userAgent() string {
 	if r.UserAgent == "" {
 		return config.DefaultUserAgent
@@ -592,6 +733,15 @@ func (r *Reporter) logNode(n *model.Node, rep NodeReport) {
 			_, _ = fmt.Fprintf(r.Progress,
 				"geo: %s (%s): self-report ok — exit-ip churn (probe saw %s, node now reports %s)\n",
 				n.Key, n.Host, rep.ProbeExitIP, rep.Geo.Query)
+		}
+	case ClassSelfReportHTTPS:
+		// A rung-2 success means rung 1 failed — the degraded evidence class
+		// is loud, same as the DoH fallback's line.
+		_, _ = fmt.Fprintf(r.Progress, "geo: %s (%s): %s\n", n.Key, n.Host, rep.Detail)
+		if rep.Churn && rep.HTTPS != nil {
+			_, _ = fmt.Fprintf(r.Progress,
+				"geo: %s (%s): https self-geo — exit-ip churn (probe saw %s, node now reports %s)\n",
+				n.Key, n.Host, rep.ProbeExitIP, rep.HTTPS.IP)
 		}
 	case ClassDoHFallback:
 		_, _ = fmt.Fprintf(r.Progress, "geo: %s (%s): %s\n", n.Key, n.Host, rep.Detail)

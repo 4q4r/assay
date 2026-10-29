@@ -165,15 +165,19 @@ func liveProbe(n *model.Node, exitIP string) store.ProbeResult {
 
 // baseInput builds a valid geo Input whose self-report rides the given
 // endpoint double (the test seam replacing the production constant URL).
+// The https hop keeps a dead-loopback [geo].https_url by default so every
+// pre-W16 test stays hermetic and the ladder's rung 2 fails fast; tests
+// exercising that rung override Cfg.HTTPSURL with an infoDouble.
 func baseInput(dir string, nodes []*model.Node, probes map[string]store.ProbeResult, f geo.Factory, selfURL string) geo.Input {
 	return geo.Input{
 		DataDir:    dir,
 		Nodes:      nodes,
 		ProbeByKey: probes,
 		Cfg: config.GeoConfig{
-			TTL:     config.Duration{Duration: 24 * time.Hour},
-			Timeout: config.Duration{Duration: 5 * time.Second},
-			DoHURL:  "https://dns.google/resolve",
+			TTL:      config.Duration{Duration: 24 * time.Hour},
+			Timeout:  config.Duration{Duration: 5 * time.Second},
+			DoHURL:   "https://dns.google/resolve",
+			HTTPSURL: "http://127.0.0.1:1/json", // dead loopback — overridden by https-hop tests
 		},
 		UserAgent: "geo-agent/11",
 		Factory:   f,
@@ -240,13 +244,13 @@ func TestSelfReportParsesDocumentedSingleIPShape(t *testing.T) {
 
 // TestFallbackLookupStartIsPacedLikeSelfReport pins the politeness pacing
 // across the FULL fallback chain with the injected clock: every external
-// request start takes a pacer slot — the self-report, the DoH TXT probe, AND
-// the fallback resolver lookup. A node riding the whole fallback path must
-// consume exactly three slots: the priming self-report slot sleeps nothing,
-// and both later starts (DoH, fallback lookup) each wait out the default
-// pacing — a lookup whose start slips past the pacer would let the wave's
-// bounded workers bypass the politeness contract exactly where the request
-// mix is heaviest.
+// request start takes a pacer slot — the self-report, the https self-geo
+// (W16 hop 2), the DoH TXT probe, AND the fallback resolver lookup. A node
+// riding the whole fallback path must consume exactly three waited slots:
+// the priming self-report slot sleeps nothing, and the three later starts
+// (https, DoH, fallback lookup) each wait out the default pacing — a start
+// that skipped the pacer would let the wave's bounded workers bypass the
+// politeness contract exactly where the request mix is heaviest.
 func TestFallbackLookupStartIsPacedLikeSelfReport(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	api.failMode.Store(1) // the self-report 503s; the fallback path runs
@@ -276,14 +280,17 @@ func TestFallbackLookupStartIsPacedLikeSelfReport(t *testing.T) {
 	assert.Equal(t, 1, summary.DoHFallback)
 
 	// The wave issued both ip-api requests (self-report + resolver lookup)
-	// and paced the two later request starts: the DoH probe AND the fallback
-	// lookup. The priming self-report slot never sleeps. (Single node = one
-	// worker: the pacer, the sleeper, and this slice are one goroutine.)
-	require.Len(t, waits, 2,
-		"both the DoH probe start and the fallback lookup start must be paced")
+	// and paced the three later request starts: the https self-geo (dead
+	// loopback — fails fast), the DoH probe, and the fallback lookup. The
+	// priming self-report slot never sleeps. (Single node = one worker: the
+	// pacer, the sleeper, and this slice are one goroutine.)
+	require.Len(t, waits, 3,
+		"the https start, the DoH probe start, and the fallback lookup start must each be paced")
 	assert.Equal(t, geo.DefaultSelfReportPacing, waits[0],
-		"the DoH probe start waits out the default pacing")
+		"the https hop start waits out the default pacing")
 	assert.Equal(t, geo.DefaultSelfReportPacing, waits[1],
+		"the DoH probe start waits out the default pacing")
+	assert.Equal(t, geo.DefaultSelfReportPacing, waits[2],
 		"the fallback lookup start is paced like the self-report's slot")
 
 	methods, paths, _ := api.saw()
@@ -336,10 +343,11 @@ func TestSelfReportFailureClassesFallBackToDoH(t *testing.T) {
 }
 
 // TestPlainHTTPBlockedExitEndsUnknown pins the honest terminal class of the
-// fallback: an exit that blocks plain HTTP wholesale defeats BOTH the
-// self-report and the fallback's ip-api lookup — the node lands in the
-// unknown class (documented limitation; DoH-over-HTTPS itself still works,
-// so a future pure-HTTPS geo fallback could rescue this class).
+// ladder when EVERY rung fails: an exit that blocks plain HTTP wholesale
+// defeats the self-report and the fallback's ip-api lookup, and with the
+// https rung unreachable too the node lands in the unknown class (the
+// rescue-by-https path itself is pinned by
+// TestHTTPSRescuesPlainHTTPBlockedExit).
 func TestPlainHTTPBlockedExitEndsUnknown(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	api.failMode.Store(2) // reset — and blanket across ALL ip-api paths
