@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,10 +29,20 @@ type recordingExecutor struct {
 	tracePath   string
 	livePath    string
 	backupDir   string
-	isActiveOut string // replayed for the is-active call; default "active\n"
+	isActiveOut string   // replayed for every is-active call; default "active\n"
+	isActiveSeq []string // per-call replay when set; falls back to isActiveOut
+	isActiveN   int      // is-active calls seen so far (the seq replay cursor)
 	restartErr  error
 	isActiveErr error
 	dialErr     error
+	// dialFailFirst makes the first N dials fail (the late-bind production
+	// race) and every later dial succeed.
+	dialFailFirst int
+	dialN         int
+	// onRestart, when set, runs inside the restart leg — the seam for the
+	// SIGTERM-mid-activate pin (the daemon's shutdown flag flips while the
+	// activate stage is in flight).
+	onRestart func()
 }
 
 func (r *recordingExecutor) Systemctl(args ...string) (string, error) {
@@ -56,14 +67,24 @@ func (r *recordingExecutor) Systemctl(args ...string) (string, error) {
 			}
 		}
 		r.trace("restart:" + detail)
+		if r.onRestart != nil {
+			r.onRestart()
+		}
 		if r.restartErr != nil {
 			return "", r.restartErr
 		}
 		return "", nil
 	case "is-active":
 		r.trace("is-active")
+		r.isActiveN++
 		if r.isActiveErr != nil {
 			return "", r.isActiveErr
+		}
+		if len(r.isActiveSeq) > 0 {
+			if r.isActiveN <= len(r.isActiveSeq) {
+				return r.isActiveSeq[r.isActiveN-1], nil
+			}
+			return r.isActiveSeq[len(r.isActiveSeq)-1], nil
 		}
 		if r.isActiveOut == "" {
 			return "active\n", nil
@@ -86,6 +107,10 @@ func (r *recordingExecutor) trace(line string) {
 
 func (r *recordingExecutor) dial(_ string, addr string, _ time.Duration) (net.Conn, error) {
 	r.trace("dial " + addr)
+	r.dialN++
+	if r.dialN <= r.dialFailFirst {
+		return nil, errors.New("connect: connection refused")
+	}
 	return nil, r.dialErr
 }
 
@@ -253,7 +278,7 @@ func TestW13HealthFailureWarnsWithRestoreHint(t *testing.T) {
 	rec.isActiveOut = "failed\n"
 	rec.dialErr = errors.New("connect: connection refused")
 	writeMaintainFiles(t, cfg, `{"v":2}`, `{"old":true}`)
-	wiring := &restartWiring{Executor: rec, Dialer: rec.dial}
+	wiring := &restartWiring{Executor: rec, Dialer: rec.dial, Sleep: noSleep}
 
 	out, err := captureStageErr(t, cfg, wiring)
 	require.NoError(t, err, "a health failure is DONE_WITH, not a wave failure")
@@ -279,6 +304,94 @@ func TestW13FailedGateNeverRestarts(t *testing.T) {
 	require.NoError(t, readErr)
 	assert.Equal(t, `{"v":1}`, string(live), "live config untouched after failed gate")
 }
+
+// --- the W17 health ladder at the flow level -------------------------------
+
+// TestW17HealthLadderPassesOnLaterAttemptInFlow drives the production race
+// through the whole activate stage: xray has not bound the socks port when
+// the restart returns; the dial is refused twice, binds on attempt 3. The
+// stage must PASS (attempt counted in the verdict) instead of the old
+// false-positive health WARNING — with the injected clock, never a real
+// wait.
+func TestW17HealthLadderPassesOnLaterAttemptInFlow(t *testing.T) {
+	cfg, rec := restartFixture(t, "ok")
+	rec.dialFailFirst = 2 // the listener binds on attempt 3
+	writeMaintainFiles(t, cfg, fixtureRendered, `{"v":1}`)
+	wiring := &restartWiring{Executor: rec, Dialer: rec.dial, Sleep: noSleep}
+
+	out := runStageCapturing(t, cfg, wiring)
+	assert.Contains(t, out, "health PASS on attempt 3/5",
+		"the late-bind client PASSES the health check — the boot race is absorbed")
+	assert.NotContains(t, out, "WARNING:", "no false-positive health warning")
+	assert.Equal(t, []string{"restart", "is-active", "is-active", "is-active"}, rec.verbs(),
+		"one restart, three health attempts (stop at the first PASS)")
+	lines := traceLines(t, rec.tracePath)
+	require.Len(t, lines, 8, "gate, restart, is-active×3, dial×3 — in this order")
+	assert.Equal(t, "dial 127.0.0.1:10808", lines[5], "the first refused dial probes the template's port")
+	assert.Equal(t, "dial 127.0.0.1:10808", lines[7], "the third dial is the PASS")
+}
+
+// TestW17HealthLadderExhaustedIsLoudWarningInFlow pins the bounded loud
+// class at the flow level: a client that never binds exhausts the ladder
+// (five attempts, injected clock) and the wave completes as the existing
+// DONE_WITH health-failure WARNING naming the backup.
+func TestW17HealthLadderExhaustedIsLoudWarningInFlow(t *testing.T) {
+	cfg, rec := restartFixture(t, "ok")
+	rec.dialErr = errors.New("connect: connection refused")
+	writeMaintainFiles(t, cfg, fixtureRendered, `{"old":true}`)
+	wiring := &restartWiring{Executor: rec, Dialer: rec.dial, Sleep: noSleep}
+
+	out, err := captureStageErr(t, cfg, wiring)
+	require.NoError(t, err, "a health failure is DONE_WITH, not a wave failure")
+	assert.Contains(t, out, "WARNING:")
+	assert.Contains(t, out, "health")
+	assert.Contains(t, out, "after 5 attempt(s)", "the loud line names the exhausted ladder")
+	assert.Contains(t, out, "no auto-restore")
+	assert.Len(t, rec.calls, 1+5, "one restart + all five ladder attempts")
+}
+
+// TestW17MidActivateShutdownCannotInterruptRestart is the non-interruptible
+// pin (W17, part b): a restart of xray-raw issued by the wave must not be
+// interrupted by the daemon's own shutdown between replace and xray-restart
+// — a checkpoint landing there orphans the live client (new config on disk,
+// old config running, no restart issued). The test flips the daemon's
+// shutdown flag INSIDE the executor's restart leg (SIGTERM arrives exactly
+// mid-activate) and asserts the whole step still completes: is-active AND
+// the dial both happen — activate+auto-restart is ONE step, the shutdown
+// checkpoint fires only between stages.
+func TestW17MidActivateShutdownCannotInterruptRestart(t *testing.T) {
+	cfg, rec := restartFixture(t, "ok")
+	var shutdown atomic.Bool
+	rec.onRestart = func() { shutdown.Store(true) } // SIGTERM mid-activate
+	writeMaintainFiles(t, cfg, fixtureRendered, `{"v":1}`)
+
+	// The wave seam: every pre-activate stage a no-op, activate = the real
+	// runner, and between() = the shutdown flag (true from the restart leg
+	// onward).
+	cmd := &cobra.Command{}
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	stages := defaultMaintainStages(maintainOptions{})
+	noop := func(*cobra.Command, *config.Config) error { return nil }
+	stages.fetch, stages.parse, stages.filter = noop, noop, noop
+	stages.probe, stages.geo = noop, noop
+	stages.stats, stages.prune, stages.selectS, stages.render = noop, noop, noop, noop
+	stages.activate = func(c *cobra.Command, cc *config.Config) error {
+		return runActivateStage(c, cc, &restartWiring{Executor: rec, Dialer: rec.dial, Sleep: noSleep})
+	}
+	require.NoError(t, runMaintainGraceful(buf, cfg, maintainOptions{}, stages, shutdown.Load),
+		"an in-flight activate completes even with shutdown already requested")
+
+	assert.Equal(t, []string{"restart", "is-active"}, rec.verbs(),
+		"the restart + health verification ran to completion — no checkpoint between replace and restart")
+	assert.Contains(t, buf.String(), "health PASS", "the health leg completed")
+	assert.NotContains(t, buf.String(), "wave paused",
+		"no stage boundary fired mid-activate: the pause can only precede the stage")
+}
+
+// noSleep is the cli-level injected clock: the ladder's waits are recorded
+// policy in the restart package pins, never real time in the flow suite.
+func noSleep(time.Duration) {}
 
 // --- helpers ---------------------------------------------------------------
 

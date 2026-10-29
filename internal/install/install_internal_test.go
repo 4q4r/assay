@@ -104,6 +104,8 @@ func TestInstallRendersWatchUnit(t *testing.T) {
 	assert.Contains(t, s, "ExecStart="+filepath.Join(binDir, "publicvpn")+" watch -c "+opts.ConfigPath)
 	assert.Contains(t, s, "Type=notify")
 	assert.Contains(t, s, "WatchdogSec=300")
+	assert.Contains(t, s, "TimeoutStopSec=1800",
+		"the installed unit carries the W17 stop timeout (mid-wave restart waits, not SIGKILL)")
 	assert.Contains(t, s, "Restart=always")
 	assert.NotContains(t, s, "{{", "template placeholders must all be rendered")
 	assert.NotContains(t, s, "systemctl", "units never invoke systemctl themselves")

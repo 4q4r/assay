@@ -17,7 +17,12 @@ go build -o publicvpn ./cmd/publicvpn
   `[maintain].refresh_interval` (default 1h), speedtest waves every
   `[maintain].speedtest_interval`, stats poll inside every wave,
   activate-if-changed behind the `-test` gate. `Restart=always` brings a
-  crashed daemon back in 5s.
+  crashed daemon back in 5s. `WatchdogSec=300` catches a wedged runtime;
+  `TimeoutStopSec=1800` (W17) makes a stop or restart of the daemon WAIT for
+  the current stage — a full probe stage can run ~28 min — instead of
+  SIGKILLing it mid-wave at the 90s default (an in-flight activate's
+  replace→restart→health sequence is one non-interruptible step, so the
+  live client is never orphaned mid-activation).
 
 ## Scheduling mechanics
 
