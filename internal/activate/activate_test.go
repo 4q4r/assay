@@ -221,13 +221,28 @@ func mustRead(t *testing.T, p string) []byte {
 	return b
 }
 
-// Guard: the package must never EXECUTE systemctl — the restart hint string
-// is the only allowed occurrence (printed for the owner).
+// Guard (W13 contract, migrated from the W4-era total ban): the activate
+// package still never EXECUTES systemctl — restart after a gated activation
+// lives behind internal/restart's byte-pinned allowlist executor, wired by
+// the cli layer. The printed restart hint remains the only non-comment
+// occurrence of the word: comments may explain the rail, code may not
+// widen it. (Migration note: W4–W12 pinned "exactly one occurrence total —
+// the hint"; W13 moves the restart capability into internal/restart and
+// pins this package to the same surface it always had — the hint.)
 func TestNoSystemdInvocationInSource(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "activate", "activate.go"))
 	require.NoError(t, err)
-	assert.Equal(t, 1, strings.Count(string(src), "systemctl"),
-		"systemctl may appear exactly once: in the printed restart hint, never as an executed command")
+	nonComment := strings.Builder{}
+	for line := range strings.SplitSeq(string(src), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		nonComment.WriteString(line)
+		nonComment.WriteByte('\n')
+	}
+	assert.Equal(t, 1, strings.Count(nonComment.String(), "systemctl"),
+		"outside comments, systemctl may appear exactly once: in the printed restart hint")
 	for line := range strings.SplitSeq(string(src), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "//") {
@@ -236,5 +251,7 @@ func TestNoSystemdInvocationInSource(t *testing.T) {
 		assert.False(t, strings.Contains(trimmed, "exec.Command") && strings.Contains(trimmed, "systemctl"),
 			"systemctl must never be executed: %s", trimmed)
 	}
+	assert.NotContains(t, nonComment.String(), "internal/restart",
+		"the activate package must not import the restart executor — the cli layer wires it")
 	_ = exec.Command // keep import used if assertions change
 }

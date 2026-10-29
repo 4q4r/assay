@@ -1,7 +1,10 @@
 // Package activate implements the activation step: xray run -test gate
 // (L10 — a bad config must never reach the live path), date-stamped backup,
-// and an atomic replace. It NEVER restarts the service — the owner does, using
-// the printed command (DESIGN.md §4.8).
+// and an atomic replace. Since W13 the restart of the live client after a
+// gated activation is the wave's concern, executed exclusively through
+// internal/restart's byte-pinned allowlist executor — the orchestration
+// lives in the cli layer (runActivate), and this package itself still never
+// executes anything but the xray -test child.
 package activate
 
 import (
