@@ -53,7 +53,13 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
     WATCHDOG=1 every WatchdogSec/2 — a wedged daemon stops pinging and
     systemd kills + restarts it; without NOTIFY_SOCKET (no systemd) this is
     a no-op;
-  - SIGINT/SIGTERM: finish the current stage, flush, exit 0.`,
+  - SIGINT/SIGTERM: finish the current stage, flush, exit 0. The activate
+    stage is the one exception to "finish the STAGE": once replace begins,
+    the replace→restart→health sequence runs to completion as one
+    non-interruptible step (a checkpoint between replace and restart would
+    orphan the live client — new config on disk, old config running, no
+    restart issued). The unit's TimeoutStopSec=1800 gives systemd the
+    matching patience for a mid-wave stop instead of SIGKILLing at 90s.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
