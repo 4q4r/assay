@@ -2,7 +2,9 @@ package probe_test
 
 import (
 	"context"
+	"net"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -14,6 +16,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// testPortBand is the DISJOINT temp-instance scan band this smoke boots into
+// — MUST match the checker suite's band (instance_internal_test.go): both
+// binaries boot through the same StartTempXray scan, and the production
+// watch daemon churns the 18xxx band hourly on this box (full -race runs
+// used to flake against that live churn — live-ops fix).
+const (
+	testPortBandMin = 28500
+	testPortBandMax = 28799
+)
+
+// TestMain pins the smoke's temp instances to the disjoint test band BEFORE
+// any test runs: real temp instances must boot OUTSIDE the production 18xxx
+// band — the live watch daemon churns it hourly on this box, and full -race
+// runs used to flake against that live churn (live-ops fix).
+func TestMain(m *testing.M) {
+	checker.SetTestPortBand(testPortBandMin, testPortBandMax)
+	os.Exit(m.Run())
+}
 
 // bootSmokeFamilies covers EVERY rendered protocol family the pool can
 // carry (round-7 owner ruling 14b: the smoke is part of the test loop).
@@ -61,6 +82,16 @@ func TestBootSmokeEveryProtocolFamily(t *testing.T) {
 			defer cancel()
 			inst, err := factory(ctx, n)
 			require.NoError(t, err, "family %s: the core must boot the rendered outbound", fam.name)
+
+			// The smoke boots through the SAME scan as the suite: the port
+			// must land in the disjoint test band, never the production
+			// 18xxx band the live daemon owns (live-ops fix).
+			_, portStr, perr := net.SplitHostPort(inst.Addr())
+			require.NoError(t, perr, "family %s", fam.name)
+			port, aerr := strconv.Atoi(portStr)
+			require.NoError(t, aerr, "family %s", fam.name)
+			assert.GreaterOrEqual(t, port, testPortBandMin, "family %s: instance must boot inside the disjoint test band", fam.name)
+			assert.LessOrEqual(t, port, testPortBandMax, "family %s: instance must boot inside the disjoint test band", fam.name)
 
 			probeFactory := probe.Factory(func(_ context.Context, _ *model.Node) (probe.SocksInstance, error) {
 				return inst, nil
