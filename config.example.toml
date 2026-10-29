@@ -141,12 +141,16 @@ balancer_tolerance = 0.2                      # leastLoad tolerance on country A
 [activate]
 target = "~/path/to/client-config.json"  # PLACEHOLDER — live client config; activate
                                          # does -test gate + date-stamped backup + atomic
-                                         # replace (NEVER auto-restarts the service)
+                                         # replace, then the gated auto-restart (see
+                                         # [maintain].auto_restart below)
 xray_bin = "/usr/bin/xray"                  # core binary used for the -test gate
 # asset_dir = ""                            # XRAY_LOCATION_ASSET for -test; default: template dir
 backup_dir = "backups"
 test_timeout = "30s"          # bounds the `xray run -test` child; explicit "0s" = no deadline
-service_name = "xray-client.service"  # unit named in the printed restart hint (never auto-restarted)
+service_name = "xray-client.service"  # unit named in the printed MANUAL restart hint
+                                      # (auto_restart = false only); the W13 auto-restart path
+                                      # is byte-pinned to xray-raw.service and refuses any
+                                      # other unit loud
 backup_keep = 0               # retain only the N newest config backups (0 = unlimited)
 
 [maintain]
@@ -166,6 +170,16 @@ refresh_interval = "1h"      # refresh wave recheck (W10 default 1h — was 6h)
 speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly)
 stats_timeout = "10s"        # bounds one `xray api statsquery` exec
 prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)
+# auto_restart (W13, default TRUE): after a gated activation (-test gate →
+# backup → atomic replace) the daemon restarts the live client itself —
+# `systemctl --user restart xray-raw.service`, exactly once per real
+# activation — and then health-checks it (is-active + the socks port read
+# from the just-activated config). A failed restart or a failed health
+# check is LOUD (the wave completes DONE_WITH restart-failure /
+# health-failure, naming the backup to restore from — report-only, no
+# auto-restore). An explicit false restores the manual semantics: the
+# command prints the restart hint and touches nothing.
+auto_restart = true
 
 [http]
 # user_agent = "public_vpn (pipeline; contact: owner)"

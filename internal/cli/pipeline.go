@@ -28,6 +28,7 @@ import (
 	"public_vpn/internal/prune"
 	"public_vpn/internal/rank"
 	"public_vpn/internal/render"
+	"public_vpn/internal/restart"
 	"public_vpn/internal/stats"
 	"public_vpn/internal/store"
 
@@ -744,20 +745,26 @@ func newActivateCommand(cfgPath *string) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "activate",
-		Short: "-test gate, date-stamped backup, atomic replace of the live config (never restarts)",
+		Short: "-test gate, date-stamped backup, atomic replace, then the gated auto-restart",
 		Long: `Runs the -test gate, takes a date-stamped backup, and atomically replaces
 the configured live target (activate.target). The target is a REQUIRED
 configured value: a configless run fails loud at this boundary —
 "configless mode cannot activate — provide -c or a config at
 ~/.config/publicvpn/config.toml" — instead of silently defaulting the target
-to the live client's config.`,
+to the live client's config.
+
+After a real replacement the live client is restarted through the
+byte-pinned allowlist executor (internal/restart) when
+[maintain].auto_restart is enabled (the default — hands-off, W13); with
+auto_restart = false the manual restart command is printed instead. A
+byte-identical render is a no-op: nothing is replaced, nothing restarts.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runActivate(cmd, res.Config, target, backup)
+			return runActivate(cmd, res.Config, target, backup, productionRestartWiring())
 		},
 	}
 	cmd.Flags().StringVar(&target, "target", "", "override the activation target path (default from config)")
@@ -765,7 +772,23 @@ to the live client's config.`,
 	return cmd
 }
 
-func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup bool) error {
+// restartWiring bundles the W13 auto-restart seam: the byte-pinned allowlist
+// executor (package restart — the daemon's only systemd surface besides
+// install) and the health check's port-probe dialer. The maintainStages seam
+// injects fakes in tests; production is SystemctlExecutor + the real dialer.
+type restartWiring struct {
+	Executor restart.Executor
+	Dialer   restart.Dialer
+}
+
+// productionRestartWiring wires the real allowlist executor (the restart
+// package's production type); the dialer is left nil (the restart package's
+// default net dialer).
+func productionRestartWiring() *restartWiring {
+	return &restartWiring{Executor: restart.SystemctlExecutor{}}
+}
+
+func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup bool, wiring *restartWiring) error {
 	p := newPaths(cfg)
 	// Loud stage boundary (W12): activate needs a CONFIGURED target, and the
 	// boundary fires AT STAGE ENTRY on the configured value alone — the
@@ -798,8 +821,47 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 	if err != nil {
 		return err
 	}
-	outf(cmd.OutOrStdout(), "%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
-		res.RestartHint, orNone(res.BackupPath), selectionSize(p.selection))
+
+	// W13 auto-restart ruling: a REAL replacement restarts the live client
+	// through the byte-pinned executor, then verifies health. A nil wiring
+	// with auto_restart enabled is a programming error — never a silent
+	// skip.
+	auto := cfg.Maintain.AutoRestartEnabled()
+	if auto && wiring == nil {
+		return errors.New(
+			"activation: [maintain].auto_restart is enabled but no restart executor is wired (programming error)")
+	}
+	if !auto {
+		// Manual semantics (auto_restart = false): print the operator hint.
+		outf(cmd.OutOrStdout(), "%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
+			res.RestartHint, orNone(res.BackupPath), selectionSize(p.selection))
+		return nil
+	}
+	outf(cmd.OutOrStdout(),
+		"activation complete: %s replaced from %s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
+		target, p.rendered, orNone(res.BackupPath), selectionSize(p.selection))
+	rres, rerr := restart.Run(restart.Input{
+		Executor:   wiring.Executor,
+		Dialer:     wiring.Dialer,
+		SocksPort:  extractSocksPort(p.rendered),
+		BackupPath: res.BackupPath,
+	})
+	var restartFailed *restart.Error
+	switch {
+	case rerr == nil:
+		outf(cmd.OutOrStdout(), "restart: %s\n", rres.Verdict)
+	case errors.As(rerr, &restartFailed):
+		outf(cmd.OutOrStdout(),
+			"ERROR: restart FAILED: %v\n"+
+				"  the config on disk IS the gated new one; the live client still runs the previous config\n"+
+				"  wave verdict: DONE_WITH restart-failure (backup: %s; no auto-restore in this generation)\n",
+			rerr, orNone(res.BackupPath))
+	default:
+		outf(cmd.OutOrStdout(),
+			"WARNING: the restart completed but the post-restart health check FAILED: %v\n"+
+				"  wave verdict: DONE_WITH health-failure (report-only; no auto-restore)\n",
+			rerr)
+	}
 	return nil
 }
 
@@ -892,19 +954,24 @@ type maintainStages struct {
 
 // defaultMaintainStages wires the real runners. filter runs with the config
 // cap (no CLI override inside the wave); probe runs full-set with speedtest
-// only when the wave carries it.
+// only when the wave carries it. The activate stage carries the production
+// restart wiring — the W13 byte-pinned allowlist executor (package restart):
+// every gated activation restarts the live client unless
+// [maintain].auto_restart is disabled.
 func defaultMaintainStages(opts maintainOptions) *maintainStages {
 	return &maintainStages{
-		fetch:    runFetch,
-		parse:    runParse,
-		filter:   func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
-		probe:    func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, "") },
-		geo:      runGeo,
-		stats:    runStatsStage,
-		prune:    runPruneStage,
-		selectS:  runSelect,
-		render:   runRender,
-		activate: runActivateStage,
+		fetch:   runFetch,
+		parse:   runParse,
+		filter:  func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
+		probe:   func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, "") },
+		geo:     runGeo,
+		stats:   runStatsStage,
+		prune:   runPruneStage,
+		selectS: runSelect,
+		render:  runRender,
+		activate: func(c *cobra.Command, cfg *config.Config) error {
+			return runActivateStage(c, cfg, productionRestartWiring())
+		},
 	}
 }
 
@@ -1172,9 +1239,10 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
 
 // runActivateStage is the activate-if-changed gate: an unchanged render is a
 // no-op with a clear line (the live config is never rewritten without a
-// diff); a differing render goes through the W3 activate path (-test gate →
-// backup → atomic replace).
-func runActivateStage(cmd *cobra.Command, cfg *config.Config) error {
+// diff — and nothing restarts); a differing render goes through the W3
+// activate path (-test gate → backup → atomic replace) and, since W13, the
+// gated auto-restart + health check via the injected wiring.
+func runActivateStage(cmd *cobra.Command, cfg *config.Config, wiring *restartWiring) error {
 	p := newPaths(cfg)
 	rendered, err := os.ReadFile(p.rendered)
 	if err != nil {
@@ -1190,7 +1258,7 @@ func runActivateStage(cmd *cobra.Command, cfg *config.Config) error {
 		outln(cmd.OutOrStdout(), "no changes — the live config already matches the rendered pool; nothing activated")
 		return nil
 	}
-	return runActivate(cmd, cfg, "", true)
+	return runActivate(cmd, cfg, "", true, wiring)
 }
 
 func newStatusCommand(cfgPath *string) *cobra.Command {

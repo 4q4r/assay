@@ -126,7 +126,9 @@ func TestMaintainActivateSkippedWhenRenderedMatchesLive(t *testing.T) {
 	writeMaintainFiles(t, cfg, `{"v":1}`, `{"v":1}`)
 	rec := &stageRecorder{}
 	stages := rec.stages()
-	stages.activate = runActivateStage // real activate-if-changed logic
+	stages.activate = func(c *cobra.Command, cc *config.Config) error {
+		return runActivateStage(c, cc, nil) // nil wiring: the no-op path never reaches systemd
+	}
 
 	out := runMaintainForTest(t, cfg, maintainOptions{}, stages)
 	assert.Contains(t, out, "no changes", "unchanged render must print a clear no-op line")
@@ -144,10 +146,14 @@ func TestMaintainActivatesWhenRenderedDiffers(t *testing.T) {
 	writeMaintainFiles(t, cfg, `{"v":2,"pool":"new"}`, `{"v":1}`)
 	rec := &stageRecorder{}
 	stages := rec.stages()
-	stages.activate = runActivateStage
+	wiring := &restartWiring{Executor: &recordingExecutor{}}
+	stages.activate = func(c *cobra.Command, cc *config.Config) error {
+		return runActivateStage(c, cc, wiring)
+	}
 
 	out := runMaintainForTest(t, cfg, maintainOptions{}, stages)
 	assert.Contains(t, out, "activation complete", "differs → activate via the -test gate")
+	assert.Contains(t, out, "restart ok", "W13: a real activation restarts the live client (auto_restart defaults on)")
 
 	live, err := os.ReadFile(cfg.Activate.Target)
 	require.NoError(t, err)
@@ -161,10 +167,14 @@ func TestMaintainFailedTestGateFailsWave(t *testing.T) {
 	writeMaintainFiles(t, cfg, `{"bad":true}`, `{"v":1}`)
 	rec := &stageRecorder{}
 	stages := rec.stages()
-	stages.activate = runActivateStage
+	exec := &recordingExecutor{}
+	stages.activate = func(c *cobra.Command, cc *config.Config) error {
+		return runActivateStage(c, cc, &restartWiring{Executor: exec})
+	}
 
 	err := runMaintain(&bytes.Buffer{}, cfg, maintainOptions{}, stages)
 	require.Error(t, err, "a config failing -test must fail the wave loud (L10)")
+	assert.Empty(t, exec.calls, "a failed gate never reaches systemd (W13 rail)")
 	live, err2 := os.ReadFile(cfg.Activate.Target)
 	require.NoError(t, err2)
 	assert.Equal(t, `{"v":1}`, string(live), "live config untouched after failed gate")
@@ -177,10 +187,14 @@ func TestMaintainMissingRenderedConfigIsLoud(t *testing.T) {
 	cfg := maintainCfg(t)
 	rec := &stageRecorder{}
 	stages := rec.stages()
-	stages.activate = runActivateStage
+	exec := &recordingExecutor{}
+	stages.activate = func(c *cobra.Command, cc *config.Config) error {
+		return runActivateStage(c, cc, &restartWiring{Executor: exec})
+	}
 	err := runMaintain(&bytes.Buffer{}, cfg, maintainOptions{}, stages)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rendered config")
+	assert.Empty(t, exec.calls, "nothing rendered — nothing replaced, nothing restarted")
 
 	_, statErr := os.Stat(cfg.Activate.Target)
 	assert.True(t, os.IsNotExist(statErr), "nothing was ever written to the target")
