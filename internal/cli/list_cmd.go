@@ -119,12 +119,32 @@ func runList(w io.Writer, cfg *config.Config, opts listOptions) error {
 		renderSection(w, "LOCATION", []string{"loc", "nodes", "alive", "median"},
 			[]int{6, 5, 5, 7}, coldRows(groupCold(records)), opts.color)
 	}
+
+	// W16 balancer awareness: the routing targets the current selection will
+	// produce at render time — the pool-wide balancer (always), the country
+	// balancers, and the unknown-geo pseudo-location when selected. City
+	// balancers are render-time decisions (>= 2 live nodes per city) and are
+	// not listed here.
+	outf(w, "\nbalancers: %s\n", balancerSummary(sel.Nodes))
 	return nil
+}
+
+// locationLabel renders one location row's display label: flag + code +
+// country name, or the unknown pseudo-location for nodes with no geo
+// evidence (the white flag — checker.FlagEmoji already maps empty codes to
+// 🏳, the ONE emoji mapping in the repo).
+func locationLabel(cc string) string {
+	up := strings.ToUpper(strings.TrimSpace(cc))
+	if up == "" {
+		return checker.FlagEmoji(up) + " unknown"
+	}
+	return checker.FlagEmoji(up) + " " + strings.ToLower(up) + " " + countryName(up)
 }
 
 // groupSelected aggregates the active core by country, resolving liveness
 // and RTT from the latest probe wave (selection fields are the fallback for
-// nodes without a probe row).
+// nodes without a probe row). Unknown-geo nodes (raw empty country) form
+// their own 🏳 unknown row (W16).
 func groupSelected(sel []model.SelectedNode, probeByKey map[string]store.ProbeResult) []selectedStat {
 	byCountry := map[string][]model.SelectedNode{}
 	for _, n := range sel {
@@ -133,10 +153,7 @@ func groupSelected(sel []model.SelectedNode, probeByKey map[string]store.ProbeRe
 	}
 	out := make([]selectedStat, 0, len(byCountry))
 	for cc, nodes := range byCountry {
-		st := selectedStat{
-			flag:  checker.FlagEmoji(cc) + " " + strings.ToLower(cc) + " " + countryName(cc),
-			nodes: nodes,
-		}
+		st := selectedStat{flag: locationLabel(cc), nodes: nodes}
 		st.alive, st.median = aggregate(nodes, func(n model.SelectedNode) (bool, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
 				return pr.Alive, pr.RTTMs
@@ -175,7 +192,7 @@ func groupCities(nodes []model.SelectedNode, probeByKey map[string]store.ProbeRe
 }
 
 // groupCold aggregates the geo-base by country (alive from each record's
-// latest probe state).
+// latest probe state). Unknown-geo records form their own 🏳 unknown row.
 func groupCold(records []*model.GeoRecord) []coldStat {
 	byCountry := map[string][]*model.GeoRecord{}
 	for _, r := range records {
@@ -185,7 +202,7 @@ func groupCold(records []*model.GeoRecord) []coldStat {
 	out := make([]coldStat, 0, len(byCountry))
 	for cc, group := range byCountry {
 		st := coldStat{
-			flag:  checker.FlagEmoji(cc) + " " + strings.ToLower(cc) + " " + countryName(cc),
+			flag:  locationLabel(cc),
 			count: len(group),
 		}
 		st.alive, st.median = aggregate(group, func(r *model.GeoRecord) (bool, float64) {
@@ -200,6 +217,36 @@ func groupCold(records []*model.GeoRecord) []coldStat {
 		return out[i].flag < out[j].flag
 	})
 	return out
+}
+
+// balancerSummary lists the routing targets the current selection produces
+// at render time (W16): the pool-wide balancer first (annotated "nodes" —
+// it spans the whole pool), then country balancers by code, then the
+// unknown-geo pseudo-location when unknown nodes are selected.
+func balancerSummary(sel []model.SelectedNode) string {
+	counts := map[string]int{}
+	var countries []string
+	unknown := 0
+	for _, n := range sel {
+		cc := strings.ToUpper(strings.TrimSpace(n.Country))
+		if cc == "" {
+			unknown++
+			continue
+		}
+		if counts[cc] == 0 {
+			countries = append(countries, cc)
+		}
+		counts[cc]++
+	}
+	sort.Strings(countries)
+	parts := []string{fmt.Sprintf("pool_all (%d nodes)", len(sel))}
+	for _, cc := range countries {
+		parts = append(parts, fmt.Sprintf("pool_%s (%d)", strings.ToLower(cc), counts[cc]))
+	}
+	if unknown > 0 {
+		parts = append(parts, fmt.Sprintf("pool_unknown (%d)", unknown))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // aggregate folds one group into (alive count, median RTT).

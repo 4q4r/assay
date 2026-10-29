@@ -20,9 +20,12 @@ import (
 
 // PoolRoute is one owner-configured routing rule into the pool (D2: the pool
 // only carries explicitly routed traffic). Balancer is the route TARGET: a
-// rendered `pool_*` balancer tag, or a direct `pool-<cc>-NN` outbound tag
-// (D5: a single-node city renders no city balancer). Render refuses any other
-// target loud (D6 namespace wall).
+// rendered `pool_*` balancer tag — a country (pool_<cc>), a city
+// (pool_<cc>_<city>), the unknown-geo pseudo-location (pool_unknown, W16),
+// the pool-wide balancer (pool_all, W16) — or a direct `pool-<cc>-NN`
+// outbound tag (D5: a single-node city renders no city balancer; unknown-geo
+// nodes are pool-xx-NN). Render refuses any other target loud (D6 namespace
+// wall).
 type PoolRoute struct {
 	Balancer string   `toml:"balancer"`
 	Domains  []string `toml:"domains"`
@@ -479,10 +482,22 @@ func ensureStatsAndPolicy(m map[string]any) {
 }
 
 // addBalancers renders pool_<cc> for every country in the selection and
-// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). tolerance is
-// the [render].balancer_tolerance knob, applied to BOTH balancer layers.
-// Every pool balancer is pinned to fallbackTag blockOutboundTag (see that
-// const for the security invariant and the verified xray semantics).
+// pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5). W16 adds two
+// balancers (owner item 14):
+//   - pool_unknown — the unknown-geo pseudo-location: rendered when ≥1 node
+//     with empty geo is in the selection; its selector is the xx pseudo-code
+//     prefix (pool-xx- — the D5 tag grammar is untouched; the BALANCER
+//     grouping is a render-time concern over resolved geo presence);
+//   - pool_all — the pool-wide balancer («общий балансир»): selector over
+//     the whole pool- namespace, rendered whenever ≥1 pool node exists.
+//
+// Every balancer here — including the new ones — is pinned to fallbackTag
+// blockOutboundTag (see that const for the security invariant and the
+// verified xray semantics). L2 coverage holds for both: the Plan A
+// observatory's subjectSelector is the pool- prefix, which covers
+// pool-xx-NN exactly like every country outbound, and leastLoad only picks
+// observatory-covered nodes. tolerance is the [render].balancer_tolerance
+// knob, applied to every balancer layer.
 // Returns the rendered balancer tags.
 func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []string {
 	routing, _ := m["routing"].(map[string]any)
@@ -492,7 +507,7 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 	}
 	existing := toAnySlice(routing["balancers"])
 
-	byCountry := map[string][]model.SelectedNode{} // country -> selected nodes (ordered)
+	byCountry := map[string][]model.SelectedNode{} // country -> selected nodes (ordered; "" = unknown-geo)
 	byCity := map[string][]model.SelectedNode{}    // "cc|city" -> nodes
 	for _, sn := range sel.Nodes {
 		byCountry[sn.Country] = append(byCountry[sn.Country], sn)
@@ -504,27 +519,39 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 	}
 	sort.Strings(countries)
 
+	leastLoadStrategy := func() map[string]any {
+		return map[string]any{
+			"type": "leastLoad",
+			"settings": map[string]any{
+				"expected":  1,
+				"tolerance": tolerance,
+			},
+		}
+	}
+
 	var rendered []string
 	for _, cc := range countries {
 		tag := model.CountryBalancerTag(cc)
+		selector := poolOutboundPrefix + cc + "-"
+		if cc == "" {
+			// The unknown-geo pseudo-location: balancer tag pool_unknown over
+			// the pool-xx- outbound prefix (never "pool_" — an empty cc would
+			// render a degenerate tag).
+			tag = model.UnknownBalancerTag
+			selector = poolOutboundPrefix + model.UnknownCountryCode + "-"
+		}
 		nodes := byCountry[cc]
-		tags := make([]any, 0, 1)
-		tags = append(tags, poolOutboundPrefix+cc+"-")
 		existing = append(existing, map[string]any{
-			"tag":         tag,
-			"selector":    tags,
+			keyTag:        tag,
+			"selector":    []any{selector},
 			"fallbackTag": blockOutboundTag, // security invariant, see blockOutboundTag
-			"strategy": map[string]any{
-				"type": "leastLoad",
-				"settings": map[string]any{
-					"expected":  1,
-					"tolerance": tolerance,
-				},
-			},
+			"strategy":    leastLoadStrategy(),
 		})
 		rendered = append(rendered, tag)
 
-		// City balancers where they make sense (>= 2 live nodes, D5).
+		// City balancers where they make sense (>= 2 live nodes, D5). The
+		// unknown group carries no cities (no geo evidence — empty city
+		// fields), so this loop is naturally skipped for it.
 		cityTags := map[string][]any{}
 		var cities []string
 		for _, sn := range nodes {
@@ -545,20 +572,30 @@ func addBalancers(m map[string]any, sel *model.Selection, tolerance float64) []s
 			}
 			ctag := model.CityBalancerTag(cc, city)
 			existing = append(existing, map[string]any{
-				"tag":         ctag,
+				keyTag:        ctag,
 				"selector":    selectors,
 				"fallbackTag": blockOutboundTag, // security invariant, see blockOutboundTag
-				"strategy": map[string]any{
-					"type": "leastLoad",
-					"settings": map[string]any{
-						"expected":  1,
-						"tolerance": tolerance,
-					},
-				},
+				"strategy":    leastLoadStrategy(),
 			})
 			rendered = append(rendered, ctag)
 		}
 	}
+
+	// pool_all — the pool-wide balancer over ALL pool outbounds (owner item
+	// 14b): always rendered when ≥1 pool node exists, regardless of geo.
+	// The selector is the whole pool- prefix, so it spans every country
+	// outbound AND every pool-xx-NN unknown-geo outbound; the observatory
+	// subjectSelector covers the same namespace (L2).
+	if len(sel.Nodes) > 0 {
+		existing = append(existing, map[string]any{
+			keyTag:        model.PoolAllBalancerTag,
+			"selector":    []any{poolOutboundPrefix},
+			"fallbackTag": blockOutboundTag, // security invariant, see blockOutboundTag
+			"strategy":    leastLoadStrategy(),
+		})
+		rendered = append(rendered, model.PoolAllBalancerTag)
+	}
+
 	routing["balancers"] = existing
 	return rendered
 }
@@ -683,10 +720,12 @@ func templateInboundTags(m map[string]any) tagSet {
 }
 
 // Repeated dial-block vocabulary as constants (goconst): the xray outbound
-// settings keys every protocol dial shares.
+// settings keys every protocol dial shares, plus the balancer-object key the
+// balancer builder emits.
 const (
 	keyAddress = "address"
 	keyPort    = "port"
+	keyTag     = "tag"
 )
 
 // buildOutbound converts one node into a complete xray outbound. Auth and

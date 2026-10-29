@@ -116,7 +116,8 @@ func TestListColorOffGolden(t *testing.T) {
 		"loc                  nodes  alive  median\n" +
 		"🇩🇪 de Germany        2      1      46ms\n" +
 		"🇫🇷 fr France         1      1      60ms\n" +
-		"🇺🇸 us United States  1      0      149ms\n"
+		"🇺🇸 us United States  1      0      149ms\n" +
+		"\nbalancers: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)\n"
 	require.Equal(t, want, out)
 }
 
@@ -133,4 +134,54 @@ func TestCountryNameFallback(t *testing.T) {
 	require.Equal(t, "Germany", countryName("de"))
 	require.Equal(t, "ZZ", countryName("zz"), "unknown codes degrade to the bare code")
 	require.Empty(t, countryName(""))
+}
+
+// TestListUnknownGroupAndBalancers pins the W16 additions (owner item 14c):
+// unknown-geo nodes in the selection render as their own 🏳 unknown row
+// (the white flag — the one emoji mapping in the repo already treats empty
+// codes as unknown), and the balancers line names the render-stage routing
+// targets the selection produces: pool_all first, then countries, then the
+// unknown pseudo-location when present.
+func TestListUnknownGroupAndBalancers(t *testing.T) {
+	dir := t.TempDir()
+	gen := time.Date(2026, 10, 29, 9, 0, 0, 0, time.UTC)
+	sel := &model.Selection{
+		GeneratedAt: gen,
+		CapApplied:  3,
+		CitiesAlive: 1,
+		Nodes: []model.SelectedNode{
+			{Tag: "pool-xx-01", Key: "k-xx-1", Country: "", City: "", RTTMs: 80},
+			{Tag: "pool-xx-02", Key: "k-xx-2", Country: "", City: "", RTTMs: 90},
+			{Tag: "pool-de-01", Key: "k-de-9", Country: "de", City: "Frankfurt", RTTMs: 40},
+		},
+	}
+	require.NoError(t, store.WriteSelection(filepath.Join(dir, "selection.json"), sel))
+	results := []store.ProbeResult{
+		{Key: "k-xx-1", Host: "x1.example.com", Alive: true, RTTMs: 80, CheckedAt: gen},
+		{Key: "k-xx-2", Host: "x2.example.com", Alive: false, RTTMs: 91, CheckedAt: gen},
+		{Key: "k-de-9", Host: "de9.example.com", Alive: true, RTTMs: 40, CheckedAt: gen},
+	}
+	require.NoError(t, store.AppendProbeResults(filepath.Join(dir, "probe-results.jsonl"), results))
+	cold := []*model.GeoRecord{
+		{Tag: "pool-xx-01", Country: "", City: "", Alive: true, RTTMs: 80},
+		{Tag: "pool-de-01", Country: "de", City: "Frankfurt", Alive: true, RTTMs: 40},
+	}
+	require.NoError(t, store.WriteGeo(filepath.Join(dir, "geo-base.jsonl"), cold))
+	cfg := &config.Config{DataDir: dir}
+
+	out := runListCapture(t, cfg, listOptions{all: true})
+	require.Contains(t, out, "🏳 unknown", "the unknown group renders as its own location row")
+	require.Contains(t, out,
+		"balancers: pool_all (3 nodes), pool_de (1), pool_unknown (2)",
+		"the balancers line names pool_all, country targets, and the unknown target")
+	require.Contains(t, out, "🏳 unknown", "the cold section groups unknown-geo records the same way")
+}
+
+// TestListBalancersLineKnownOnly pins the conditional: a selection with only
+// known countries names NO pool_unknown target (it would not render).
+func TestListBalancersLineKnownOnly(t *testing.T) {
+	cfg, _ := listFixture(t)
+	out := runListCapture(t, cfg, listOptions{})
+	require.Contains(t, out, "balancers: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)")
+	require.NotContains(t, out, "pool_unknown", "no unknown-geo nodes — no pool_unknown target")
 }

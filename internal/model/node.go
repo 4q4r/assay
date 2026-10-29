@@ -236,6 +236,22 @@ func CountryBalancerTag(cc string) string {
 	return "pool_" + strings.ToLower(cc)
 }
 
+// Naming contract for the W16 pseudo-location surface (owner item 14):
+//   - UnknownCountryCode is the D5 tag-grammar pseudo-code (cc=xx) carried by
+//     unknown-geo nodes: their outbounds stay pool-xx-NN, so the flat tag
+//     grammar and every geo-base join stay intact. NOT an ISO code — never
+//     confusable with a real country.
+//   - UnknownBalancerTag is the pseudo-location balancer tag over those
+//     nodes (pool_unknown) — a first-class pool_routes target.
+//   - PoolAllBalancerTag is the pool-wide balancer (the «общий балансир»):
+//     leastLoad over the ENTIRE pool- namespace, rendered whenever ≥1 pool
+//     node exists.
+const (
+	UnknownCountryCode = "xx"
+	UnknownBalancerTag = "pool_unknown"
+	PoolAllBalancerTag = "pool_all"
+)
+
 // CityBalancerTag renders the per-city balancer tag: pool_<cc>_<city-slug>.
 func CityBalancerTag(cc, city string) string {
 	return fmt.Sprintf("pool_%s_%s", strings.ToLower(cc), CitySlug(city))

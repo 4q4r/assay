@@ -28,7 +28,8 @@
 - [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer)
 - [👀 Pool inventory (`list`)](#-pool-inventory-list)
 - [🌍 Site check (`check`)](#-site-check-check)
-- [🛰️ Exit-geo self-report (W11)](#️-exit-geo-self-report-w11)
+- [🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)](#️-exit-geo-self-report-w11--w16-https-rung)
+- [⚖️ Pool balancers (W16)](#️-pool-balancers-w16)
 - [📂 Project Structure](#-project-structure)
 - [🚀 Requirements](#-requirements)
 - [⚡ Quick Start](#-quick-start)
@@ -91,11 +92,11 @@ flowchart LR
 | 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
 | 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
 | 🩺 probe | `publicvpn probe` | out-of-band `xray-knife`: liveness, RTT, tunnel exit IP (D8), optional `-S` speedtest |
-| 🌍 geo | `publicvpn geo` | **W11 per-node self-report**: every alive node asks ip-api through its own tunnel (exit-truth geo; the old aggregate batch clamp is retired) |
+| 🌍 geo | `publicvpn geo` | **W11 per-node self-report + W16 HTTPS rung**: every alive node asks geo endpoints through its own tunnel (exit-truth geo; the old aggregate batch clamp is retired) |
 | 📊 stats | `maintain` sub-step | `xray api statsquery` poll → per-outbound uplink/downlink into the cold base |
 | ✂️ prune | `maintain` sub-step | dead/ttl-stale-orphan removal with a `.bak-<ts>` backup |
-| 🏆 select | `publicvpn select` | rank (alive → checks → speed), per-country cap K, soft cap N with city expansion (D7) |
-| 📝 render | `publicvpn render` | template + pool outbounds + balancers + Plan A observatory, L1-gated |
+| 🏆 select | `publicvpn select` | rank (alive → checks → speed), per-group cap K (unknown-geo nodes share one `unknown` group — W16), soft cap N with city expansion (D7) |
+| 📝 render | `publicvpn render` | template + pool outbounds + balancers (country / city / `pool_unknown` / `pool_all`) + Plan A observatory, L1-gated |
 | ⚡ activate | `publicvpn activate` | `-test` gate → date-stamped backup → atomic replace. **Never restarts the service.** |
 
 ## 🧭 What Happens on `maintain`
@@ -188,7 +189,7 @@ publicvpn list                 # active core by country: flag, code+name, nodes,
 publicvpn list --cities --all  # + indented city sub-rows (D5 view) + the cold base section
 ```
 
-Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
+Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. Unknown-geo nodes in the selection render as their own `🏳 unknown` row, and the `balancers:` line names the routing targets the current selection will produce (W16: `pool_all`, country balancers, `pool_unknown` when present). Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
 
 ## 🌍 Site check (`check`)
 
@@ -217,15 +218,30 @@ For picky sites that open only from specific countries/cities/ASNs, `check` answ
 | `--no-color` | off | deprecated-friendly alias for `--color=never` (wins over a conflicting `--color`) |
 | `--save` | *(none)* | write the JSON report under the data dir (relative path) or at an absolute path |
 
-## 🛰️ Exit-geo self-report (W11)
+## 🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)
 
 The geo stage asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
 
-1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID).
-2. Through that instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
-3. **Why the old limit disappeared in principle:** the batch era POSTed exit-IP groups from this box's one source IP against a 15 requests/min clamp. The self-report's requests originate from thousands of DISTINCT node exit IPs — each carries its own 45 req/min single-endpoint budget, and those budgets never pool. The retired batch knobs (`[geo].endpoint`, `[geo].batch_size`, `[geo].per_minute`) fail config load with a loud migration error naming the replacement. A small politeness pacing (≈10 request starts/s across the wave) remains — courtesy toward nodes and the DoH endpoint, not a rate-limit honor. ip-api's free tier stays **HTTP-only, non-commercial** — personal use of public geo data satisfies it.
-4. **Fallback chain (never a dropped node):** a self-report that resets, times out, returns non-200 or `status=fail` retries as the through-tunnel **DoH view**: `o-o.myaddr.l.google.com` TXT via `[geo].doh_url` (default `https://dns.google/resolve`) reveals the exit network's own DNS resolver IP, and the ip-api single-IP lookup of THAT IP rides the same tunnel — still a per-node source, so the aggregate limit stays gone on the fallback path too. If both hops fail (some exits block plain HTTP wholesale), the node keeps its record, stays usable, its previous geo evidence is preserved (store blank-fold), and the **unknown** class is reported loud in the wave log. Honest limitation: for exits behind big anycast public resolvers the fallback describes the resolver-operator's network — that is exactly what the provenance marker below makes visible.
-5. **Provenance in the cold base:** every record carries `geo_source` — `self-report` (the node's own answer), `doh-fallback` (the indirect DoH view), or empty (no evidence) — so evidence quality is always visible next to the fields it describes. A self-report whose `query` IP differs from the probe wave's exit IP (exit churn) wins the record with the freshest tunnel truth and prints a loud churn line.
+1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID). Every rung of the ladder below rides that SAME instance.
+2. **Rung 1 — plain-HTTP ip-api self-report.** Through the instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
+3. **Why the old limit disappeared in principle:** the batch era POSTed exit-IP groups from this box's one source IP against a 15 requests/min clamp. The self-report's requests originate from thousands of DISTINCT node exit IPs — each carries its own 45 req/min single-endpoint budget, and those budgets never pool. The retired batch knobs (`[geo].endpoint`, `[geo].batch_size`, `[geo].per_minute`) fail config load with a loud migration error naming the replacement. A small politeness pacing (≈10 request starts/s across the wave) remains — every external request start on every rung takes a pacer slot; courtesy toward nodes and the geo endpoints, not a rate-limit honor. ip-api's free tier stays **HTTP-only, non-commercial** — personal use of public geo data satisfies it.
+4. **Rung 2 — HTTPS self-geo (W16).** A rung-1 failure (reset / timeout / non-200 / `status=fail`) retries as `GET [geo].https_url` — default `https://ipinfo.io/json`, **keyless and TLS-only**, so an exit that blocks plain HTTP wholesale is rescued here (the class W11 could only offer the resolver-network DoH view). Same no-aggregate argument: ipinfo's free tier is limited per source IP, and every node is its own source; the ToS is personal-use — same footing as ip-api. The knob is a plain string: ANY https endpoint is accepted verbatim (structural https check only, no allowlist). **Field honesty:** the ipinfo free tier has no separate ISP field and no proxy/hosting flags — those are stored **empty**, with the `self-report-https` provenance marker naming the evidence class (an empty flag is never presented as a measured "not a proxy"); the composite `org` field (`AS24940 Hetzner Online GmbH`) splits honestly into `asn` + `asname`. Country / city / ip map 1:1 (field surface verified live 2026-10-29); the reported `ip` is treated as the freshest exit truth exactly like ip-api's `query`, churn logged loud.
+5. **Rung 3 — DoH fallback.** Both self-geo rungs failing retries as the through-tunnel **DoH view**: `o-o.myaddr.l.google.com` TXT via `[geo].doh_url` (default `https://dns.google/resolve`) reveals the exit network's own DNS resolver IP, and the ip-api single-IP lookup of THAT IP rides the same tunnel — still a per-node source. Honest limitation: for exits behind big anycast public resolvers the fallback describes the resolver-operator's network — exactly what the provenance marker makes visible (and why rung 2 exists).
+6. **Rung 4 — unknown (never a dropped node).** If every rung fails, the node keeps its record, stays usable, its previous geo evidence is preserved (store blank-fold), and the **unknown** class is reported loud in the wave log. Unknown-geo nodes are not wasted: they enter the selection under the `unknown` cap group and render into the `pool_unknown` balancer (below).
+7. **Provenance in the cold base:** every record carries `geo_source` — `self-report` (the node's own ip-api answer), `self-report-https` (the node's own ipinfo answer, W16), `doh-fallback` (the indirect DoH view), or empty (no evidence) — so evidence quality is always visible next to the fields it describes. A self-report whose IP differs from the probe wave's exit IP (exit churn) wins the record with the freshest tunnel truth and prints a loud churn line.
+
+## ⚖️ Pool balancers (W16)
+
+The renderer emits a leastLoad balancer per location — plus two W16 targets — and **every one of them carries `fallbackTag: "block"`** (a location with no healthy candidate blackholes instead of falling back — the W9 security invariant, not a knob):
+
+| Balancer | Selector | When it renders | Use case |
+| :-- | :-- | :-- | :-- |
+| `pool_<cc>` | `pool-<cc>-` | ≥1 node from that country selected | per-country routing (D5: leastLoad quality guarantee) |
+| `pool_<cc>_<city>` | explicit tags | ≥2 live nodes in one city | city override (D5; single-node cities route by direct tag) |
+| `pool_unknown` | `pool-xx-` | ≥1 unknown-geo node selected | the unknown-geo pseudo-location — nodes whose geo evidence failed stay usable and routable |
+| `pool_all` | `pool-` | always, with ≥1 pool node | the **whole-pool** balancer: one route target spanning every country and the unknown group |
+
+Unknown-geo nodes keep the D5 tag grammar intact with the `xx` pseudo-code (`pool-xx-NN` — not an ISO code, never confusable with a country); the grouping happens at render time over resolved geo presence, and the cold-base schema is untouched. Their cap treatment is symmetric: `unknown` acts as a cap group exactly like a country (D7 K applies). All four balancer kinds select only observatory-covered outbounds (the Plan A observatory's `pool-` prefix covers every pool tag — leastLoad ignores uncovered nodes), and `[render.pool_routes]` accepts all of them plus direct `pool-<cc>-NN` / `pool-xx-NN` tags — anything else fails the render loud (D6). `publicvpn list` shows the same picture: unknown nodes render as a `🏳 unknown` row, and a `balancers:` line names the targets the current selection will produce.
 
 ## 📂 Project Structure
 
@@ -242,12 +258,12 @@ public_vpn/
 │   ├── parse/              # base64/link decoding (vless/vmess/trojan/ss) → normalized Node
 │   ├── filter/             # ingest security filter (protocols allowlist + insecure policy)
 │   ├── probe/              # xray-knife out-of-band runner (L5)
-│   ├── geo/                # W11 per-node self-report (through-tunnel ip-api, DoH fallback)
+│   ├── geo/                # W11+W16 per-node self-report ladder (ip-api → HTTPS → DoH → unknown)
 │   ├── checker/            # W8 site-to-location check: temp xray instances, socks5h client, blockpage classifier, geo summary
 │   ├── stats/              # W4 statsquery poll + byte folding (L7-tolerant)
 │   ├── prune/              # W4 dead/ttl-stale-orphan rules (reuses rank freshness)
 │   ├── rank/               # select stage: ranking, caps D7, pool tags
-│   ├── render/             # W3/W5 renderer: full transport surface, balancers, Plan A observatory, L1 gate
+│   ├── render/             # W3/W5/W16 renderer: transports, country/city/unknown/all balancers, L1 gate
 │   ├── activate/           # -test gate + backup + atomic replace (never restarts)
 │   ├── install/            # W5 self-install: binary copy, unit rendering, allowlisted systemctl seam
 │   └── store/              # JSONL cold base, probe log, selection — all writes atomic
