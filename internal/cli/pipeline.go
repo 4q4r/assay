@@ -468,45 +468,45 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 	var (
 		limit     int
 		speedtest bool
-		preset    string
 	)
 	cmd := &cobra.Command{
 		Use:   "probe",
-		Short: "Out-of-band xray-knife probe: liveness, latency, exit IP (D8), optional speed/grading",
+		Short: "Out-of-band probe: a temp single-node xray per node — liveness, latency, exit IP (D8), optional speed",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runProbe(cmd, res.Config, limit, speedtest, preset)
+			return runProbe(cmd, res.Config, limit, speedtest)
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "probe only the first N filtered nodes (0 = all)")
-	cmd.Flags().BoolVar(&speedtest, "speedtest", false, "run -S throughput measurement (slow)")
-	cmd.Flags().StringVar(&preset, "check-preset", "", "panel grading preset (cloudflare|global|google|gstatic|streaming)")
+	cmd.Flags().BoolVar(&speedtest, "speedtest", false,
+		"run the throughput measurement even when the config disables it (slow)")
 	return cmd
 }
 
-// probeOptions translates config + CLI flags into one probe wave's options
-// (paths are the caller's concern — they come from newPaths). Extracted so
-// the config→Options wiring (max_passed, speedtest OR-flag, check-preset
-// precedence) is unit-testable (review finding 7).
-func probeOptions(cfg *config.Config, speedtestFlag bool, presetFlag string) probe.Options {
+// probeOptions translates config + CLI flags into one probe wave's options.
+// The prober binary and its database are GONE (W14): every node gets a
+// temporary single-node xray from the SAME factory the check/geo stages
+// use, so there is no per-stage tooling left to configure. ExitProbe stays
+// nil: the D8 exit-IP echo defaults ON in production (nil = on — every
+// alive record carries its tunnel exit IP).
+func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 	return probe.Options{
-		Timeout:             cfg.Probe.Timeout.Duration,
-		Threads:             cfg.Probe.Threads,
-		URL:                 cfg.Probe.URL,
-		Speedtest:           speedtestFlag || cfg.Probe.IsSpeedtest(),
-		SpeedtestTimeout:    cfg.Probe.SpeedtestTimeout.Duration,
-		CheckPreset:         firstNonEmpty(presetFlag, cfg.Probe.CheckPreset),
-		URLSuccessThreshold: cfg.Probe.URLSuccessThreshold,
-		MaxPassed:           cfg.Probe.MaxPassed,
-		SkipFreshWithin:     cfg.Probe.SkipFreshWithin.Duration,
+		Timeout:          cfg.Probe.Timeout.Duration,
+		Threads:          cfg.Probe.Threads,
+		URL:              cfg.Probe.URL,
+		Attempts:         cfg.Probe.Attempts,
+		Speedtest:        speedtestFlag || cfg.Probe.IsSpeedtest(),
+		SpeedtestURL:     cfg.Probe.SpeedtestURL,
+		SpeedtestTimeout: cfg.Probe.SpeedtestTimeout.Duration,
+		SkipFreshWithin:  cfg.Probe.SkipFreshWithin.Duration,
 	}
 }
 
-func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool, preset string) error {
+func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool) error {
 	p := newPaths(cfg)
 	nodes, err := store.ReadNodes(p.filtered)
 	if err != nil {
@@ -521,10 +521,16 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 	if err := os.MkdirAll(p.workDir, 0o750); err != nil {
 		return err
 	}
-	runner := &probe.KnifeRunner{BinPath: config.ExpandHome(cfg.Probe.Path)}
-	opts := probeOptions(cfg, speedtest, preset)
-	opts.DBPath = p.knifeDB
-	opts.WorkDir = p.workDir
+	// The SAME temp-instance infrastructure the check/geo stages use — one
+	// factory, one render.BuildOutbound outbound builder, zero drift (W14).
+	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
+		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+		TLSFingerprint: cfg.Render.TLSFingerprint,
+	})
+	factory := probe.Factory(func(ctx context.Context, n *model.Node) (probe.SocksInstance, error) {
+		return xrayFactory(ctx, n)
+	})
+	opts := probeOptions(cfg, speedtest)
 	opts.Progress = cmd.OutOrStdout()
 	if opts.SkipFreshWithin > 0 {
 		// The freshness skip reads the recorded history: skipped nodes keep
@@ -535,7 +541,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 		}
 		opts.Latest = latest
 	}
-	results, err := probe.Run(context.Background(), nodes, runner, opts, p.probeResults)
+	results, err := probe.Run(context.Background(), nodes, factory, opts, p.probeResults)
 	if err != nil {
 		return err
 	}
@@ -547,15 +553,6 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 	}
 	outf(cmd.OutOrStdout(), "probe complete: %d/%d alive → %s\n", alive, len(results), p.probeResults)
 	return nil
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func newGeoCommand(cfgPath *string) *cobra.Command {
@@ -1011,7 +1008,7 @@ func defaultMaintainStages(opts maintainOptions) *maintainStages {
 		fetch:   runFetch,
 		parse:   runParse,
 		filter:  func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
-		probe:   func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, "") },
+		probe:   func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest) },
 		geo:     runGeo,
 		stats:   runStatsStage,
 		prune:   runPruneStage,

@@ -44,6 +44,7 @@ func New() *cobra.Command {
 		newInstallCommand(&cfgPath),
 		newUninstallCommand(&cfgPath),
 		newCheckCommand(&cfgPath),
+		newXrayUpdateCommand(&cfgPath),
 	)
 	return root
 }
@@ -61,7 +62,6 @@ type paths struct {
 	renderedDir  string
 	rendered     string
 	backupDir    string
-	knifeDB      string
 	workDir      string
 }
 
@@ -81,7 +81,6 @@ func newPaths(cfg *config.Config) paths {
 		renderedDir:  renderedDir,
 		rendered:     filepath.Join(renderedDir, "config.json"),
 		backupDir:    filepath.Join(dataDir, config.ExpandHome(cfg.Activate.BackupDir)),
-		knifeDB:      filepath.Join(dataDir, config.ExpandHome(cfg.Probe.DBPath)),
 		workDir:      filepath.Join(dataDir, "probe-work"),
 	}
 }

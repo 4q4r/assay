@@ -292,7 +292,11 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 
 	workDir := t.TempDir()
 	ctx := context.Background()
-	for round := 1; round <= 6; round++ {
+
+	// One full round (I-4 restructure): fresh nodes/config/tmpdir per round
+	// so a retry never reuses a possibly-poisoned workspace.
+	runRound := func(round int) (*NodeResult, *NodeResult) {
+		var okRow, deadRow *NodeResult
 		nodes := []*model.Node{
 			model.NewNode("test", "vless", "uuid-1", "alive.example.com", 443, map[string]string{"type": "ws", "path": "/p"}),
 			model.NewNode("test", "vless", "uuid-2", "dead.example.com", 443, map[string]string{"type": "ws", "path": "/p"}),
@@ -314,9 +318,14 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "filtered.jsonl"), nodesJSONL(t, nodes), 0o600))
 
 		rep, err := Run(ctx, Options{
-			Targets:          []string{httpTargetURL(t, site)},
-			Attempts:         1,
-			Timeout:          5 * time.Second,
+			Targets:  []string{httpTargetURL(t, site)},
+			Attempts: 1,
+			// 15s: the full -race suite saturates the box (packages run
+			// concurrently) and the W14 boot-smoke adds real xray boots to
+			// that load — a 5s attempt deadline flaked the healthy-control
+			// sanity under that peak. Success is milliseconds; the larger
+			// deadline only buys headroom under saturation.
+			Timeout:          15 * time.Second,
 			Concurrency:      2,
 			XrayBin:          os.Args[0], // the PRODUCTION factory path, no override
 			GeoBasePath:      filepath.Join(cfgDir, "geo-base.jsonl"),
@@ -328,7 +337,6 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 		})
 		require.NoError(t, err, "round %d", round)
 		require.Len(t, rep.Targets, 1)
-		var okRow, deadRow *NodeResult
 		for _, r := range rep.Targets[0].Rows {
 			switch r.Tag {
 			case "pool-ok-01":
@@ -339,11 +347,36 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 		}
 		require.NotNil(t, okRow, "round %d", round)
 		require.NotNil(t, deadRow, "round %d", round)
-		assert.False(t, deadRow.InstanceFailed, "round %d: the dead node must BOOT (its socks works)", round)
-		assert.Equal(t, 1, deadRow.Total, "round %d", round)
-		assert.Equal(t, 0, deadRow.OK,
+		return okRow, deadRow
+	}
+
+	for round := 1; round <= 6; round++ {
+		okRow, deadRow := runRound(round)
+		// THE INVARIANT — single-shot strict on EVERY round result (I-4
+		// discipline): a dead node reporting ok>0 fails the test IMMEDIATELY
+		// and is NEVER retried; a retry would mask the exact
+		// cross-contamination race this test hunts.
+		require.Equal(t, 0, deadRow.OK,
 			"round %d: a dead-outbound node can NEVER report ok>0 — scoring means its attempts rode another instance's tunnel", round)
-		assert.Equal(t, 1, okRow.OK, "round %d: healthy control node must serve (fixture sanity)", round)
+		// Fixture sanity (both instances boot; the control serves) — the
+		// load-flaky half: under full -race package-pair load either the
+		// dead boot can fail (round 5, witnessed live pre-I4) or the
+		// control's single attempt can starve (1-in-3). A degenerate round
+		// exercises nothing. Retry the round ONCE, for the SANITY ONLY; the
+		// invariant above keeps its single-shot semantics on the original
+		// round and on any retry.
+		if deadRow.InstanceFailed || deadRow.Total != 1 || okRow.OK != 1 {
+			t.Logf("round %d: fixture sanity failed under suite load (dead boot failed=%v, total=%d, control ok=%d) — retrying the round once (sanity only)",
+				round, deadRow.InstanceFailed, deadRow.Total, okRow.OK)
+			okRow, deadRow = runRound(round)
+			require.Equal(t, 0, deadRow.OK,
+				"round %d (sanity retry): the dead-node invariant holds on the retry too", round)
+			require.False(t, deadRow.InstanceFailed,
+				"round %d (sanity retry): the dead node must BOOT — failing twice is real breakage", round)
+			require.Equal(t, 1, deadRow.Total, "round %d (sanity retry)", round)
+			require.Equal(t, 1, okRow.OK,
+				"round %d (sanity retry): the healthy control failed twice under load — real fixture breakage, not a flake", round)
+		}
 	}
 
 	entries, rerr := os.ReadDir(workDir)

@@ -92,7 +92,7 @@ func TestVerdictFor(t *testing.T) {
 		{"unknown", staticError("proxy: unknown authentication method"), false, VerdictError},
 	}
 	for _, tc := range cases {
-		require.Equal(t, tc.want, verdictFor(tc.err, tc.connected), "%s: error %q", tc.name, tc.err)
+		require.Equal(t, tc.want, VerdictFor(tc.err, tc.connected), "%s: error %q", tc.name, tc.err)
 	}
 }
 

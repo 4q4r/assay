@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -35,16 +36,18 @@ const dnsMethod = "doh-via-exit"
 const checkUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
-// tunnelClient drives HTTP through one node's temp SOCKS5 instance.
-type tunnelClient struct {
+// TunnelClient drives HTTP through one node's temp SOCKS5 instance.
+type TunnelClient struct {
 	socksAddr string
 	timeout   time.Duration
 	dohURL    string         // test seam; empty = dohEndpoint
 	tlsRoots  *x509.CertPool // test seam; nil = system roots
 }
 
-func newTunnelClient(socksAddr string, timeout time.Duration) *tunnelClient {
-	return &tunnelClient{socksAddr: socksAddr, timeout: timeout, dohURL: dohEndpoint}
+// NewTunnelClient returns a client whose ONLY transport path is the SOCKS5
+// endpoint at socksAddr (socks5h semantics: hostnames resolve at the exit).
+func NewTunnelClient(socksAddr string, timeout time.Duration) *TunnelClient {
+	return &TunnelClient{socksAddr: socksAddr, timeout: timeout, dohURL: dohEndpoint}
 }
 
 // dialer builds the SOCKS5 dialer for the temp instance. The x/net socks
@@ -53,7 +56,7 @@ func newTunnelClient(socksAddr string, timeout time.Duration) *tunnelClient {
 // feature measures.
 //
 //nolint:ireturn // x/net exposes SOCKS5 dialers only as interfaces; http.Transport consumes this one
-func (t *tunnelClient) dialer() (proxy.ContextDialer, error) {
+func (t *TunnelClient) dialer() (proxy.ContextDialer, error) {
 	d, err := proxy.SOCKS5("tcp", t.socksAddr, nil, proxy.Direct)
 	if err != nil {
 		return nil, fmt.Errorf("socks dialer: %w", err)
@@ -69,7 +72,7 @@ func (t *tunnelClient) dialer() (proxy.ContextDialer, error) {
 // Proxy nil is the L5 landmine guard pinned in code: the ambient http_proxy
 // of the owner's shell must never hijack check traffic through the live
 // client — every dial goes through the temp instance, resolution at the exit.
-func (t *tunnelClient) client(chain *redirectChain) (*http.Client, error) {
+func (t *TunnelClient) client(chain *redirectChain) (*http.Client, error) {
 	dialer, err := t.dialer()
 	if err != nil {
 		return nil, err
@@ -106,29 +109,54 @@ func (c *redirectChain) checkRedirect(req *http.Request, via []*http.Request) er
 	return nil
 }
 
-// get performs ONE HTTP attempt through the tunnel, collecting httptrace
+// Get performs ONE HTTP attempt through the tunnel, collecting httptrace
 // timings (connect, TLS handshake, TTFB, total), the redirect chain, body
 // bytes (capped) and the response verdict.
-func (t *tunnelClient) get(ctx context.Context, rawURL string) (Attempt, error) {
+func (t *TunnelClient) Get(ctx context.Context, rawURL string) (Attempt, error) {
+	attempt, _, err := t.getFull(ctx, rawURL)
+	return attempt, err
+}
+
+// GetJSON performs ONE GET through the tunnel and decodes the (capped)
+// response body into out — the machine-readable variant of Get (the probe's
+// D8 exit-IP echo and similar JSON endpoints). The classification verdict
+// still applies: the caller checks attempt.Verdict before trusting out.
+func (t *TunnelClient) GetJSON(ctx context.Context, rawURL string, out any) (Attempt, error) {
+	attempt, body, err := t.getFull(ctx, rawURL)
+	if err != nil {
+		return attempt, err
+	}
+	if attempt.Verdict != VerdictSuccess {
+		return attempt, fmt.Errorf("%s: %s (verdict %s)", rawURL, attemptStatusText(attempt), attempt.Verdict)
+	}
+	return attempt, json.Unmarshal(body, out)
+}
+
+// getFull is the single request core behind Get/GetJSON: ONE HTTP attempt
+// through the tunnel with full trace diagnostics and the capped body.
+func (t *TunnelClient) getFull(ctx context.Context, rawURL string) (Attempt, []byte, error) {
 	attempt := Attempt{}
 	chain := &redirectChain{}
 	client, err := t.client(chain)
 	if err != nil {
 		attempt.Verdict, attempt.Err = VerdictError, err.Error()
-		return attempt, err
+		return attempt, nil, err
 	}
 	var (
 		t0           = time.Now()
 		connectStart time.Time
 		tlsStart     time.Time
-		connected    bool // the tunnel CONNECT completed (phase for verdictFor)
+		connected    atomic.Bool // the tunnel CONNECT completed (phase for VerdictFor);
+		// the trace callbacks run on the DIAL goroutine (net's happy-eyeballs
+		// dialSingle/dialParallel internals), the read happens on the request
+		// goroutine after client.Do — the flag MUST be atomic (-race-proven).
 	)
 	trace := &httptrace.ClientTrace{
 		ConnectStart: func(_, _ string) { connectStart = time.Now() },
 		ConnectDone: func(_, _ string, err error) {
 			if err == nil && !connectStart.IsZero() {
 				attempt.ConnectMS = msSince(connectStart)
-				connected = true
+				connected.Store(true)
 			}
 		},
 		TLSHandshakeStart: func() { tlsStart = time.Now() },
@@ -143,16 +171,16 @@ func (t *tunnelClient) get(ctx context.Context, rawURL string) (Attempt, error) 
 		httptrace.WithClientTrace(ctx, trace), http.MethodGet, rawURL, nil)
 	if err != nil {
 		attempt.Verdict, attempt.Err = VerdictError, err.Error()
-		return attempt, err
+		return attempt, nil, err
 	}
 	req.Header.Set("User-Agent", checkUserAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		attempt.TotalMS = msSince(t0)
-		attempt.Verdict = verdictFor(err, connected)
+		attempt.Verdict = VerdictFor(err, connected.Load())
 		attempt.Err = err.Error()
-		return attempt, err
+		return attempt, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := readCapped(resp.Body)
@@ -170,7 +198,18 @@ func (t *tunnelClient) get(ctx context.Context, rawURL string) (Attempt, error) 
 	cls := Classify(resp.StatusCode, body)
 	attempt.Verdict = cls.Verdict
 	attempt.Signature = cls.Signature
-	return attempt, nil
+	return attempt, body, nil
+}
+
+// attemptStatusText is the compact non-success marker for GetJSON errors.
+func attemptStatusText(a Attempt) string {
+	if a.Status != 0 {
+		return fmt.Sprintf("http %d", a.Status)
+	}
+	if a.Err != "" {
+		return a.Err
+	}
+	return "no answer"
 }
 
 // readCapped reads up to maxBodyBytes from r.
@@ -193,10 +232,75 @@ func readCapped(r io.Reader) []byte {
 	return body
 }
 
+// errDownloadWindow marks a non-positive speedtest window (structural guard).
+var errDownloadWindow = errors.New("download window must be positive")
+
+// DownloadWindow streams ONE GET through the tunnel for at most `window`,
+// counting the bytes received — the probe speedtest primitive (W14).
+// Window expiry is a NORMAL measurement end (bytes so far, nil error): a
+// throughput sample never needs the whole file. A transport failure before
+// any byte is an error — a silent 0 B/s result would masquerade as a
+// measurement. Returns bytes received and the measured elapsed time.
+func (t *TunnelClient) DownloadWindow(
+	ctx context.Context, rawURL string, window time.Duration,
+) (int64, time.Duration, error) {
+	if window <= 0 {
+		return 0, 0, errDownloadWindow
+	}
+	client, err := t.client(&redirectChain{})
+	if err != nil {
+		return 0, 0, err
+	}
+	dlCtx, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+	req, err := http.NewRequestWithContext(dlCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("User-Agent", checkUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	start := time.Now()
+	var got int64
+	buf := make([]byte, 64*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		got += int64(n)
+		if rerr != nil {
+			// Context deadline (window expired) or stream end: both are
+			// normal sample terminations. Any OTHER read error before a
+			// single byte is a transport failure — loud; after bytes have
+			// flowed the sample is still valid (bytes/time up to the cut).
+			// PARENT cancellation is deliberately NOT folded into the
+			// window-expiry branch (dlCtx wraps ctx, so both fire together
+			// when the caller cancels): only the WINDOW's own deadline may
+			// end a sample "successfully" — a cancelled caller falls
+			// through to the generic error/partial-sample handling below,
+			// so a torn-down wave can never read as a finished measurement.
+			if dlCtx.Err() != nil && ctx.Err() == nil {
+				return got, time.Since(start), nil
+			}
+			if rerr == io.EOF {
+				return got, time.Since(start), nil
+			}
+			if got == 0 {
+				return 0, time.Since(start), rerr
+			}
+			return got, time.Since(start), nil
+		}
+		if dlCtx.Err() != nil && ctx.Err() == nil {
+			return got, time.Since(start), nil
+		}
+	}
+}
+
 // resolveAtExit queries the DoH endpoint THROUGH the tunnel and returns the
 // A records the exit's resolver sees (type-filtered; AAAA ignored — the
 // checked connectivity is IPv4 egress).
-func (t *tunnelClient) resolveAtExit(ctx context.Context, host string) ([]string, error) {
+func (t *TunnelClient) resolveAtExit(ctx context.Context, host string) ([]string, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []string{host}, nil // literal target: no resolution question
 	}
@@ -243,7 +347,7 @@ func (t *tunnelClient) resolveAtExit(ctx context.Context, host string) ([]string
 // host:port (the CONNECT address); serverName is the SNI/verification name —
 // resolution of a hostname addr happens at the exit. Returns the negotiated
 // version ("1.3" style) and the verification error, if any.
-func (t *tunnelClient) tlsCheck(ctx context.Context, addr, serverName string) (string, error) {
+func (t *TunnelClient) tlsCheck(ctx context.Context, addr, serverName string) (string, error) {
 	dialer, err := t.dialer()
 	if err != nil {
 		return "", err

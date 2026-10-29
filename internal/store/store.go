@@ -16,7 +16,8 @@ import (
 	"public_vpn/internal/model"
 )
 
-// ProbeResult is one node's outcome from a probe wave (xray-knife).
+// ProbeResult is one node's outcome from a probe wave (the W14 real-xray
+// engine: a temp single-node xray per node — the xray-knife tool is gone).
 type ProbeResult struct {
 	Key         string    `json:"key"`
 	Host        string    `json:"host"`
