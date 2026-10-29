@@ -30,17 +30,37 @@ type SocksInstance interface {
 // the node's rendered outbound).
 type InstanceFactory func(ctx context.Context, n *model.Node) (SocksInstance, error)
 
-// Temp-instance geometry: the 18xxx range is clear of the live client's
-// 10808/10809 inbounds and fox-proxy 9999; boot gets 10s; a killed child's
-// inherited pipes get 5s to release Wait (activate.go M-3 landmine).
+// Temp-instance geometry: boot gets 10s; a killed child's inherited pipes
+// get 5s to release Wait (activate.go M-3 landmine).
 const (
-	instancePortMin    = 18500
-	instancePortMax    = 18799
 	instanceBootBound  = 10 * time.Second
 	instanceKillDelay  = 5 * time.Second
 	tempOutboundTag    = "check-out"
 	instanceLogBuffers = 8 * 1024
 )
+
+// Temp-instance PRODUCTION scan band: 18xxx is clear of the live client's
+// 10808/10809 inbounds and fox-proxy 9999, and the watch daemon boots its
+// own temp instances there on every hourly wave — the daemon and the live
+// instances KEEP this band. It is a variable pair solely so TEST SUITES can
+// re-pin it to a disjoint band (SetTestPortBand): a full -race suite run
+// overlapped by a live daemon wave used to flake boot/ports/env-strip tests,
+// each side's bind-test-close window losing against the other's churn.
+// Production callers never reassign it — the production scan is unchanged.
+var (
+	instancePortMin = 18500
+	instancePortMax = 18799
+)
+
+// SetTestPortBand re-pins the temp-instance port scan band. FOR TEST SUITES
+// ONLY (the checker TestMain and the probe boot-smoke TestMain): suite temp
+// instances must boot OUTSIDE the production 18xxx band so suite runs and
+// live daemon waves never contend for the same ports. Calling it from
+// production code is a bug.
+func SetTestPortBand(minPort, maxPort int) {
+	instancePortMin = minPort
+	instancePortMax = maxPort
+}
 
 // NewXrayFactory returns the production InstanceFactory: each node gets a
 // temporary single-node xray instance (managed binary) — a socks inbound on a
@@ -219,13 +239,14 @@ func (x *xrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter
 	}
 }
 
-// freeInstancePort hands out a bindable 127.0.0.1 port from the 18xxx range.
-// The bind test closes before xray binds — the resulting boot-to-bind window
-// is exactly why bootMu serializes handout-to-readiness: inside one process
-// a second factory cannot even SCAN while an instance is booting, so the
-// loser-rides-the-winner's-socket collision cannot happen (cross-process
-// contention on this range remains theoretically possible and surfaces as a
-// loud boot failure, never as a silent wrong measurement).
+// freeInstancePort hands out a bindable 127.0.0.1 port from the configured
+// scan band (production: 18xxx; test suites: the disjoint band pinned via
+// SetTestPortBand). The bind test closes before xray binds — the resulting
+// boot-to-bind window is exactly why bootMu serializes handout-to-readiness:
+// inside one process a second factory cannot even SCAN while an instance is
+// booting, so the loser-rides-the-winner's-socket collision cannot happen
+// (cross-process contention on this band remains theoretically possible and
+// surfaces as a loud boot failure, never as a silent wrong measurement).
 func freeInstancePort(ctx context.Context) (int, error) {
 	var lc net.ListenConfig
 	for p := instancePortMin; p <= instancePortMax; p++ {

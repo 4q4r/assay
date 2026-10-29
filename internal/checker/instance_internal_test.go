@@ -49,8 +49,26 @@ func TestMain(m *testing.M) {
 		runCheckFakeServe()
 		return // killed by the exact-PID Close; never fall through to tests
 	}
+	// The suite's temp instances boot OUTSIDE the production 18xxx band —
+	// the live watch daemon churns that band hourly and a full -race run
+	// used to flake against it (live-ops fix; see testPortBand below).
+	SetTestPortBand(testPortBandMin, testPortBandMax)
 	os.Exit(m.Run())
 }
+
+// testPortBand is the suite's DISJOINT temp-instance scan band — the twin of
+// the production 18500-18799 (same 300-port width), below the kernel
+// ephemeral range (32768-60999 on this box, so the kernel never auto-assigns
+// these ports to unrelated sockets) and verified clear of every listener.
+// The production watch daemon boots its own temp instances into 18xxx on
+// every hourly wave; sharing the band made full -race runs flake against
+// that live churn (boot/ports/env-strip tests lost the boot race, and a
+// daemon boot could equally lose against a test). The PRODUCTION band stays
+// untouched — this is the suite-side construction only.
+const (
+	testPortBandMin = 28500
+	testPortBandMax = 28799
+)
 
 // runCheckFakeServe mimics the boot xray does: read the given config, (after
 // an optional delay — the real binary takes ~100ms to bind) bind the socks
@@ -462,6 +480,29 @@ func TestFreeInstancePortSkipsOccupiedAndFailsLoud(t *testing.T) {
 	_, err = freeInstancePort(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no free port")
+}
+
+// The suite constructs temp instances ONLY inside the disjoint test band —
+// the production 18xxx band belongs to the live daemon (live-ops fix: suite
+// runs and daemon waves must never contend for the same ports).
+func TestSuiteInstancesUseDisjointPortBand(t *testing.T) {
+	// Disjoint from the PRODUCTION band (18500-18799) by construction —
+	// pinned against the literals because the package vars now carry the
+	// test band inside this binary.
+	require.Greater(t, testPortBandMin, 18799, "the test band must sit entirely above the production 18xxx band")
+
+	inst, err := StartTempXray(context.Background(), fakeBin(t, checkFakeModeServe), t.TempDir(), freedomOutbound())
+	require.NoError(t, err)
+	defer func() { _ = inst.Close() }()
+
+	_, portStr, perr := net.SplitHostPort(inst.Addr())
+	require.NoError(t, perr)
+	port, aerr := strconv.Atoi(portStr)
+	require.NoError(t, aerr)
+	assert.GreaterOrEqual(t, port, testPortBandMin,
+		"suite instances must boot inside the disjoint test band, never the production 18xxx band")
+	assert.LessOrEqual(t, port, testPortBandMax,
+		"suite instances must boot inside the disjoint test band, never the production 18xxx band")
 }
 
 // M2 test lands with the M2 implementation (NewXrayFactory knobs) — see the
