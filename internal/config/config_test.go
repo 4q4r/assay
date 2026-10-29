@@ -29,13 +29,11 @@ concurrency = 3
 github_token = "gh_test_token"
 
 [probe]
-path = "~/.local/bin/xray-knife"
 timeout = "8s"
 threads = 20
 speedtest = false
-check_preset = ""
-url_success_threshold = 1.0
-db_path = "xray-knife.db"
+attempts = 2
+speedtest_url = "https://example.test/down"
 
 [geo]
 doh_url = "https://dns.google/resolve"
@@ -72,9 +70,10 @@ xray_bin = "/usr/bin/xray"
 	assert.Equal(t, 3, cfg.Fetch.Concurrency)
 	assert.Equal(t, "gh_test_token", cfg.Fetch.GitHubToken)
 
-	assert.Equal(t, "~/.local/bin/xray-knife", cfg.Probe.Path)
 	assert.Equal(t, 8*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 20, cfg.Probe.Threads)
+	assert.Equal(t, 2, cfg.Probe.Attempts)
+	assert.Equal(t, "https://example.test/down", cfg.Probe.SpeedtestURL)
 	require.NotNil(t, cfg.Probe.Speedtest)
 	assert.False(t, *cfg.Probe.Speedtest, "explicit speedtest=false is honored")
 	assert.False(t, cfg.Probe.IsSpeedtest())
@@ -110,9 +109,9 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, 4, cfg.Fetch.Concurrency)
 	assert.True(t, cfg.Probe.IsSpeedtest(), "speedtest defaults to ON (W10 owner ruling)")
 	assert.Nil(t, cfg.Probe.Speedtest)
-	assert.Equal(t, "~/.local/bin/xray-knife", cfg.Probe.Path)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
-	assert.Equal(t, 20, cfg.Probe.Threads)
+	assert.Equal(t, 8, cfg.Probe.Threads)
+	assert.Equal(t, 3, cfg.Probe.Attempts)
 	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
 	assert.Equal(t, "https://ipinfo.io/json", cfg.Geo.HTTPSURL, "https_url defaults to the keyless ipinfo.io/json self-geo endpoint")
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
@@ -433,10 +432,10 @@ func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 func TestFilterProtocolsAndAllowInsecureConfig(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		cfg := load(t, "data_dir = \"d\"\n")
-		assert.Equal(t, []string{"vless", "vmess", "trojan"}, cfg.Filter.Protocols)
+		assert.Equal(t, []string{"vless", "vmess", "trojan", "ss", "hysteria2"}, cfg.Filter.Protocols)
 		assert.False(t, cfg.Filter.AllowInsecure)
 	})
-	t.Run("ss opt-in", func(t *testing.T) {
+	t.Run("explicit subset", func(t *testing.T) {
 		cfg := load(t, "data_dir = \"d\"\n[filter]\nprotocols = [\"vless\", \"ss\"]\nallow_insecure = true\n")
 		assert.Equal(t, []string{"vless", "ss"}, cfg.Filter.Protocols)
 		assert.True(t, cfg.Filter.AllowInsecure)
@@ -670,4 +669,80 @@ func TestW6UnknownKeysFailStrict(t *testing.T) {
 		require.Error(t, err, "unknown key must fail the strict decode")
 		assert.Contains(t, err.Error(), "strict mode")
 	}
+}
+
+// --- W14: real-xray probe engine, protocols default ALL, knife removal. ---
+
+// TestW14ProtocolsDefaultAll pins the round-7 owner ruling (14c): with
+// [filter].protocols unset, EVERY rendered protocol is accepted —
+// vless, vmess, trojan, ss, hysteria2. The security filter (reality/tls,
+// allow_insecure=false default) is unaffected: protocol breadth is not a
+// license for insecure links.
+func TestW14ProtocolsDefaultAll(t *testing.T) {
+	cfg := load(t, w6Base)
+	assert.Equal(t, []string{"vless", "vmess", "trojan", "ss", "hysteria2"}, cfg.Filter.Protocols)
+}
+
+// TestW14ProbeKnobsDefaults pins the real-xray probe wave defaults: the
+// knife keys are gone (path/db_path/check_preset/url_success_threshold/
+// max_passed do not exist), attempts defaults to 3, the speedtest URL is the
+// Cloudflare 25 MB sample, and threads (now parallel temp-instance workers)
+// defaults to a sane 8 for real xray processes.
+func TestW14ProbeKnobsDefaults(t *testing.T) {
+	cfg := load(t, w6Base)
+	p := cfg.Probe
+	assert.Equal(t, 3, p.Attempts)
+	assert.Equal(t, 8, p.Threads)
+	assert.Equal(t, "https://speed.cloudflare.com/__down?bytes=25000000", p.SpeedtestURL)
+	assert.Equal(t, 10*time.Second, p.Timeout.Duration)
+	assert.Equal(t, 30*time.Second, p.SpeedtestTimeout.Duration)
+	assert.Equal(t, "https://cloudflare.com/cdn-cgi/trace", p.URL)
+	assert.True(t, p.IsSpeedtest(), "speedtest stays default-ON (W10 owner ruling)")
+}
+
+// TestW14ExplicitProbeKnobsLoad pins that explicit values load unchanged
+// (owner ruling: no range bounds — structural checks only).
+func TestW14ExplicitProbeKnobsLoad(t *testing.T) {
+	cfg := load(t, w6Base+`[probe]
+threads = 24
+attempts = 1
+speedtest_url = "https://example.test/down?bytes=1000"
+speedtest = false
+`)
+	p := cfg.Probe
+	assert.Equal(t, 24, p.Threads)
+	assert.Equal(t, 1, p.Attempts)
+	assert.Equal(t, "https://example.test/down?bytes=1000", p.SpeedtestURL)
+	assert.False(t, p.IsSpeedtest())
+}
+
+// TestW14RemovedKnifeKeysFailLoud pins the loud migration: every removed
+// xray-knife key inside [probe] fails the load naming the dead key and the
+// migration path (house style — never a bare strict-decode error).
+func TestW14RemovedKnifeKeysFailLoud(t *testing.T) {
+	for _, key := range []string{"path", "db_path", "check_preset", "url_success_threshold", "max_passed"} {
+		t.Run(key, func(t *testing.T) {
+			body := fmt.Sprintf("data_dir = \"d\"\n[probe]\n%s = \"x\"\n", key)
+			if key == "url_success_threshold" || key == "max_passed" {
+				body = fmt.Sprintf("data_dir = \"d\"\n[probe]\n%s = 1.0\n", key)
+			}
+			_, err := config.Load(writeCfg(t, body))
+			require.Error(t, err, "removed knife key %s must fail the load loud", key)
+			assert.Contains(t, err.Error(), key)
+			assert.Contains(t, err.Error(), "xray-knife", "the migration text must name the removed engine")
+		})
+	}
+}
+
+// TestW14ProbeKnobValidation pins the structural checks on the surviving
+// knobs: a negative attempt/worker count is sign-invalid (0 = unset →
+// default, the W6 convention). No range bounds (owner ruling).
+func TestW14ProbeKnobValidation(t *testing.T) {
+	_, err := config.Load(writeCfg(t, w6Base+"[probe]\nattempts = -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "probe.attempts")
+
+	_, err = config.Load(writeCfg(t, w6Base+"[probe]\nthreads = -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "probe.threads")
 }

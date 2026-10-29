@@ -84,9 +84,10 @@ type FilterConfig struct {
 	// SourceCap limits how many nodes one source may contribute per wave.
 	// 0 = unlimited. The --source-cap CLI flag overrides it when set.
 	SourceCap int `toml:"source_cap"`
-	// Protocols is the scheme allowlist (acceptance policy). Default
-	// vless,vmess,trojan; ss is opt-in (PSK-only shadowsocks is weak — the
-	// reality/tls security requirement below still applies on top).
+	// Protocols is the scheme allowlist (acceptance policy). Default: every
+	// rendered protocol — vless,vmess,trojan,ss,hysteria2 (round-7 owner
+	// ruling 14c). The reality/tls security requirement and the
+	// allow_insecure=false default below still apply on top.
 	Protocols []string `toml:"protocols"`
 	// AllowInsecure admits links carrying allowInsecure/insecure=1|true
 	// instead of dropping them. Default false (denial in filter). The
@@ -97,22 +98,34 @@ type FilterConfig struct {
 	AllowInsecure bool `toml:"allow_insecure"`
 }
 
-// ProbeConfig controls the xray-knife probe wave (out-of-band only).
+// ProbeConfig controls the real-xray probe wave (W14): every probed node
+// gets a temporary single-node xray instance (the SAME infrastructure the
+// check/geo stages use — one factory, no drift), so liveness and speed
+// measurement uniformly cover every rendered protocol, hysteria2 included.
+// The xray binary is [activate].xray_bin (one knob, shared with check/geo).
 type ProbeConfig struct {
-	Path    string   `toml:"path"`
 	Timeout Duration `toml:"timeout"`
-	Threads int      `toml:"threads"`
-	URL     string   `toml:"url"`
-	// Speedtest opts every wave's probe into the -S throughput measurement.
-	// W10 owner ruling: default TRUE (speed data on every wave; the
-	// dedicated speedtest_interval wave remains for deeper runs). nil =
-	// unset → true; an explicit false turns it off.
-	Speedtest           *bool    `toml:"speedtest"`
-	SpeedtestTimeout    Duration `toml:"speedtest_timeout"`
-	CheckPreset         string   `toml:"check_preset"`
-	URLSuccessThreshold float64  `toml:"url_success_threshold"`
-	DBPath              string   `toml:"db_path"`
-	MaxPassed           int      `toml:"max_passed"`
+	// Threads is the parallel temp-instance worker count (each worker owns
+	// one node's probe; instance BOOTs are serialized by the factory's boot
+	// mutex, the HTTP phase runs fully parallel). Default 8 — sane for real
+	// xray processes (each is a full core instance).
+	Threads int `toml:"threads"`
+	// Attempts is the HTTP GET count per node per wave. Default 3 (checker
+	// parity): all attempts success = `passed`, some = `semi-passed`, none =
+	// `failed`. 0 = unset → the default; negative values are structurally
+	// invalid.
+	Attempts int    `toml:"attempts"`
+	URL      string `toml:"url"`
+	// Speedtest opts every wave's probe into the throughput measurement: a
+	// sample download from SpeedtestURL through the node's temp instance →
+	// bytes/time → speed_bps. W10 owner ruling: default TRUE (speed data on
+	// every wave; the dedicated speedtest_interval wave remains for deeper
+	// runs). nil = unset → true; an explicit false turns it off.
+	Speedtest *bool `toml:"speedtest"`
+	// SpeedtestURL is the sample the speedtest downloads (default: the
+	// Cloudflare 25 MB down endpoint).
+	SpeedtestURL     string   `toml:"speedtest_url"`
+	SpeedtestTimeout Duration `toml:"speedtest_timeout"`
 	// SkipFreshWithin skips re-probing nodes whose latest result is `passed`
 	// and NEWER than this window (0s = probe everything, the default).
 	// Negative values are structurally invalid.
@@ -321,6 +334,16 @@ const (
 	// DefaultRefreshInterval is the W10 owner ruling: the refresh wave
 	// rechecks hourly (was 6h in the timer era).
 	DefaultRefreshInterval = time.Hour
+	// DefaultProbeThreads is the W14 probe default: parallel temp-instance
+	// workers sane for REAL xray processes (each is a full core instance;
+	// boot windows serialize inside the factory).
+	DefaultProbeThreads = 8
+	// DefaultProbeAttempts is the W14 probe default (checker parity): all
+	// attempts success = `passed`, some = `semi-passed`, none = `failed`.
+	DefaultProbeAttempts = 3
+	// DefaultProbeSpeedtestURL is the W14 speedtest sample: the Cloudflare
+	// 25 MB down endpoint, downloaded through each node's tunnel.
+	DefaultProbeSpeedtestURL = "https://speed.cloudflare.com/__down?bytes=25000000"
 )
 
 // defaultPoolInboundTags is the render.pool_inbound_tags default (the tags
@@ -412,6 +435,26 @@ func checkRemovedSections(raw []byte) error {
 					"dir on first run — edit or add .lua files there; a new provider is a new " +
 					".lua file, no Go rebuild")
 		}
+		if probeTable, ok := probe["probe"].(map[string]any); ok {
+			dead := make([]string, 0, 5)
+			for _, key := range []string{"path", "db_path", "check_preset", "url_success_threshold", "max_passed"} {
+				if _, present := probeTable[key]; present {
+					dead = append(dead, "probe."+key)
+				}
+			}
+			if len(dead) > 0 {
+				return fmt.Errorf(
+					"%s: removed — the probe wave no longer shells out to xray-knife (W14): every "+
+						"probed node now gets a temporary single-node xray instance (the SAME "+
+						"infrastructure the check/geo stages use), so liveness and the speedtest "+
+						"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
+						"delete the dead key(s); the temp instances use [activate].xray_bin (there is "+
+						"no separate prober binary or database anymore); panel grading moved to the "+
+						"`publicvpn check` command (per-site verdicts through real tunnels); early "+
+						"stop is gone — selection caps live at the select stage",
+					strings.Join(dead, ", "))
+			}
+		}
 		if geoTable, ok := probe["geo"].(map[string]any); ok {
 			dead := make([]string, 0, 3)
 			for _, key := range []string{"endpoint", "batch_size", "per_minute"} {
@@ -465,8 +508,12 @@ func applyPluginsDefaults(c *Config) {
 }
 
 // defaultProtocols is the protocol acceptance allowlist applied when
-// [filter].protocols is unset (ss is opt-in — PSK-only shadowsocks is weak).
-var defaultProtocols = []string{"vless", "vmess", "trojan"}
+// [filter].protocols is unset: EVERY rendered protocol (round-7 owner
+// ruling 14c — the former vless/vmess/trojan-only default disabled hysteria
+// without the owner's word). The security filter (reality/tls requirement,
+// allow_insecure=false default) still applies ON TOP: protocol breadth is
+// not a license for insecure links.
+var defaultProtocols = []string{"vless", "vmess", "trojan", "ss", "hysteria2"}
 
 func applyFilterDefaults(f *FilterConfig) {
 	if len(f.Protocols) == 0 {
@@ -496,26 +543,23 @@ func applyFetchDefaults(f *FetchConfig) {
 }
 
 func applyProbeDefaults(p *ProbeConfig) {
-	if p.Path == "" {
-		p.Path = "~/.local/bin/xray-knife"
-	}
 	if p.Timeout.Duration == 0 {
 		p.Timeout.Duration = 10 * time.Second
 	}
 	if p.Threads == 0 {
-		p.Threads = 20
+		p.Threads = DefaultProbeThreads
+	}
+	if p.Attempts == 0 {
+		p.Attempts = DefaultProbeAttempts
 	}
 	if p.URL == "" {
 		p.URL = "https://cloudflare.com/cdn-cgi/trace"
 	}
+	if p.SpeedtestURL == "" {
+		p.SpeedtestURL = DefaultProbeSpeedtestURL
+	}
 	if p.SpeedtestTimeout.Duration == 0 {
 		p.SpeedtestTimeout.Duration = 30 * time.Second
-	}
-	if p.URLSuccessThreshold == 0 {
-		p.URLSuccessThreshold = 1.0
-	}
-	if p.DBPath == "" {
-		p.DBPath = "xray-knife.db"
 	}
 	// SkipFreshWithin: no default application — 0s IS the default (probe
 	// everything); an explicit 0s and an absent key are the same behavior.
@@ -694,7 +738,20 @@ func validate(c *Config) error {
 			return err
 		}
 	}
+	if err := validateProbe(c.Probe); err != nil {
+		return err
+	}
 	return validateNonNegative("probe.skip_fresh_within", c.Probe.SkipFreshWithin.Duration)
+}
+
+// validateProbe carries the W14 structural checks: a negative attempt count
+// or worker count is sign-invalid (0 = unset → default, the W6 convention).
+// No range bounds (owner ruling).
+func validateProbe(p ProbeConfig) error {
+	if err := validateNonNegative("probe.attempts", p.Attempts); err != nil {
+		return err
+	}
+	return validateNonNegative("probe.threads", p.Threads)
 }
 
 // validateNonNegative is the W6 structural check: a negative number is
@@ -742,8 +799,8 @@ func validateMaintain(m MaintainConfig) error {
 }
 
 // parseableSchemes are the schemes the parser can normalize; the filter
-// allowlist may only reference these. hysteria2 parses like ss: OPT-IN via
-// [filter].protocols — the default acceptance list is unchanged.
+// allowlist may only reference these. Since W14 ALL of them are accepted by
+// default (round-7 owner ruling 14c).
 var parseableSchemes = map[string]bool{
 	"vless": true, "vmess": true, "trojan": true, "ss": true,
 	"hysteria2": true,

@@ -20,36 +20,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestProbeOptionsWiresConfig pins the config→Options translation: max_passed
-// and the check-preset/speedtest precedence must reach the probe wave
-// (review finding 7 — max_passed was a lying knob pre-fix, declared in TOML
-// but never copied into probe.Options).
+// TestProbeOptionsWiresConfig pins the config→Options translation for the
+// real-xray engine: attempts/threads/speedtest-default-ON and the speedtest
+// URL must reach the probe wave; the knife-era knobs (max_passed, presets)
+// are gone with the tool that needed them.
 func TestProbeOptionsWiresConfig(t *testing.T) {
 	noSpeedtest := false
 	cfg := &config.Config{
 		Probe: config.ProbeConfig{
-			MaxPassed:           7,
-			Threads:             11,
-			CheckPreset:         "global",
-			Speedtest:           &noSpeedtest,
-			URLSuccessThreshold: 0.9,
+			Threads:      11,
+			Attempts:     5,
+			Speedtest:    &noSpeedtest,
+			SpeedtestURL: "https://example.test/down",
 		},
 	}
 
-	opts := probeOptions(cfg, false, "")
-	assert.Equal(t, 7, opts.MaxPassed, "probe.max_passed must reach the wave")
+	opts := probeOptions(cfg, false)
 	assert.Equal(t, 11, opts.Threads)
-	assert.Equal(t, "global", opts.CheckPreset, "config preset used when no flag")
+	assert.Equal(t, 5, opts.Attempts)
 	assert.False(t, opts.Speedtest, "explicit speedtest=false holds without a flag")
-	assert.InDelta(t, 0.9, opts.URLSuccessThreshold, 0.0001)
+	assert.Equal(t, "https://example.test/down", opts.SpeedtestURL)
+	assert.Nil(t, opts.ExitProbe, "the production literal leaves ExitProbe nil — the D8 echo defaults ON")
 
 	cfg.Probe.Speedtest = nil
-	opts = probeOptions(cfg, false, "")
+	opts = probeOptions(cfg, false)
 	assert.True(t, opts.Speedtest, "nil speedtest defaults to ON (W10 owner ruling)")
 
-	cfg.Probe.CheckPreset = ""
-	opts = probeOptions(cfg, false, "cloudflare")
-	assert.Equal(t, "cloudflare", opts.CheckPreset, "flag preset overrides config")
+	opts = probeOptions(cfg, true)
+	assert.True(t, opts.Speedtest, "the CLI flag forces the speedtest even when the config disables it")
 }
 
 // TestRunParseSourceOrderIsDeterministic pins the M-b determinism contract:

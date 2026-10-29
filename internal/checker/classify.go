@@ -55,7 +55,7 @@ func Classify(status int, body []byte) Classification {
 	return Classification{Verdict: VerdictSuccess}
 }
 
-// verdictFor maps a transport-level error onto a verdict class, honoring the
+// VerdictFor maps a transport-level error onto a verdict class, honoring the
 // httptrace phase. The classes are diagnostic, not exact: they separate the
 // actionable groups (node cannot resolve the target / node egress failed /
 // response stalled / our deadline / operator abort) with an "error" catch-all
@@ -66,7 +66,7 @@ func Classify(status int, body []byte) Classification {
 // same timeout AFTER connect is a stalled response READ — the node connected
 // fine, so "dial-fail" would misdiagnose it. A canceled context is the
 // operator (Ctrl-C), never a timeout of any kind.
-func verdictFor(err error, connected bool) Verdict {
+func VerdictFor(err error, connected bool) Verdict {
 	if err == nil {
 		return VerdictSuccess
 	}
