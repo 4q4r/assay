@@ -29,39 +29,83 @@ func resolveCommand(explicit string) (*config.Resolved, error) {
 	return config.Resolve(explicit, home, cwd)
 }
 
+// installResolution is the install-style resolution: the effective config,
+// whether the unit must embed `-c <path>` (explicit -c and the legacy
+// courtesy — the daemon must be pointed at those files), and — when NO
+// config file exists anywhere in the install-style chain — the canonical
+// local-share path the default config must be materialized at (the daemon
+// then reads the default location; no -c in the unit).
+type installResolution struct {
+	res *config.Resolved
+	// embedsConfig: explicit -c and legacy-path installs render
+	// `watch -c <path>`; share-default and configless (default-location)
+	// installs render plain `watch` — the daemon reads the default location.
+	embedsConfig bool
+	// materializePath is non-empty only for the configless case.
+	materializePath string
+}
+
 // resolveInstallPath resolves the config for `install` (and `uninstall
-// --purge`): explicit -c wins; else the HOME default if it exists; else a
-// loud, actionable error. The CWD default is deliberately NOT consulted —
-// the rendered unit embeds the config path and must reference a stable
-// location, never whatever directory the operator happened to stand in.
-// A RELATIVE explicit -c resolves through the SAME single scheme as every
-// other command: config.Resolve joins it onto the injected cwd (round-7
-// item 10 — the pre-fix code passed cwd="" and silently switched to the
-// process-cwd scheme; the cwd default consult above is unaffected).
-func resolveInstallPath(explicit string) (*config.Resolved, error) {
+// --purge`): explicit -c wins and must exist; else the canonical
+// local-share default when present; else the DEPRECATED legacy home
+// location (one-release-cycle courtesy — loud move warning, the unit embeds
+// its exact path so the owner's tuned config keeps working); else — and
+// this is the W13-deploy canonical user flow — a CONFIGLESS resolution and
+// a non-empty materializePath: install materializes the default config at
+// ~/.local/share/publicvpn/config.toml and the daemon unit runs plain
+// `watch`. A no--c install is default-location FOREVER: even after the
+// first install materialized the share config, a re-install renders plain
+// `watch` (the daemon reads the default location — the unit never flips to
+// -c). The CWD default is deliberately NOT consulted — a daemon unit must
+// reference a stable location, never whatever directory the operator
+// happened to stand in. A RELATIVE explicit -c resolves through the SAME
+// single scheme as every other command: config.Resolve joins it onto the
+// injected cwd (round-7 item 10).
+func resolveInstallPath(explicit string) (installResolution, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("resolve home dir: %w", err)
+		return installResolution{}, fmt.Errorf("resolve home dir: %w", err)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("resolve working directory: %w", err)
+		return installResolution{}, fmt.Errorf("resolve working directory: %w", err)
 	}
 	if explicit != "" {
-		return config.Resolve(explicit, home, cwd)
+		res, err := config.Resolve(explicit, home, cwd)
+		return installResolution{res: res, embedsConfig: true}, err
 	}
-	p := config.DefaultHomeConfigPath(home)
-	if _, err := os.Stat(p); err != nil {
-		return nil, fmt.Errorf(
-			"install requires a config file: pass -c /path/to/config.toml or create one at %s "+
-				"(configless mode cannot install — the daemon unit must reference a real config path)",
-			config.HomeConfigDisplay)
+	if p := config.DefaultShareConfigPath(home); pathExists(p) {
+		cfg, err := config.Load(p)
+		if err != nil {
+			return installResolution{}, err
+		}
+		return installResolution{
+			res: &config.Resolved{Config: cfg, Source: config.SourceShare, Path: p},
+		}, nil
 	}
-	cfg, err := config.Load(p)
+	if p := config.LegacyHomeConfigPath(home); pathExists(p) {
+		cfg, err := config.Load(p)
+		if err != nil {
+			return installResolution{}, err
+		}
+		return installResolution{res: &config.Resolved{
+			Config: cfg, Source: config.SourceLegacyHome, Path: p,
+			Warnings: []string{config.LegacyLocationWarning(p, config.ShareConfigDisplay)},
+		}, embedsConfig: true}, nil
+	}
+	res, err := config.Resolve("", home, "")
 	if err != nil {
-		return nil, err
+		return installResolution{}, err
 	}
-	return &config.Resolved{Config: cfg, Source: config.SourceHome, Path: p}, nil
+	return installResolution{
+		res:             res,
+		materializePath: config.DefaultShareConfigPath(home),
+	}, nil
+}
+
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // reportConfigSource prints the resolved provenance — the visibility

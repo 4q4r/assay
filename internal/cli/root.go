@@ -25,7 +25,7 @@ func New() *cobra.Command {
 	}
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "",
 		"path to the TOML configuration file (optional — resolution: this path, else "+
-			config.HomeConfigDisplay+", else ./config.toml, else built-in defaults; "+
+			config.ShareConfigDisplay+", else ./config.toml, else built-in defaults; "+
 			"one file wins whole, nothing is ever merged)")
 
 	root.AddCommand(

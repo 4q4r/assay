@@ -107,7 +107,7 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, 30*time.Second, cfg.Fetch.Timeout.Duration)
 	assert.Equal(t, 3, cfg.Fetch.Retries)
 	assert.Equal(t, 4, cfg.Fetch.Concurrency)
-	assert.True(t, cfg.Probe.IsSpeedtest(), "speedtest defaults to ON (W10 owner ruling)")
+	assert.False(t, cfg.Probe.IsSpeedtest(), "speedtest defaults OFF (round-8 owner ruling — supersedes the W10 default-ON)")
 	assert.Nil(t, cfg.Probe.Speedtest)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
 	assert.Equal(t, 8, cfg.Probe.Threads)
@@ -400,17 +400,37 @@ func load(t *testing.T, body string) *config.Config {
 
 // TestMaintainIntervalsDefaultsFloorAndStrict pins the maintain knobs:
 // defaults 1h (W10)/168h, a 5-minute floor with loud failure below, and
-// strict decoding.
+// strict decoding. speedtest_interval is a TRI-STATE pointer (round-8):
+// absent → the 168h default (the weekly wave exists), explicit "0s" → 0 =
+// the speedtest wave is DISABLED entirely (the owner's «выключи» at the
+// schedule level), a positive value below the floor fails loud.
 func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		cfg := load(t, "data_dir = \"d\"\n")
 		assert.Equal(t, time.Hour, cfg.Maintain.RefreshInterval.Duration, "refresh default is 1h (W10 owner ruling)")
+		require.NotNil(t, cfg.Maintain.SpeedtestInterval)
 		assert.Equal(t, 168*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
 	})
 	t.Run("custom values parse", func(t *testing.T) {
 		cfg := load(t, "data_dir = \"d\"\n[maintain]\nrefresh_interval = \"90m\"\nspeedtest_interval = \"240h\"\n")
 		assert.Equal(t, 90*time.Minute, cfg.Maintain.RefreshInterval.Duration)
+		require.NotNil(t, cfg.Maintain.SpeedtestInterval)
 		assert.Equal(t, 240*time.Hour, cfg.Maintain.SpeedtestInterval.Duration)
+	})
+	t.Run("explicit 0s disables the speedtest wave", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n[maintain]\nspeedtest_interval = \"0s\"\n")
+		require.NotNil(t, cfg.Maintain.SpeedtestInterval, "explicit 0s must stay an explicit zero, never re-defaulted")
+		assert.Zero(t, cfg.Maintain.SpeedtestInterval.Duration)
+		assert.False(t, cfg.Maintain.SpeedtestWaveEnabled(), "0s = no speedtest wave at all")
+		assert.Zero(t, cfg.Maintain.SpeedtestWavePeriod())
+		// refresh keeps its default — disabling speedtest never touches the
+		// refresh cadence.
+		assert.Equal(t, time.Hour, cfg.Maintain.RefreshInterval.Duration)
+	})
+	t.Run("absent keeps the wave enabled at the default", func(t *testing.T) {
+		cfg := load(t, "data_dir = \"d\"\n")
+		assert.True(t, cfg.Maintain.SpeedtestWaveEnabled())
+		assert.Equal(t, 168*time.Hour, cfg.Maintain.SpeedtestWavePeriod())
 	})
 	t.Run("below floor fails loud", func(t *testing.T) {
 		for name, val := range map[string]string{
@@ -421,6 +441,11 @@ func TestMaintainIntervalsDefaultsFloorAndStrict(t *testing.T) {
 			require.Error(t, err, "%s below the 5m floor must fail", name)
 			assert.Contains(t, err.Error(), "5m0s")
 		}
+	})
+	t.Run("negative speedtest_interval fails loud", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[maintain]\nspeedtest_interval = \"-5m\"\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
 	})
 	t.Run("unknown maintain key fails loud", func(t *testing.T) {
 		_, err := config.Load(writeCfg(t, "data_dir = \"d\"\n[maintain]\nrefresh_intervalz = \"6h\"\n"))
@@ -697,7 +722,33 @@ func TestW14ProbeKnobsDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Second, p.Timeout.Duration)
 	assert.Equal(t, 30*time.Second, p.SpeedtestTimeout.Duration)
 	assert.Equal(t, "https://cloudflare.com/cdn-cgi/trace", p.URL)
-	assert.True(t, p.IsSpeedtest(), "speedtest stays default-ON (W10 owner ruling)")
+	// (the speedtest default pins live in TestSpeedtestTriState — round-8)
+}
+
+// TestSpeedtestTriStatePins the round-8 pointer semantics: nil (absent) →
+// the new default false; an explicit true STAYS true (existing configs with
+// speedtest = true keep it); an explicit false stays false. The dedicated
+// weekly speedtest wave ([maintain].speedtest_interval) is unaffected: it
+// carries -S semantics regardless of this knob (refresh waves become
+// probe-only, the speedtest wave still speedtests).
+func TestSpeedtestTriState(t *testing.T) {
+	t.Run("nil defaults to false", func(t *testing.T) {
+		cfg := load(t, w6Base)
+		assert.False(t, cfg.Probe.IsSpeedtest())
+		assert.Nil(t, cfg.Probe.Speedtest)
+	})
+	t.Run("explicit true stays true", func(t *testing.T) {
+		cfg := load(t, w6Base+"[probe]\nspeedtest = true\n")
+		require.NotNil(t, cfg.Probe.Speedtest)
+		assert.True(t, *cfg.Probe.Speedtest)
+		assert.True(t, cfg.Probe.IsSpeedtest())
+	})
+	t.Run("explicit false stays false", func(t *testing.T) {
+		cfg := load(t, w6Base+"[probe]\nspeedtest = false\n")
+		require.NotNil(t, cfg.Probe.Speedtest)
+		assert.False(t, *cfg.Probe.Speedtest)
+		assert.False(t, cfg.Probe.IsSpeedtest())
+	})
 }
 
 // TestW14ExplicitProbeKnobsLoad pins that explicit values load unchanged

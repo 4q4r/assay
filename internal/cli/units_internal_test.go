@@ -35,8 +35,9 @@ func TestWatchUnitTemplate(t *testing.T) {
 	assert.Contains(t, service, "TimeoutStopSec=1800",
 		"a mid-wave stop waits for the current stage (a full probe stage runs ~28 min) "+
 			"instead of SIGKILLing at the 90s default — the W17 mid-wave kill fix")
-	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} watch -c \{\{ \.ConfigPath \}\}$`,
-		service, "ExecStart = installed binary + watch + the config the user passed")
+	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} watch\{\{ if \.ConfigPath \}\} -c \{\{ \.ConfigPath \}\}\{\{ end \}\}$`,
+		service, "ExecStart = installed binary + watch; -c only for explicit/legacy-path installs "+
+			"(the W13-deploy default-location install renders plain watch — the daemon reads the default config)")
 	assert.Regexp(t, `(?m)^Restart=always$`, service, "a daemon crash restarts automatically")
 	assert.NotContains(t, service, "{{ .RefreshInterval", "no timer-era placeholders survive")
 	assert.NotContains(t, service, "{{ .SpeedtestInterval", "no timer-era placeholders survive")

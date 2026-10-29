@@ -9,6 +9,7 @@ package install
 
 import (
 	"bytes"
+	"embed"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,15 @@ import (
 
 	units "public_vpn/systemd"
 )
+
+// defaultConfigTemplate is the embedded default-config TOML (single source
+// of truth, go:embed): the values a configless run uses, written as TOML
+// with full comments. `publicvpn install` without -c materializes it at the
+// canonical local-share path — the same file every command then resolves
+// first (one file wins whole, nothing is ever merged).
+//
+//go:embed defaults_config.toml
+var defaultConfigFS embed.FS
 
 // installedBinaryName is the fixed executable name in BinDir.
 const installedBinaryName = "publicvpn"
@@ -58,7 +68,15 @@ func AllKnownUnitNames() []string {
 // TemplateData is rendered into the systemd unit template.
 type TemplateData struct {
 	BinaryPath string
+	// ConfigPath embeds into ExecStart as `-c <path>`. EMPTY = the daemon
+	// runs plain `watch` and reads the default config location (the
+	// W13-deploy canonical user flow — the local-share config).
 	ConfigPath string
+}
+
+// defaultConfigData is rendered into the embedded default-config TOML.
+type defaultConfigData struct {
+	DataDir string
 }
 
 // Options configures Install. Paths must be absolute (the CLI layer expands
@@ -68,9 +86,20 @@ type Options struct {
 	BinDir        string
 	UnitDir       string
 	RunningBinary string // os.Executable() of the caller
-	ConfigPath    string // required unless NoSystemd
-	NoSystemd     bool
-	Exec          Executor // required unless NoSystemd
+	// ConfigPath is embedded into the unit's ExecStart (-c <path>). REQUIRED
+	// for the explicit-config install. EMPTY = default-location install:
+	// DefaultConfigPath drives materialization and the unit runs plain
+	// `watch` (the daemon reads the default location).
+	ConfigPath string
+	// DefaultConfigPath is the canonical local-share config path to
+	// materialize when absent (never overwritten; present = kept). Required
+	// when ConfigPath is empty; ignored otherwise.
+	DefaultConfigPath string
+	// DataDir is rendered into the materialized default config (the
+	// configless data dir — the local-share default).
+	DataDir   string
+	NoSystemd bool
+	Exec      Executor // required unless NoSystemd
 }
 
 // Result reports what install did.
@@ -80,12 +109,21 @@ type Result struct {
 	LegacyCleaned []string // legacy timer units disabled + removed by this install
 	ServiceActive bool
 	SkippedUnits  bool // --no-systemd: binary copy only, units skipped
+	// ConfigWritten is the default-config path materialized by this install
+	// ("" = explicit -c install or the file already existed).
+	ConfigWritten string
+	// ConfigKept is the default-config path found ALREADY PRESENT (never
+	// overwritten — the owner's edits win); "" when not applicable.
+	ConfigKept string
 }
 
 // Install copies the running binary into BinDir (atomic, 0755 — self-upgrade
-// is a re-run), renders the daemon unit from the repo template, cleans up
-// the legacy W5 timer units when present, and then — only then —
-// daemon-reloads and enables the daemon through the injected Executor.
+// is a re-run), materializes the default config at DefaultConfigPath when no
+// explicit -c is given (never overwriting an existing file), renders the
+// daemon unit from the repo template (with -c for an explicit config, plain
+// `watch` for the default-location install), cleans up the legacy W5 timer
+// units when present, and then — only then — daemon-reloads and enables the
+// daemon through the injected Executor.
 func Install(o Options) (Result, error) {
 	if o.BinDir == "" || o.RunningBinary == "" {
 		return Result{}, errors.New("install: BinDir and RunningBinary are required")
@@ -95,13 +133,15 @@ func Install(o Options) (Result, error) {
 		return Result{}, err
 	}
 	res := Result{BinaryPath: binPath}
+	if err := materializeDefault(o, &res); err != nil {
+		return res, err
+	}
+	// ConfigPath == "" with NO materialization target is still a valid
+	// default-location install (the daemon reads the default location — the
+	// canonical config may already be in place from an earlier install).
 	if o.NoSystemd {
 		res.SkippedUnits = true
 		return res, nil
-	}
-	if o.ConfigPath == "" {
-		return res, errors.New("install: --config is required to render the unit file (the unit embeds the config path); " +
-			"use --no-systemd to install the binary without units")
 	}
 	if o.Exec == nil {
 		return res, errors.New("install: no systemctl executor provided")
@@ -134,6 +174,52 @@ func Install(o Options) (Result, error) {
 	}
 	res.ServiceActive = true
 	return res, nil
+}
+
+// MaterializeDefaultConfig writes the embedded default-config TOML (the
+// values a configless run uses, fully commented) at path with the given
+// data_dir. An EXISTING file is never touched — (false, nil), the caller
+// reports "kept". Creation is atomic (temp file in the same directory →
+// fsync → rename), mode 0600: the schema carries optional token knobs.
+func MaterializeDefaultConfig(path, dataDir string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
+	tmpl, err := template.ParseFS(defaultConfigFS, "defaults_config.toml")
+	if err != nil {
+		return false, fmt.Errorf("install: parse embedded default-config template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "defaults_config.toml", defaultConfigData{DataDir: dataDir}); err != nil {
+		return false, fmt.Errorf("install: render default config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return false, fmt.Errorf("install: create config dir %s: %w", filepath.Dir(path), err)
+	}
+	if err := writeFileAtomic(path, buf.Bytes(), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// materializeDefault applies the default-location materialization: an
+// explicit-config install does nothing; a default-location install with a
+// target materializes the embedded default config there (present = kept,
+// never overwritten) and records the outcome on the Result.
+func materializeDefault(o Options, res *Result) error {
+	if o.ConfigPath != "" || o.DefaultConfigPath == "" {
+		return nil
+	}
+	created, err := MaterializeDefaultConfig(o.DefaultConfigPath, o.DataDir)
+	if err != nil {
+		return err
+	}
+	if created {
+		res.ConfigWritten = o.DefaultConfigPath
+	} else {
+		res.ConfigKept = o.DefaultConfigPath
+	}
+	return nil
 }
 
 // cleanupLegacyUnits disables the legacy timers (only when their unit files
