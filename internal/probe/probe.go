@@ -1,38 +1,50 @@
-// Package probe implements the out-of-band liveness wave (W2) on top of
-// xray-knife: real-tunnel HTTP probes deliver latency, the tunnel EXIT IP
-// (D8 — never the advertised host), optional throughput (--speedtest) and
-// optional panel grading (--check-preset). The live client is never involved.
+// Package probe implements the out-of-band liveness wave (W2, W14 engine):
+// every probed node gets a temporary single-node xray instance — the SAME
+// infrastructure the check/geo stages use (one factory, no drift) — so
+// real-tunnel HTTP probes deliver latency, the tunnel EXIT IP (D8 — never
+// the advertised host) and an optional through-tunnel speedtest uniformly
+// across EVERY rendered protocol, hysteria2 included. The live client is
+// never involved.
 package probe
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 	"time"
 
+	"public_vpn/internal/checker"
 	"public_vpn/internal/model"
 	"public_vpn/internal/store"
 )
 
+// DefaultConcurrency bounds how many temp instances exist at once (each is
+// a full xray process). Deliberately below the knife era's 20 threads: the
+// engine boots REAL cores now, and the factory serializes boot windows via
+// its boot mutex anyway.
+const DefaultConcurrency = 8
+
+// exitIPURL is the through-tunnel endpoint the engine reads the D8 exit IP
+// from (the SAME ip-api self-report call the geo stage makes — one mental
+// model, one rate-limit surface; the free tier's budget is per requesting
+// IP, and our requests originate from thousands of distinct exits). Test
+// seam: ExitIPURL (zero in production).
+const exitIPURL = "http://ip-api.com/json/"
+
 // Options configures one probe wave.
 type Options struct {
-	Timeout             time.Duration // per-probe HTTP timeout
-	Threads             int           // xray-knife parallelism
-	URL                 string        // probe target URL
-	Speedtest           bool          // -S (speed.cloudflare.com)
-	SpeedtestTimeout    time.Duration // --speedtest-timeout window
-	CheckPreset         string        // --check-preset (cloudflare|global|google|gstatic|streaming)
-	URLSuccessThreshold float64       // --url-success-threshold
-	DBPath              string        // isolated knife database (never the user default)
-	WorkDir             string        // scratch dir for links/results files
-	MaxPassed           int           // stop after N passed (0 = all)
+	Timeout time.Duration // per-attempt HTTP timeout
+	// Threads is the parallel temp-instance worker count (0 = default 8).
+	// Boot windows serialize inside the factory; the HTTP phase is parallel.
+	Threads   int
+	URL       string // probe target URL
+	Attempts  int    // HTTP GET attempts per node (>= 1)
+	Speedtest bool   // measure download speed through the node's instance
+	// SpeedtestURL is the sample the speedtest downloads.
+	SpeedtestURL     string
+	SpeedtestTimeout time.Duration // download sample window
 	// SkipFreshWithin is [probe].skip_fresh_within: nodes whose LATEST probe
 	// result is exactly `passed` and newer than this window are skipped in
 	// the wave — no link, no probe-log entry (their passed history stays
@@ -43,93 +55,77 @@ type Options struct {
 	Latest map[string]store.ProbeResult
 	// Now is the clock seam (tests inject; nil = time.Now().UTC()).
 	Now func() time.Time
-	// Progress receives per-skipped-node lines ("skipping …"). nil = discard.
+	// Progress receives per-node progress lines ("probing …"). nil = discard.
 	Progress io.Writer
+	// ExitProbe controls the D8 exit-IP echo. nil = ON (the production
+	// default: every alive record carries its tunnel exit IP — the W10
+	// *bool precedent). Tests pass an explicit false to run without the
+	// echo double.
+	ExitProbe *bool
+	// ExitIPURL overrides the exit-IP echo endpoint (test seam; empty =
+	// exitIPURL).
+	ExitIPURL string
 }
 
-// RawResult mirrors one xray-knife http -x jsonl record (v11.4.1 wire shape).
-type RawResult struct {
-	Link         string  `json:"link"`
-	Status       string  `json:"status"`
-	Reason       string  `json:"reason"`
-	IP           string  `json:"ip"` // exit IP, or the literal string "null"
-	Delay        float64 `json:"delay"`
-	Download     float64 `json:"download"`
-	Upload       float64 `json:"upload"`
-	SuccessCount int     `json:"successCount"`
-	TotalCount   int     `json:"totalCount"`
-	FailureKind  string  `json:"failureKind"`
-	Protocol     struct {
-		Remark   string `json:"remark"`
-		Protocol string `json:"protocol"`
-		Address  string `json:"address"`
-		Port     string `json:"port"`
-	} `json:"protocol"`
+// SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;
+// tests: an in-process server). Structural twin of the checker/geo seams —
+// the CLI adapter hands a checker.NewXrayFactory product over 1:1.
+type SocksInstance interface {
+	Addr() string
+	Close() error
 }
 
-// Runner executes one probe batch.
-type Runner interface {
-	Run(ctx context.Context, links []string, opts Options) ([]RawResult, error)
+// Factory spawns one instance per node (production: checker.NewXrayFactory
+// — one temp single-node xray per probed node, the SAME render.BuildOutbound
+// product the live renderer uses, hardening knobs included).
+type Factory func(ctx context.Context, n *model.Node) (SocksInstance, error)
+
+// probeJob is one unique-link unit of work: every node carrying the link
+// takes the outcome.
+type probeJob struct {
+	link  string
+	keys  []string
+	host  string
+	node  *model.Node
+	order int
 }
 
 // Run probes every node and appends outcomes to the probe log. Nodes without
-// a knife result are recorded as not-alive-this-wave. Nodes skipped by
+// an outcome are recorded as not-alive-this-wave. Nodes skipped by
 // [probe].skip_fresh_within (latest result exactly `passed`, newer than the
 // window) produce NEITHER a link NOR a log entry — their probe history is
-// preserved untouched.
+// preserved untouched. Input node order is preserved in the output.
 func Run(
-	ctx context.Context, nodes []*model.Node, r Runner, opts Options, resultsPath string,
+	ctx context.Context, nodes []*model.Node, f Factory, opts Options, resultsPath string,
 ) ([]store.ProbeResult, error) {
 	now := time.Now().UTC()
 	if opts.Now != nil {
 		now = opts.Now().UTC()
 	}
 	skipped := freshSkipSet(nodes, opts, now)
-	links := make([]string, 0, len(nodes))
-	keyByLink := make(map[string]string, len(nodes))
+	byLink := make(map[string]*probeJob, len(nodes))
+	ordered := make([]*probeJob, 0, len(nodes))
 	for _, n := range nodes {
 		if skipped[n.Key] {
 			continue
 		}
 		link := n.Link()
-		if _, dup := keyByLink[link]; dup {
-			continue // identical links probe once; both nodes take the outcome
+		job, dup := byLink[link]
+		if dup {
+			job.keys = append(job.keys, n.Key) // identical links probe once; both nodes take the outcome
+			continue
 		}
-		keyByLink[link] = n.Key
-		links = append(links, link)
+		job = &probeJob{link: link, keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
+		byLink[link] = job
+		ordered = append(ordered, job)
 	}
-	raw, err := r.Run(ctx, links, opts)
-	if err != nil {
-		return nil, err
-	}
+	outcomes := runJobs(ctx, f, ordered, opts)
+
 	out := make([]store.ProbeResult, 0, len(nodes))
-	seen := make(map[string]bool, len(raw))
-	for _, rr := range raw {
-		key, ok := keyByLink[rr.Link]
-		if !ok {
-			return nil, fmt.Errorf("probe: unmapped result link %q (runner contract breach)", shortLink(rr.Link))
+	for _, job := range ordered {
+		for _, key := range job.keys {
+			out = append(out, outcomeFor(key, outcomes[job.order], now))
 		}
-		seen[key] = true
-		out = append(out, store.ProbeResult{
-			Key:         key,
-			Host:        rr.Protocol.Address,
-			Alive:       rr.Status == "passed" || rr.Status == "semi-passed",
-			Status:      rr.Status,
-			Reason:      rr.Reason,
-			ExitIP:      normalizeIP(rr.IP),
-			RTTMs:       rr.Delay,
-			SpeedBPS:    int64(rr.Download),
-			Checks:      rr.SuccessCount,
-			TotalChecks: rr.TotalCount,
-			FailureKind: rr.FailureKind,
-			CheckedAt:   now,
-		})
-	}
-	for _, n := range nodes {
-		if skipped[n.Key] || seen[n.Key] {
-			continue // skipped nodes keep their history; no synthetic dead record
-		}
-		out = append(out, store.ProbeResult{Key: n.Key, Host: n.Host, Alive: false, CheckedAt: now})
 	}
 	if resultsPath != "" {
 		if err := store.AppendProbeResults(resultsPath, out); err != nil {
@@ -137,6 +133,203 @@ func Run(
 		}
 	}
 	return out, nil
+}
+
+// outcomeFor translates one link outcome into the per-node store record
+// (schema unchanged — select/geo-base consumers keep reading the same
+// fields).
+func outcomeFor(key string, o *outcome, now time.Time) store.ProbeResult {
+	if o == nil {
+		return store.ProbeResult{Key: key, Alive: false, CheckedAt: now}
+	}
+	return store.ProbeResult{
+		Key:         key,
+		Host:        o.host,
+		Alive:       o.alive,
+		Status:      o.status,
+		Reason:      o.reason,
+		ExitIP:      o.exitIP,
+		RTTMs:       o.rttMS,
+		SpeedBPS:    o.speedBPS,
+		Checks:      o.checks,
+		TotalChecks: o.total,
+		FailureKind: o.failureKind,
+		CheckedAt:   now,
+	}
+}
+
+// outcome is one link's aggregated probe result.
+type outcome struct {
+	host        string
+	alive       bool
+	status      string // passed | semi-passed | failed
+	reason      string
+	exitIP      string
+	rttMS       float64
+	speedBPS    int64
+	checks      int
+	total       int
+	failureKind string
+}
+
+// runJobs executes every job under the concurrency throttle, preserving the
+// input order in the returned slice.
+func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*outcome {
+	concurrency := opts.Threads
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
+	out := make([]*outcome, len(jobs))
+	if len(jobs) == 0 {
+		return out
+	}
+	sem := make(chan struct{}, concurrency)
+	done := make([]chan struct{}, len(jobs))
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	for i := range jobs {
+		go func(i int) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = runJob(ctx, f, jobs[i], opts)
+			close(done[i])
+		}(i)
+	}
+	for i := range done {
+		<-done[i]
+	}
+	return out
+}
+
+// runJob drives one unique link: temp instance → attempts → exit IP →
+// speedtest → aggregation. An instance that fails to boot is a loud per-node
+// outcome (failureKind instance-boot), never a wave error.
+func runJob(ctx context.Context, f Factory, job *probeJob, opts Options) *outcome {
+	progressf(opts.Progress, "probing %s (%s)…", job.keys[0], job.host)
+	inst, err := f(ctx, job.node)
+	if err != nil {
+		return &outcome{
+			host: job.host, alive: false, status: "failed",
+			reason: oneLine(err.Error()), failureKind: "instance-boot",
+			total: opts.Attempts,
+		}
+	}
+	defer func() { _ = inst.Close() }()
+
+	o := &outcome{host: job.host} // total counts up in the attempt loop below
+	var ttfbs, totals []float64
+	tc := checker.NewTunnelClient(inst.Addr(), opts.Timeout)
+	for range opts.Attempts {
+		attempt, aerr := tc.Get(ctx, opts.URL)
+		if aerr != nil && attempt.Verdict == "" {
+			// Fallback (Get normally classifies itself): a measured connect
+			// means the tunnel came up, so a timeout here is a stalled read.
+			attempt.Verdict = checker.VerdictFor(aerr, attempt.ConnectMS > 0)
+		}
+		o.total++
+		if attempt.Verdict == checker.VerdictSuccess {
+			o.checks++
+			ttfbs = append(ttfbs, attempt.TTFBMS)
+			totals = append(totals, attempt.TotalMS)
+		} else {
+			o.noteFailure(attempt)
+		}
+	}
+
+	// kept simple: an if-else chain here would trip gocritic's ifElseChain
+	switch {
+	case o.checks == o.total && o.total > 0:
+		o.status, o.alive = "passed", true
+	case o.checks > 0:
+		o.status, o.alive = "semi-passed", true
+	default:
+		o.status, o.alive = "failed", false
+	}
+
+	if o.alive {
+		o.rttMS = median(ttfbs)
+		if o.rttMS <= 0 {
+			o.rttMS = median(totals)
+		}
+		measureAliveExtras(ctx, tc, o, opts)
+	}
+	return o
+}
+
+// measureAliveExtras fills the alive-only anchors: the D8 exit-IP echo and
+// the optional through-tunnel speedtest. The echo defaults ON (nil means
+// on — production waves build Options without touching the field);
+// best-effort — an unreachable echo leaves the anchor empty and never
+// fails the probe.
+func measureAliveExtras(ctx context.Context, tc *checker.TunnelClient, o *outcome, opts Options) {
+	if opts.ExitProbe == nil || *opts.ExitProbe {
+		o.exitIP = exitIPOf(ctx, tc, opts.ExitIPURL)
+	}
+	if opts.Speedtest && opts.SpeedtestURL != "" {
+		o.speedBPS = speedSample(ctx, tc, opts.SpeedtestURL, opts.SpeedtestTimeout)
+	}
+}
+
+// noteFailure records one failed attempt's verdict class and reason. The
+// failure kind keeps the FIRST failure class seen (deterministic tie-break —
+// mixed failure classes on one node are rare and any honest class beats a
+// misleading aggregate).
+func (o *outcome) noteFailure(a checker.Attempt) {
+	if o.failureKind == "" && a.Verdict != "" && a.Verdict != checker.VerdictSuccess {
+		o.failureKind = string(a.Verdict)
+	}
+	if o.reason == "" {
+		switch {
+		case a.Signature != "":
+			o.reason = "blockpage: " + a.Signature
+		case a.Err != "":
+			o.reason = oneLine(a.Err)
+		case a.Status != 0:
+			o.reason = fmt.Sprintf("http %d", a.Status)
+		}
+	}
+}
+
+// exitIPOf reads the tunnel exit IP (D8) through the node's own instance —
+// the same self-report call the geo stage makes. Best-effort: a failed echo
+// leaves the anchor empty (geo falls back gracefully); it must never fail
+// the probe of an alive node.
+func exitIPOf(ctx context.Context, tc *checker.TunnelClient, endpoint string) string {
+	if endpoint == "" {
+		endpoint = exitIPURL
+	}
+	var payload struct {
+		Query string `json:"query"`
+	}
+	if _, err := tc.GetJSON(ctx, endpoint, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Query)
+}
+
+// speedSample downloads ONE sample through the node's instance and returns
+// bytes/second (0 on any failure — a missing measurement is honest, an
+// invented one is not).
+func speedSample(ctx context.Context, tc *checker.TunnelClient, url string, window time.Duration) int64 {
+	bytes, elapsed, err := tc.DownloadWindow(ctx, url, window)
+	if err != nil || bytes == 0 || elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(bytes) / elapsed.Seconds())
+}
+
+// median returns the median of a float sample (0 on empty — never invented).
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), xs...)
+	sort.Float64s(sorted)
+	if len(sorted)%2 == 1 {
+		return sorted[len(sorted)/2]
+	}
+	return (sorted[len(sorted)/2-1] + sorted[len(sorted)/2]) / 2
 }
 
 // freshSkipSet resolves the [probe].skip_fresh_within skip list: a node is
@@ -157,145 +350,25 @@ func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]b
 				skipped = map[string]bool{}
 			}
 			skipped[n.Key] = true
-			if opts.Progress != nil {
-				_, _ = fmt.Fprintf(opts.Progress,
-					"probe: skipping %s (%s): latest passed %s ago, within skip_fresh_within %s\n",
-					n.Key, n.Host, age.Round(time.Second), opts.SkipFreshWithin)
-			}
+			progressf(opts.Progress,
+				"skipping %s (%s): latest passed %s ago, within skip_fresh_within %s",
+				n.Key, n.Host, age.Round(time.Second), opts.SkipFreshWithin)
 		}
 	}
 	return skipped
 }
 
-func normalizeIP(s string) string {
-	if s == "" || s == "null" {
-		return ""
+func progressf(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format+"\n", args...)
+}
+
+func oneLine(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len(s) > 200 {
+		return s[:200]
 	}
 	return s
-}
-
-func shortLink(link string) string {
-	if i := strings.Index(link, "#"); i > 0 {
-		return link[:i]
-	}
-	return link
-}
-
-// KnifeRunner shells out to xray-knife (out-of-band only).
-type KnifeRunner struct {
-	BinPath string // e.g. ~/.local/bin/xray-knife
-
-	// TestEnv is appended to the subprocess environment verbatim. It is a
-	// test seam: nil in production, so spawned knife processes carry no test
-	// channels (review finding 8 — FAKE_ARGV was previously always set).
-	TestEnv []string
-}
-
-// Run executes one xray-knife http batch over the links.
-func (k *KnifeRunner) Run(ctx context.Context, links []string, opts Options) ([]RawResult, error) {
-	if len(links) == 0 {
-		return nil, nil
-	}
-	if opts.WorkDir == "" {
-		opts.WorkDir = "."
-	}
-	linksPath := filepath.Join(opts.WorkDir, fmt.Sprintf("links-%d.txt", time.Now().UnixNano()))
-	outPath := filepath.Join(opts.WorkDir, fmt.Sprintf("results-%d.jsonl", time.Now().UnixNano()))
-	if err := os.WriteFile(linksPath, []byte(strings.Join(links, "\n")+"\n"), 0o600); err != nil {
-		return nil, fmt.Errorf("write links file: %w", err)
-	}
-	defer func() { _ = os.Remove(linksPath) }()
-	defer func() { _ = os.Remove(outPath) }()
-
-	args := []string{
-		"http",
-		"-f", linksPath,
-		"-x", "jsonl",
-		"-o", outPath,
-		"-t", strconv.Itoa(opts.Threads),
-		"--timeout", strconv.Itoa(int(opts.Timeout.Milliseconds())),
-		"--db", opts.DBPath,
-		"--quiet",
-	}
-	if opts.URL != "" {
-		args = append(args, "-u", opts.URL)
-	}
-	if opts.Speedtest {
-		args = append(args, "-S")
-		if opts.SpeedtestTimeout > 0 {
-			args = append(args, "--speedtest-timeout", strconv.Itoa(int(opts.SpeedtestTimeout.Seconds())))
-		}
-	}
-	if opts.CheckPreset != "" {
-		args = append(args, "--check-preset", opts.CheckPreset)
-		args = append(args, "--url-success-threshold", strconv.FormatFloat(opts.URLSuccessThreshold, 'f', 2, 64))
-	}
-	if opts.MaxPassed > 0 {
-		args = append(args, "--max-passed", strconv.Itoa(opts.MaxPassed))
-	}
-
-	//nolint:gosec // binary path from owner config; args constructed here
-	cmd := exec.CommandContext(ctx, k.BinPath, args...)
-	// L5 hygiene in-process: the knife subprocess must not inherit a proxy
-	// environment, or probes would tunnel through the owner's VPN.
-	cmd.Env = dropProxyEnv(os.Environ())
-	cmd.Env = append(cmd.Env, k.TestEnv...)
-	output, err := cmd.CombinedOutput()
-	// The knife CLI signals "N of M passed" through its exit code (non-zero
-	// when some/all fail) — that is a normal probe outcome, not an invocation
-	// error. Only a missing/unparseable results file is a contract breach.
-	results, parseErr := parseJSONLFile(outPath)
-	if parseErr != nil {
-		return nil, fmt.Errorf("xray-knife %s produced no usable results (err=%w): %w\n%s",
-			k.BinPath, err, parseErr, tail(string(output), 800))
-	}
-	return results, nil
-}
-
-func parseJSONLFile(path string) ([]RawResult, error) {
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("xray-knife produced no results file at %s", path)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	var out []RawResult
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
-	line := 0
-	for sc.Scan() {
-		line++
-		text := strings.TrimSpace(sc.Text())
-		if text == "" {
-			continue
-		}
-		var rr RawResult
-		if err := json.Unmarshal([]byte(text), &rr); err != nil {
-			return nil, fmt.Errorf("decode xray-knife jsonl line %d: %w", line, err)
-		}
-		out = append(out, rr)
-	}
-	return out, sc.Err()
-}
-
-func dropProxyEnv(env []string) []string {
-	out := env[:0]
-	for _, e := range env {
-		upper := strings.ToUpper(e)
-		if strings.HasPrefix(upper, "HTTP_PROXY=") || strings.HasPrefix(upper, "HTTPS_PROXY=") ||
-			strings.HasPrefix(upper, "ALL_PROXY=") {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
-}
-
-func tail(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return "..." + s[len(s)-n:]
 }

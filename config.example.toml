@@ -60,10 +60,12 @@ concurrency = 4
 # overrides this value for one run when set (both 0 = unlimited).
 source_cap = 0
 # Protocol acceptance allowlist (parse normalizes all of these; the filter
-# decides). Default vless,vmess,trojan — ss is opt-in: PSK-only shadowsocks
-# is weak crypto by design, and the reality/tls security requirement below
-# still applies on top (a plain ss link is dropped regardless).
-# protocols = ["vless", "vmess", "trojan", "ss"]
+# decides). W14 default: EVERY rendered protocol — vless,vmess,trojan,ss,
+# hysteria2 (round-7 owner ruling; the former ss/hysteria2 opt-in is gone).
+# The reality/tls security requirement below still applies on top, and
+# allow_insecure=false (default) stays: protocol breadth is not a license
+# for insecure links.
+# protocols = ["vless", "vmess", "trojan", "ss", "hysteria2"]
 # allow_insecure = false (default) drops links carrying allowInsecure=1.
 # true admits them into the pipeline — but the renderer CANNOT render the
 # flag: xray 26.3.27 removed allowInsecure (migrated to
@@ -72,17 +74,23 @@ source_cap = 0
 allow_insecure = false
 
 [probe]
-path = "~/.local/bin/xray-knife"   # out-of-band prober (never inside the live client)
-timeout = "10s"
-threads = 20
-url = "https://cloudflare.com/cdn-cgi/trace"  # response carries the tunnel exit IP (D8)
-speedtest = true                    # W10 default ON: every wave carries -S speed data
-                                    # (explicit false turns it off). Slow by design.
-speedtest_timeout = "30s"
-check_preset = ""                   # optional panel grading: cloudflare|global|google|gstatic|streaming
-url_success_threshold = 1.0
-db_path = "xray-knife.db"           # isolated knife DB under data_dir (never the user default)
-max_passed = 0                      # stop the wave after N passed nodes (0 = probe all)
+# W14 real-xray engine: every probed node gets a temporary single-node xray
+# (the SAME factory the check/geo stages use — [activate].xray_bin, no
+# separate prober binary or database), so liveness and the speedtest cover
+# EVERY rendered protocol uniformly, hysteria2 included. The removed
+# xray-knife keys (path/db_path/check_preset/url_success_threshold/max_passed)
+# fail the load loud with their migration text.
+timeout = "10s"                      # per-attempt HTTP timeout
+threads = 8                          # parallel temp-instance workers (each is a real xray
+                                     # process; boot windows serialize inside the factory)
+attempts = 3                         # HTTP GETs per node: all success = passed, some =
+                                     # semi-passed, none = failed (skip_fresh_within is strict)
+url = "https://cloudflare.com/cdn-cgi/trace"  # the liveness target
+speedtest = true                     # W10 default ON: every wave carries a speed sample
+                                     # (explicit false turns it off). Slow by design.
+speedtest_url = "https://speed.cloudflare.com/__down?bytes=25000000"  # the sample:
+                                     # downloaded through the node's tunnel → bytes/time → speed_bps
+speedtest_timeout = "30s"            # the download sample window
 skip_fresh_within = "0s"            # skip re-probing nodes whose latest result is `passed`
                                     # and newer than this window (0s = probe everything; failed/
                                     # semi-passed/stale nodes are always re-probed)

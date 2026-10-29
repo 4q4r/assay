@@ -272,7 +272,7 @@ func runNode(
 		return out
 	}
 	defer func() { _ = inst.Close() }()
-	tc := newTunnelClient(inst.Addr(), opts.Timeout)
+	tc := NewTunnelClient(inst.Addr(), opts.Timeout)
 	tc.dohURL = opts.dohOverride
 	tc.tlsRoots = opts.tlsRoots
 
@@ -283,13 +283,13 @@ func runNode(
 			ASN: entry.rec.ASN, ISP: displayISP(entry.rec),
 		}
 		for n := range opts.Attempts {
-			attempt, aerr := tc.get(ctx, tg.URL)
+			attempt, aerr := tc.Get(ctx, tg.URL)
 			attempt.N = n + 1
 			if aerr != nil && attempt.Verdict == "" {
 				// Fallback (get normally classifies itself): the trace phase
 				// read from the attempt — a measured connect means the tunnel
 				// came up, so a timeout here is a stalled read, not a dial.
-				attempt.Verdict = verdictFor(aerr, attempt.ConnectMS > 0)
+				attempt.Verdict = VerdictFor(aerr, attempt.ConnectMS > 0)
 			}
 			r.Attempts = append(r.Attempts, attempt)
 		}
