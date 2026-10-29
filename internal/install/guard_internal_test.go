@@ -10,14 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// W10 hard-scope guard: the install package's ENTIRE systemctl surface is
-// the four-command allowlist — --user only, only public_vpn-* units,
-// daemon-reload / enable --now (watch) / disable --now (watch) / disable
-// --now (the legacy W5 timers, solely for the one-time migration). No
-// restart, no other unit, no --system. The maintain/pipeline surface keeps
-// its separate strict ban (cli units_internal_test.go); THIS package is the
-// only place allowed to talk to systemd at all, and the DAEMON itself never
-// talks to systemd (watch_cmd.go carries no exec/Systemctl surface).
+// W10 hard-scope guard, migrated through W13: the install package's ENTIRE
+// systemctl surface stays the four-command allowlist — --user only, only
+// public_vpn-* units, daemon-reload / enable --now (watch) / disable --now
+// (watch) / disable --now (the legacy W5 timers, solely for the one-time
+// migration). UNCHANGED by W13: install still never restarts anything —
+// the owner-ruled xray restart lives in internal/restart's own byte-pinned
+// executor (the only other sanctioned exec-of-systemctl file in the tree).
+// The maintain/pipeline surface keeps its separate spelling ban (cli units
+// guard); the two executor files are the complete daemon surface.
 
 func TestSystemctlAllowlistIsExactlyThePinnedSet(t *testing.T) {
 	require.Len(t, allowedCommands, 4, "the allowlist is exactly four commands")
@@ -113,10 +114,14 @@ func TestUnitTemplatesAreTheSingleSource(t *testing.T) {
 	}
 }
 
-// TestDaemonNeverTouchesSystemd is the W10 extension of the maintain-surface
-// systemctl ban: the watch DAEMON (internal/cli watch path) must carry no
-// exec-of-systemctl surface at all — scheduling lives in the process; only
-// install talks to systemd.
+// TestDaemonNeverTouchesSystemd is the W10 guard, kept through the W13
+// migration with the same assertions and an updated meaning: the watch
+// DAEMON entry (internal/cli watch path) must carry no exec-of-systemctl
+// surface of its own — the restart capability lives in the byte-pinned
+// allowlist executor (internal/restart) behind the stages seam, so this
+// file stays process-spawn-free. (W4–W12 wording: "only install talks to
+// systemd"; W13 adds the restart executor as the second — and last —
+// sanctioned file.)
 func TestDaemonNeverTouchesSystemd(t *testing.T) {
 	cliDir := filepath.Join("..", "cli")
 	entries, err := os.ReadDir(cliDir)

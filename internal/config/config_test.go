@@ -287,6 +287,46 @@ func TestMaintainSectionParsesAndDefaults(t *testing.T) {
 	})
 }
 
+// TestAutoRestartKnobDefaultsToTrue pins [maintain].auto_restart (W13, the
+// owner's hands-off ruling): unset = TRUE — the daemon restarts the live
+// xray client after every gated activation; an explicit false restores the
+// manual-restart semantics (the hint is printed instead).
+func TestAutoRestartKnobDefaultsToTrue(t *testing.T) {
+	write := func(content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	base := `data_dir = "/tmp/publicvpn-autorestart"
+`
+
+	t.Run("unset defaults to true (hands-off)", func(t *testing.T) {
+		cfg, err := config.Load(write(base))
+		require.NoError(t, err)
+		assert.True(t, cfg.Maintain.AutoRestartEnabled(),
+			"auto_restart must default to true — zero manual restarts is the approved premise")
+	})
+
+	t.Run("explicit false restores manual semantics", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[maintain]\nauto_restart = false\n"))
+		require.NoError(t, err)
+		assert.False(t, cfg.Maintain.AutoRestartEnabled())
+	})
+
+	t.Run("explicit true parses", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[maintain]\nauto_restart = true\n"))
+		require.NoError(t, err)
+		assert.True(t, cfg.Maintain.AutoRestartEnabled())
+	})
+
+	t.Run("unknown key still fails strict decode", func(t *testing.T) {
+		_, err := config.Load(write(base + "\n[maintain]\nauto_restartt = true\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "strict mode")
+	})
+}
+
 // TestFilterSourceCapConfigParsesAndValidates pins the [filter] section:
 // source_cap defaults to unlimited (0) and negative values fail validation
 // (review finding 6).

@@ -21,8 +21,10 @@ import (
 // newWatchCommand is the W10 daemon entry: fsnotify watchdog on the plugins
 // dir + the wave scheduler ([maintain].refresh_interval / speedtest_interval)
 // reusing the exact maintainStages runners. SIGINT/SIGTERM finish the current
-// stage, flush, and exit 0. The daemon NEVER touches systemctl — scheduling
-// lives here, install owns the unit file that runs this command.
+// stage, flush, and exit 0. Since W13 the daemon's systemd surface is
+// exactly the restart executor the activate stage carries (byte-pinned
+// two-command allowlist in internal/restart) — scheduling still lives here;
+// this file itself carries no process-spawning surface of any kind.
 func newWatchCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "watch",

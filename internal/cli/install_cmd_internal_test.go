@@ -263,6 +263,50 @@ func TestRunUninstallPurgeRemovesConfigAndDataDir(t *testing.T) {
 	assert.True(t, os.IsNotExist(err))
 }
 
+// TestStatusFlagsStaleInstalledBinary pins the W13 stale-binary notice (the
+// owner's incident: a pre-W12 binary stayed installed across a rebuild and
+// `list` errored on it). The installed binary does NOT self-update on
+// `git pull` — when the RUNNING binary's content differs from the installed
+// one, status must name the drift and the recovery (re-run install + restart
+// the daemon unit).
+func TestStatusFlagsStaleInstalledBinary(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "run", "systemd"), 0o755))
+
+	binDir := filepath.Join(home, ".local", "bin")
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
+	ex := &fakeCtl{}
+	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
+		installOptions{binDir: binDir, unitDir: unitDir, exec: ex}))
+
+	// A freshly installed binary is a copy of the running one: no drift.
+	status := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(status)
+	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
+	assert.NotContains(t, status.String(), "STALE",
+		"an install that just self-copied the running binary is not stale")
+
+	// The on-disk binary changed under the running process (the post-pull
+	// rebuild scenario): the drift must be flagged with the recovery.
+	installed := filepath.Join(binDir, "publicvpn")
+	current, err := os.ReadFile(installed)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(installed,
+		append([]byte("#!/bin/sh\necho newer-build\n"), current...), 0o755))
+
+	status.Reset()
+	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
+	out := status.String()
+	assert.Contains(t, out, "STALE", "a content-drifted installed binary must be flagged")
+	assert.Contains(t, out, "re-run `publicvpn install`", "the recovery names the self-copy command")
+	assert.Contains(t, out, "restart public_vpn-watch.service",
+		"the recovery names the daemon restart (the unit keeps running the old code otherwise)")
+}
+
 // TestStatusShowsInstallState pins the status extension: binary, units,
 // timers, configured-vs-installed periods, and the MISMATCH hint when the
 // config drifted after the last install.

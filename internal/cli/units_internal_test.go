@@ -73,10 +73,18 @@ var w4MaintainSources = [8]string{
 // an append-capable slice would let the guard list drift silently.
 var _ [8]string = w4MaintainSources
 
-// TestNoSystemdInvocationInMaintainSource extends the activate package's
-// TestNoSystemdInvocationInSource pattern to the full W4 surface — the eight
-// files in w4MaintainSources: the pipeline must never execute systemctl;
-// systemd interaction is the operator's job via the repo unit files.
+// TestNoSystemdInvocationInMaintainSource pins the orchestration surface's
+// side of the W13 security rail. MIGRATION (W4 → W13): through W12 this was
+// the total no-systemctl ban — "the pipeline must never execute systemctl;
+// systemd interaction is the operator's job". The owner's round-6 ruling
+// (hands-off, zero manual restarts) moved the restart capability into
+// internal/restart's byte-pinned allowlist executor, wired through the
+// restartWiring seam in pipeline.go. The ban's LETTER is unchanged — these
+// eight files still never spell the word (all systemd verbs are spelled
+// only inside the two allowlist executor packages, install + restart, both
+// guard-pinned) — but its MEANING is now "the orchestration surface never
+// touches systemd directly": the only sanctioned execution paths are the
+// two executors, enforced by restart's TestDaemonSystemdSurfaceIsExactlyTwoExecutorFiles.
 // The list is pinned EXACTLY (the EXACTLY-8 subtest): both directions of set
 // equality, not merely "contains" — a silently added ninth file would escape
 // the guard, a silently removed one would fake coverage.

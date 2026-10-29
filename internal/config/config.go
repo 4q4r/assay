@@ -203,8 +203,9 @@ type ActivateConfig struct {
 	// behavior, documented). Negative values are structurally invalid.
 	TestTimeout *Duration `toml:"test_timeout"`
 	// ServiceName is the systemd unit named in the printed restart hint
-	// (this package never restarts anything itself). Default:
-	// xray-raw.service.
+	// (the manual path — auto_restart = false only; the W13 auto path is
+	// byte-pinned to DefaultServiceName and refuses any other unit loud).
+	// Default: xray-raw.service.
 	ServiceName string `toml:"service_name"`
 	// BackupKeep caps backup retention: after a successful new backup write,
 	// only the BackupKeep newest .bak-<ts> files are kept (0 = unlimited,
@@ -234,6 +235,18 @@ type MaintainConfig struct {
 	// activate.backup_keep caps activation backups (0 = unlimited, the
 	// default; deletion failures are loud). Resolves parked item M3.
 	PruneBackupKeep int `toml:"prune_backup_keep"`
+	// AutoRestart restarts the live xray client through the byte-pinned
+	// allowlist executor (internal/restart) after every gated activation —
+	// the W13 owner ruling: hands-off, zero manual restarts ever. Nil
+	// (unset) defaults to TRUE; an explicit false restores the W4-era
+	// manual semantics (the printed restart hint instead of a restart).
+	AutoRestart *bool `toml:"auto_restart"`
+}
+
+// AutoRestartEnabled resolves the tri-state knob: unset = true (hands-off
+// is the approved premise), explicit false = manual-restart semantics.
+func (m MaintainConfig) AutoRestartEnabled() bool {
+	return m.AutoRestart == nil || *m.AutoRestart
 }
 
 // HTTPConfig carries settings shared by every pipeline HTTP client (fetch
@@ -594,6 +607,13 @@ func applyMaintainDefaults(m *MaintainConfig) {
 		m.StatsTimeout.Duration = DefaultStatsTimeout
 	}
 	// PruneBackupKeep: no default application — 0 IS the default (unlimited).
+	// AutoRestart: nil (unset) materializes as TRUE — hands-off is the W13
+	// owner ruling; AutoRestartEnabled() treats a nil pointer the same way,
+	// so both direct-struct (test) construction and file loading agree.
+	if m.AutoRestart == nil {
+		v := true
+		m.AutoRestart = &v
+	}
 }
 
 func applyHTTPDefaults(h *HTTPConfig) {

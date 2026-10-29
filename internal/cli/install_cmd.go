@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -293,6 +294,33 @@ func checkExecStartPath(flag, p string) error {
 	return nil
 }
 
+// binariesDiffer reports whether two files carry different CONTENT (sha256
+// — the drift is content-level, not path-level). A read failure on either
+// side returns an error: the caller skips the notice rather than guessing.
+func binariesDiffer(a, b string) (bool, error) {
+	sha := func(p string) ([]byte, error) {
+		f, err := os.Open(p)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
+	aSha, err := sha(a)
+	if err != nil {
+		return false, err
+	}
+	bSha, err := sha(b)
+	if err != nil {
+		return false, err
+	}
+	return string(aSha) != string(bSha), nil
+}
+
 // printInstallStatus extends `status` with the install state: binary path,
 // the watch-daemon unit, its enablement, and any legacy W5 timer units still
 // awaiting migration. Read-only: pure filesystem inspection of the user unit
@@ -303,6 +331,19 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
 	binPath := filepath.Join(config.ExpandHome("~/.local/bin"), "publicvpn")
 	if st, err := os.Stat(binPath); err == nil {
 		outf(out, "  binary:    %s (mode %s)\n", binPath, st.Mode())
+		// W13 stale-binary notice (the owner's incident): the installed
+		// binary does NOT self-update on `git pull` — a rebuilt-but-not-
+		// reinstalled binary keeps running OLD code under the daemon unit.
+		// A cheap sha256 pair names the drift and the recovery. Honest in
+		// every divergence case, including dev builds (`go run` differs
+		// from the install by definition).
+		if running, e := os.Executable(); e == nil && running != binPath {
+			if differ, shaErr := binariesDiffer(running, binPath); shaErr == nil && differ {
+				outln(out, "  STALE:     running binary differs from the installed one — "+
+					"the installed binary does not self-update; re-run `publicvpn install` "+
+					"(self-copy) and restart public_vpn-watch.service to load the new code")
+			}
+		}
 	} else {
 		outln(out, "  binary:    not installed ("+binPath+" missing) — run `publicvpn install`")
 	}
