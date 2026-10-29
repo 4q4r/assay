@@ -819,11 +819,14 @@ byte-identical render is a no-op: nothing is replaced, nothing restarts.`,
 
 // restartWiring bundles the W13 auto-restart seam: the byte-pinned allowlist
 // executor (package restart — the daemon's only systemd surface besides
-// install) and the health check's port-probe dialer. The maintainStages seam
-// injects fakes in tests; production is SystemctlExecutor + the real dialer.
+// install) and the health check's port-probe dialer. Sleep carries the W17
+// health ladder's clock (tests inject a no-op; production leaves nil for the
+// real time.Sleep). The maintainStages seam injects fakes in tests;
+// production is SystemctlExecutor + the real dialer.
 type restartWiring struct {
 	Executor restart.Executor
 	Dialer   restart.Dialer
+	Sleep    func(time.Duration)
 }
 
 // productionRestartWiring wires the real allowlist executor (the restart
@@ -871,6 +874,16 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 	// through the byte-pinned executor, then verifies health. A nil wiring
 	// with auto_restart enabled is a programming error — never a silent
 	// skip.
+	//
+	// W17 non-interruptibility: the replace→restart→health sequence below
+	// is ONE non-interruptible step. The daemon's shutdown checkpoint is
+	// consulted only BETWEEN wave stages (runMaintainGraceful), never here
+	// — a SIGTERM landing between the atomic replace and the xray restart
+	// must not pause the stage, or the live client would be orphaned (new
+	// config on disk, old config running, no restart issued). The
+	// guard pin is TestW17MidActivateShutdownCannotInterruptRestart; the
+	// unit's TimeoutStopSec gives systemd the matching patience to wait for
+	// the step (and the stage around it) instead of SIGKILLing mid-activate.
 	auto := cfg.Maintain.AutoRestartEnabled()
 	if auto && wiring == nil {
 		return errors.New(
@@ -888,6 +901,7 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 	rres, rerr := restart.Run(restart.Input{
 		Executor:   wiring.Executor,
 		Dialer:     wiring.Dialer,
+		Sleep:      wiring.Sleep,
 		SocksPort:  extractSocksPort(p.rendered),
 		BackupPath: res.BackupPath,
 	})

@@ -12,6 +12,19 @@ Description=publicvpn watch daemon (plugin hot-reload watchdog + scheduled maint
 # recovery, immune to wave length.
 Type=notify
 WatchdogSec=300
+# W17 stop timeout: SIGTERM (a stop or a restart of THIS unit) finishes the
+# current stage — the between-stage checkpoint pauses the wave only between
+# stages, never inside one. A full probe stage can legitimately run ~28 min,
+# so the stop budget must outlast it: 1800s covers the observed stage with
+# headroom, while 900s (15 min) would re-kill mid-probe — the exact
+# "State 'stop-sigterm' timed out. Killing." class this fixes. Deliberately
+# bounded, not infinity: an hours-long speedtest wave can still exceed the
+# cap (weekly cadence; a stop must terminate eventually), and a genuinely
+# wedged RUNTIME is WatchdogSec's job, not TimeoutStopSec's. An in-flight
+# activate is never the casualty: the activate stage's
+# replace→restart→health sequence is one non-interruptible step, so the
+# live client is never left running the old config with the new one on disk.
+TimeoutStopSec=1800
 # The wave reuses the pipeline config file (single source of truth, no env
 # vars). Rendered by `publicvpn install` from this template — do not edit the
 # installed copy by hand. The daemon reads [maintain].refresh_interval and

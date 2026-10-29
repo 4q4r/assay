@@ -49,19 +49,45 @@ func (f *fakeExecutor) verbs() []string {
 }
 
 // fakeDialer records dial attempts; scriptedErr is returned for every call.
+// failFirst>0 makes the FIRST failFirst dials fail (connection refused) and
+// every later dial succeed — the "the client binds late" production race,
+// hermetically.
 type fakeDialer struct {
-	addrs []string
-	err   error
+	addrs     []string
+	err       error
+	failFirst int
 }
 
 func (f *fakeDialer) Dial(_ string, addr string, _ time.Duration) (net.Conn, error) {
 	f.addrs = append(f.addrs, addr)
+	if len(f.addrs) <= f.failFirst {
+		return nil, errors.New("connect: connection refused")
+	}
 	return nil, f.err
+}
+
+// fakeSleeper is the injected clock for the health ladder: every sleep is
+// RECORDED, none is real — the bounded-time pin reads the record.
+type fakeSleeper struct {
+	calls []time.Duration
+}
+
+func (f *fakeSleeper) Sleep(d time.Duration) {
+	f.calls = append(f.calls, d)
 }
 
 func okExecutor() *fakeExecutor {
 	return &fakeExecutor{outputs: []string{"", "active\n"}}
 }
+
+// okExecutorLadder scripts a restart plus ENOUGH active is-active outputs
+// for the whole health ladder (attempts after the script ends would read ""
+// = a crash-looping unit — the exact drift the ladder introduced).
+func okExecutorLadder() *fakeExecutor {
+	return &fakeExecutor{outputs: []string{"", "active\n", "active\n", "active\n", "active\n", "active\n"}}
+}
+
+func noSleep(time.Duration) {}
 
 // --- the byte-pinned allowlist -------------------------------------------
 
@@ -167,42 +193,47 @@ func TestRunRestartFailureIsTypedLoudAndSkipsHealth(t *testing.T) {
 }
 
 func TestRunInactiveUnitIsHealthFailure(t *testing.T) {
-	ex := &fakeExecutor{outputs: []string{"", "failed\n"}}
+	ex := &fakeExecutor{outputs: []string{"", "failed\n", "failed\n", "failed\n", "failed\n", "failed\n"}}
 	dial := &fakeDialer{}
-	res, err := restart.Run(restart.Input{Executor: ex, Dialer: dial.Dial, SocksPort: 10808})
+	res, err := restart.Run(restart.Input{Executor: ex, Dialer: dial.Dial, SocksPort: 10808, Sleep: noSleep})
 	require.Error(t, err, "is-active reporting a dead unit is a health failure")
 
 	var he *restart.HealthError
 	require.ErrorAs(t, err, &he)
 	assert.Equal(t, "unit-state", he.Leg)
+	assert.Equal(t, 5, he.Attempts, "the crash-loop state was re-probed across the whole ladder")
 	assert.Contains(t, err.Error(), "failed", "the raw unit state reaches the operator")
 	assert.False(t, res.Active)
 	assert.Empty(t, dial.addrs, "no port probe when the unit is not active")
 }
 
 func TestRunIsActiveExecErrorIsHealthFailure(t *testing.T) {
-	ex := &fakeExecutor{errs: []error{nil, errors.New("exit status 3")}}
-	_, err := restart.Run(restart.Input{Executor: ex, SocksPort: 10808})
+	ex := &fakeExecutor{errs: []error{nil, errors.New("exit status 3"), errors.New("exit status 3"),
+		errors.New("exit status 3"), errors.New("exit status 3"), errors.New("exit status 3")}}
+	_, err := restart.Run(restart.Input{Executor: ex, SocksPort: 10808, Sleep: noSleep})
 	require.Error(t, err)
 	var he *restart.HealthError
 	require.ErrorAs(t, err, &he)
 	assert.Equal(t, "is-active", he.Leg)
+	assert.Equal(t, 5, he.Attempts)
 }
 
 func TestRunClosedPortIsHealthFailureWithRestoreHint(t *testing.T) {
-	ex := okExecutor()
+	ex := okExecutorLadder()
 	dial := &fakeDialer{err: errors.New("connect: connection refused")}
 	res, err := restart.Run(restart.Input{
 		Executor:   ex,
 		Dialer:     dial.Dial,
 		SocksPort:  10808,
 		BackupPath: "/backups/config.json.bak-20261029-010101",
+		Sleep:      noSleep,
 	})
 	require.Error(t, err, "a closed socks port after restart is a health failure")
 
 	var he *restart.HealthError
 	require.ErrorAs(t, err, &he)
 	assert.Equal(t, "socks-port", he.Leg)
+	assert.Equal(t, 5, he.Attempts)
 	assert.Contains(t, err.Error(), "connection refused")
 	assert.Contains(t, err.Error(), "/backups/config.json.bak-20261029-010101",
 		"the health failure carries the backup-restore hint")
@@ -226,12 +257,94 @@ func TestRunNilExecutorIsLoud(t *testing.T) {
 	assert.Contains(t, err.Error(), "executor")
 }
 
+// --- the W17 health ladder (bounded retry, production boot race) ----------
+
+// TestHealthLadderPassesOnLaterAttempt is the production race pin: xray has
+// not bound the socks port when `systemctl restart` returns, and comes up on
+// attempt 3. The check must PASS on ANY attempt, count the attempts, and
+// stop retrying at the first success (exactly two backoff sleeps: 1s then
+// 2s — the exponential ladder, injected clock, zero real waits).
+func TestHealthLadderPassesOnLaterAttempt(t *testing.T) {
+	ex := okExecutorLadder()
+	dial := &fakeDialer{failFirst: 2} // listener binds on attempt 3
+	sleep := &fakeSleeper{}
+	res, err := restart.Run(restart.Input{
+		Executor:  ex,
+		Dialer:    dial.Dial,
+		SocksPort: 10808,
+		Sleep:     sleep.Sleep,
+	})
+	require.NoError(t, err, "a client that binds within the ladder passes the health check")
+
+	assert.Len(t, dial.addrs, 3, "dial attempts: two refused, then the bind")
+	assert.True(t, res.PortOpen)
+	assert.Equal(t, 3, res.Attempts, "the verdict counts the attempt the PASS landed on")
+	assert.Equal(t, []time.Duration{time.Second, 2 * time.Second}, sleep.calls,
+		"exponential backoff 1s/2s between the first three attempts — no sleep after success")
+	assert.Contains(t, res.Verdict, "health PASS")
+	assert.Contains(t, res.Verdict, "attempt 3", "the PASS names which attempt landed")
+	assert.Equal(t, []string{"restart", "is-active", "is-active", "is-active"}, ex.verbs(),
+		"one restart, then the health phase re-probes is-active per attempt")
+}
+
+// TestHealthLadderNeverHealthyIsLoudAndBounded pins the deadline safety: a
+// genuinely dead client exhausts the ladder in BOUNDED time (injected clock:
+// exactly the 1s/2s/4s/8s backoff, five attempts, no real waits) and fails
+// with the existing loud HealthError class — never a wedge, never a silent
+// pass.
+func TestHealthLadderNeverHealthyIsLoudAndBounded(t *testing.T) {
+	ex := okExecutorLadder()
+	dial := &fakeDialer{err: errors.New("connect: connection refused")}
+	sleep := &fakeSleeper{}
+	res, err := restart.Run(restart.Input{
+		Executor:   ex,
+		Dialer:     dial.Dial,
+		SocksPort:  10808,
+		BackupPath: "/backups/config.json.bak-20261029",
+		Sleep:      sleep.Sleep,
+	})
+	require.Error(t, err, "a client that never binds fails loud after the ladder")
+
+	var he *restart.HealthError
+	require.ErrorAs(t, err, &he, "the failure stays the typed health class")
+	assert.Equal(t, "socks-port", he.Leg)
+	assert.Contains(t, err.Error(), "/backups/config.json.bak-20261029", "the restore hint survives the ladder")
+	assert.Len(t, dial.addrs, restart.HealthAttempts(), "every ladder attempt probes the port once")
+	assert.Equal(t, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second},
+		sleep.calls, "the whole ladder is the bounded 1s/2s/4s/8s backoff — 15s of sleeps, no more")
+	assert.Equal(t, 5, res.Attempts)
+	assert.Len(t, ex.calls, 1+5, "one restart + five health attempts — the ladder never re-restarts")
+}
+
+// TestHealthLadderFirstTrySuccessZeroRetries pins the no-op healthy path:
+// the client bound before the first probe — zero retries, zero sleeps, and
+// exactly one restart + one is-active + one dial (the W13 ordering pins stay
+// byte-for-byte).
+func TestHealthLadderFirstTrySuccessZeroRetries(t *testing.T) {
+	ex := okExecutor()
+	dial := &fakeDialer{}
+	sleep := &fakeSleeper{}
+	res, err := restart.Run(restart.Input{
+		Executor:  ex,
+		Dialer:    dial.Dial,
+		SocksPort: 10808,
+		Sleep:     sleep.Sleep,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, res.Attempts, "first-try success is attempt 1")
+	assert.Empty(t, sleep.calls, "a first-try PASS never sleeps")
+	assert.Len(t, ex.calls, 2, "restart + one is-active — no retries")
+	assert.Len(t, dial.addrs, 1)
+	assert.Contains(t, res.Verdict, "health PASS")
+}
+
 // TestRunDefaultDialerIsNet covers the production wiring: a nil Dialer must
 // still attempt a real loopback dial (an unreachable port with a REAL dial
 // error path — loopback :1 is reserved, so the dial fails fast everywhere).
 func TestRunDefaultDialerIsNet(t *testing.T) {
-	ex := okExecutor()
-	_, err := restart.Run(restart.Input{Executor: ex, SocksPort: 1})
+	ex := okExecutorLadder()
+	_, err := restart.Run(restart.Input{Executor: ex, SocksPort: 1, Sleep: noSleep})
 	require.Error(t, err, "the default dialer is the real net dialer — port 1 on loopback is closed")
 	var he *restart.HealthError
 	require.ErrorAs(t, err, &he)

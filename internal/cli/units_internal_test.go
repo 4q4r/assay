@@ -32,6 +32,9 @@ func TestWatchUnitTemplate(t *testing.T) {
 	assert.Contains(t, service, "Type=notify", "sd_notify(3): READY=1 + WATCHDOG=1 pings")
 	assert.Contains(t, service, "WatchdogSec=300",
 		"a wedged daemon stops pinging — systemd kills and restarts it")
+	assert.Contains(t, service, "TimeoutStopSec=1800",
+		"a mid-wave stop waits for the current stage (a full probe stage runs ~28 min) "+
+			"instead of SIGKILLing at the 90s default — the W17 mid-wave kill fix")
 	assert.Regexp(t, `(?m)^ExecStart=\{\{ \.BinaryPath \}\} watch -c \{\{ \.ConfigPath \}\}$`,
 		service, "ExecStart = installed binary + watch + the config the user passed")
 	assert.Regexp(t, `(?m)^Restart=always$`, service, "a daemon crash restarts automatically")
