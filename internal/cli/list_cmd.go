@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -20,11 +21,16 @@ import (
 // grouped by location (the D5 two-layer view), optionally expanded to city
 // sub-rows and extended with the cold base. Display only — it reads
 // selection.json + probe results + the geo-base and writes nothing.
+// --json emits the machine-readable twin (round-7 item 12a): one JSON
+// document on stdout — countries → cities hierarchy, counts, alive, median
+// RTT, and the W12 provenance as the config object — with the human
+// config-source line and table banners suppressed (schema: README).
 func newListCommand(cfgPath *string) *cobra.Command {
 	var (
 		cities  bool
 		all     bool
 		noColor bool
+		jsonOut bool
 	)
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -34,12 +40,17 @@ func newListCommand(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res)
-			color, err := resolveColor("auto", noColor, cmd.OutOrStdout())
-			if err != nil {
-				return err
+			color := false
+			if !jsonOut {
+				reportConfigSource(cmd.OutOrStdout(), res)
+				color, err = resolveColor("auto", noColor, cmd.OutOrStdout())
+				if err != nil {
+					return err
+				}
 			}
-			return runList(cmd.OutOrStdout(), res.Config, listOptions{cities: cities, all: all, color: color})
+			return runList(cmd.OutOrStdout(), res, listOptions{
+				cities: cities, all: all, color: color, json: jsonOut,
+			})
 		},
 	}
 	cmd.Flags().BoolVar(&cities, "cities", false,
@@ -48,6 +59,8 @@ func newListCommand(cfgPath *string) *cobra.Command {
 		"append the cold base (geo-base) as a separate section, grouped the same way")
 	cmd.Flags().BoolVar(&noColor, "no-color", false,
 		"disable colors (NO_COLOR is honored too; default is terminal-detected)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false,
+		"emit one machine-readable JSON document instead of the table (schema in the README)")
 	return cmd
 }
 
@@ -56,26 +69,32 @@ type listOptions struct {
 	cities bool
 	all    bool
 	color  bool
+	json   bool
 }
 
 // selectedStat is one country row of the active core plus its nodes (the
-// --cities expansion re-groups them by city).
+// --cities expansion re-groups them by city). code is the RAW country key
+// the row was grouped by ("DE"; "" = the unknown-geo pseudo-group) — the
+// wire structs consume it directly instead of re-parsing display labels.
 type selectedStat struct {
+	code   string
 	flag   string
 	nodes  []model.SelectedNode
 	alive  int
 	median float64
 }
 
-// coldStat is one cold-base country row.
+// coldStat is one cold-base country row (code: see selectedStat).
 type coldStat struct {
+	code   string
 	flag   string
 	count  int
 	alive  int
 	median float64
 }
 
-func runList(w io.Writer, cfg *config.Config, opts listOptions) error {
+func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
+	cfg := res.Config
 	p := newPaths(cfg)
 	sel, err := store.ReadSelection(p.selection)
 	if err != nil {
@@ -89,24 +108,24 @@ func runList(w io.Writer, cfg *config.Config, opts listOptions) error {
 		return err
 	}
 
+	countries := groupSelected(sel.Nodes, probeByKey)
+
+	if opts.json {
+		return writeListJSON(w, res, p, sel, countries, probeByKey, opts)
+	}
+
 	outf(w, "publicvpn pool inventory — active core: %d nodes (selection: %s)\n",
 		len(sel.Nodes), sel.GeneratedAt.Format(time.RFC3339))
 
-	countries := groupSelected(sel.Nodes, probeByKey)
 	renderSection(w, "LOCATION", []string{"loc", "nodes", "alive", "median"},
 		[]int{6, 5, 5, 7}, countryRows(countries, 0), opts.color)
 
 	if opts.cities {
 		for _, cs := range countries {
-			if len(cs.nodes) < 2 {
-				continue // a single-node country needs no sub-rows
+			if cityStats := cityView(cs, probeByKey); cityStats != nil {
+				renderSection(w, "", []string{"", "city", "nodes", "alive", "median"},
+					[]int{2, 24, 5, 5, 7}, cityRows(cityStats), opts.color)
 			}
-			cityStats := groupCities(cs.nodes, probeByKey)
-			if len(cityStats) <= 1 {
-				continue // a single-city country IS its own sub-row
-			}
-			renderSection(w, "", []string{"", "city", "nodes", "alive", "median"},
-				[]int{2, 24, 5, 5, 7}, cityRows(cityStats), opts.color)
 		}
 	}
 
@@ -141,6 +160,136 @@ func locationLabel(cc string) string {
 	return checker.FlagEmoji(up) + " " + strings.ToLower(up) + " " + countryName(up)
 }
 
+// listJSON* are the wire structs of `list --json` (round-7 item 12a): the
+// machine-readable twin of the table — same aggregation, same ordering,
+// color-independent by construction. The schema is pinned by
+// TestListJSONGolden and documented in the README.
+type listJSONDoc struct {
+	GeneratedAt string            `json:"generated_at"`
+	Config      listJSONConfig    `json:"config"`
+	Selection   listJSONMetadata  `json:"selection"`
+	Countries   []listJSONCountry `json:"countries"`
+	ColdBase    *listJSONColdBase `json:"cold_base,omitempty"` // present only under --all
+	// Balancers is the structured W16 routing-target view of the selection
+	// (pool_all / pool_<cc> / pool_unknown with node counts) — the data
+	// behind the table's `balancers:` display line, always present.
+	Balancers []balancerTarget `json:"balancers"`
+}
+
+type listJSONConfig struct {
+	Source string `json:"source"`
+	Path   string `json:"path,omitempty"` // empty when configless
+}
+
+type listJSONMetadata struct {
+	Path  string `json:"path"`
+	Nodes int    `json:"nodes"`
+}
+
+type listJSONCountry struct {
+	Code        string         `json:"code"` // ISO 3166-1 alpha-2, upper case
+	Name        string         `json:"name"`
+	Flag        string         `json:"flag"` // the country's flag emoji
+	Nodes       int            `json:"nodes"`
+	Alive       int            `json:"alive"`
+	MedianRTTms float64        `json:"median_rtt_ms"`
+	Cities      []listJSONCity `json:"cities,omitempty"` // present only under --cities
+}
+
+type listJSONCity struct {
+	City        string  `json:"city"`
+	Nodes       int     `json:"nodes"`
+	Alive       int     `json:"alive"`
+	MedianRTTms float64 `json:"median_rtt_ms"`
+}
+
+type listJSONColdBase struct {
+	Path      string            `json:"path"`
+	Records   int               `json:"records"`
+	Countries []listJSONCountry `json:"countries"`
+}
+
+// balancerTarget is one structured routing target of the current selection
+// (W16): `pool_all` spans the whole pool, `pool_<cc>` is a country
+// balancer, `pool_unknown` the unknown-geo pseudo-location. This is wire
+// data — the table's `balancers:` display line renders from the SAME
+// aggregation (balancerSummary), never a fork and never a parsed string.
+type balancerTarget struct {
+	Name  string `json:"name"`
+	Nodes int    `json:"nodes"`
+}
+
+// jsonCountryName names a grouped row: the English short name for a real
+// code, "unknown" for the unknown-geo pseudo-group (the raw empty country
+// — the table renders the same row as `🏳 unknown`).
+func jsonCountryName(cc string) string {
+	if cc == "" {
+		return "unknown"
+	}
+	return countryName(cc)
+}
+
+// writeListJSON renders the JSON twin. Deterministic: the country/city
+// order is the table's sort order, cold-base rows the table's sort order,
+// and the balancer targets are the table line's own aggregation.
+func writeListJSON(
+	w io.Writer, res *config.Resolved, p paths, sel *model.Selection,
+	countries []selectedStat, probeByKey map[string]store.ProbeResult, opts listOptions,
+) error {
+	doc := listJSONDoc{
+		GeneratedAt: sel.GeneratedAt.Format(time.RFC3339),
+		Config:      listJSONConfig{Source: res.Source.String(), Path: res.Path},
+		Selection:   listJSONMetadata{Path: p.selection, Nodes: len(sel.Nodes)},
+		Countries:   make([]listJSONCountry, 0, len(countries)),
+		Balancers:   balancerTargets(sel.Nodes),
+	}
+	for _, cs := range countries {
+		jc := listJSONCountry{
+			Code:        cs.code,
+			Name:        jsonCountryName(cs.code),
+			Flag:        checker.FlagEmoji(cs.code),
+			Nodes:       len(cs.nodes),
+			Alive:       cs.alive,
+			MedianRTTms: cs.median,
+		}
+		if opts.cities {
+			for _, city := range cityView(cs, probeByKey) {
+				jc.Cities = append(jc.Cities, listJSONCity{
+					City:        strings.TrimPrefix(city.flag, "· "),
+					Nodes:       len(city.nodes),
+					Alive:       city.alive,
+					MedianRTTms: city.median,
+				})
+			}
+		}
+		doc.Countries = append(doc.Countries, jc)
+	}
+	if opts.all {
+		records, err := store.ReadGeo(p.geoBase)
+		if err != nil {
+			return err
+		}
+		cold := &listJSONColdBase{Path: p.geoBase, Records: len(records)}
+		for _, st := range groupCold(records) {
+			cold.Countries = append(cold.Countries, listJSONCountry{
+				Code:        st.code,
+				Name:        jsonCountryName(st.code),
+				Flag:        checker.FlagEmoji(st.code),
+				Nodes:       st.count,
+				Alive:       st.alive,
+				MedianRTTms: st.median,
+			})
+		}
+		doc.ColdBase = cold
+	}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(b, '\n'))
+	return err
+}
+
 // groupSelected aggregates the active core by country, resolving liveness
 // and RTT from the latest probe wave (selection fields are the fallback for
 // nodes without a probe row). Unknown-geo nodes (raw empty country) form
@@ -153,7 +302,7 @@ func groupSelected(sel []model.SelectedNode, probeByKey map[string]store.ProbeRe
 	}
 	out := make([]selectedStat, 0, len(byCountry))
 	for cc, nodes := range byCountry {
-		st := selectedStat{flag: locationLabel(cc), nodes: nodes}
+		st := selectedStat{code: cc, flag: locationLabel(cc), nodes: nodes}
 		st.alive, st.median = aggregate(nodes, func(n model.SelectedNode) (bool, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
 				return pr.Alive, pr.RTTMs
@@ -167,6 +316,22 @@ func groupSelected(sel []model.SelectedNode, probeByKey map[string]store.ProbeRe
 }
 
 // groupCities aggregates one country's nodes by city.
+// cityView is the --cities expansion of one country under the table's
+// suppression rule — the ONE rule both outputs share (the JSON is the
+// table's twin, never a fork): a single-node country needs no sub-rows, and
+// a single-city country IS its own sub-row (two nodes in the same city are
+// not two cities). Nil when the table would render nothing.
+func cityView(cs selectedStat, probeByKey map[string]store.ProbeResult) []selectedStat {
+	if len(cs.nodes) < 2 {
+		return nil
+	}
+	cityStats := groupCities(cs.nodes, probeByKey)
+	if len(cityStats) <= 1 {
+		return nil
+	}
+	return cityStats
+}
+
 func groupCities(nodes []model.SelectedNode, probeByKey map[string]store.ProbeResult) []selectedStat {
 	byCity := map[string][]model.SelectedNode{}
 	for _, n := range nodes {
@@ -202,6 +367,7 @@ func groupCold(records []*model.GeoRecord) []coldStat {
 	out := make([]coldStat, 0, len(byCountry))
 	for cc, group := range byCountry {
 		st := coldStat{
+			code:  cc,
 			flag:  locationLabel(cc),
 			count: len(group),
 		}
@@ -219,11 +385,15 @@ func groupCold(records []*model.GeoRecord) []coldStat {
 	return out
 }
 
-// balancerSummary lists the routing targets the current selection produces
-// at render time (W16): the pool-wide balancer first (annotated "nodes" —
-// it spans the whole pool), then country balancers by code, then the
-// unknown-geo pseudo-location when unknown nodes are selected.
-func balancerSummary(sel []model.SelectedNode) string {
+// balancerTargets aggregates the routing targets the current selection
+// produces at render time (W16): the pool-wide balancer first (it spans the
+// whole pool), then country balancers by code, then the unknown-geo
+// pseudo-location when unknown nodes are selected. THE one aggregation both
+// outputs share: the table's `balancers:` line renders from it
+// (balancerSummary) and `list --json` serializes it directly. City
+// balancers are render-time decisions (>= 2 live nodes per city) and are
+// not listed.
+func balancerTargets(sel []model.SelectedNode) []balancerTarget {
 	counts := map[string]int{}
 	var countries []string
 	unknown := 0
@@ -239,12 +409,27 @@ func balancerSummary(sel []model.SelectedNode) string {
 		counts[cc]++
 	}
 	sort.Strings(countries)
-	parts := []string{fmt.Sprintf("pool_all (%d nodes)", len(sel))}
+	targets := make([]balancerTarget, 0, len(countries)+2)
+	targets = append(targets, balancerTarget{Name: "pool_all", Nodes: len(sel)})
 	for _, cc := range countries {
-		parts = append(parts, fmt.Sprintf("pool_%s (%d)", strings.ToLower(cc), counts[cc]))
+		targets = append(targets, balancerTarget{Name: "pool_" + strings.ToLower(cc), Nodes: counts[cc]})
 	}
 	if unknown > 0 {
-		parts = append(parts, fmt.Sprintf("pool_unknown (%d)", unknown))
+		targets = append(targets, balancerTarget{Name: "pool_unknown", Nodes: unknown})
+	}
+	return targets
+}
+
+// balancerSummary renders balancerTargets as the table's display line
+// (pool_all carries the spelled-out "nodes" — it spans the whole pool).
+func balancerSummary(sel []model.SelectedNode) string {
+	parts := make([]string, 0, len(sel))
+	for _, t := range balancerTargets(sel) {
+		if t.Name == "pool_all" {
+			parts = append(parts, fmt.Sprintf("pool_all (%d nodes)", t.Nodes))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%d)", t.Name, t.Nodes))
 	}
 	return strings.Join(parts, ", ")
 }

@@ -108,7 +108,7 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 3. **filter** — apply the ingest security filter; the survivors are the wave's reference set.
 4. **probe** — out-of-band xray-knife liveness + exit-IP discovery (skipped by `--skip-probe`).
 5. **geo** — per-node in-tunnel self-report: every alive node asks ip-api through its own tunnel (fallback = DoH view; skipped together with probe).
-6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent.
+6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent. CLOSED RULING (owner, round-7 M1): a strict/stats-fatal mode was rejected — stats poll failures are warning-class and **never** fail a wave; the write-loss LOUD exception (data integrity) is the only carve-out, and it stays.
 7. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
 8. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
 9. **render** — rebuild the full client config (template + pool + balancers + observatory, stats/policy ensured).
@@ -123,6 +123,17 @@ Since W10 the sources are **Lua plugins**, not config tables. Every `.lua` file 
 **Lifecycle:** the built-in plugins — `matin`, `epodonios`, `radikal`, `haker` (the four former Go-discovered sources) and `stintikvpn` (the network-API reference plugin) — materialize into the plugins dir on **first run only**. Owner edits and removals persist (delete the whole dir to restore all defaults). A plugin file present = source **active**; remove or rename it (e.g. `haker.lua.off`) to disable. The `publicvpn watch` daemon hot-reloads the dir: a new provider is a new `.lua` file — no rebuild, no restart.
 
 **Plugin contract:** the chunk itself must stay side-effect-free and RETURN its discover `function() → nodes`. All fetching happens inside that function (the load-time check runs the chunk with the network surface loud-disabled — a plugin doing work in the chunk fails the load with a clear error).
+
+### Plugin circuit breaker (`[plugins].max_consecutive_failures`)
+
+A plugin whose run keeps failing is auto-disabled instead of failing every wave forever (owner spec: «автоотключение неотвечающих плагинов, 5 ошибок по дефолту отключают его»):
+
+- A **failure event** is a run-timeout abandonment or a loud run error. A **successful run resets** the plugin's consecutive-failure counter to zero.
+- After `max_consecutive_failures` consecutive failures (default **5**) the plugin is **auto-disabled**: the wave logs `plugin <id> DISABLED after N consecutive failures (breaker limit N)` loud, and the plugin is **excluded from subsequent wave snapshots**.
+- The counter also resets (and a disabled plugin is **re-enabled**) when the plugin **file is edited** — the watchdog reload = you touched it = fresh chance. Removing the file clears the state too.
+- `0` = **unlimited**: the breaker is off, plugins are never auto-disabled (owner no-floor ruling — the counter still accumulates for observability).
+- **Where the state lives:** in the plugin registry. A one-shot run (`publicvpn fetch`) gets a fresh registry per process — and each plugin runs at most once per wave, so at any limit **≥ 2** a one-shot wave can never trip the breaker by itself (an explicit `max_consecutive_failures = 1` is the exception: it trips on the very first failure, one-shot wave included). The `watch` daemon shares its watchdog-maintained registry across waves, so counts and disables **persist for the daemon's lifetime**. There is no state file by design: a daemon restart is deliberately a fresh chance (you restart after fixing plugin files; a systemd WatchdogSec restart behaves the same).
+- Every wave lists currently disabled plugins: `breaker: N plugin(s) disabled — <ids> (a file edit reloads and re-enables)`.
 
 ### Host API reference
 
@@ -190,6 +201,24 @@ publicvpn list --cities --all  # + indented city sub-rows (D5 view) + the cold b
 ```
 
 Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. Unknown-geo nodes in the selection render as their own `🏳 unknown` row, and the `balancers:` line names the routing targets the current selection will produce (W16: `pool_all`, country balancers, `pool_unknown` when present). Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
+
+### `--json` (machine-readable twin)
+
+`publicvpn list --json` prints exactly **one JSON document** on stdout — no human config-source line, no table banners, no color codes (the W12 provenance lives inside it as the `config` object). The data is the same the table renders, same aggregation and ordering (the city sub-rows obey the table's suppression rule; the W16 unknown row and the `balancers:` line data serialize as structured fields), and is **pinned byte-for-byte by a golden test**. Schema:
+
+| Field | Type | Meaning |
+| :-- | :-- | :-- |
+| `generated_at` | string (RFC 3339) | the selection's generation timestamp |
+| `config` | `{source, path?}` | W12 provenance: the resolved config source (`path` omitted when configless) |
+| `selection` | `{path, nodes}` | the selection file read and its node count |
+| `countries[]` | array | the active core grouped by country, table sort order; unknown-geo nodes form their own entry with `code` `""`, `name` `"unknown"`, flag `🏳` (the same row the table renders) |
+| `countries[].code` | string | ISO 3166-1 alpha-2, upper case; `""` = the unknown-geo pseudo-group (not an ISO code) |
+| `countries[].name` / `.flag` | string | English short name / flag emoji (`"unknown"` / `🏳` for the unknown group) |
+| `countries[].nodes` / `.alive` | int | node count / alive count (latest probe wave truth) |
+| `countries[].median_rtt_ms` | number | median RTT of nodes with a positive RTT (`0` when none) |
+| `countries[].cities[]` | array, `--cities` only | city sub-rows (`city`, `nodes`, `alive`, `median_rtt_ms`) — the exact rows the table renders (a single-city country gets none); omitted without `--cities` |
+| `cold_base` | object, `--all` only | `{path, records, countries[]}` — the cold base grouped the same way |
+| `balancers[]` | array | the structured W16 routing targets (`pool_all` / `pool_<cc>` / `pool_unknown` with `nodes` counts) — the data behind the table's `balancers:` line, same aggregation |
 
 ## 🌍 Site check (`check`)
 
@@ -313,13 +342,13 @@ go build -o publicvpn ./cmd/publicvpn
 - **install never creates or moves config files** — the unit references the resolved path; keep that file in place.
 - **No user systemd session?** install fails loud with an actionable message; pass `--no-systemd` to copy the binary only (unit skipped, documented in the output).
 - **`publicvpn uninstall`** — the symmetric teardown: disables the daemon (and any legacy timers still present) → removes every known unit file (current + the W5-era names) → `daemon-reload` → report. User data (config, data dir, installed binary) is **kept by default**; `--purge` (explicit, destructive) also removes the config file and `[data_dir]` — and nothing else, in particular nothing xray-raw.
-- **`publicvpn status`** — install state: installed binary, the watch unit, its enablement (read-only filesystem inspection), a `STALE:` hint when the running binary differs from the installed one (post-`git pull` rebuild without re-install — the exact stale-binary incident class), and a `LEGACY:` hint while old timer units survive. **Default dirs only:** detection reads `~/.local/bin` and `~/.config/systemd/user` — custom `--bin-dir`/`--unit-dir` installs are not tracked (`status` keeps no state file, by design).
+- **`publicvpn status`** — install state: installed binary, the watch unit, its enablement (read-only filesystem inspection), a `STALE:` hint when the running binary differs from the installed one (post-`git pull` rebuild without re-install — the exact stale-binary incident class), and a `LEGACY:` hint while old timer units survive. Detection reads the directories given via `--bin-dir` / `--unit-dir` (defaults identical to `install`: `~/.local/bin` and `~/.config/systemd/user`) — an install made with custom paths is tracked by passing the same values here (`status` keeps no state file, by design).
 
 ## ⏱️ The watch daemon
 
 `publicvpn watch` is the long-running form of the pipeline (what `install` enables):
 
-- **plugin watchdog** — fsnotify on `[plugins].dir`: add/modify of a `.lua` hot-swaps it into the registry (a broken file keeps the **previous version active** with a loud error naming the Lua failure); removal disables the source on the fly;
+- **plugin watchdog** — fsnotify on `[plugins].dir`: add/modify of a `.lua` hot-swaps it into the registry (a broken file keeps the **previous version active** with a loud error naming the Lua failure); removal disables the source on the fly; `Close` is idempotent (double-close is a no-op) and a debounce callback that fires at the shutdown boundary re-checks the closed gate before touching the registry — no reload can begin after `Close` returns;
 - **wave scheduler** — refresh waves every `[maintain].refresh_interval` (**default 1h since W10**), speedtest waves every `[maintain].speedtest_interval` (the speedtest tick runs the full wave with `-S` and covers the refresh); waves re-arm from completion, so they never overlap; the **first wave runs immediately** at start;
 - **stats poll** — inside every wave (the existing stage cadence);
 - **broken-plugin waves** — one dead provider never kills a refresh: per-plugin failures are loud, the healthy plugins carry the wave;
@@ -362,7 +391,7 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 
 | Section | Owns | Notable keys |
 | :-- | :-- | :-- |
-| `[plugins]` | **W10: the source ingest is Lua plugins** | `dir` (default `<data_dir>/plugins`; built-ins materialize on first run; see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), `run_timeout` (default `120s`, `0s` = unbounded — a plugin exceeding it is abandoned loud and the wave continues). The old `[sources.*]` tables fail config load with a loud migration error. |
+| `[plugins]` | **W10: the source ingest is Lua plugins** | `dir` (default `<data_dir>/plugins`; built-ins materialize on first run; see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), `run_timeout` (default `120s`, `0s` = unbounded — a plugin exceeding it is abandoned loud and the wave continues), `max_consecutive_failures` (default `5`, `0` = unlimited — the circuit breaker; see below). The old `[sources.*]` tables fail config load with a loud migration error. |
 | `[fetch]` | download client (the plugins' `github_files` engine) | `timeout`, `retries`, `concurrency`, `api_base`/`raw_base` (mirrors), `github_token`; `cache_max_age` is a W5-era leftover — unused by the plugin ingest |
 | `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
 | `[filter]` | ingest security | `source_cap`, `protocols` (allowlist, ss + hysteria2 opt-in), `allow_insecure` (default `false`) |
@@ -384,7 +413,7 @@ The CLI does not require a config path. `-c/--config` is optional on every comma
 | 1 | `-c <path>` (explicit) | wins **always**; the file must exist — a missing explicit path fails loud naming the path (no silent fall-through) |
 | 2 | `~/.config/publicvpn/config.toml` | used when it exists (the home default) |
 | 3 | `./config.toml` | used when it exists (keeps the repo/owner operational workflow working) |
-| 4 | nothing found | **configless run** — built-in defaults (`data_dir = $XDG_DATA_HOME/publicvpn` when the env var is set, else `~/.local/share/publicvpn`; every other knob at its documented default; the plugins dir defaults under `data_dir`, so the embedded Lua sources materialize there on first run) |
+| 4 | nothing found | **configless run** — built-in defaults (`data_dir = $XDG_DATA_HOME/publicvpn` when the env var is set to an **absolute** path — a set-but-relative value violates the XDG spec, is treated as unset, and prints a loud warning naming the violation; else `~/.local/share/publicvpn`; every other knob at its documented default; the plugins dir defaults under `data_dir`, so the embedded Lua sources materialize there on first run) |
 
 Every command prints the resolved source as a `config:` line (`explicit -c <path>` / `home default <path>` / `cwd default <path>` / `configless (built-in defaults)`), and `status` carries the same line.
 
@@ -404,7 +433,7 @@ go test -race -count=1 ./...  # race detector
 golangci-lint run             # strict gate: 0 issues, caps disabled
 ```
 
-The suite covers every stage with hermetic fixtures: the **W10 plugin matrix** — node-class contract (constructor/collector loudness with plugin + index attribution), the host network API over httptest (GET/POST/headers/redirect-caps/timeout/body-cap, a dynamic ambient-proxy-env test pinning **L5**), the `github_files` helper (include filters, manifest mode, truncated-tree loudness), the sandbox (os/io/require/dofile fail loud, at load-check AND at run time), defaults materialization (first-run-only; owner edits persist), watchdog hot-reload (add/modify/remove/broken-keeps-last-good, `-race`-pinned concurrent reload vs wave snapshots), the daemon scheduler (injected clock: tick order, speedtest-covers-refresh, failure survival, signal-driven clean shutdown), the StintikVPN fixture (nested fetches, per-subscription isolation) plus `live`-tagged real-source runs —: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics — and the W8 check matrix: URL normalization, blockpage classifier, aggregation/ranking math, a golden report (`--no-color`), an in-process SOCKS5 server pinning the **remote-DNS (`socks5h`) contract** behaviorally, engine integration (filters, limits, throttling, verdict classes, staleness hint), and a `live`-tagged real-xray temp-instance lifecycle test (`go test -tags live ./internal/checker/`).
+The suite covers every stage with hermetic fixtures: the **W10 plugin matrix** — node-class contract (constructor/collector loudness with plugin + index attribution), the host network API over httptest (GET/POST/headers/redirect-caps/timeout/body-cap, a dynamic ambient-proxy-env test pinning **L5**), the `github_files` helper (include filters, manifest mode, truncated-tree loudness), the sandbox (os/io/require/dofile fail loud, at load-check AND at run time), defaults materialization (first-run-only; owner edits persist), watchdog hot-reload (add/modify/remove/broken-keeps-last-good, `-race`-pinned concurrent reload vs wave snapshots), the daemon scheduler (injected clock: tick order, speedtest-covers-refresh, failure survival, signal-driven clean shutdown), the StintikVPN fixture (nested fetches, per-subscription isolation) plus `live`-tagged real-source runs —: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics — and the W8 check matrix: URL normalization, blockpage classifier, aggregation/ranking math, a golden report (`--no-color`), an in-process SOCKS5 server pinning the **remote-DNS (`socks5h`) contract** behaviorally, engine integration (filters, limits, throttling, verdict classes, staleness hint), and a `live`-tagged real-xray temp-instance lifecycle test (`go test -tags live ./internal/checker/`) — plus the round-7 pins: the plugin circuit-breaker state machine (4 failures + success reset, 5 → disable, reload re-enable, unlimited mode, wave-level exclusion and loud lines), the `list --json` golden schema, the relative-`XDG_DATA_HOME` validation, watchdog `Close` idempotence and the post-close reload gate, and the gate's start-failure classification seam.
 
 ## 🗺️ Roadmap
 
