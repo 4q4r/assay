@@ -3,6 +3,8 @@ package checker
 import (
 	"sort"
 	"strings"
+
+	"public_vpn/internal/model"
 )
 
 // Aggregate computes the node-level aggregates from the raw attempts:
@@ -106,11 +108,16 @@ func groupBy(rows []*NodeResult, keyOf func(*NodeResult) (string, string)) []Gro
 		if strings.TrimSpace(cc) == "" {
 			cc = "??"
 		}
-		k := cc + "|" + city
+		// The city part of the key is case-folded (model.CityKey): geo
+		// case variants of one city are one bucket. The bucket's displayed
+		// City stays an original spelling — the lowest variant seen.
+		k := cc + "|" + model.CityKey(city)
 		g, ok := byKey[k]
 		if !ok {
-			g = GroupStat{Country: strings.ToUpper(cc), City: city}
+			g = GroupStat{Country: strings.ToUpper(cc), City: strings.TrimSpace(city)}
 			order = append(order, k)
+		} else {
+			g.City = model.CityDisplay(g.City, city)
 		}
 		g.Nodes++
 		g.Total += r.Total
@@ -133,7 +140,7 @@ func groupBy(rows []*NodeResult, keyOf func(*NodeResult) (string, string)) []Gro
 func fillTimings(groups []GroupStat, rows []*NodeResult, keyOf func(*NodeResult) (string, string)) {
 	byKey := map[string]*GroupStat{}
 	for i := range groups {
-		byKey[groups[i].Country+"|"+groups[i].City] = &groups[i]
+		byKey[groups[i].Country+"|"+model.CityKey(groups[i].City)] = &groups[i]
 	}
 	perGroupMedians := map[string][]float64{}
 	speeds := map[string][]float64{}
@@ -142,7 +149,7 @@ func fillTimings(groups []GroupStat, rows []*NodeResult, keyOf func(*NodeResult)
 		if strings.TrimSpace(cc) == "" {
 			cc = "??"
 		}
-		k := strings.ToUpper(cc) + "|" + city
+		k := strings.ToUpper(cc) + "|" + model.CityKey(city)
 		if r.MedianTotalMS > 0 {
 			perGroupMedians[k] = append(perGroupMedians[k], r.MedianTotalMS)
 		}

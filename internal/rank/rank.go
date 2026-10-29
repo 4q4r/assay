@@ -107,12 +107,14 @@ func sortByPrimaryMetrics(cands []candidate) {
 	})
 }
 
-// distinctCities counts the distinct cities among alive candidates.
+// distinctCities counts the distinct cities among alive candidates. The
+// distinctness unit is the folded key (model.CityKey, M-b): case variants
+// of one city count once toward the D7 caps and city diversity.
 func distinctCities(cands []candidate) int {
 	seen := map[string]bool{}
 	for _, c := range cands {
 		if c.rec.City != "" {
-			seen[c.rec.City] = true
+			seen[model.CityKey(c.rec.City)] = true
 		}
 	}
 	return len(seen)
@@ -149,7 +151,7 @@ func greedySelect(cands []candidate, cfg config.SelectConfig, capApplied int) []
 		chosen := cands[pick]
 		picked[pick] = true
 		countryCount[chosen.rec.Country]++
-		cityCount[chosen.rec.City]++
+		cityCount[model.CityKey(chosen.rec.City)]++ // folded: variants are one city (M-b)
 		selected = append(selected, chosen)
 	}
 	return selected
@@ -168,6 +170,9 @@ func nextSelectable(cands []candidate, picked []bool, countryCount map[string]in
 }
 
 // pickWithCityTieBreak scans the head's tie-band for an unrepresented city.
+// Representation is counted through the folded city key (model.CityKey,
+// M-b): a case-variant pair is one represented city, so a variant spelling
+// never counts as city diversity.
 func pickWithCityTieBreak(
 	cands []candidate, picked []bool, countryCount, cityCount map[string]int, cfg config.SelectConfig, base int,
 	tolerance float64,
@@ -182,7 +187,7 @@ func pickWithCityTieBreak(
 		if !sameBand(head, c, tolerance) {
 			break
 		}
-		if cityCount[c.rec.City] == 0 && cityCount[head.rec.City] > 0 {
+		if cityCount[model.CityKey(c.rec.City)] == 0 && cityCount[model.CityKey(head.rec.City)] > 0 {
 			pick = i
 		}
 	}

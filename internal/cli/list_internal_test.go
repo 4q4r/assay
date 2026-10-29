@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -91,6 +92,78 @@ func TestListCitiesExpansion(t *testing.T) {
 	require.Contains(t, out, "· Berlin")
 	require.NotContains(t, out, "· Paris")
 	require.NotContains(t, out, "· Dallas")
+}
+
+// M-b pins: a geo case-variant pair ("Frankfurt am Main" vs
+// "Frankfurt Am Main") is ONE city under `list --cities` — one table row
+// and one JSON entry, both showing the deterministic lowest-string
+// spelling, with the group's merged node counts; the display is identical
+// regardless of node order.
+func TestListCitiesFoldCaseVariants(t *testing.T) {
+	t.Parallel()
+	fraMain := model.SelectedNode{
+		Tag: "pool-de-01", Key: "k-de-1", Country: "de",
+		City: "Frankfurt am Main", RTTMs: 40,
+	}
+	fraAlt := model.SelectedNode{
+		Tag: "pool-de-02", Key: "k-de-2", Country: "de",
+		City: "Frankfurt Am Main", RTTMs: 50,
+	}
+	berlin := model.SelectedNode{
+		Tag: "pool-de-03", Key: "k-de-3", Country: "de",
+		City: "Berlin", RTTMs: 60,
+	}
+
+	capture := func(nodes []model.SelectedNode, opts listOptions) string {
+		t.Helper()
+		dir := t.TempDir()
+		gen := time.Date(2026, 10, 28, 15, 0, 0, 0, time.UTC)
+		require.NoError(t, store.WriteSelection(filepath.Join(dir, "selection.json"),
+			&model.Selection{GeneratedAt: gen, Nodes: nodes}))
+		results := make([]store.ProbeResult, 0, len(nodes))
+		for i, n := range nodes {
+			results = append(results, store.ProbeResult{
+				Key: n.Key, Host: fmt.Sprintf("de%d.example.com", i+1),
+				Alive: true, RTTMs: n.RTTMs, CheckedAt: gen,
+			})
+		}
+		require.NoError(t, store.AppendProbeResults(
+			filepath.Join(dir, "probe-results.jsonl"), results))
+		return runListCapture(t, &config.Config{DataDir: dir}, opts)
+	}
+
+	nodes := []model.SelectedNode{fraMain, fraAlt, berlin}
+	out := capture(nodes, listOptions{cities: true})
+	require.Equal(t, 1, strings.Count(out, "· Frankfurt"),
+		"the case-variant pair is ONE city row, not two")
+	require.Contains(t, out, "· Frankfurt Am Main",
+		"display = the lowest string variant of the group")
+	require.NotContains(t, out, "Frankfurt am Main",
+		"the higher-sorting variant never displays")
+
+	// The JSON twin agrees with the table: same single folded group, same
+	// displayed spelling, merged node count (2 Frankfurt nodes + Berlin).
+	var doc listJSONDoc
+	require.NoError(t, json.Unmarshal([]byte(
+		capture(nodes, listOptions{cities: true, json: true})), &doc))
+	var de *listJSONCountry
+	for i := range doc.Countries {
+		if doc.Countries[i].Code == "DE" {
+			de = &doc.Countries[i]
+		}
+	}
+	require.NotNil(t, de, "the DE country row is present")
+	require.Len(t, de.Cities, 2, "folded Frankfurt group + Berlin")
+	require.Equal(t, "Frankfurt Am Main", de.Cities[0].City,
+		"json city name agrees with the table")
+	require.Equal(t, 2, de.Cities[0].Nodes, "json node count merges the variants")
+
+	// Determinism: reversing the node order must not move the display name.
+	reversed := capture([]model.SelectedNode{berlin, fraAlt, fraMain},
+		listOptions{cities: true})
+	require.Equal(t, 1, strings.Count(reversed, "· Frankfurt"))
+	require.Contains(t, reversed, "· Frankfurt Am Main",
+		"display is order-independent")
 }
 
 func TestListAllColdSection(t *testing.T) {
