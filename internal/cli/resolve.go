@@ -34,13 +34,21 @@ func resolveCommand(explicit string) (*config.Resolved, error) {
 // loud, actionable error. The CWD default is deliberately NOT consulted —
 // the rendered unit embeds the config path and must reference a stable
 // location, never whatever directory the operator happened to stand in.
+// A RELATIVE explicit -c resolves through the SAME single scheme as every
+// other command: config.Resolve joins it onto the injected cwd (round-7
+// item 10 — the pre-fix code passed cwd="" and silently switched to the
+// process-cwd scheme; the cwd default consult above is unaffected).
 func resolveInstallPath(explicit string) (*config.Resolved, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir: %w", err)
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("resolve working directory: %w", err)
+	}
 	if explicit != "" {
-		return config.Resolve(explicit, home, "")
+		return config.Resolve(explicit, home, cwd)
 	}
 	p := config.DefaultHomeConfigPath(home)
 	if _, err := os.Stat(p); err != nil {
@@ -58,10 +66,16 @@ func resolveInstallPath(explicit string) (*config.Resolved, error) {
 
 // reportConfigSource prints the resolved provenance — the visibility
 // contract: every command prints the line, `status` carries it too.
+// Resolution warnings (e.g. a spec-invalid relative XDG_DATA_HOME treated
+// as unset) print loud right after the config line — visible, attributed,
+// never fatal.
 func reportConfigSource(w io.Writer, res *config.Resolved) {
 	if res.Path != "" {
 		outf(w, "config: %s %s\n", res.Source, res.Path)
-		return
+	} else {
+		outf(w, "config: %s\n", res.Source)
 	}
-	outf(w, "config: %s\n", res.Source)
+	for _, warning := range res.Warnings {
+		outf(w, "warning: %s\n", warning)
+	}
 }

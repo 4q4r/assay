@@ -56,8 +56,10 @@ scheduler; [maintain].refresh_interval / [maintain].speedtest_interval and
 restart of the unit, never a re-install. Legacy W5 timer units
 (public_vpn-refresh/speedtest.*) still on disk are disabled and removed by
 this install: waves fire from exactly ONE scheduler. Config files are NEVER
-created or moved: the unit references the resolved --config path, so it must
-be absolute or ~-expanded and must stay in place.
+created or moved: the unit references the resolved --config path (explicit
+-c wins; a relative -c resolves against the current directory and is
+embedded absolute — the same resolution scheme as every other command), so
+it must exist and stay in place.
 
 Install REQUIRES a resolvable config (the unit embeds its path): an explicit
 -c wins and must exist; otherwise the home default
@@ -323,12 +325,15 @@ func binariesDiffer(a, b string) (bool, error) {
 
 // printInstallStatus extends `status` with the install state: binary path,
 // the watch-daemon unit, its enablement, and any legacy W5 timer units still
-// awaiting migration. Read-only: pure filesystem inspection of the user unit
-// dir, no systemctl. The daemon reads intervals from the config live, so —
+// awaiting migration. Read-only: pure filesystem inspection of the given
+// unit dir, no systemctl. binDir/unitDir arrive from the status --bin-dir /
+// --unit-dir flags (defaults = the install defaults) — no hardcoded paths
+// here, so a custom-dir install is tracked by passing the same values
+// (round-7 item 11). The daemon reads intervals from the config live, so —
 // unlike the W5 timers — there is no configured-vs-installed mismatch class.
-func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
+func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unitDir string) {
 	outln(out, "install:")
-	binPath := filepath.Join(config.ExpandHome("~/.local/bin"), "publicvpn")
+	binPath := filepath.Join(binDir, "publicvpn")
 	if st, err := os.Stat(binPath); err == nil {
 		outf(out, "  binary:    %s (mode %s)\n", binPath, st.Mode())
 		// W13 stale-binary notice (the owner's incident): the installed
@@ -347,7 +352,8 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath string) {
 	} else {
 		outln(out, "  binary:    not installed ("+binPath+" missing) — run `publicvpn install`")
 	}
-	unitDir := config.ExpandHome("~/.config/systemd/user")
+	// unitDir arrives already expanded (status flags → ExpandHome at the
+	// caller); the rest of this function only joins names onto it.
 	_, watchErr := os.Stat(filepath.Join(unitDir, install.WatchService))
 	if watchErr != nil {
 		outln(out, "  units:     watch daemon not rendered ("+unitDir+")")

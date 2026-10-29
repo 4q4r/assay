@@ -38,6 +38,7 @@ type Watchdog struct {
 	mu      sync.Mutex
 	closed  bool // Close set: pending debounce callbacks must skip reload
 	pending map[string]*time.Timer
+	once    sync.Once // Close teardown runs exactly once (idempotent Close)
 }
 
 // Start performs the initial full load (materialize defaults + compile
@@ -80,19 +81,39 @@ func start(dir string, log io.Writer, debounce time.Duration) (*plugins.Registry
 
 // Close stops the watcher and the reload loop. The registry keeps its last
 // state (the daemon is shutting down anyway).
+//
+// Idempotent (round-7 hardening): a second Close is a no-op returning nil —
+// the teardown runs once (sync.Once), so a double-Close can neither panic
+// on close-of-closed-channel nor double-stop the watcher.
+//
+// Mid-reload window, honestly documented: a debounce callback that fired
+// just before Close may already be past its own closed check and inside
+// reload when Close returns. The guard is the closed flag itself — reload
+// re-checks it after acquiring mu, so any reload ENTERED after Close's
+// critical section mutates nothing. What remains theoretical: a reload
+// that passed its re-check BEFORE Close armed the flag can still be
+// mid-Compile (os.ReadFile + Lua compile, ms-scale) when Close returns,
+// and its registry write may land marginally after Close returns. Close
+// does not wait for such an in-flight reload by design: at daemon shutdown
+// the process is exiting anyway, and no reload can BEGIN after Close
+// returns.
 func (w *Watchdog) Close() error {
-	w.mu.Lock()
-	w.closed = true
-	w.mu.Unlock()
-	close(w.stop)
-	<-w.stopped
-	w.mu.Lock()
-	for _, t := range w.pending {
-		t.Stop()
-	}
-	w.pending = map[string]*time.Timer{}
-	w.mu.Unlock()
-	return w.watcher.Close()
+	var err error
+	w.once.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		w.mu.Unlock()
+		close(w.stop)
+		<-w.stopped
+		w.mu.Lock()
+		for _, t := range w.pending {
+			t.Stop()
+		}
+		w.pending = map[string]*time.Timer{}
+		w.mu.Unlock()
+		err = w.watcher.Close()
+	})
+	return err
 }
 
 func (w *Watchdog) loop() {
@@ -155,6 +176,18 @@ func (w *Watchdog) schedule(name string) {
 //   - broken file   → LOUD error, previous version stays active (last-good);
 //   - vanished file → treated as removal (source disabled).
 func (w *Watchdog) reload(name string) {
+	// Reload-internal closed gate (round-7): the callback body checks
+	// closed before calling reload, but a callback that fired just before
+	// Close may still enter here after Close's critical section. Re-check
+	// under the mutex so a post-Close entry mutates nothing (the remaining
+	// theoretical window — a reload already past THIS check when Close
+	// arms the flag — is documented at Close).
+	w.mu.Lock()
+	closed := w.closed
+	w.mu.Unlock()
+	if closed {
+		return
+	}
 	code, err := os.ReadFile(name)
 	if errors.Is(err, os.ErrNotExist) {
 		w.removeNow(name)

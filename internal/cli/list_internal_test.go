@@ -58,7 +58,8 @@ func listFixture(t *testing.T) (*config.Config, string) {
 func runListCapture(t *testing.T, cfg *config.Config, opts listOptions) string {
 	t.Helper()
 	out := &bytes.Buffer{}
-	require.NoError(t, runList(out, cfg, opts))
+	res := &config.Resolved{Config: cfg, Source: config.SourceConfigless}
+	require.NoError(t, runList(out, res, opts))
 	return out.String()
 }
 
@@ -103,7 +104,7 @@ func TestListAllColdSection(t *testing.T) {
 func TestListNoSelectionFailsLoud(t *testing.T) {
 	cfg := &config.Config{DataDir: t.TempDir()}
 	out := &bytes.Buffer{}
-	err := runList(out, cfg, listOptions{})
+	err := runList(out, &config.Resolved{Config: cfg, Source: config.SourceConfigless}, listOptions{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no active selection")
 }

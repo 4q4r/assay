@@ -16,24 +16,48 @@ import (
 // under the read lock. A wave takes ONE snapshot at its start and runs
 // against it — mid-wave reloads never affect a running wave (pinned by
 // -race tests).
+//
+// The registry also owns the plugin circuit breaker state (round-7 item 6):
+// consecutive failure counts per plugin, and the auto-disabled set. Both
+// live HERE — the one structure every wave consumer shares — so a one-shot
+// run gets per-process state (each plugin runs at most once per wave, so at
+// any limit ≥ 2 a one-shot wave can never trip the breaker by itself; an
+// explicit limit of 1 trips on the first failure regardless) and the watch
+// daemon gets state that PERSISTS across waves for the daemon's lifetime
+// via its watchdog-maintained registry. No file: a daemon restart is
+// deliberately a fresh chance (the operator restarts after fixing plugin
+// files; a WatchdogSec restart behaves the same).
 type Registry struct {
-	mu     sync.RWMutex
-	byID   map[string]*Plugin
-	broken map[string]error // last loud failure per plugin id (status/debug)
+	mu       sync.RWMutex
+	byID     map[string]*Plugin
+	broken   map[string]error // last loud failure per plugin id (status/debug)
+	fails    map[string]int   // consecutive failure events per plugin id (breaker)
+	disabled map[string]bool  // breaker-tripped plugins, excluded from snapshots
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{byID: map[string]*Plugin{}, broken: map[string]error{}}
+	return &Registry{
+		byID:     map[string]*Plugin{},
+		broken:   map[string]error{},
+		fails:    map[string]int{},
+		disabled: map[string]bool{},
+	}
 }
 
 // Snapshot returns the current plugins sorted by id (deterministic wave
-// order — identical inputs must always run identically).
+// order — identical inputs must always run identically). Breaker-disabled
+// plugins are EXCLUDED: they never enter subsequent waves until re-enabled
+// (a successful run is impossible while excluded, so re-enabling happens
+// via a file reload — Set — i.e. the owner editing the file).
 func (r *Registry) Snapshot() []*Plugin {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]*Plugin, 0, len(r.byID))
 	for _, p := range r.byID {
+		if r.disabled[p.ID] {
+			continue
+		}
 		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -41,24 +65,76 @@ func (r *Registry) Snapshot() []*Plugin {
 }
 
 // Set upserts a compiled plugin; reports whether it replaced a previous
-// version.
+// version. A reload = the owner touched the file = a FRESH CHANCE: the
+// breaker counter resets to zero and a breaker-disabled plugin is
+// re-enabled (it re-enters the next wave snapshot).
 func (r *Registry) Set(p *Plugin) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, existed := r.byID[p.ID]
 	r.byID[p.ID] = p
 	delete(r.broken, p.ID)
+	delete(r.fails, p.ID)
+	delete(r.disabled, p.ID)
 	return existed
 }
 
-// Remove disables a plugin (watchdog removal event = source off).
+// Remove disables a plugin (watchdog removal event = source off). The
+// breaker state goes with it — a re-added file starts from zero.
 func (r *Registry) Remove(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, existed := r.byID[id]
 	delete(r.byID, id)
 	delete(r.broken, id)
+	delete(r.fails, id)
+	delete(r.disabled, id)
 	return existed
+}
+
+// RecordSuccess folds one SUCCESSFUL plugin run into the breaker state:
+// the consecutive-failure counter resets to zero.
+func (r *Registry) RecordSuccess(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.fails, id)
+}
+
+// RecordFailure folds one FAILURE event (a run-timeout abandonment or a
+// loud run error) into the breaker state. maxFailures is the configured
+// limit: <= 0 means UNLIMITED — the breaker is off and the plugin is never
+// disabled (the counter still accumulates for observability). When the
+// limit is reached the plugin is AUTO-DISABLED and the method reports true
+// exactly once, at the tripping event.
+func (r *Registry) RecordFailure(id string, maxFailures int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fails[id]++
+	if maxFailures <= 0 || r.disabled[id] || r.fails[id] < maxFailures {
+		return false
+	}
+	r.disabled[id] = true
+	return true
+}
+
+// DisabledPlugins returns the breaker-disabled ids, sorted (status surface).
+func (r *Registry) DisabledPlugins() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.disabled))
+	for id := range r.disabled {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// FailureCount reports the current consecutive-failure counter for one
+// plugin (status/debug surface).
+func (r *Registry) FailureCount(id string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fails[id]
 }
 
 // Len reports the number of live plugins.
