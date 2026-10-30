@@ -13,6 +13,7 @@ import (
 	"public_vpn/internal/config"
 	"public_vpn/internal/model"
 	"public_vpn/internal/store"
+	"public_vpn/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -29,7 +30,6 @@ func newListCommand(cfgPath *string) *cobra.Command {
 	var (
 		cities  bool
 		all     bool
-		noColor bool
 		jsonOut bool
 	)
 	cmd := &cobra.Command{
@@ -42,11 +42,12 @@ func newListCommand(cfgPath *string) *cobra.Command {
 			}
 			color := false
 			if !jsonOut {
-				reportConfigSource(cmd.OutOrStdout(), res)
-				color, err = resolveColor("auto", noColor, cmd.OutOrStdout())
+				mode, noColor := commandColorFlags(cmd)
+				color, err = resolveColor(mode, noColor, cmd.OutOrStdout())
 				if err != nil {
 					return err
 				}
+				reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
 			}
 			return runList(cmd.OutOrStdout(), res, listOptions{
 				cities: cities, all: all, color: color, json: jsonOut,
@@ -57,10 +58,9 @@ func newListCommand(cfgPath *string) *cobra.Command {
 		"show indented city sub-rows under multi-city countries (the D5 two-layer view)")
 	cmd.Flags().BoolVar(&all, "all", false,
 		"append the cold base (geo-base) as a separate section, grouped the same way")
-	cmd.Flags().BoolVar(&noColor, "no-color", false,
-		"disable colors (NO_COLOR is honored too; default is terminal-detected)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false,
 		"emit one machine-readable JSON document instead of the table (schema in the README)")
+	attachColorFlags(cmd)
 	return cmd
 }
 
@@ -114,29 +114,21 @@ func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 		return writeListJSON(w, res, p, sel, countries, probeByKey, opts)
 	}
 
-	outf(w, "publicvpn pool inventory — active core: %d nodes (selection: %s)\n",
-		len(sel.Nodes), sel.GeneratedAt.Format(time.RFC3339))
+	// W18 screen: header accent + selection provenance chip, then the ONE
+	// bordered table (countries; --cities adds tree-glyph city sub-rows
+	// under their country), then the pools chip footer.
+	outln(w, ui.Header("📦 pool inventory — active core: "+strconv.Itoa(len(sel.Nodes))+" nodes", opts.color))
+	_, _ = fmt.Fprintln(w, ui.Chip("selection:", sel.GeneratedAt.Format(time.RFC3339), opts.color))
 
-	renderSection(w, "LOCATION", []string{"loc", "nodes", "alive", "median"},
-		[]int{6, 5, 5, 7}, countryRows(countries, 0), opts.color)
-
-	if opts.cities {
-		for _, cs := range countries {
-			if cityStats := cityView(cs, probeByKey); cityStats != nil {
-				renderSection(w, "", []string{"", "city", "nodes", "alive", "median"},
-					[]int{2, 24, 5, 5, 7}, cityRows(cityStats), opts.color)
-			}
-		}
-	}
+	_, _ = io.WriteString(w, ui.Table(listColumns(), listRows(countries, opts.cities, probeByKey), opts.color))
 
 	if opts.all {
 		records, err := store.ReadGeo(p.geoBase)
 		if err != nil {
 			return err
 		}
-		outf(w, "\ncold base: %d records (%s)\n", len(records), p.geoBase)
-		renderSection(w, "LOCATION", []string{"loc", "nodes", "alive", "median"},
-			[]int{6, 5, 5, 7}, coldRows(groupCold(records)), opts.color)
+		_, _ = fmt.Fprintf(w, "\ncold base: %d records (%s)\n", len(records), p.geoBase)
+		_, _ = io.WriteString(w, ui.Table(listColumns(), coldRows(groupCold(records)), opts.color))
 	}
 
 	// W16 balancer awareness: the routing targets the current selection will
@@ -144,8 +136,49 @@ func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 	// balancers, and the unknown-geo pseudo-location when selected. City
 	// balancers are render-time decisions (>= 2 live nodes per city) and are
 	// not listed here.
-	outf(w, "\nbalancers: %s\n", balancerSummary(sel.Nodes))
+	_, _ = fmt.Fprintln(w, "\n"+ui.Chip("⚖️ pools:", balancerSummary(sel.Nodes), opts.color))
 	return nil
+}
+
+// listColumns is the shape every list section renders (countries, expanded
+// cities, cold base): one column set for the whole screen.
+func listColumns() []ui.Column {
+	return []ui.Column{
+		{Header: "loc", Width: 6},
+		{Header: "nodes", Width: 5, Right: true},
+		{Header: "alive", Width: 5, Right: true},
+		{Header: "median", Width: 7, Right: true},
+	}
+}
+
+// listRows builds the active-core table rows: one row per country and —
+// under --cities — tree-glyph city sub-rows directly beneath their country
+// (the D5 two-layer view in ONE table; no duplicate header blocks).
+func listRows(countries []selectedStat, cities bool, probeByKey map[string]store.ProbeResult) [][]ui.Cell {
+	rows := make([][]ui.Cell, 0, len(countries))
+	for _, st := range countries {
+		rows = append(rows, []ui.Cell{
+			{S: st.flag},
+			{S: strconv.Itoa(len(st.nodes))},
+			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, len(st.nodes))},
+			{S: checker.FormatMS(st.median), Color: ui.TrafficName(st.median)},
+		})
+		if !cities {
+			continue
+		}
+		cityStats := cityView(st, probeByKey)
+		for i, city := range cityStats {
+			rows = append(rows, []ui.Cell{
+				// RAW glyph (the dim styling applies through the cell color —
+				// glyph and city name are dim 240 together, owner spec).
+				{S: ui.TreeGlyph(i, len(cityStats), false) + city.flag, Color: ui.ColorPlainName},
+				{S: strconv.Itoa(len(city.nodes))},
+				{S: strconv.Itoa(city.alive), Color: aliveColor(city.alive, len(city.nodes))},
+				{S: checker.FormatMS(city.median), Color: ui.TrafficName(city.median)},
+			})
+		}
+	}
+	return rows
 }
 
 // locationLabel renders one location row's display label: flag + code +
@@ -255,7 +288,7 @@ func writeListJSON(
 		if opts.cities {
 			for _, city := range cityView(cs, probeByKey) {
 				jc.Cities = append(jc.Cities, listJSONCity{
-					City:        strings.TrimPrefix(city.flag, "· "),
+					City:        city.flag,
 					Nodes:       len(city.nodes),
 					Alive:       city.alive,
 					MedianRTTms: city.median,
@@ -355,7 +388,9 @@ func groupCities(nodes []model.SelectedNode, probeByKey map[string]store.ProbeRe
 	}
 	out := make([]selectedStat, 0, len(byCity))
 	for k, group := range byCity {
-		st := selectedStat{flag: "· " + display[k], nodes: group}
+		// flag = the deterministic display name (no prefix — the table adds
+		// the tree glyph at render time, the JSON twin uses the name as-is).
+		st := selectedStat{flag: display[k], nodes: group}
 		st.alive, st.median = aggregate(group, func(n model.SelectedNode) (bool, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
 				return pr.Alive, pr.RTTMs
@@ -486,65 +521,30 @@ func median(values []float64) float64 {
 	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
-// renderSection renders one table through the shared checker renderer (the
-// ONE table implementation in the repo, shared with `check`). Rows arrive
-// pre-built; callers own their column shapes.
-func renderSection(w io.Writer, title string, headers []string, widths []int, rows [][]checker.TableCell, color bool) {
-	if title != "" {
-		outln(w, title)
-	}
-	_, _ = io.WriteString(w, checker.RenderTable(headers, widths, rows, color))
-}
-
-func countryRows(stats []selectedStat, indent int) [][]checker.TableCell {
-	rows := make([][]checker.TableCell, 0, len(stats))
+// coldRows builds the cold-base section rows (same columns as the active
+// core table).
+func coldRows(stats []coldStat) [][]ui.Cell {
+	rows := make([][]ui.Cell, 0, len(stats))
 	for _, st := range stats {
-		rows = append(rows, []checker.TableCell{
-			{S: strings.Repeat(" ", indent) + st.flag},
-			{S: strconv.Itoa(len(st.nodes))},
-			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, len(st.nodes))},
-			{S: checker.FormatMS(st.median)},
-		})
-	}
-	return rows
-}
-
-func cityRows(stats []selectedStat) [][]checker.TableCell {
-	rows := make([][]checker.TableCell, 0, len(stats))
-	for _, st := range stats {
-		rows = append(rows, []checker.TableCell{
-			{S: "  "},
-			{S: st.flag},
-			{S: strconv.Itoa(len(st.nodes))},
-			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, len(st.nodes))},
-			{S: checker.FormatMS(st.median)},
-		})
-	}
-	return rows
-}
-
-func coldRows(stats []coldStat) [][]checker.TableCell {
-	rows := make([][]checker.TableCell, 0, len(stats))
-	for _, st := range stats {
-		rows = append(rows, []checker.TableCell{
+		rows = append(rows, []ui.Cell{
 			{S: st.flag},
 			{S: strconv.Itoa(st.count)},
 			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, st.count)},
-			{S: checker.FormatMS(st.median)},
+			{S: checker.FormatMS(st.median), Color: ui.TrafficName(st.median)},
 		})
 	}
 	return rows
 }
 
-// aliveColor: green when every node is alive, yellow for a mixed group,
-// red for none — the same rate classes the check report uses.
+// aliveColor: green when every node is alive, amber for a mixed group,
+// red for none — the ui palette classes the whole CLI shares (W18).
 func aliveColor(alive, total int) string {
 	switch {
 	case alive == total && total > 0:
-		return "green"
+		return ui.Green
 	case alive > 0:
-		return "yellow"
+		return ui.Amber
 	default:
-		return "red"
+		return ui.Red
 	}
 }

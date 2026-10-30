@@ -208,8 +208,10 @@ func TestRunInactiveUnitIsHealthFailure(t *testing.T) {
 }
 
 func TestRunIsActiveExecErrorIsHealthFailure(t *testing.T) {
-	ex := &fakeExecutor{errs: []error{nil, errors.New("exit status 3"), errors.New("exit status 3"),
-		errors.New("exit status 3"), errors.New("exit status 3"), errors.New("exit status 3")}}
+	ex := &fakeExecutor{errs: []error{
+		nil, errors.New("exit status 3"), errors.New("exit status 3"),
+		errors.New("exit status 3"), errors.New("exit status 3"), errors.New("exit status 3"),
+	}}
 	_, err := restart.Run(restart.Input{Executor: ex, SocksPort: 10808, Sleep: noSleep})
 	require.Error(t, err)
 	var he *restart.HealthError

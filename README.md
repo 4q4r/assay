@@ -32,6 +32,7 @@
 - [⚖️ Pool balancers (W16)](#️-pool-balancers-w16)
 - [🩺 The probe wave (W14, real xray)](#-the-probe-wave-w14-real-xray)
 - [🔃 xray core update (`xray-update`)](#-xray-core-update-xray-update)
+- [🖥️ Terminal UI (W18)](#️-terminal-ui-w18)
 - [🚀 Requirements](#-requirements)
 - [⚡ Quick Start](#-quick-start)
 - [📦 Self-install / uninstall](#-self-install--uninstall)
@@ -304,6 +305,34 @@ A piped confirmation (e.g. `echo y | publicvpn xray-update`) **is** accepted —
 
 **Root-owned target (the `/usr/bin/xray` reality):** when the target's directory is not writable, the command stages everything under `<data_dir>/xray-staged`, prints the **exact privileged commands** (backup + `sudo install -m 0755 <staged> <target>`), and exits 1 — never a half-apply. The staged, `-test`-passed binary survives for you to apply manually. **User-level alternative:** point `[activate].xray_bin` at `~/.local/bin/xray` and `xray-update` applies freely without sudo. The GitHub API host follows the `[fetch].api_base` mirror knob (one mirror surface for the whole pipeline).
 
+## 🖥️ Terminal UI (W18)
+
+Every CLI screen is styled by **one package** (`internal/ui`) on [charmbracelet lipgloss v2](https://github.com/charmbracelet/lipgloss) — one palette, one bordered-table builder, one color contract. `NO_COLOR`, `--color=never`, and the `--no-color` alias strip **every ANSI byte** (color-off output is byte-stable and golden-pinned); `--color=always` forces styling on pipes; `auto` (the default) follows terminal detection.
+
+**Screens**
+
+| Screen | Treatment |
+| --- | --- |
+| `list` | `config:` provenance chip → `📦 pool inventory` header accent → ONE bordered table (countries; `--cities` adds tree-glyph city sub-rows under their country) → `⚖️ pools:` chip footer. `--json` is the untouched color-independent twin (zero ANSI, pinned). |
+| `check` | Bordered per-node table + geo summaries (countries; cities with tree glyphs); section titles carry the accent; recommendation locations and speeds are info-bold; `--save` JSON untouched. |
+| `status` | Title accent + every label:value line as a chip (dim label, info value); `install:` block carries a header accent; `STALE` stays a **red** warning, `LEGACY` and resolution warnings are **amber**. |
+| `maintain` / `activate` / `xray-update` / `install` | Final **verdict lines** chip-styled (`activation complete:`, `restart:` green on success, `wave verdict:` amber on DONE_WITH, `xray-update:` outcome lines); **stage progress lines stay plain** — journald-friendly by construction. |
+
+**Traffic-light legend** (code-owned display constants, not knobs): median RTT (`list`) and the `rtt` / `ttfb` / `avg` columns and geo medians/avgs (`check`) are colored by latency band — 🟢 **green 46** under 400 ms · 🟠 **amber 214** at 400–799 ms · 🔴 **red 196** at 800 ms and above. An em dash (no data) keeps the row's verdict color: missing data is not a latency.
+
+**Tree legend**: city sub-rows render under their country with `├──` / `└──` connectors in dim gray — the last sub-row always closes with `└──`. Geo case variants of one city stay ONE row (deterministic lowest-string display), and the ordering is node count first, name second — the same aggregation the `--json` twin serializes.
+
+**Chips ("плашки")**: compact `label value` pairs — dim-gray label (241) + bold info-blue value (45) — carry service info (config path, data dir, selection timestamp, balancer targets, install state). Table borders are dim (238); header rows bold (99).
+
+**Dependencies** (the W18 delta — everything else pre-existing):
+
+| Module | Version | Role |
+| :-- | :-- | :-- |
+| `charm.land/lipgloss/v2` | v2.0.6 | terminal styling, bordered tables (the current v2 line — v1 paths are frozen upstream) |
+| `github.com/charmbracelet/x/ansi` | v0.11.8 | ANSI-aware display widths (flag emoji = 2 cells) |
+| `github.com/charmbracelet/colorprofile` + `x/term`, `x/termios`, `ultraviolet` | transitives | profile detection under lipgloss v2 |
+| `github.com/clipperhouse/displaywidth`, `uax29`, `lucasb-eyer/go-colorful`, `mattn/go-runewidth`, `muesli/cancelreader`, `rivo/uniseg`, `xo/terminfo`, `golang.org/x/sync` | transitives | grapheme widths, color math, lipgloss support |
+
 ## 📂 Project Structure
 
 ```text
@@ -326,6 +355,7 @@ public_vpn/
 │   ├── render/             # W3/W5/W16 renderer: transports, country/city/unknown/all balancers, L1 gate
 │   ├── activate/           # -test gate + backup + atomic replace (never restarts)
 │   ├── install/            # W5 self-install: binary copy, unit rendering, allowlisted systemctl seam
+│   ├── ui/                 # W18 the ONE terminal-styling owner: lipgloss palette, traffic light, tree glyphs, chips, bordered table builder
 │   └── store/              # JSONL cold base, probe log, selection — all writes atomic
 ├── systemd/                # the watch-daemon unit TEMPLATE (single source of truth, go:embed'd by install) + embed.go
 ├── config.example.toml     # sanitized template (defaults + schema comments); real config.toml stays local, gitignored

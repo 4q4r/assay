@@ -119,7 +119,7 @@ func TestListJSONCitiesMirrorTableSuppression(t *testing.T) {
 	cfg := &config.Config{DataDir: dir}
 
 	table := runListCapture(t, cfg, listOptions{cities: true})
-	tableCityRows := strings.Count(table, "· ")
+	tableCityRows := strings.Count(table, "├── ") + strings.Count(table, "└── ")
 
 	doc := runListJSON(t, cfg, listOptions{cities: true})
 	jsonCityRows := 0
