@@ -196,7 +196,11 @@ func (g *GeoRecord) ApplyProbe(alive bool, rttMs float64, speedBPS int64, probed
 // Selection is the outcome of the select stage: the active node set with
 // assigned pool tags, grouped so the renderer can build balancers.
 type Selection struct {
-	GeneratedAt time.Time      `json:"generated_at"`
+	GeneratedAt time.Time `json:"generated_at"`
+	// CapApplied is the selection bound actually applied. W19 semantics:
+	// every [select] cap defaults to UNBOUNDED, so when no cap is configured
+	// CapApplied equals len(Nodes) (every alive node went active); an
+	// explicit cap knob reports the bound it enforced.
 	CapApplied  int            `json:"cap_applied"`
 	CitiesAlive int            `json:"cities_alive"`
 	Nodes       []SelectedNode `json:"nodes"`

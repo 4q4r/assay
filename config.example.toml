@@ -87,8 +87,10 @@ allow_insecure = false
 # xray-knife keys (path/db_path/check_preset/url_success_threshold/max_passed)
 # fail the load loud with their migration text.
 timeout = "10s"                      # per-attempt HTTP timeout
-threads = 8                          # parallel temp-instance workers (each is a real xray
-                                     # process; boot windows serialize inside the factory)
+threads = 32                         # parallel temp-instance workers (each is a real xray
+                                     # process; W19 default — saturates the boot-serialization
+                                     # ceiling so wave wall time stays bounded-minutes per 1000
+                                     # nodes; the semaphore still bounds instantaneous load)
 attempts = 3                         # HTTP GETs per node: all success = passed, some =
                                      # semi-passed, none = failed (skip_fresh_within is strict)
 url = "https://cloudflare.com/cdn-cgi/trace"  # the liveness target
@@ -134,10 +136,15 @@ timeout = "15s"                        # bounds ONE through-tunnel HTTP request 
                                        # and each fallback hop alike)
 
 [select]
-per_country_cap = 3        # K: nodes per country (design guidance 3–5)
-soft_cap = 25              # N: global soft cap
-city_expand_threshold = 25 # expand N when ≥ this many distinct cities are alive
-ceiling = 40               # expansion bound (CPU safety)
+# W19 (owner order): every cap defaults to UNBOUNDED — absent/0 = ALL alive
+# nodes go active (the unknown-geo group included) and land in the country/
+# city balancers. An explicit positive value keeps its D7 cap semantics.
+# per_country_cap = 3      # K: nodes per country (0/absent = unlimited — the default)
+# soft_cap = 25            # N: global soft cap (0/absent = unbounded — the default;
+#                          # city expansion is moot when unbounded)
+# city_expand_threshold = 25 # expand N when ≥ this many distinct cities are alive
+#                          # (0/absent = expansion off)
+# ceiling = 40             # expansion bound (0/absent = bounded only by the alive count)
 tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance joins the band
 
 [render]
@@ -148,8 +155,12 @@ stats_port = 15490                            # api/stats inbound, bound to 127.
 pool_inbound_tags = ["socks-in", "http-in"]   # tags every pool rule carries; each MUST exist
                                               # among the template's inbounds or the render
                                               # fails loud (no silent D2 fall-through)
-observatory_interval = "60s"                  # Plan-A pool observatory probeInterval — verbatim
-                                              # passthrough, deliberately unbounded (owner ruling)
+observatory_interval = "60s"                  # Plan-A pool observatory probeInterval. ABSENT =
+                                              # ADAPTIVE (W19 default): the render computes
+                                              # max(60s, ceil(active×200ms)) so observatory probes
+                                              # stay ≤ 5/s at any pool size. An explicit value is a
+                                              # verbatim passthrough, deliberately unbounded
+                                              # (owner ruling)
 tcp_max_seg = 1440                            # emitted MANDATORILY on every pool outbound
                                               # (anti-TSPU MSS clamp); value configurable,
                                               # emission not. NO range validation.

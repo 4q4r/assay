@@ -2,6 +2,7 @@ package render_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -65,8 +66,11 @@ const twoInbounds = `[
 // TestKnobDefaultsPreserveW3Shape pins the default-preservation contract: an
 // empty knob surface (zero-value Config fields beyond StatsPort/PoolRoutes)
 // renders byte-identical pool artifacts to the W3 baseline — inboundTag
-// [socks-in http-in], probeInterval 60s, tcpMaxSeg 1440, fingerprint firefox,
-// tolerance 0.2.
+// [socks-in http-in], tcpMaxSeg 1440, fingerprint firefox, tolerance 0.2 —
+// with one W19 divergence: an ABSENT observatory_interval is now ADAPTIVE
+// (render-time computation from the active count), whose 60s floor for this
+// 1-node selection spells as Go duration "1m0s" (same value the core parsed
+// from the old fixed "60s" default).
 func TestKnobDefaultsPreserveW3Shape(t *testing.T) {
 	in, renderFn := knobFixture(t, twoInbounds)
 	in.Cfg = render.Config{ // zero values everywhere except the W3-era fields
@@ -88,7 +92,7 @@ func TestKnobDefaultsPreserveW3Shape(t *testing.T) {
 	assert.Equal(t, []any{"socks-in", "http-in"}, poolRule["inboundTag"])
 
 	obs := m["observatory"].(map[string]any)
-	assert.Equal(t, "60s", obs["probeInterval"])
+	assert.Equal(t, "1m0s", obs["probeInterval"], "W19: absent knob → adaptive interval (60s floor at this pool size)")
 
 	outbounds := m["outbounds"].([]any)
 	var pool map[string]any
@@ -187,6 +191,70 @@ func TestRenderKnobValuesRenderVerbatim(t *testing.T) {
 	assert.InDelta(t, 1380, stream["sockopt"].(map[string]any)["tcpMaxSeg"], 1e-9)
 	assert.Equal(t, "chrome", reality["fingerprint"])
 	assert.InDelta(t, 0.55, strategy["tolerance"], 1e-9)
+}
+
+// TestObservatoryIntervalAdaptive pins the W19 load-engineering formula: an
+// ABSENT observatory_interval makes the render compute the pool observatory
+// probeInterval from the ACTIVE COUNT —
+//
+//	interval = max(60s, ceil(N × 200ms))   (200ms = 1 / 5 probes-per-sec target)
+//
+// so sustained observatory probes stay ≤ 5/s regardless of pool growth
+// (code-owned budget, deliberately no new knob). An explicit interval keeps
+// verbatim precedence (TestRenderKnobValuesRenderVerbatim). The
+// subjectSelector is untouched by the scaling — ["pool-"] covers EVERY pool
+// outbound regardless of count (L2).
+func TestObservatoryIntervalAdaptive(t *testing.T) {
+	tmpl := `{
+	  "log": {"loglevel": "warning"},
+	  "inbounds": ` + twoInbounds + `,
+	  "outbounds": [
+	    {"tag": "direct", "protocol": "freedom"},
+	    {"tag": "block", "protocol": "blackhole"}
+	  ],
+	  "routing": {"rules": [
+	    {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}
+	  ]}
+	}`
+	build := func(t *testing.T, n int) map[string]any {
+		t.Helper()
+		sel := &model.Selection{}
+		byKey := map[string]*model.Node{}
+		for i := range n {
+			node := model.NewNode("s", "vless", fmt.Sprintf("%032d", i),
+				fmt.Sprintf("n%d.example.com", i), 443,
+				map[string]string{"security": "tls", "type": "tcp"})
+			byKey[node.Key] = node
+			sel.Nodes = append(sel.Nodes, model.SelectedNode{
+				Tag: fmt.Sprintf("pool-de-%02d", i+1), Key: node.Key, Country: "de",
+			})
+		}
+		res, err := render.Render(render.Input{
+			Template: []byte(tmpl), Selection: sel, NodesByKey: byKey,
+			Cfg: render.Config{StatsPort: 15490},
+		})
+		require.NoError(t, err)
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(res.Config, &m))
+		return m
+	}
+
+	for _, tc := range []struct {
+		active int
+		want   string
+		note   string
+	}{
+		{3, "1m0s", "small pool rides the 60s floor (the old fixed default)"},
+		{259, "1m0s", "the owner's live pool: 259×200ms=51.8s < 60s floor → 60s"},
+		{1000, "3m20s", "1000×200ms=200s exactly"},
+		{3001, "10m1s", "3001×200ms=600.2s, ceil → 601s (probes/sec ≤ 5)"},
+	} {
+		m := build(t, tc.active)
+		obs, ok := m["observatory"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, tc.want, obs["probeInterval"], "active=%d: %s", tc.active, tc.note)
+		assert.Equal(t, []any{"pool-"}, obs["subjectSelector"], "L2: coverage namespace never scales away")
+	}
 }
 
 // TestBalancerToleranceAppliesToCityBalancersToo pins the second consumption
