@@ -1,0 +1,11 @@
+📦 pool inventory — active core: 4 nodes
+selection: 2026-10-28T15:00:00Z
+┌─────────────────────┬───────┬───────┬─────────┐
+│ loc                 │ nodes │ alive │  median │
+├─────────────────────┼───────┼───────┼─────────┤
+│ 🇩🇪 de Germany       │     2 │     1 │    46ms │
+│ 🇫🇷 fr France        │     1 │     1 │    60ms │
+│ 🇺🇸 us United States │     1 │     0 │   149ms │
+└─────────────────────┴───────┴───────┴─────────┘
+
+⚖️ pools: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)

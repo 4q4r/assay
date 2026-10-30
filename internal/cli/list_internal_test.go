@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,10 +65,34 @@ func runListCapture(t *testing.T, cfg *config.Config, opts listOptions) string {
 	return out.String()
 }
 
+// multiCityFixture writes a selection + probes for arbitrary nodes (the
+// tree-hierarchy fixture: one multi-city country plus a single-city one).
+func multiCityFixture(t *testing.T, nodes []model.SelectedNode) (*config.Config, string) {
+	t.Helper()
+	dir := t.TempDir()
+	gen := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, store.WriteSelection(filepath.Join(dir, "selection.json"),
+		&model.Selection{GeneratedAt: gen, CapApplied: len(nodes), Nodes: nodes}))
+	results := make([]store.ProbeResult, 0, len(nodes))
+	for i, n := range nodes {
+		results = append(results, store.ProbeResult{
+			Key: n.Key, Host: fmt.Sprintf("h%d.example.com", i+1),
+			Alive: true, RTTMs: n.RTTMs, CheckedAt: gen,
+		})
+	}
+	require.NoError(t, store.AppendProbeResults(
+		filepath.Join(dir, "probe-results.jsonl"), results))
+	return &config.Config{DataDir: dir}, gen.Format(time.RFC3339)
+}
+
 func TestListGroupsActiveCoreByCountry(t *testing.T) {
 	cfg, gen := listFixture(t)
 	out := runListCapture(t, cfg, listOptions{})
-	require.Contains(t, out, fmt.Sprintf("active core: 4 nodes (selection: %s)", gen))
+	// Owner header (verbatim) + the selection provenance as its own dim chip.
+	require.Contains(t, out, "📦 pool inventory — active core: 4 nodes")
+	require.Contains(t, out, "selection: "+gen)
+	require.NotContains(t, out, fmt.Sprintf("active core: 4 nodes (selection: %s)", gen),
+		"the selection timestamp moved to its own provenance chip line")
 	// Node-count ordering: de (2) first, then fr/us (1 each, name-ordered).
 	deIdx := strings.Index(out, "🇩🇪 de Germany")
 	frIdx := strings.Index(out, "🇫🇷 fr France")
@@ -87,11 +112,15 @@ func TestListGroupsActiveCoreByCountry(t *testing.T) {
 func TestListCitiesExpansion(t *testing.T) {
 	cfg, _ := listFixture(t)
 	out := runListCapture(t, cfg, listOptions{cities: true})
-	// Germany has two cities → indented sub-rows; single-city countries get none.
-	require.Contains(t, out, "· Frankfurt")
-	require.Contains(t, out, "· Berlin")
-	require.NotContains(t, out, "· Paris")
-	require.NotContains(t, out, "· Dallas")
+	// Germany has two cities → tree-glyph sub-rows UNDER the country row
+	// (alphabetical: Berlin opens ├──, Frankfurt closes └──);
+	// single-city countries get none (W16 suppression rule unchanged).
+	require.Contains(t, out, "├── Berlin")
+	require.Contains(t, out, "└── Frankfurt")
+	require.NotContains(t, out, "├── Frankfurt", "Frankfurt is the last sub-row (└──)")
+	require.NotContains(t, out, "└── Paris")
+	require.NotContains(t, out, "├── Paris")
+	require.NotContains(t, out, "├── Dallas")
 }
 
 // M-b pins: a geo case-variant pair ("Frankfurt am Main" vs
@@ -134,10 +163,12 @@ func TestListCitiesFoldCaseVariants(t *testing.T) {
 
 	nodes := []model.SelectedNode{fraMain, fraAlt, berlin}
 	out := capture(nodes, listOptions{cities: true})
-	require.Equal(t, 1, strings.Count(out, "· Frankfurt"),
+	require.Equal(t, 1, strings.Count(out, "Frankfurt Am Main"),
 		"the case-variant pair is ONE city row, not two")
-	require.Contains(t, out, "· Frankfurt Am Main",
-		"display = the lowest string variant of the group")
+	require.Contains(t, out, "├── Frankfurt Am Main",
+		"the folded 2-node pair sorts first (node-count order) and opens ├──")
+	require.Contains(t, out, "└── Berlin",
+		"the 1-node city closes the tree with └──")
 	require.NotContains(t, out, "Frankfurt am Main",
 		"the higher-sorting variant never displays")
 
@@ -161,9 +192,50 @@ func TestListCitiesFoldCaseVariants(t *testing.T) {
 	// Determinism: reversing the node order must not move the display name.
 	reversed := capture([]model.SelectedNode{berlin, fraAlt, fraMain},
 		listOptions{cities: true})
-	require.Equal(t, 1, strings.Count(reversed, "· Frankfurt"))
-	require.Contains(t, reversed, "· Frankfurt Am Main",
-		"display is order-independent")
+	require.Equal(t, 1, strings.Count(reversed, "Frankfurt Am Main"))
+	require.Contains(t, reversed, "├── Frankfurt Am Main",
+		"display is order-independent (node-count tree order regardless of node order)")
+}
+
+// W18 tree hierarchy: --cities sub-rows live INSIDE the one country table
+// (glyphs ├──/└── under their country row), never as duplicate header
+// blocks. First/mid/last glyph order is pinned with a three-city country.
+func TestListTreeHierarchy(t *testing.T) {
+	nodes := []model.SelectedNode{
+		{Tag: "pool-de-01", Key: "k-de-1", Country: "de", City: "Aachen", RTTMs: 30},
+		{Tag: "pool-de-02", Key: "k-de-2", Country: "de", City: "Berlin", RTTMs: 60},
+		{Tag: "pool-de-03", Key: "k-de-3", Country: "de", City: "Cologne", RTTMs: 850},
+		{Tag: "pool-fr-01", Key: "k-fr-1", Country: "fr", City: "Paris", RTTMs: 60},
+	}
+	cfg, _ := multiCityFixture(t, nodes)
+	out := runListCapture(t, cfg, listOptions{cities: true})
+	deIdx := strings.Index(out, "🇩🇪 de Germany")
+	require.GreaterOrEqual(t, deIdx, 0)
+	aachen := strings.Index(out, "├── Aachen")
+	berlin := strings.Index(out, "├── Berlin")
+	cologne := strings.Index(out, "└── Cologne")
+	frIdx := strings.Index(out, "🇫🇷 fr France")
+	require.Greater(t, aachen, deIdx, "cities render under their country")
+	require.Greater(t, berlin, aachen, "glyph order: first/mid/last")
+	require.Greater(t, cologne, berlin)
+	require.Greater(t, frIdx, cologne, "the next country renders after the tree block")
+	require.Equal(t, 1, strings.Count(out, "loc "),
+		"ONE table header — cities never get their own header block")
+	require.Equal(t, 1, strings.Count(out, "│ loc"),
+		"one bordered table for countries + city sub-rows")
+	// Cologne 850ms ≥ 800 → the red traffic light on a city median cell.
+	colored := runListCapture(t, cfg, listOptions{cities: true, color: true})
+	require.Contains(t, colored, "38;5;196", "≥800ms median is red (owner spec)")
+}
+
+// W18 JSON purity: --json output is a pure JSON document — zero ANSI bytes
+// even though the underlying data carries colorable values.
+func TestListJSONPurity(t *testing.T) {
+	cfg, _ := listFixture(t)
+	out := runListCapture(t, cfg, listOptions{json: true})
+	require.NotContains(t, out, "\x1b", "JSON must never carry ANSI styling")
+	require.True(t, json.Valid([]byte(out)), "output is valid JSON")
+	require.Contains(t, out, `"median_rtt_ms": 45.5`, "JSON numbers unchanged (color-independent twin)")
 }
 
 func TestListAllColdSection(t *testing.T) {
@@ -182,26 +254,38 @@ func TestListNoSelectionFailsLoud(t *testing.T) {
 	require.Contains(t, err.Error(), "no active selection")
 }
 
+// W18 golden: the bordered, chip-rendered list screen (color-off bytes).
+// First run materializes testdata/golden-list-plain.txt; later runs pin it.
+// The golden was REGENERATED deliberately for the lipgloss migration —
+// deltas (bordered table, header/pools chips, selection chip line) are
+// documented in the W18 report.
 func TestListColorOffGolden(t *testing.T) {
-	cfg, gen := listFixture(t)
+	cfg, _ := listFixture(t)
 	out := runListCapture(t, cfg, listOptions{})
-	want := "publicvpn pool inventory — active core: 4 nodes (selection: " + gen + ")\n" +
-		"LOCATION\n" +
-		"loc                  nodes  alive  median\n" +
-		"🇩🇪 de Germany        2      1      46ms\n" +
-		"🇫🇷 fr France         1      1      60ms\n" +
-		"🇺🇸 us United States  1      0      149ms\n" +
-		"\nbalancers: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)\n"
-	require.Equal(t, want, out)
+	goldenPath := filepath.Join("testdata", "golden-list-plain.txt")
+	golden, err := os.ReadFile(goldenPath)
+	if err != nil {
+		require.NoError(t, os.MkdirAll("testdata", 0o750), "testdata dir")
+		require.NoError(t, os.WriteFile(goldenPath, []byte(out), 0o644),
+			"first run materializes the golden")
+		return
+	}
+	require.Equal(t, string(golden), out,
+		"list output diverged from testdata/golden-list-plain.txt — regenerate deliberately")
 }
 
-func TestListColorsAppliedWhenEnabled(t *testing.T) {
+// W18: median cells carry the owner traffic light (46/214/196); the screen
+// with color on contains the exact SGR codes; color-off stays clean.
+func TestListTrafficLightColors(t *testing.T) {
 	cfg, _ := listFixture(t)
 	colored := runListCapture(t, cfg, listOptions{color: true})
 	plain := runListCapture(t, cfg, listOptions{})
 	require.NotEqual(t, colored, plain, "color mode must add ANSI sequences")
-	require.Contains(t, colored, "\x1b[", "expected ANSI escapes")
+	require.Contains(t, colored, "\x1b[")
 	require.NotContains(t, plain, "\x1b[")
+	require.Contains(t, colored, "38;5;46", "green median (46ms < 400) is 46")
+	require.Contains(t, colored, "38;5;214", "amber alive (de 1/2 partial) is 214")
+	require.Contains(t, colored, "38;5;196", "red alive (us 0/1 dead) is 196")
 }
 
 func TestCountryNameFallback(t *testing.T) {
@@ -246,8 +330,8 @@ func TestListUnknownGroupAndBalancers(t *testing.T) {
 	out := runListCapture(t, cfg, listOptions{all: true})
 	require.Contains(t, out, "🏳 unknown", "the unknown group renders as its own location row")
 	require.Contains(t, out,
-		"balancers: pool_all (3 nodes), pool_de (1), pool_unknown (2)",
-		"the balancers line names pool_all, country targets, and the unknown target")
+		"⚖️ pools: pool_all (3 nodes), pool_de (1), pool_unknown (2)",
+		"the pools chip names pool_all, country targets, and the unknown target")
 	require.Contains(t, out, "🏳 unknown", "the cold section groups unknown-geo records the same way")
 }
 
@@ -256,6 +340,6 @@ func TestListUnknownGroupAndBalancers(t *testing.T) {
 func TestListBalancersLineKnownOnly(t *testing.T) {
 	cfg, _ := listFixture(t)
 	out := runListCapture(t, cfg, listOptions{})
-	require.Contains(t, out, "balancers: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)")
+	require.Contains(t, out, "⚖️ pools: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)")
 	require.NotContains(t, out, "pool_unknown", "no unknown-geo nodes — no pool_unknown target")
 }

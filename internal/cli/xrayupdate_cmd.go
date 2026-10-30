@@ -32,10 +32,15 @@ func newXrayUpdateCommand(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res)
-			return runXrayUpdate(cmd, res.Config, checkOnly, binPath, assumeYes)
+			color, err := commandColor(cmd, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
+			return runXrayUpdate(cmd, res.Config, checkOnly, binPath, assumeYes, color)
 		},
 	}
+	attachColorFlags(cmd)
 	cmd.Flags().BoolVar(&checkOnly, "check", false,
 		"report the latest release vs the current binary version; download nothing")
 	cmd.Flags().StringVar(&binPath, "bin", "", "target binary path override (default: [activate].xray_bin)")
@@ -43,7 +48,9 @@ func newXrayUpdateCommand(cfgPath *string) *cobra.Command {
 	return cmd
 }
 
-func runXrayUpdate(cmd *cobra.Command, cfg *config.Config, checkOnly bool, binPath string, assumeYes bool) error {
+func runXrayUpdate(cmd *cobra.Command, cfg *config.Config,
+	checkOnly bool, binPath string, assumeYes bool, color bool,
+) error {
 	p := newPaths(cfg)
 	target := config.ExpandHome(cfg.Activate.XrayBin)
 	if binPath != "" {
@@ -53,6 +60,7 @@ func runXrayUpdate(cmd *cobra.Command, cfg *config.Config, checkOnly bool, binPa
 		CheckOnly:  checkOnly,
 		TargetPath: target,
 		AssumeYes:  assumeYes,
+		Color:      color,
 		APIBase:    cfg.Fetch.APIBase,
 		StagingDir: filepath.Join(p.dataDir, "xray-staged"),
 		Stdin:      cmd.InOrStdin(),

@@ -83,17 +83,21 @@ func TestRenderReportExtremeValuesWidenColumns(t *testing.T) {
 	}
 	out := RenderReport(rep, RenderOptions{Color: false, Top: 10})
 	lines := strings.Split(out, "\n")
-	require.GreaterOrEqual(t, len(lines), 6)
-	header, overflow, normal := lines[3], lines[4], lines[5]
+	require.GreaterOrEqual(t, len(lines), 8)
+	header, overflow, normal := lines[4], lines[6], lines[7]
 
 	// Row-to-row byte offsets are the honest alignment check (both rows
-	// carry identical flag-emoji geometry; a header-vs-row byte compare
-	// would be skewed by the emoji's 8 bytes, not by real alignment).
-	assert.Equal(t, strings.Index(normal, "3/3"), strings.Index(overflow, "0/100000"),
+	// carry identical flag-emoji geometry). W18: numeric columns are
+	// RIGHT-aligned, so values end at the same offset — compare value END
+	// offsets (start + length), not start offsets.
+	assert.Equal(t, strings.Index(normal, "3/3")+len("3/3"),
+		strings.Index(overflow, "0/100000")+len("0/100000"),
 		"ok column must hold the full attempt count, aligned across rows")
-	assert.Equal(t, strings.Index(normal, "200"), strings.Index(overflow, "403"),
+	assert.Equal(t, strings.Index(normal, "200")+len("200"),
+		strings.Index(overflow, "403")+len("403"),
 		"statuses column must stay aligned under an overflowing ok cell")
-	assert.Equal(t, strings.Index(normal, "1.2MB/s"), strings.Index(overflow, "1536.0MB/s"),
+	assert.Equal(t, strings.Index(normal, "1.2MB/s")+len("1.2MB/s"),
+		strings.Index(overflow, "1536.0MB/s")+len("1536.0MB/s"),
 		"speed column must stay aligned under a ≥1GB/s value")
 	assert.Contains(t, overflow, "0/100000", "attempt count must not be clipped")
 	assert.Contains(t, overflow, "1536.0MB/s", "extreme speed must not be clipped")
@@ -114,15 +118,35 @@ func TestRenderReportGoldenNoColor(t *testing.T) {
 		"rendered report diverged from the golden file — if intentional, regenerate testdata/golden-check-report.txt deliberately")
 }
 
+// W18 palette: the shared ui traffic-light trio replaced the ANSI16 codes
+// (32/33/31 → 38;5;46/38;5;214/38;5;196). Same assertion strength — the
+// color classes are still pinned, the byte spelling updated.
 func TestRenderReportColorAndNoColor(t *testing.T) {
 	colored := RenderReport(goldenReport(), RenderOptions{Color: true, Top: 3})
 	plain := RenderReport(goldenReport(), RenderOptions{Color: false, Top: 3})
-	assert.Contains(t, colored, "\x1b[32m", "green success must be colored by default")
-	assert.Contains(t, colored, "\x1b[31m", "red fail must be colored by default")
-	assert.NotContains(t, colored, "\x1b[33m\x1b[33m", "no accidental double-wrap")
+	assert.Contains(t, colored, "\x1b[38;5;46m", "green success must be colored (46)")
+	assert.Contains(t, colored, "\x1b[38;5;196m", "red fail must be colored (196)")
+	assert.NotContains(t, colored, "\x1b[38;5;214m\x1b[38;5;214m", "no accidental double-wrap")
 	assert.NotContains(t, plain, "\x1b[", "no ANSI in --no-color mode")
-	assert.Contains(t, RenderReport(goldenReport(), RenderOptions{Color: true, Top: 3}), "\x1b[33m",
-		"yellow partial must be colored")
+	assert.Contains(t, colored, "\x1b[38;5;214m",
+		"amber partial must be colored (214)")
+}
+
+// W18 owner traffic light on the check table: rtt/ttfb/avg cells are
+// colored by the LATENCY bands (<400 green 46, 400–799 amber 214,
+// ≥800 red 196), overriding the row verdict color; dash cells keep the
+// verdict color (no data is not a latency).
+func TestRenderReportTrafficLightCells(t *testing.T) {
+	// goldenReport: ok node rtt 45 / ttfb 210 / avg 480 → the first two are
+	// green, the avg amber. partial: rtt 120 / ttfb 380 / avg 640 → same
+	// classes. blocked/dead rows have no latency data — dashes carry the
+	// red verdict.
+	out := RenderReport(goldenReport(), RenderOptions{Color: true, Top: 3})
+	require.Contains(t, out, "38;5;46m45ms", "45ms rtt is green (<400)")
+	require.Contains(t, out, "38;5;46m210ms", "210ms ttfb is green (<400)")
+	require.Contains(t, out, "38;5;214m480ms", "480ms avg is amber (400–799)")
+	require.Contains(t, out, "38;5;214m640ms", "640ms avg is amber (400–799)")
+	require.Contains(t, out, "38;5;196m—", "a failed node's dash keeps the red verdict color")
 }
 
 func TestFlagEmoji(t *testing.T) {

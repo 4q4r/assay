@@ -11,6 +11,7 @@ import (
 
 	"public_vpn/internal/config"
 	"public_vpn/internal/install"
+	"public_vpn/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -88,16 +89,22 @@ session.`,
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res.res)
+			color, err := commandColor(cmd, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			reportConfigSourceStyled(cmd.OutOrStdout(), res.res, color)
 			return runInstall(cmd.OutOrStdout(), res.res.Config, res.res.Path, installOptions{
 				binDir:          binDir,
 				unitDir:         unitDir,
 				noSystemd:       noSystemd,
 				embedsConfig:    res.embedsConfig,
 				materializePath: res.materializePath,
+				color:           color,
 			})
 		},
 	}
+	attachColorFlags(cmd)
 	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin", "directory for the installed publicvpn binary")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user", "systemd user unit directory")
 	cmd.Flags().BoolVar(&noSystemd, "no-systemd", false,
@@ -168,6 +175,8 @@ type installOptions struct {
 	// no config anywhere in the install-style chain): install materializes
 	// the embedded default config there and the unit runs plain `watch`.
 	materializePath string
+	// color chips the summary block (W18); resolved by the command wrapper.
+	color bool
 }
 
 func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOptions) error {
@@ -204,21 +213,22 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
-	outf(w, "installed binary: %s (copy of the running image, mode 0755)\n", res.BinaryPath)
+	outf(w, "%s\n", ui.ChipKV("installed binary: ", res.BinaryPath+" (copy of the running image, mode 0755)", opts.color))
 	if res.ConfigWritten != "" {
-		outf(w, "config created:   %s (materialized defaults — edit to configure; "+
-			"a re-install never overwrites it)\n", res.ConfigWritten)
+		outf(w, "%s\n", ui.ChipKV("config created:   ", res.ConfigWritten+
+			" (materialized defaults — edit to configure; a re-install never overwrites it)", opts.color))
 	}
 	if res.ConfigKept != "" {
-		outf(w, "config kept:      %s (already present — never overwritten)\n", res.ConfigKept)
+		outf(w, "%s\n", ui.ChipKV("config kept:      ",
+			res.ConfigKept+" (already present — never overwritten)", opts.color))
 	}
 	if res.SkippedUnits {
-		outln(w, "systemd units skipped (--no-systemd): no timers installed; "+
-			"run the maintain wave manually or from your own scheduler")
+		outf(w, "%s\n", ui.ChipKV("systemd units skipped (--no-systemd): ",
+			"no timers installed; run the maintain wave manually or from your own scheduler", opts.color))
 		return nil
 	}
-	printInstallSummary(w, cfg, cfgAbs, daemonCfg(opts, cfgPath), res)
-	outln(w, "journal: journalctl --user -u public_vpn-watch.service -f")
+	printInstallSummary(w, cfg, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
+	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u public_vpn-watch.service -f", opts.color))
 	return nil
 }
 
@@ -236,23 +246,32 @@ func daemonCfg(opts installOptions, cfgPath string) string {
 // legacy cleanup, and the config guidance — explicit-path installs name the
 // referenced file, default-location installs name where the daemon reads
 // its config and what the owner must fill to activate.
-func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs, daemonCfgPath string, res install.Result) {
+func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs string,
+	daemonCfgPath string, res install.Result, color bool,
+) {
 	for _, p := range res.UnitPaths {
-		outf(w, "unit written:     %s\n", p)
+		outf(w, "%s\n", ui.ChipKV("unit written:     ", p, color))
 	}
-	outln(w, "daemon active:    publicvpn watch (Restart=always) — wave intervals and the plugins dir")
-	outln(w, "                  are read from the config live (a change needs a restart, not a re-install)")
+	outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+		"publicvpn watch (Restart=always) — wave intervals and the plugins dir", color))
+	outf(w, "%s\n", ui.ChipKV("                  ",
+		"are read from the config live (a change needs a restart, not a re-install)", color))
 	for _, name := range res.LegacyCleaned {
-		outf(w, "legacy removed:   %s (W5 timer unit — the daemon replaced the timers)\n", name)
+		outf(w, "%s\n", ui.ChipKV("legacy removed:   ",
+			name+" (W5 timer unit — the daemon replaced the timers)", color))
 	}
 	if cfgAbs != "" {
-		outf(w, "config reference: %s (install never creates or moves it — keep it in place)\n", cfgAbs)
+		outf(w, "%s\n", ui.ChipKV("config reference: ",
+			cfgAbs+" (install never creates or moves it — keep it in place)", color))
 		return
 	}
-	outf(w, "daemon config:    %s (the daemon reads the default location — no -c in the unit)\n", daemonCfgPath)
+	outf(w, "%s\n", ui.ChipKV("daemon config:    ",
+		daemonCfgPath+" (the daemon reads the default location — no -c in the unit)", color))
 	if cfg != nil && cfg.Render.Template == "" && cfg.Activate.Target == "" {
-		outln(w, "to activate:      fill [render].template and [activate].target in the config above;")
-		outln(w, "                  until then render/activate fail loud at their stage boundary (data stages run)")
+		outf(w, "%s\n", ui.ChipKV("to activate:      ",
+			"fill [render].template and [activate].target in the config above;", color))
+		outf(w, "%s\n", ui.ChipKV("                  ",
+			"until then render/activate fail loud at their stage boundary (data stages run)", color))
 	}
 }
 
@@ -429,11 +448,12 @@ func binariesDiffer(a, b string) (bool, error) {
 // here, so a custom-dir install is tracked by passing the same values
 // (round-7 item 11). The daemon reads intervals from the config live, so —
 // unlike the W5 timers — there is no configured-vs-installed mismatch class.
-func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unitDir string) {
-	outln(out, "install:")
+func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unitDir string, color bool) {
+	outln(out, ui.Header("install:", color))
 	binPath := filepath.Join(binDir, "publicvpn")
 	if st, err := os.Stat(binPath); err == nil {
-		outf(out, "  binary:    %s (mode %s)\n", binPath, st.Mode())
+		outf(out, "%s\n", ui.ChipKV("  binary:    ",
+			fmt.Sprintf("%s (mode %s)", binPath, st.Mode()), color))
 		// W13 stale-binary notice (the owner's incident): the installed
 		// binary does NOT self-update on `git pull` — a rebuilt-but-not-
 		// reinstalled binary keeps running OLD code under the daemon unit.
@@ -442,21 +462,24 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 		// from the install by definition).
 		if running, e := os.Executable(); e == nil && running != binPath {
 			if differ, shaErr := binariesDiffer(running, binPath); shaErr == nil && differ {
-				outln(out, "  STALE:     running binary differs from the installed one — "+
+				outf(out, "%s\n", ui.Warn("  STALE:     running binary differs from the installed one — "+
 					"the installed binary does not self-update; re-run `publicvpn install` "+
-					"(self-copy) and restart public_vpn-watch.service to load the new code")
+					"(self-copy) and restart public_vpn-watch.service to load the new code", ui.Red, color))
 			}
 		}
 	} else {
-		outln(out, "  binary:    not installed ("+binPath+" missing) — run `publicvpn install`")
+		outf(out, "%s\n", ui.ChipKV("  binary:    ",
+			"not installed ("+binPath+" missing) — run `publicvpn install`", color))
 	}
 	// unitDir arrives already expanded (status flags → ExpandHome at the
 	// caller); the rest of this function only joins names onto it.
 	_, watchErr := os.Stat(filepath.Join(unitDir, install.WatchService))
 	if watchErr != nil {
-		outln(out, "  units:     watch daemon not rendered ("+unitDir+")")
+		outf(out, "%s\n", ui.ChipKV("  units:     ",
+			"watch daemon not rendered ("+unitDir+")", color))
 	} else {
-		outf(out, "  units:     %s present in %s\n", install.WatchService, unitDir)
+		outf(out, "%s\n", ui.ChipKV("  units:     ",
+			fmt.Sprintf("%s present in %s", install.WatchService, unitDir), color))
 		enabled := false
 		for _, wants := range []string{"default.target.wants", "multi-user.target.wants"} {
 			if _, err := os.Stat(filepath.Join(unitDir, wants, install.WatchService)); err == nil {
@@ -468,11 +491,12 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 			if cfg.Maintain.SpeedtestWaveEnabled() {
 				speedtest = install.Span(cfg.Maintain.SpeedtestWavePeriod())
 			}
-			outln(out, "  service:   enabled (wants symlink) — waves: refresh "+
-				install.Span(cfg.Maintain.RefreshInterval.Duration)+", speedtest "+
-				speedtest+" (read live from the config)")
+			outf(out, "%s\n", ui.ChipKV("  service:   ",
+				fmt.Sprintf("enabled (wants symlink) — waves: refresh %s, speedtest %s (read live from the config)",
+					install.Span(cfg.Maintain.RefreshInterval.Duration), speedtest), color))
 		} else {
-			outln(out, "  service:   not enabled — run `publicvpn install`")
+			outf(out, "%s\n", ui.ChipKV("  service:   ",
+				"not enabled — run `publicvpn install`", color))
 		}
 	}
 	legacy := install.LegacyUnitNames()
@@ -484,11 +508,12 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 	}
 	if present > 0 {
 		if cfgPath != "" {
-			outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate\n",
-				present, cfgPath)
+			outf(out, "%s\n", ui.Warn(fmt.Sprintf(
+				"  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate",
+				present, cfgPath), ui.Amber, color))
 		} else {
-			outf(out, "  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install` "+
-				"with a config (-c or %s) to migrate\n", present, config.ShareConfigDisplay)
+			outf(out, "%s\n", ui.Warn(fmt.Sprintf("  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install` "+
+				"with a config (-c or %s) to migrate", present, config.ShareConfigDisplay), ui.Amber, color))
 		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"public_vpn/internal/checker"
 	"public_vpn/internal/config"
 	"public_vpn/internal/render"
+	"public_vpn/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -80,39 +81,18 @@ geo.ttl.`,
 	return cmd
 }
 
-// resolveColor applies the --color mode: auto = a terminal decides (and
-// NO_COLOR / the --no-color alias force off); always/never force it. The
-// --no-color alias is kept for muscle memory and wins over a conflicting
-// --color — the explicit "off" is the safer reading of contradictory input.
+// resolveColor applies the --color mode contract — the CLI seam delegates
+// to the ui package (W18: ONE color-contract implementation for every
+// screen). The --no-color alias is kept for muscle memory and wins over a
+// conflicting --color — the explicit "off" is the safer reading of
+// contradictory input.
 func resolveColor(mode string, noColor bool, out io.Writer) (bool, error) {
-	switch mode {
-	case "always":
-		return !noColor, nil
-	case "never":
-		return false, nil
-	case "auto":
-	default:
-		return false, fmt.Errorf("invalid --color %q (want auto|always|never)", mode)
-	}
-	if noColor || os.Getenv("NO_COLOR") != "" {
-		return false, nil
-	}
-	return writerIsTerminal(out), nil
+	return ui.Resolve(mode, noColor, out)
 }
 
 // writerIsTerminal reports whether w is a character device (a TTY). A
 // non-file writer (pipes, buffers, tests) is never a terminal.
-func writerIsTerminal(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
+func writerIsTerminal(w io.Writer) bool { return ui.WriterIsTerminal(w) }
 
 func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkFlags) error {
 	p := newPaths(cfg)
