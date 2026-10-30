@@ -21,10 +21,14 @@ import (
 )
 
 // DefaultConcurrency bounds how many temp instances exist at once (each is
-// a full xray process). Deliberately below the knife era's 20 threads: the
-// engine boots REAL cores now, and the factory serializes boot windows via
-// its boot mutex anyway.
-const DefaultConcurrency = 8
+// a full xray process). W19: 32 — enough workers to saturate the factory's
+// boot-serialization ceiling (~10 boots/sec; the HTTP phase is parallel), so
+// wave wall time stays bounded-minutes per 1000 nodes while the semaphore
+// still bounds instantaneous load. The engine boots REAL cores: the boot
+// mutex remains the true bottleneck, and 32 workers keep every core busy
+// behind it. An explicit [probe].threads (the owner's live 20) is
+// untouched by this default.
+const DefaultConcurrency = 32
 
 // exitIPURL is the through-tunnel endpoint the engine reads the D8 exit IP
 // from (the SAME ip-api self-report call the geo stage makes — one mental
@@ -36,7 +40,7 @@ const exitIPURL = "http://ip-api.com/json/"
 // Options configures one probe wave.
 type Options struct {
 	Timeout time.Duration // per-attempt HTTP timeout
-	// Threads is the parallel temp-instance worker count (0 = default 8).
+	// Threads is the parallel temp-instance worker count (0 = default 32).
 	// Boot windows serialize inside the factory; the HTTP phase is parallel.
 	Threads   int
 	URL       string // probe target URL

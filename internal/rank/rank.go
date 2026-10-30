@@ -1,8 +1,11 @@
-// Package rank implements the select stage (W2, D5/D7): rank alive nodes by
-// checks then speed (rtt as tiebreaker), enforce the per-country cap K
-// (unknown-geo nodes share one "unknown" cap group — W16), apply the global
-// soft cap N that expands to cover city diversity (bounded by the ceiling),
-// and assign flat pool-<cc>-NN tags (cc=xx for unknown geo).
+// Package rank implements the select stage (W2, D5/D7; W19 unbounded flip):
+// rank alive nodes by checks then speed (rtt as tiebreaker). Every [select]
+// cap defaults to UNBOUNDED (owner order «259 живых, значит 259 раскидываются
+// по балансирам стран и городов»): absent/0 = ALL alive nodes go active —
+// per-country K unlimited, no soft cap, no ceiling, unknown-geo group
+// included — so the render carries every alive node into the country/city
+// balancers. An explicit positive knob keeps its D7 cap semantics. Tags are
+// flat pool-<cc>-NN (cc=xx for unknown geo).
 package rank
 
 import (
@@ -19,6 +22,13 @@ import (
 // as fully checked. maxAliveAge is the geo.ttl wiring: alive data whose
 // last_probe is older (or absent) is stale liveness evidence and the node is
 // not selectable until re-probed; 0 disables expiry (review finding 7).
+//
+// W19 cap doctrine (owner no-floor/no-ceiling ruling class — knobs stay, the
+// DEFAULT is unbounded): a zero-value SelectConfig selects every alive
+// candidate, so the wave emits ALL alive nodes across the country/city
+// balancers and the city-expansion threshold is moot (nothing left to
+// expand). The unbounded path is O(N log N): one sort + one pass — no
+// greedy rescanning.
 func Select(
 	nodes []*model.Node,
 	geo []*model.GeoRecord,
@@ -65,6 +75,18 @@ func collectCandidates(
 		}
 		c := candidate{node: n, rec: g}
 		if pr, ok := probeByKey[n.Key]; ok {
+			// W19 own-result liveness gate: the geo record is PER IDENTITY
+			// (scheme+host+port) but a link variant's liveness belongs to its
+			// OWN latest probe. Several parse records can share one identity;
+			// without this gate a variant whose own probe failed (unrenderable
+			// link, dead transport) rides the sibling's alive geo record into
+			// the selection — the caps used to hide it (it ranks last on
+			// checks=0), the unbounded default would hand it to the renderer
+			// and fail the whole wave loud (L9). A node with NO probe entry
+			// stays admissible (checks 1,1 — the documented cold-base path).
+			if !pr.Alive {
+				continue
+			}
 			c.checks, c.total = pr.Checks, pr.TotalChecks
 		} else {
 			c.checks, c.total = 1, 1
@@ -120,12 +142,32 @@ func distinctCities(cands []candidate) int {
 	return len(seen)
 }
 
-// effectiveCap applies D7: the soft cap, expanded to cover city diversity
-// (bounded by the ceiling).
+// effectiveCap applies the W19 cap doctrine: absent/0 imposes NO constraint.
+// soft_cap absent → ALL alive nodes (the D7 city expansion is moot — there
+// is nothing left to expand). An explicit soft_cap keeps D7: it expands to
+// cover city diversity only when an explicit city_expand_threshold fires,
+// bounded by the ceiling only when the ceiling is itself present.
 func effectiveCap(cands []candidate, cfg config.SelectConfig) int {
+	n := len(cands)
+	if cfg.SoftCap <= 0 {
+		return n // unbounded: every alive node goes active
+	}
 	capApplied := cfg.SoftCap
-	if distinctCities(cands) >= cfg.CityExpandThreshold {
-		capApplied = min(max(distinctCities(cands), cfg.SoftCap), cfg.Ceiling)
+	if cfg.CityExpandThreshold > 0 {
+		cities := distinctCities(cands)
+		if cities >= cfg.CityExpandThreshold {
+			limit := n
+			if cfg.Ceiling > 0 {
+				limit = min(cfg.Ceiling, n)
+			}
+			capApplied = min(max(cities, cfg.SoftCap), limit)
+		}
+	}
+	// Defensive no-op: validation guarantees ceiling ≥ soft_cap when both
+	// are positive, and the expansion branch already clamped to
+	// min(Ceiling, n).
+	if cfg.Ceiling > 0 {
+		capApplied = min(capApplied, cfg.Ceiling)
 	}
 	return capApplied
 }
@@ -133,7 +175,15 @@ func effectiveCap(cands []candidate, cfg config.SelectConfig) int {
 // greedySelect runs the cap-aware greedy pass with the city-diversity
 // tie-break inside metric tie-bands. The band width comes from the
 // [select].tie_band_rtt_tolerance knob (0 → the DefaultTieBandRTTTolerance).
+//
+// W19: the unbounded default (no cap left to reach, no K to enforce) takes a
+// fast path — every candidate, in the primary sort order, one pass. The
+// greedy loop below is O(capApplied × N); it only runs under EXPLICIT caps,
+// where capApplied is bounded by the operator's own configuration.
 func greedySelect(cands []candidate, cfg config.SelectConfig, capApplied int) []candidate {
+	if cfg.PerCountryCap <= 0 && capApplied >= len(cands) {
+		return append([]candidate(nil), cands...) // O(N) fast path (sort lives in Select)
+	}
 	tolerance := cfg.TieBandRTTTolerance
 	if tolerance <= 0 {
 		tolerance = config.DefaultTieBandRTTTolerance
@@ -158,10 +208,10 @@ func greedySelect(cands []candidate, cfg config.SelectConfig, capApplied int) []
 }
 
 // nextSelectable returns the first unpicked candidate whose country still has
-// headroom under K, or -1.
+// headroom under K (0/absent K = unlimited), or -1.
 func nextSelectable(cands []candidate, picked []bool, countryCount map[string]int, cfg config.SelectConfig) int {
 	for i, c := range cands {
-		if picked[i] || countryCount[c.rec.Country] >= cfg.PerCountryCap {
+		if picked[i] || (cfg.PerCountryCap > 0 && countryCount[c.rec.Country] >= cfg.PerCountryCap) {
 			continue
 		}
 		return i
@@ -181,7 +231,7 @@ func pickWithCityTieBreak(
 	pick := base
 	for i := base + 1; i < len(cands); i++ {
 		c := cands[i]
-		if picked[i] || countryCount[c.rec.Country] >= cfg.PerCountryCap {
+		if picked[i] || (cfg.PerCountryCap > 0 && countryCount[c.rec.Country] >= cfg.PerCountryCap) {
 			continue
 		}
 		if !sameBand(head, c, tolerance) {

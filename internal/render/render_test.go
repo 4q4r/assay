@@ -206,7 +206,7 @@ func TestPlanAObservatoryCoexistsWithBurstObservatory(t *testing.T) {
 	obs, ok := m["observatory"].(map[string]any)
 	require.True(t, ok, "Plan A: legacy observatory rendered alongside burst")
 	assert.Equal(t, []any{"pool-"}, obs["subjectSelector"])
-	assert.Equal(t, "60s", obs["probeInterval"])
+	assert.Equal(t, "1m0s", obs["probeInterval"], "W19: absent knob → adaptive (2 nodes ride the 60s floor)")
 	assert.Equal(t, true, obs["enableConcurrency"])
 
 	burst, ok := m["burstObservatory"].(map[string]any)

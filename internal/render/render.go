@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"public_vpn/internal/config"
 	"public_vpn/internal/model"
@@ -150,10 +151,13 @@ type Config struct {
 	// PoolInboundTags: inbound tags every pool rule carries; render-time
 	// validated against the template's inbounds. Zero → DefaultPoolInboundTags.
 	PoolInboundTags []string
-	// ObservatoryInterval: Plan-A probeInterval, verbatim string passthrough.
-	// Zero → config.DefaultObservatoryInterval. NEVER validated here (no
-	// floor per owner ruling); the L1 empty-selector refusal is orthogonal
-	// and stays unconditional.
+	// ObservatoryInterval: Plan-A probeInterval. Empty (the W19 default) →
+	// ADAPTIVE: the render computes max(60s, ceil(active×200ms)) from the
+	// selection size so sustained observatory probes stay ≤ 5/s regardless
+	// of pool growth (render.AdaptiveObservatoryInterval). A set value is a
+	// verbatim string passthrough. NEVER validated here (no floor per
+	// owner ruling); the L1 empty-selector refusal is orthogonal and stays
+	// unconditional.
 	ObservatoryInterval string
 	// TCPMaxSeg: mandatory sockopt value on every pool outbound.
 	// Zero → config.DefaultTCPMaxSeg.
@@ -254,11 +258,15 @@ func Render(in Input) (Result, error) {
 
 		// Plan A: legacy observatory covering exactly the pool namespace. The
 		// burstObservatory (Germans) is untouched — verified coexistence.
-		// probeInterval is a verbatim passthrough of the observatory_interval
-		// knob; the L1 empty-selector refusal above is untouched by it.
+		// probeInterval: verbatim passthrough of the observatory_interval
+		// knob when set; ABSENT (the W19 default) → the adaptive interval
+		// computed from the active count (observatoryInterval below). The
+		// subjectSelector covers EVERY pool tag regardless of count, so
+		// interval scaling never breaks L2 coverage; the L1 empty-selector
+		// refusal above is untouched by it.
 		m["observatory"] = map[string]any{
 			"subjectSelector":   []any{poolOutboundPrefix},
-			"probeInterval":     cfg.ObservatoryInterval,
+			"probeInterval":     observatoryInterval(cfg.ObservatoryInterval, poolCount),
 			"enableConcurrency": true,
 		}
 	}
@@ -291,9 +299,9 @@ func normalizeKnobs(c Config) Config {
 	if len(c.PoolInboundTags) == 0 {
 		c.PoolInboundTags = config.DefaultPoolInboundTags()
 	}
-	if c.ObservatoryInterval == "" {
-		c.ObservatoryInterval = config.DefaultObservatoryInterval
-	}
+	// ObservatoryInterval: intentionally NOT defaulted here (W19) — an empty
+	// value means ADAPTIVE pacing, resolved at the emission site from the
+	// active count; a set value passes through verbatim.
 	if c.TCPMaxSeg == 0 {
 		c.TCPMaxSeg = config.DefaultTCPMaxSeg
 	}
@@ -304,6 +312,46 @@ func normalizeKnobs(c Config) Config {
 		c.BalancerTolerance = config.DefaultBalancerTolerance
 	}
 	return c
+}
+
+// W19 load engineering: the pool observatory re-probes EVERY rendered pool
+// outbound once per interval, so the sustained daemon-side probe load is
+// ≈ N/interval probes per second — the one cost that would otherwise grow
+// linearly with the pool forever. The adaptive interval keeps that load at
+// or below a constant budget without a new knob (owner ruling: code-owned
+// constant + README math; the wave wall time stays honestly O(N) — every
+// alive node IS probed — and that trade-off is owner-accepted).
+const (
+	// ObservatoryProbeTargetPerSec is the sustained pool-probe budget the
+	// adaptive interval guarantees regardless of pool size.
+	ObservatoryProbeTargetPerSec = 5.0
+	// MinObservatoryInterval is the adaptive floor: pools at or below 300
+	// active nodes keep the historical fixed 60s cadence (the pre-W19
+	// default; 259 alive → 60s exactly as before).
+	MinObservatoryInterval = 60 * time.Second
+)
+
+// AdaptiveObservatoryInterval computes the pool observatory probeInterval
+// from the active pool size: max(60s, ceil(N × 200ms)), where 200ms per node
+// = 1/ObservatoryProbeTargetPerSec — probes/sec never exceeds the budget.
+// The result is rounded up to whole seconds (xray parses Go durations).
+func AdaptiveObservatoryInterval(active int) time.Duration {
+	perNode := time.Duration(float64(time.Second) / ObservatoryProbeTargetPerSec)
+	d := max(time.Duration(max(active, 0))*perNode, MinObservatoryInterval)
+	if r := d % time.Second; r > 0 {
+		d += time.Second - r // ceil to whole seconds
+	}
+	return d
+}
+
+// observatoryInterval resolves the emitted probeInterval: an explicit
+// observatory_interval wins verbatim (no floor — owner ruling); an empty
+// knob means adaptive pacing from the active count (W19).
+func observatoryInterval(verbatim string, active int) string {
+	if verbatim != "" {
+		return verbatim
+	}
+	return AdaptiveObservatoryInterval(active).String()
 }
 
 // stripPoolArtifacts removes every pool-owned artifact from a (possibly

@@ -91,3 +91,26 @@ func BenchmarkRender40PoolCeiling(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkRenderEmissionScaling is the W19 O(N²) regression guard for the
+// render emission path under the UNBOUNDED selection default: 100 countries
+// × 37 cities of balancers (harder than the owner's live 40 countries) plus
+// the adaptive-observatory arithmetic. Emission must stay linear-ish —
+// 300 → 3000 nodes ≈ 10-15× ns/op, not ~100×. Benchmark-report guard (no
+// wall-clock assertions); the grouping itself is map-based single passes
+// (addBalancers), verified by construction.
+func BenchmarkRenderEmissionScaling(b *testing.B) {
+	tpl := benchTemplate(5, 40)
+	cfg := render.Config{StatsPort: 15490}
+	for _, n := range []int{300, 3000} {
+		b.Run(fmt.Sprintf("nodes_%d", n), func(b *testing.B) {
+			sel, byKey := benchSelection(n)
+			b.ResetTimer()
+			for range b.N {
+				if _, err := render.Render(render.Input{Template: tpl, Selection: sel, NodesByKey: byKey, Cfg: cfg}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -50,3 +50,25 @@ func BenchmarkSelect50kNodesUnlimitedCities(b *testing.B) {
 		_ = rank.Select(ns, recs, probe, cfg, 0)
 	}
 }
+
+// BenchmarkSelectUnboundedScaling is the W19 O(N²) regression guard for the
+// unbounded DEFAULT (absent caps = all alive selected): the fast path is one
+// sort + one pass, so ns/op must scale ~linearly with pool size (300 → 3000
+// nodes ≈ 10-15×, not the ~100× of a quadratic rescan). Benchmark-report
+// guard — no wall-clock assertions (CI-flake-proof); the structural
+// guarantee is the greedy-loop bypass in greedySelect, pinned behaviorally by
+// TestUnboundedFastPathPreservesRankOrder.
+func BenchmarkSelectUnboundedScaling(b *testing.B) {
+	for _, n := range []int{300, 3000} {
+		b.Run(fmt.Sprintf("nodes_%d", n), func(b *testing.B) {
+			ns, recs, probe := buildRankCorpus(n, 40)
+			b.ResetTimer()
+			for range b.N {
+				sel := rank.Select(ns, recs, probe, config.SelectConfig{}, 0)
+				if len(sel.Nodes) == 0 {
+					b.Fatal("unbounded select produced an empty selection")
+				}
+			}
+		})
+	}
+}

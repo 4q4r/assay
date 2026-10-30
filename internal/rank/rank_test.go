@@ -309,3 +309,127 @@ func TestCityDiversityTieBreakFoldsCaseVariants(t *testing.T) {
 	assert.Len(t, cities, 2,
 		"K=2 must cover two DISTINCT cities: the variant pair must not consume both slots")
 }
+
+// --- W19: unbounded selection (owner order «259 живых, значит 259
+// раскидываются по балансирам стран и городов») — absent/0 = ALL alive nodes
+// go active; an explicit positive number stays a cap. ---
+
+// TestUnboundedByDefault pins the W19 flip: a zero-value SelectConfig selects
+// EVERY alive candidate — no soft cap, no ceiling, no K, unknown group
+// included. CapApplied equals the alive count (the bound actually applied).
+func TestUnboundedByDefault(t *testing.T) {
+	f := newFixture()
+	for i := range 50 {
+		f.add(t, fmt.Sprintf("c%02d", i), fmt.Sprintf("City%02d", i), true, 3, 1_000_000, 100)
+	}
+	f.add(t, "", "", true, 3, 1_000_000, 100) // unknown-geo: admitted (W16)
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{}, 0)
+	require.Len(t, sel.Nodes, 51, "zero config = ALL alive nodes go active (owner W19)")
+	assert.Equal(t, 51, sel.CapApplied, "cap applied = the alive count when unbounded")
+	assert.Equal(t, 50, sel.CitiesAlive, "the unknown-geo node carries no city (W16 semantics)")
+}
+
+// TestPerCountryCapAbsentMeansUnlimited pins the K flip: absent per_country_cap
+// never trims a country; an explicit K still caps it (old D7 semantics on an
+// explicit knob).
+func TestPerCountryCapAbsentMeansUnlimited(t *testing.T) {
+	f := newFixture()
+	for i := range 10 {
+		f.add(t, "de", fmt.Sprintf("City%02d", i), true, 3, 1_000_000, 100)
+		f.add(t, "fr", fmt.Sprintf("Ville%02d", i), true, 3, 1_000_000, 100)
+		f.add(t, "nl", fmt.Sprintf("Stad%02d", i), true, 3, 1_000_000, 100)
+	}
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{}, 0)
+	require.Len(t, sel.Nodes, 30, "no K: every alive node of every country lands in the render")
+
+	sel = rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{PerCountryCap: 3}, 0)
+	require.Len(t, sel.Nodes, 9, "explicit K=3 still caps each country at 3")
+}
+
+// TestSoftCapUnboundedWhenAbsent pins the global-cap flip: absent soft_cap
+// never binds regardless of pool size; an explicit soft_cap still caps (and
+// the city-expansion machinery keeps its old D7 semantics on explicit knobs).
+func TestSoftCapUnboundedWhenAbsent(t *testing.T) {
+	f := newFixture()
+	for i := range 300 {
+		f.add(t, fmt.Sprintf("c%02d", i%40), fmt.Sprintf("City%03d", i), true, 3, 1_000_000, 100)
+	}
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{}, 0)
+	require.Len(t, sel.Nodes, 300, "absent soft_cap: 300 alive → 300 active (D7 expansion moot when unbounded)")
+
+	// Explicit caps on the same 300-city fixture: the threshold 301 never
+	// fires, so the explicit soft cap binds exactly (D7 intact on explicit
+	// knobs).
+	sel = rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{SoftCap: 25, CityExpandThreshold: 301, Ceiling: 40}, 0)
+	assert.Len(t, sel.Nodes, 25, "explicit soft cap still caps when city diversity is below the threshold")
+}
+
+// TestCityExpansionNeedsExplicitThreshold pins the sub-flip: with an explicit
+// soft_cap but an ABSENT city_expand_threshold, no expansion happens (0 =
+// the feature is off — absent imposes no constraint, and expansion is one).
+// An explicit threshold expands the cap, bounded by the ceiling only when
+// the ceiling is itself present.
+func TestCityExpansionNeedsExplicitThreshold(t *testing.T) {
+	f := newFixture()
+	for i := range 12 {
+		f.add(t, fmt.Sprintf("c%02d", i), fmt.Sprintf("City%02d", i), true, 3, 1_000_000, 100)
+	}
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{SoftCap: 5}, 0)
+	require.Len(t, sel.Nodes, 5, "soft cap without a threshold never expands")
+
+	sel = rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{SoftCap: 5, CityExpandThreshold: 3}, 0)
+	assert.Len(t, sel.Nodes, 12, "explicit threshold expands to city diversity; absent ceiling = bounded only by alive count")
+
+	sel = rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{SoftCap: 5, CityExpandThreshold: 3, Ceiling: 8}, 0)
+	assert.Len(t, sel.Nodes, 8, "explicit ceiling still bounds the expansion (D7 intact)")
+}
+
+// TestUnboundedFastPathPreservesRankOrder pins the O(N log N) guarantee of
+// the unbounded path: the selection is exactly the candidates in the primary
+// sort order (checks desc, speed desc, rtt asc, key asc) — the greedy loop is
+// bypassed, tags follow the same stable per-country NN scheme.
+func TestUnboundedFastPathPreservesRankOrder(t *testing.T) {
+	f := newFixture()
+	a := f.add(t, "de", "Slow", true, 3, 1_000_000, 400)
+	b := f.add(t, "de", "Fast", true, 3, 9_000_000, 50)
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{}, 0)
+	require.Len(t, sel.Nodes, 2)
+	assert.Equal(t, b.Key, sel.Nodes[0].Key, "speed ranks first")
+	assert.Equal(t, a.Key, sel.Nodes[1].Key)
+	assert.Equal(t, "pool-de-01", sel.Nodes[0].Tag, "stable NN sequence survives the fast path")
+	assert.Equal(t, "pool-de-02", sel.Nodes[1].Tag)
+}
+
+// TestOwnProbeFailureNeverRidesSharedIdentity pins the W19 liveness gate:
+// one geo identity (scheme+host+port) can carry MULTIPLE link-variant node
+// records (parse keeps distinct param sets), and the geo record is PER
+// IDENTITY — a variant whose OWN latest probe failed (e.g. an extra=null
+// link the renderer refuses: the live 16:04-wave case) must never ride the
+// sibling's alive geo record into the selection. Under the old caps the dead
+// variant ranked last and the cap hid it; unbounded, it would reach the
+// renderer and fail the whole wave loud (L9).
+func TestOwnProbeFailureNeverRidesSharedIdentity(t *testing.T) {
+	f := newFixture()
+	// Three records, ONE identity: same scheme/host/port, different uuids.
+	good1 := model.NewNode("s", "vless", "11111111-1111-1111-1111-111111111111", "shared.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	good2 := model.NewNode("s", "vless", "22222222-2222-2222-2222-222222222222", "shared.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	dead := model.NewNode("s", "vless", "33333333-3333-3333-3333-333333333333", "shared.example.com", 443,
+		map[string]string{"security": "tls", "type": "xhttp", "extra": "null"})
+	f.nodes = append(f.nodes, good1, good2, dead)
+	// ONE alive geo record for the shared identity (the store's real shape).
+	f.geo = append(f.geo, &model.GeoRecord{
+		Source: "s", Scheme: "vless", Host: "shared.example.com", Port: 443,
+		Country: "nl", City: "Eygelshoven", Alive: true, RTTMs: 430, SpeedBPS: 300_000,
+	})
+	f.probe[good1.Key] = store.ProbeResult{Key: good1.Key, Alive: true, Checks: 3, TotalChecks: 3}
+	f.probe[good2.Key] = store.ProbeResult{Key: good2.Key, Alive: true, Checks: 3, TotalChecks: 3}
+	f.probe[dead.Key] = store.ProbeResult{Key: dead.Key, Alive: false, Checks: 0, TotalChecks: 3}
+
+	sel := rank.Select(f.nodes, f.geo, f.probe, config.SelectConfig{}, 0)
+	require.Len(t, sel.Nodes, 2, "the failed variant must not ride the shared identity's alive geo record")
+	for _, sn := range sel.Nodes {
+		assert.NotEqual(t, dead.Key, sn.Key, "a node whose own probe failed is never selectable")
+	}
+}
