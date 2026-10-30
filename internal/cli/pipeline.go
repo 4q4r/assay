@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"public_vpn/internal/restart"
 	"public_vpn/internal/stats"
 	"public_vpn/internal/store"
+	"public_vpn/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -808,10 +810,15 @@ byte-identical render is a no-op: nothing is replaced, nothing restarts.`,
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res)
+			color, err := commandColor(cmd, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
 			return runActivate(cmd, res.Config, target, backup, productionRestartWiring())
 		},
 	}
+	attachColorFlags(cmd)
 	cmd.Flags().StringVar(&target, "target", "", "override the activation target path (default from config)")
 	cmd.Flags().BoolVar(&backup, "backup", true, "date-stamped backup of the target before replace")
 	return cmd
@@ -892,12 +899,14 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 	if !auto {
 		// Manual semantics (auto_restart = false): print the operator hint.
 		outf(cmd.OutOrStdout(), "%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
-			res.RestartHint, orNone(res.BackupPath), selectionSize(p.selection))
+			ui.Chip("activation hint:", res.RestartHint, stageColor(cmd)),
+			orNone(res.BackupPath), selectionSize(p.selection))
 		return nil
 	}
 	outf(cmd.OutOrStdout(),
-		"activation complete: %s replaced from %s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
-		target, p.rendered, orNone(res.BackupPath), selectionSize(p.selection))
+		"%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
+		ui.Chip("activation complete:", fmt.Sprintf("%s replaced from %s", target, p.rendered), stageColor(cmd)),
+		orNone(res.BackupPath), selectionSize(p.selection))
 	rres, rerr := restart.Run(restart.Input{
 		Executor:   wiring.Executor,
 		Dialer:     wiring.Dialer,
@@ -908,18 +917,24 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 	var restartFailed *restart.Error
 	switch {
 	case rerr == nil:
-		outf(cmd.OutOrStdout(), "restart: %s\n", rres.Verdict)
+		outf(cmd.OutOrStdout(), "%s\n",
+			ui.Chip("restart:", ui.Colorize(ui.Green, rres.Verdict, stageColor(cmd)), stageColor(cmd)))
 	case errors.As(rerr, &restartFailed):
 		outf(cmd.OutOrStdout(),
 			"ERROR: restart FAILED: %v\n"+
 				"  the config on disk IS the gated new one; the live client still runs the previous config\n"+
-				"  wave verdict: DONE_WITH restart-failure (backup: %s; no auto-restore in this generation)\n",
-			rerr, orNone(res.BackupPath))
+				"%s\n",
+			rerr,
+			ui.Chip("  wave verdict:", ui.Colorize(ui.Amber,
+				"DONE_WITH restart-failure (backup: "+orNone(res.BackupPath)+"; no auto-restore in this generation)",
+				stageColor(cmd)), stageColor(cmd)))
 	default:
 		outf(cmd.OutOrStdout(),
 			"WARNING: the restart completed but the post-restart health check FAILED: %v\n"+
-				"  wave verdict: DONE_WITH health-failure (report-only; no auto-restore)\n",
-			rerr)
+				"%s\n",
+			rerr,
+			ui.Chip("  wave verdict:", ui.Colorize(ui.Amber,
+				"DONE_WITH health-failure (report-only; no auto-restore)", stageColor(cmd)), stageColor(cmd)))
 	}
 	return nil
 }
@@ -975,7 +990,12 @@ Flags:
 			if err != nil {
 				return err
 			}
-			reportConfigSource(cmd.OutOrStdout(), res)
+			color, err := commandColor(cmd, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			opts.color = color
+			reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
 			return runMaintain(cmd.OutOrStdout(), res.Config, opts, defaultMaintainStages(opts))
 		},
 	}
@@ -985,6 +1005,7 @@ Flags:
 		"reselect from the cold base without probing (skips probe and geo)")
 	cmd.Flags().BoolVar(&opts.speedtest, "speedtest", false,
 		"run the probe wave with throughput measurement (weekly speedtest wave)")
+	attachColorFlags(cmd)
 	return cmd
 }
 
@@ -993,6 +1014,9 @@ type maintainOptions struct {
 	noActivate bool
 	skipProbe  bool
 	speedtest  bool
+	// color is the resolved color mode for the wave's verdict lines (the
+	// stage progress lines stay plain — journald-friendly).
+	color bool
 }
 
 // maintainStages is the wave's seam: each pipeline stage as a function, so
@@ -1056,9 +1080,15 @@ func runMaintainGraceful(
 ) error {
 	// The wave's stages print through their own writer; give them a command
 	// shim bound to w so the seam stays signature-compatible with the W1–W3
-	// runners.
+	// runners. The shim carries the wave's resolved color mode so stage
+	// verdict lines (activation complete / restart / wave verdict) chip the
+	// same way the interactive command would.
 	cmd := &cobra.Command{}
 	cmd.SetOut(w)
+	attachColorFlags(cmd)
+	if opts.color {
+		_ = cmd.Flags().Set("color", "always")
+	}
 
 	outf(w, "maintain: refresh wave starting (probe=%t, speedtest=%t, activate=%t)\n",
 		!opts.skipProbe, opts.speedtest, !opts.noActivate)
@@ -1350,24 +1380,29 @@ passing the same values here — publicvpn keeps no state file by design.`,
 		"directory to inspect for the installed publicvpn binary (same default as install)")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
 		"systemd user unit directory to inspect (same default as install)")
+	attachColorFlags(cmd)
 	return cmd
 }
 
 func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 	p := newPaths(res.Config)
 	out := cmd.OutOrStdout()
+	color, err := commandColor(cmd, out)
+	if err != nil {
+		return err
+	}
 
-	outln(out, "publicvpn pipeline status")
-	reportConfigSource(out, res)
-	outln(out, "data dir:", p.dataDir)
-	printFetchStatus(out, p)
-	printStageCounts(out, p)
-	printProbeStatus(out, p)
-	printGeoStatus(out, p)
-	printSelectionStatus(out, p)
-	printRenderStatus(out, p)
+	outln(out, ui.Header("publicvpn pipeline status", color))
+	reportConfigSourceStyled(out, res, color)
+	outln(out, ui.Chip("data dir:", p.dataDir, color))
+	printFetchStatus(out, p, color)
+	printStageCounts(out, p, color)
+	printProbeStatus(out, p, color)
+	printGeoStatus(out, p, color)
+	printSelectionStatus(out, p, color)
+	printRenderStatus(out, p, color)
 	binDir, unitDir := statusInstallDirs(cmd)
-	printInstallStatus(out, res.Config, res.Path, binDir, unitDir)
+	printInstallStatus(out, res.Config, res.Path, binDir, unitDir, color)
 	return nil
 }
 
@@ -1386,39 +1421,40 @@ func statusInstallDirs(cmd *cobra.Command) (string, string) {
 	return config.ExpandHome(binDir), config.ExpandHome(unitDir)
 }
 
-func printFetchStatus(out io.Writer, p paths) {
+func printFetchStatus(out io.Writer, p paths, color bool) {
 	b, err := os.ReadFile(p.manifest)
 	if err != nil {
-		outln(out, "fetch:    no manifest (never fetched)")
+		outln(out, ui.ChipKV("fetch:    ", "no manifest (never fetched)", color))
 		return
 	}
 	var m fetchManifest
 	if json.Unmarshal(b, &m) != nil {
-		outln(out, "fetch:    manifest unreadable")
+		outln(out, ui.ChipKV("fetch:    ", "manifest unreadable", color))
 		return
 	}
 	files := 0
 	for _, fs := range m.Sources {
 		files += len(fs)
 	}
-	outf(out, "fetch:    %d files from %d sources at %s\n", files, len(m.Sources), m.FetchedAt.Format(time.RFC3339))
+	outf(out, "%s\n", ui.ChipKV("fetch:    ",
+		fmt.Sprintf("%d files from %d sources at %s", files, len(m.Sources), m.FetchedAt.Format(time.RFC3339)), color))
 }
 
-func printStageCounts(out io.Writer, p paths) {
+func printStageCounts(out io.Writer, p paths, color bool) {
 	for label, path := range map[string]string{"nodes": p.nodes, "filtered": p.filtered} {
 		n, err := countLines(path)
 		if err != nil || n == 0 {
-			outf(out, "%-9s empty\n", label+":")
+			outf(out, "%s\n", ui.ChipKV(fmt.Sprintf("%-9s ", label+":"), "empty", color))
 			continue
 		}
-		outf(out, "%-9s %d\n", label+":", n)
+		outf(out, "%s\n", ui.ChipKV(fmt.Sprintf("%-9s ", label+":"), strconv.Itoa(n), color))
 	}
 }
 
-func printProbeStatus(out io.Writer, p paths) {
+func printProbeStatus(out io.Writer, p paths, color bool) {
 	results, err := store.ReadProbeResults(p.probeResults)
 	if err != nil || len(results) == 0 {
-		outln(out, "probe:    empty")
+		outln(out, ui.ChipKV("probe:    ", "empty", color))
 		return
 	}
 	alive := 0
@@ -1427,13 +1463,14 @@ func printProbeStatus(out io.Writer, p paths) {
 			alive++
 		}
 	}
-	outf(out, "probe:    %d results logged, %d alive (latest wave per node)\n", len(results), alive)
+	outf(out, "%s\n", ui.ChipKV("probe:    ",
+		fmt.Sprintf("%d results logged, %d alive (latest wave per node)", len(results), alive), color))
 }
 
-func printGeoStatus(out io.Writer, p paths) {
+func printGeoStatus(out io.Writer, p paths, color bool) {
 	recs, err := store.ReadGeo(p.geoBase)
 	if err != nil || len(recs) == 0 {
-		outln(out, "geo:      empty")
+		outln(out, ui.ChipKV("geo:      ", "empty", color))
 		return
 	}
 	alive, countries := 0, map[string]bool{}
@@ -1448,14 +1485,15 @@ func printGeoStatus(out io.Writer, p paths) {
 		up += r.BytesUp
 		down += r.BytesDown
 	}
-	outf(out, "geo:      %d records, %d alive, %d countries, traffic folded: %d up / %d down bytes\n",
-		len(recs), alive, len(countries), up, down)
+	outf(out, "%s\n", ui.ChipKV("geo:      ",
+		fmt.Sprintf("%d records, %d alive, %d countries, traffic folded: %d up / %d down bytes",
+			len(recs), alive, len(countries), up, down), color))
 }
 
-func printSelectionStatus(out io.Writer, p paths) {
+func printSelectionStatus(out io.Writer, p paths, color bool) {
 	sel, err := store.ReadSelection(p.selection)
 	if err != nil || sel == nil {
-		outln(out, "select:   empty")
+		outln(out, ui.ChipKV("select:   ", "empty", color))
 		return
 	}
 	// Display label: unknown-geo nodes carry a raw empty country — shown as
@@ -1468,16 +1506,18 @@ func printSelectionStatus(out io.Writer, p paths) {
 		}
 		byCountry[label]++
 	}
-	outf(out, "select:   %d active (cap %d) %v\n", len(sel.Nodes), sel.CapApplied, byCountry)
+	outf(out, "%s\n", ui.ChipKV("select:   ",
+		fmt.Sprintf("%d active (cap %d) %v", len(sel.Nodes), sel.CapApplied, byCountry), color))
 }
 
-func printRenderStatus(out io.Writer, p paths) {
+func printRenderStatus(out io.Writer, p paths, color bool) {
 	st, err := os.Stat(p.rendered)
 	if err != nil {
-		outln(out, "render:   none")
+		outln(out, ui.ChipKV("render:   ", "none", color))
 		return
 	}
-	outf(out, "render:   %s (%d bytes, %s)\n", p.rendered, st.Size(), st.ModTime().Format(time.RFC3339))
+	outf(out, "%s\n", ui.ChipKV("render:   ",
+		fmt.Sprintf("%s (%d bytes, %s)", p.rendered, st.Size(), st.ModTime().Format(time.RFC3339)), color))
 }
 
 func countLines(path string) (int, error) {

@@ -23,6 +23,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"public_vpn/internal/ui"
 )
 
 // Platform names for the release asset map (goconst: repeated literals).
@@ -64,6 +66,9 @@ type Options struct {
 	BinOverride string // --bin: target path override ([activate].xray_bin otherwise)
 	TargetPath  string // resolved [activate].xray_bin (expanded; CLI's concern)
 	AssumeYes   bool   // --yes: skip the confirmation prompt
+	// Color chip-styles the final VERDICT lines (W18); the stage progress
+	// lines stay plain — journald-friendly by construction.
+	Color bool
 	// APIBase overrides the GitHub API host (test seam; empty = default).
 	APIBase string
 	// StagingDir is where the release is downloaded, verified, and unpacked
@@ -134,11 +139,11 @@ func Run(opts Options) (*Result, error) {
 	res.LatestVersion = rel.TagName
 
 	if opts.CheckOnly {
-		printCheck(opts.Stdout, res)
+		printCheck(opts.Stdout, res, opts.Color)
 		return res, nil
 	}
 	if sameVersion(current, rel.TagName) {
-		_, _ = fmt.Fprintf(opts.Stdout, "xray-update: already at %s — nothing to do\n", rel.TagName)
+		printVerdict(opts.Stdout, opts.Color, ui.Green, "already at "+rel.TagName+" — nothing to do")
 		return res, nil
 	}
 
@@ -149,7 +154,7 @@ func Run(opts Options) (*Result, error) {
 	case err != nil:
 		return res, err
 	case !proceed:
-		_, _ = fmt.Fprintf(opts.Stdout, "xray-update: declined — nothing touched\n")
+		printVerdict(opts.Stdout, opts.Color, "", "declined — nothing touched")
 		return res, nil
 	}
 
@@ -162,9 +167,29 @@ func Run(opts Options) (*Result, error) {
 		return res, err
 	}
 	res.Updated = true
-	_, _ = fmt.Fprintf(opts.Stdout, "xray-update: %s → %s installed at %s (old binary backed up at %s)\n",
-		displayVersion(current), rel.TagName, opts.TargetPath, res.BackupPath)
+	printVerdict(opts.Stdout, opts.Color, ui.Green,
+		displayVersion(current)+" → "+rel.TagName+" installed at "+opts.TargetPath+
+			" (old binary backed up at "+orEmpty(res.BackupPath)+")")
 	return res, nil
+}
+
+// printVerdict renders one final outcome line as a chip: the
+// "xray-update:" label dim 241, the verdict colored by its class
+// (green installed/no-op, plain informational). Progress lines never use
+// this — they stay plain for journald.
+func printVerdict(w io.Writer, color bool, class, verdict string) {
+	value := verdict
+	if class != "" {
+		value = ui.Colorize(class, verdict, color)
+	}
+	_, _ = fmt.Fprintln(w, ui.Chip("xray-update:", value, color))
+}
+
+func orEmpty(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
 }
 
 // confirm reads the owner's answer for the version pair. y/yes proceeds;
@@ -258,16 +283,16 @@ func sameVersion(current, tag string) bool {
 	return current != "" && strings.TrimPrefix(tag, "v") == current
 }
 
-func printCheck(w io.Writer, res *Result) {
+func printCheck(w io.Writer, res *Result, color bool) {
 	switch {
 	case res.CurrentVersion == "":
-		_, _ = fmt.Fprintf(w, "xray-update: latest %s, current (not installed)\n", res.LatestVersion)
+		printVerdict(w, color, ui.Green, "latest "+res.LatestVersion+", current (not installed)")
 	case sameVersion(res.CurrentVersion, res.LatestVersion):
-		_, _ = fmt.Fprintf(w, "xray-update: latest %s, current v%s — up to date\n",
-			res.LatestVersion, res.CurrentVersion)
+		printVerdict(w, color, ui.Green,
+			"latest "+res.LatestVersion+", current v"+res.CurrentVersion+" — up to date")
 	default:
-		_, _ = fmt.Fprintf(w, "xray-update: latest %s, current v%s — update available (run without --check)\n",
-			res.LatestVersion, res.CurrentVersion)
+		printVerdict(w, color, ui.Amber,
+			"latest "+res.LatestVersion+", current v"+res.CurrentVersion+" — update available (run without --check)")
 	}
 }
 

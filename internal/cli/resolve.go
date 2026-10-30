@@ -11,6 +11,9 @@ import (
 	"os"
 
 	"public_vpn/internal/config"
+	"public_vpn/internal/ui"
+
+	"github.com/spf13/cobra"
 )
 
 // resolveCommand resolves the effective config for a regular command:
@@ -114,12 +117,63 @@ func pathExists(p string) bool {
 // as unset) print loud right after the config line — visible, attributed,
 // never fatal.
 func reportConfigSource(w io.Writer, res *config.Resolved) {
+	reportConfigSourceStyled(w, res, false)
+}
+
+// reportConfigSourceStyled is the chip-styled variant for screens with a
+// resolved color mode (list, status): the config: label dim 241, the
+// provenance value info 45, warnings amber. Color off = the exact plain
+// block above.
+func reportConfigSourceStyled(w io.Writer, res *config.Resolved, color bool) {
+	value := res.Source.String()
 	if res.Path != "" {
-		outf(w, "config: %s %s\n", res.Source, res.Path)
-	} else {
-		outf(w, "config: %s\n", res.Source)
+		value += " " + res.Path
 	}
+	outf(w, "%s\n", ui.Chip("config:", value, color))
 	for _, warning := range res.Warnings {
-		outf(w, "warning: %s\n", warning)
+		outf(w, "%s\n", ui.Warn("warning: "+warning, ui.Amber, color))
 	}
+}
+
+// attachColorFlags adds the shared --color/--no-color pair to a command
+// (one definition: every screen with chip output carries the same flags).
+func attachColorFlags(cmd *cobra.Command) {
+	cmd.Flags().String("color", "auto",
+		"colorize output: auto (terminal-detected), always, never")
+	cmd.Flags().Bool("no-color", false,
+		"disable colors (NO_COLOR is honored too; default is terminal-detected)")
+}
+
+// stageColor resolves the color mode for stage rendering off the stage's
+// command (flags when present, auto against the writer otherwise). A
+// resolution error fails CLOSED (plain) — stage output is journald-first;
+// the interactive commands validate their flags in RunE before stages run.
+func stageColor(cmd *cobra.Command) bool {
+	on, err := commandColor(cmd, cmd.OutOrStdout())
+	if err != nil {
+		return false
+	}
+	return on
+}
+
+// commandColorFlags reads the shared --color/--no-color pair off a command
+// (absent flags = the auto defaults) — the raw mode-contract inputs every
+// screen resolves the same way.
+func commandColorFlags(cmd *cobra.Command) (string, bool) {
+	mode, noColor := "auto", false
+	if f := cmd.Flags().Lookup("color"); f != nil {
+		mode = f.Value.String()
+	}
+	if f := cmd.Flags().Lookup("no-color"); f != nil {
+		noColor = f.Value.String() == "true"
+	}
+	return mode, noColor
+}
+
+// commandColor resolves a command's color mode from its flags (absent
+// flags = auto against the writer). The explicit --no-color alias wins
+// over a conflicting --color (the ui contract); invalid modes are loud.
+func commandColor(cmd *cobra.Command, out io.Writer) (bool, error) {
+	mode, noColor := commandColorFlags(cmd)
+	return ui.Resolve(mode, noColor, out)
 }
