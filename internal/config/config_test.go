@@ -110,15 +110,19 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.False(t, cfg.Probe.IsSpeedtest(), "speedtest defaults OFF (round-8 owner ruling — supersedes the W10 default-ON)")
 	assert.Nil(t, cfg.Probe.Speedtest)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
-	assert.Equal(t, 8, cfg.Probe.Threads)
+	assert.Equal(t, 32, cfg.Probe.Threads, "W19: default raised 8→32 to saturate the boot-serialization ceiling (bounded wave wall time)")
 	assert.Equal(t, 3, cfg.Probe.Attempts)
 	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
 	assert.Equal(t, "https://ipinfo.io/json", cfg.Geo.HTTPSURL, "https_url defaults to the keyless ipinfo.io/json self-geo endpoint")
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
-	assert.Equal(t, 3, cfg.Select.PerCountryCap)
-	assert.Equal(t, 25, cfg.Select.SoftCap)
-	assert.Equal(t, 25, cfg.Select.CityExpandThreshold)
-	assert.Equal(t, 40, cfg.Select.Ceiling)
+	// W19 owner order («259 живых, значит 259 раскидываются по балансирам»):
+	// absent/0 = ALL alive nodes go active — every cap knob defaults
+	// UNBOUNDED; an explicit positive number stays a cap (no-floor/no-ceiling
+	// ruling class: knobs stay, defaults flip).
+	assert.Equal(t, 0, cfg.Select.PerCountryCap, "absent = unlimited per country")
+	assert.Equal(t, 0, cfg.Select.SoftCap, "absent = unbounded global selection")
+	assert.Equal(t, 0, cfg.Select.CityExpandThreshold, "absent = expansion off (moot when unbounded)")
+	assert.Equal(t, 0, cfg.Select.Ceiling, "absent = unbounded ceiling")
 	assert.Equal(t, 15490, cfg.Render.StatsPort)
 	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Render.Template)
 	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Activate.Target)
@@ -499,7 +503,8 @@ func TestW6KnobDefaults(t *testing.T) {
 	require.NotNil(t, cfg.Activate.TestTimeout, "activate.test_timeout must default (30s), not nil")
 	assert.Equal(t, 30*time.Second, cfg.Activate.TestTimeout.Duration)
 	assert.Equal(t, []string{"socks-in", "http-in"}, cfg.Render.PoolInboundTags)
-	assert.Equal(t, "60s", cfg.Render.ObservatoryInterval)
+	assert.Empty(t, cfg.Render.ObservatoryInterval,
+		"W19: absent observatory_interval = ADAPTIVE (render computes max(60s, ceil(N×200ms)) from the active count); explicit stays verbatim")
 	assert.Equal(t, 1440, cfg.Render.TCPMaxSeg)
 	assert.Equal(t, time.Duration(0), cfg.Probe.SkipFreshWithin.Duration, "probe everything by default")
 	// P2
@@ -513,6 +518,61 @@ func TestW6KnobDefaults(t *testing.T) {
 	assert.InDelta(t, 1.2, cfg.Select.TieBandRTTTolerance, 1e-9)
 	assert.Equal(t, 0, cfg.Activate.BackupKeep, "0 = unlimited retention")
 	assert.Equal(t, 0, cfg.Maintain.PruneBackupKeep, "0 = unlimited retention")
+}
+
+// TestSelectCapsUnboundedValidation pins the W19 structural contract: the
+// flip makes 0 = UNBOUNDED legal for every select cap, negative values stay
+// structurally invalid, and the artificial per_country_cap 1..10 range is
+// GONE (owner no-floor/no-ceiling ruling — an explicit cap of any size is the
+// operator's call). ceiling < soft_cap remains invalid only when both are
+// positive constraints.
+func TestSelectCapsUnboundedValidation(t *testing.T) {
+	dir := t.TempDir()
+	write := func(t *testing.T, body string) *config.Config {
+		t.Helper()
+		path := filepath.Join(dir, "cfg.toml")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+		cfg, err := config.Load(path)
+		require.NoError(t, err)
+		return cfg
+	}
+
+	// All-zero select block loads and stays zero (unbounded everywhere).
+	cfg := write(t, "data_dir = \"/tmp/x\"\n[select]\n")
+	assert.Zero(t, cfg.Select.PerCountryCap)
+	assert.Zero(t, cfg.Select.SoftCap)
+	assert.Zero(t, cfg.Select.CityExpandThreshold)
+	assert.Zero(t, cfg.Select.Ceiling)
+
+	// An explicit cap of any positive size is structurally valid (no range).
+	cfg = write(t, "data_dir = \"/tmp/x\"\n[select]\nper_country_cap = 100\nsoft_cap = 5000\nceiling = 9000\ncity_expand_threshold = 300\n")
+	assert.Equal(t, 100, cfg.Select.PerCountryCap)
+	assert.Equal(t, 5000, cfg.Select.SoftCap)
+	assert.Equal(t, 9000, cfg.Select.Ceiling)
+	assert.Equal(t, 300, cfg.Select.CityExpandThreshold)
+
+	// Negative values remain structurally invalid (sign correctness only).
+	for _, body := range []string{
+		"per_country_cap = -1",
+		"soft_cap = -1",
+		"ceiling = -1",
+		"city_expand_threshold = -1",
+	} {
+		path := filepath.Join(dir, "neg.toml")
+		require.NoError(t, os.WriteFile(path, []byte("data_dir = \"/tmp/x\"\n[select]\n"+body+"\n"), 0o644))
+		_, err := config.Load(path)
+		require.Error(t, err, "negative %s must fail loud", body)
+	}
+
+	// ceiling below soft_cap: invalid when both are positive constraints…
+	path := filepath.Join(dir, "cross.toml")
+	require.NoError(t, os.WriteFile(path, []byte("data_dir = \"/tmp/x\"\n[select]\nsoft_cap = 40\nceiling = 30\n"), 0o644))
+	_, err := config.Load(path)
+	require.Error(t, err, "ceiling 30 < soft_cap 40 must fail loud")
+	// …but an absent (unbounded) ceiling coexists with an explicit soft cap.
+	require.NoError(t, os.WriteFile(path, []byte("data_dir = \"/tmp/x\"\n[select]\nsoft_cap = 40\n"), 0o644))
+	_, err = config.Load(path)
+	require.NoError(t, err, "soft_cap without ceiling = expansion bounded only by the alive count")
 }
 
 // TestW6KnobsParseExplicitValues pins that every W6 knob accepts its value
@@ -712,12 +772,13 @@ func TestW14ProtocolsDefaultAll(t *testing.T) {
 // knife keys are gone (path/db_path/check_preset/url_success_threshold/
 // max_passed do not exist), attempts defaults to 3, the speedtest URL is the
 // Cloudflare 25 MB sample, and threads (now parallel temp-instance workers)
-// defaults to a sane 8 for real xray processes.
+// defaults to 32 (W19: saturates the boot-serialization ceiling — bounded
+// wave wall time as the pool grows; the semaphore still bounds load).
 func TestW14ProbeKnobsDefaults(t *testing.T) {
 	cfg := load(t, w6Base)
 	p := cfg.Probe
 	assert.Equal(t, 3, p.Attempts)
-	assert.Equal(t, 8, p.Threads)
+	assert.Equal(t, 32, p.Threads)
 	assert.Equal(t, "https://speed.cloudflare.com/__down?bytes=25000000", p.SpeedtestURL)
 	assert.Equal(t, 10*time.Second, p.Timeout.Duration)
 	assert.Equal(t, 30*time.Second, p.SpeedtestTimeout.Duration)

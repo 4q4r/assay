@@ -107,8 +107,9 @@ type ProbeConfig struct {
 	Timeout Duration `toml:"timeout"`
 	// Threads is the parallel temp-instance worker count (each worker owns
 	// one node's probe; instance BOOTs are serialized by the factory's boot
-	// mutex, the HTTP phase runs fully parallel). Default 8 — sane for real
-	// xray processes (each is a full core instance).
+	// mutex, the HTTP phase runs fully parallel). Default 32 (W19: raised
+	// from 8 — 32 workers saturate the ~10 boots/sec serialization ceiling,
+	// keeping wave wall time bounded-minutes per 1000 nodes).
 	Threads int `toml:"threads"`
 	// Attempts is the HTTP GET count per node per wave. Default 3 (checker
 	// parity): all attempts success = `passed`, some = `semi-passed`, none =
@@ -170,14 +171,28 @@ type GeoConfig struct {
 	Timeout Duration `toml:"timeout"`
 }
 
-// SelectConfig controls the ranking caps (D7): countries unlimited,
-// per-country cap K, global soft cap N expanding to the ceiling when enough
-// distinct cities are alive.
+// SelectConfig controls the ranking caps (D5/D7; W19 unbounded flip):
+// countries unlimited; every cap knob defaults to UNBOUNDED — absent/0 means
+// ALL alive nodes go active (the owner order «259 живых, значит 259
+// раскидываются по балансирам стран и городов»), the unknown-geo group
+// included. An explicit positive value keeps its D7 cap semantics; the
+// city-expansion threshold is moot when the selection is unbounded.
 type SelectConfig struct {
-	PerCountryCap       int `toml:"per_country_cap"`
-	SoftCap             int `toml:"soft_cap"`
+	// PerCountryCap caps one country's active nodes (the old K). 0 =
+	// UNLIMITED (W19 default) — every alive node of every country lands in
+	// the render. Negative values are structurally invalid.
+	PerCountryCap int `toml:"per_country_cap"`
+	// SoftCap is the global selection cap. 0 = UNBOUNDED (W19 default): all
+	// alive nodes go active. Negative values are structurally invalid.
+	SoftCap int `toml:"soft_cap"`
+	// CityExpandThreshold fires the D7 expansion (cap grows to cover city
+	// diversity). 0 = expansion OFF (W19 default — moot when the selection
+	// is unbounded anyway). Only meaningful with an explicit soft_cap.
 	CityExpandThreshold int `toml:"city_expand_threshold"`
-	Ceiling             int `toml:"ceiling"`
+	// Ceiling bounds the D7 expansion. 0 = UNBOUNDED (W19 default — the
+	// expansion is bounded only by the alive count). Only meaningful with
+	// an explicit soft_cap. Negative values are structurally invalid.
+	Ceiling int `toml:"ceiling"`
 	// TieBandRTTTolerance widens/narrows the city tie-break band: a candidate
 	// joins the head's band when its RTT ≤ head·tolerance. 0 → the
 	// DefaultTieBandRTTTolerance; negative values are structurally invalid.
@@ -209,10 +224,12 @@ type RenderConfig struct {
 	// socks-in,http-in.
 	PoolInboundTags []string `toml:"pool_inbound_tags"`
 	// ObservatoryInterval is the Plan-A pool observatory probeInterval — a
-	// STRING PASSTHROUGH rendered verbatim (default "60s") so any duration
-	// spelling the core accepts works. Deliberately unbounded (owner ruling —
-	// the ≥30s recommendation is rejected); garbage values fail the xray
-	// -test gate loud.
+	// STRING PASSTHROUGH rendered verbatim when set, so any duration spelling
+	// the core accepts works. ABSENT (empty, the W19 default) = ADAPTIVE: the
+	// render computes the interval from the active count (max(60s,
+	// ceil(N×200ms)) — probes/sec ≤ 5, code-owned budget, no new knob).
+	// Deliberately unbounded (owner ruling — the ≥30s recommendation is
+	// rejected); garbage values fail the xray -test gate loud.
 	ObservatoryInterval string `toml:"observatory_interval"`
 	// TCPMaxSeg is the sockopt.tcpMaxSeg value emitted MANDATORILY on every
 	// rendered streamSettings (the owner-calibrated anti-TSPU clamp — the
@@ -338,7 +355,6 @@ const (
 	DefaultCacheMaxAge         = 6 * time.Hour
 	DefaultTestTimeout         = 30 * time.Second
 	DefaultStatsTimeout        = 10 * time.Second
-	DefaultObservatoryInterval = "60s"
 	DefaultTLSFingerprint      = "firefox"
 	DefaultTCPMaxSeg           = 1440
 	DefaultBalancerTolerance   = 0.2
@@ -366,10 +382,13 @@ const (
 	// DefaultRefreshInterval is the W10 owner ruling: the refresh wave
 	// rechecks hourly (was 6h in the timer era).
 	DefaultRefreshInterval = time.Hour
-	// DefaultProbeThreads is the W14 probe default: parallel temp-instance
-	// workers sane for REAL xray processes (each is a full core instance;
-	// boot windows serialize inside the factory).
-	DefaultProbeThreads = 8
+	// DefaultProbeThreads is the W14 probe default, RAISED in W19: parallel
+	// temp-instance workers. 32 saturates the factory's boot-serialization
+	// ceiling (~10 boots/sec — the readiness window is the only serialized
+	// phase; the HTTP checks stay fully parallel), keeping wave wall time at
+	// bounded-minutes per 1000 nodes as the pool grows. The semaphore still
+	// bounds instantaneous load (32 concurrent real xray processes max).
+	DefaultProbeThreads = 32
 	// DefaultProbeAttempts is the W14 probe default (checker parity): all
 	// attempts success = `passed`, some = `semi-passed`, none = `failed`.
 	DefaultProbeAttempts = 3
@@ -613,18 +632,10 @@ func applyGeoDefaults(g *GeoConfig) {
 }
 
 func applySelectDefaults(s *SelectConfig) {
-	if s.PerCountryCap == 0 {
-		s.PerCountryCap = 3
-	}
-	if s.SoftCap == 0 {
-		s.SoftCap = 25
-	}
-	if s.CityExpandThreshold == 0 {
-		s.CityExpandThreshold = 25
-	}
-	if s.Ceiling == 0 {
-		s.Ceiling = 40
-	}
+	// W19 owner flip: NO default refills remain on the cap knobs — 0 IS the
+	// default (UNBOUNDED: every alive node goes active; per-country K
+	// unlimited, no ceiling, no city expansion). An explicit positive value
+	// keeps the D7 cap semantics (rank.effectiveCap).
 	if s.TieBandRTTTolerance == 0 {
 		s.TieBandRTTTolerance = DefaultTieBandRTTTolerance
 	}
@@ -668,9 +679,11 @@ func applyRenderDefaults(r *RenderConfig, configless bool) {
 	if len(r.PoolInboundTags) == 0 {
 		r.PoolInboundTags = DefaultPoolInboundTags()
 	}
-	if r.ObservatoryInterval == "" {
-		r.ObservatoryInterval = DefaultObservatoryInterval
-	}
+	// ObservatoryInterval: NO default application (W19) — empty = ADAPTIVE:
+	// the render computes max(60s, ceil(active×200ms)) from the selection
+	// size so sustained observatory probes stay ≤ 5/s regardless of pool
+	// growth. An explicit value renders verbatim (xray -test gate remains
+	// the loud backstop for garbage spellings).
 	if r.TCPMaxSeg == 0 {
 		r.TCPMaxSeg = DefaultTCPMaxSeg
 	}
@@ -868,17 +881,23 @@ func validateBasics(c *Config) error {
 }
 
 func validateSelect(s SelectConfig) error {
-	if s.PerCountryCap < 1 || s.PerCountryCap > 10 {
-		return fmt.Errorf("select.per_country_cap must be 1..10 (design guidance K=3-5), got %d", s.PerCountryCap)
+	// W19 doctrine: 0 = UNBOUNDED is legal on every cap knob; only sign
+	// correctness is structural (owner no-floor/no-ceiling ruling — the
+	// former per_country_cap 1..10 range is gone with the flip).
+	if s.PerCountryCap < 0 {
+		return fmt.Errorf("select.per_country_cap must be >= 0 (0 = unlimited), got %d", s.PerCountryCap)
 	}
-	if s.SoftCap < 1 {
-		return errors.New("select.soft_cap must be >= 1")
+	if s.SoftCap < 0 {
+		return fmt.Errorf("select.soft_cap must be >= 0 (0 = unbounded), got %d", s.SoftCap)
 	}
-	if s.Ceiling < s.SoftCap {
+	if s.Ceiling < 0 {
+		return fmt.Errorf("select.ceiling must be >= 0 (0 = unbounded), got %d", s.Ceiling)
+	}
+	if s.CityExpandThreshold < 0 {
+		return fmt.Errorf("select.city_expand_threshold must be >= 0 (0 = expansion off), got %d", s.CityExpandThreshold)
+	}
+	if s.Ceiling > 0 && s.SoftCap > 0 && s.Ceiling < s.SoftCap {
 		return fmt.Errorf("select.ceiling (%d) must be >= soft_cap (%d)", s.Ceiling, s.SoftCap)
-	}
-	if s.CityExpandThreshold < 1 {
-		return errors.New("select.city_expand_threshold must be >= 1")
 	}
 	return validateNonNegative("select.tie_band_rtt_tolerance", s.TieBandRTTTolerance)
 }
