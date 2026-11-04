@@ -7,7 +7,7 @@
 *Fetch, probe, geo-enrich, rank, render, and maintain a pool of third-party public proxy nodes — explicitly routed, never your default route.*
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-520-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-868-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
 [![xray-core](https://img.shields.io/badge/xray--core-26.3.27-red?style=for-the-badge)](https://github.com/XTLS/Xray-core)
 [![Plugins](https://img.shields.io/badge/sources-Lua%20plugins-blue?style=for-the-badge)](#-lua-plugins-the-source-ingest-layer)
 [![Daemon](https://img.shields.io/badge/daemon-publicvpn%20watch-teal?style=for-the-badge)](#-the-watch-daemon)
@@ -26,6 +26,7 @@
 - [🔌 Link & Transport Support](#-link--transport-support)
 - [🧭 What Happens on `maintain`](#-what-happens-on-maintain)
 - [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer)
+- [✍️ Writing Custom Plugins](#-writing-custom-plugins)
 - [👀 Pool inventory (`list`)](#-pool-inventory-list)
 - [🌍 Site check (`check`)](#-site-check-check)
 - [🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)](#️-exit-geo-self-report-w11--w16-https-rung)
@@ -212,6 +213,85 @@ return collect
 4. Every candidate line becomes `publicvpn.node{ raw = line, remark = sub.id }`.
 
 Run it against the real upstreams (documented live test): `env -u http_proxy -u https_proxy go test -tags live -run TestLive ./internal/plugins/`.
+
+## ✍️ Writing Custom Plugins
+
+A plugin is a single **Lua file** (`.lua`) that discovers proxy nodes from a source and returns them as `publicvpn.node` records. Go owns URI normalization, parsing, dedupe, and filtering — the plugin only discovers. A new provider is a new file: **no rebuild, no restart** (the `publicvpn watch` daemon hot-reloads the dir).
+
+### Where plugins live
+
+- **Directory**: `~/.local/share/publicvpn/plugins/` (the `[plugins].dir` default; override via config).
+- **One file = one source**. The file name (without `.lua`) becomes the plugin id and the default `source` grouping.
+- **Built-in defaults** ship in `internal/plugins/defaults/` and materialize into the dir on **first run only**; owner edits and removals persist. Delete the whole dir to restore all defaults; copy individual `.lua` files from `internal/plugins/defaults/` to add a missing default to an existing install.
+
+### File format
+
+- Lua 5.1, run by [gopher-lua](https://github.com/yuin/gopher-lua) (pure-Go, no cgo).
+- The chunk must be **side-effect-free at load time** and `return` a collector `function() → nodes`. All fetching happens inside that function; a plugin doing work in the chunk fails the load with a clear error (the load-time check runs the chunk with the network surface loud-disabled).
+- Only `base`, `string`, `table`, `math` are opened; `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `print`, `require`, `module`, `newproxy` are stripped. Plugins are trusted local code, but the callable surface is exactly the host API below.
+
+### Host API available to plugins
+
+| Function | Signature | Notes |
+| :-- | :-- | :-- |
+| `publicvpn.node` | `node{ raw, source?, remark?, scheme?, host?, port? }` | **`raw` is required** (a share link); Go owns parsing. `source` regroups under another source id. `remark` names a node without a fragment. `scheme`/`host`/`port` are optional pre-parse hints (parsed URI wins). `port` must be 1–65535. |
+| `publicvpn.http` | `http{ url, method?, headers?, body?, timeout?, max_redirects?, max_body_bytes? } → { status, headers, body }` | Defaults: `GET`, 30s timeout, 10 redirects, 8 MiB body cap. Non-2xx is a **value**, not an error. Network errors and body-cap overruns fail loud. Multi-value headers join with `", "`. **No proxy by construction** (plugin traffic never rides your own VPN). |
+| `publicvpn.github_files` | `github_files{ repo, include?, manifest? } → { path, content }[]` | GitHub contents API, or `manifest` + raw downloads (mirrors via `[fetch].api_base`/`raw_base`, token via `[fetch].github_token`). A truncated tree or zero include matches fails loud. |
+| `publicvpn.base64` | `encode(s)`, `decode(s)` | `encode` = standard. `decode` accepts std + URL-safe alphabets, padding optional (mirrors the parser's flexible decode). |
+| `publicvpn.json` | `decode(s) → table`, `encode(t) → string` | Objects ⇄ tables, arrays ⇄ sequences; decode errors fail loud. |
+| `publicvpn.log` | `log(a, b, …)` | One prefixed line into the stage/daemon log. (`print` is stripped — the sandbox has no stdout.) |
+
+### How the watchdog hot-reloads plugins
+
+- `publicvpn watch` runs an **fsnotify** watcher over `[plugins].dir`.
+- **Add / modify** of a `.lua` hot-swaps it into the registry; a broken file keeps the **previous version active** with a loud error naming the Lua failure (last-good semantics).
+- **Remove** disables the source on the fly.
+- **No rebuild, no restart** of Go: a new provider is a new `.lua` file. `Close` is idempotent.
+- The plugin's consecutive-failure counter (circuit breaker) resets on a file edit — touching the file = fresh chance.
+
+### Minimal plugin example
+
+```lua
+-- mysource.lua — drop into ~/.local/share/publicvpn/plugins/, done.
+local REPO = "Owner/v2ray-configs"
+local INCLUDE = { "sub/vless.txt" }
+
+local function body_lines(body)
+  local trimmed = body:gsub("^%s+", ""):gsub("%s+$", "")
+  if trimmed:find("://", 1, true) then return body end
+  local ok, decoded = pcall(publicvpn.base64.decode, trimmed)
+  if ok and decoded:find("://", 1, true) then return decoded end
+  return body
+end
+
+local function collect()
+  local nodes = {}
+  for _, file in ipairs(publicvpn.github_files{ repo = REPO, include = INCLUDE }) do
+    local text = body_lines(file.content) .. "\n"   -- assign BEFORE gmatch (see VM note)
+    for line in text:gmatch("([^\r\n]*)\n") do
+      line = line:gsub("^%s+", ""):gsub("%s+$", "")
+      if line ~= "" and not line:find("^#") and not line:find("^//") then
+        nodes[#nodes + 1] = publicvpn.node{ raw = line }
+      end
+    end
+  end
+  return nodes
+end
+
+return collect
+```
+
+> ⚠️ **gopher-lua v1.1.2 VM bug:** a `for … in (fn() .. "x"):gmatch(…)` loop — an *inline call-chain expression* feeding the iterator — panics with a nil dereference. Assign the loop text to a local first, then iterate. All built-in plugins follow this; `TestGopherLuaInlineGmatchWorkaround` pins it.
+
+### Disabling / removing a plugin
+
+- **Disable temporarily**: rename the file so it no longer ends in `.lua` (e.g. `mysource.lua.off`) — the watcher drops it from the registry.
+- **Remove permanently**: delete the `.lua` file — the source is gone from the next wave.
+- **Auto-disable (circuit breaker)**: a plugin failing `max_consecutive_failures` (default 5) consecutive waves is auto-disabled and excluded from future waves; a successful run or a file edit resets and re-enables it. Set `[plugins].max_consecutive_failures = 0` to disable the breaker (counter still accumulates for observability).
+- **Threshold-based disable**: with `[plugins].max_duplicate_percent` / `min_live_percent` set, a plugin whose duplicate% exceeds the threshold or whose live% falls below it is disabled via the same breaker (`RecordFailure`), with a loud line naming the values.
+- **Restore defaults**: delete the whole plugins dir (or copy the wanted `.lua` from `internal/plugins/defaults/`).
+
+See also: [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer) for the built-in source list, the circuit breaker, and the StintikVPN reference plugin.
 
 ## 👀 Pool inventory (`list`)
 
@@ -464,7 +544,7 @@ speedtest_interval = "168h" # speedtest wave recheck (default 168h = weekly, flo
 - **Fingerprint `firefox` only where a fingerprint can exist.** The client-side uTLS override applies to `tls`/`reality` settings; `security=none` has no TLS handshake, so an `fp` param there is reported in the drop report, not consumed.
 - **The `-test` gate is unconditional.** A config that fails validation never replaces the live file — a crash-looping client is the one failure mode this pipeline refuses to create.
 - **The daemon's systemd surface is two byte-pinned allowlist executors — nothing else.** `install` may run exactly its four pinned commands (daemon-reload, enable/disable `--now` on `public_vpn-*` units only); the W13 restart executor may run exactly `systemctl --user restart xray-raw.service` (the owner-ruled hands-off restart, once per real activation) and its read-only `is-active` verification. Any other unit, verb, flag, or scope fails loud before a process is spawned; guard tests pin the command sets byte-for-byte, the constructor call sites, and the whole-tree fact that no other production file spawns systemctl at all. Config knobs cannot widen this surface (`[activate].service_name` names the printed manual-restart hint only; the auto path is pinned to `xray-raw.service` and refuses anything else loud).
-- **Lua plugins are trusted code: CPU and memory inside a plugin are unbounded by design.** The sandbox restricts *what a plugin can call* (`os`/`io`/`package`/`debug` stripped, host API capped), never *how much it can compute* — gopher-lua has no instruction-count or allocation budget, and that is the trusted-code contract, not a defense gap. The runtime caps around it: `[plugins].run_timeout` (default `120s`, explicit `0s` = unbounded) abandons a hung plugin **loud** and the wave continues with the healthy sources — the abandoned goroutine and its Lua state leak one per wave for a persistently hanging plugin (the documented detection-first trade-off; plugins are pure fetch, so nothing else is lost). A `string.rep` memory bomb crashes the whole process — the unit's `Restart=always` covers exactly that class. A daemon wedged by anything else stops its `sd_notify` watchdog pings, so systemd kills it at `WatchdogSec=300` and restarts it. The honest control for a plugin you do not trust is the one that has always existed: plugins are local files you edit — do not ship one you cannot vouch for.
+- **Lua plugins are trusted code: CPU and memory inside a plugin are bounded by context.** The sandbox restricts *what a plugin can call* (`os`/`io`/`package`/`debug` stripped, host API capped). Execution timeouts are strictly enforced via gopher-lua's `LState.SetContext(ctx)`: `[plugins].run_timeout` (default `120s`, explicit `0s` = unbounded) bounds the execution context. When a plugin exceeds its deadline, context cancellation terminates bytecode execution immediately, ensuring clean termination without hanging goroutines or leaked Lua states. A `string.rep` memory bomb crashes the whole process — the unit's `Restart=always` covers exactly that class. A daemon wedged by anything else stops its `sd_notify` watchdog pings, so systemd kills it at `WatchdogSec=300` and restarts it. The honest control for a plugin you do not trust is the one that has always existed: plugins are local files you edit — do not ship one you cannot vouch for.
 - **Credentials stay local.** The rendered config and pipeline state are written `0600`; the repository ships no secrets and no pinned node URLs.
 
 ## ⚠️ Landmine Warnings
@@ -481,13 +561,13 @@ Everything lives in `config.toml` — unknown keys fail loud, there are no env-v
 
 | Section | Owns | Notable keys |
 | :-- | :-- | :-- |
-| `[plugins]` | **W10: the source ingest is Lua plugins** | `dir` (default `<data_dir>/plugins`; built-ins materialize on first run; see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), `run_timeout` (default `120s`, `0s` = unbounded — a plugin exceeding it is abandoned loud and the wave continues), `max_consecutive_failures` (default `5`, `0` = unlimited — the circuit breaker; see below). The old `[sources.*]` tables fail config load with a loud migration error. |
+| `[plugins]` | **W10: the source ingest is Lua plugins** | `dir` (default `<data_dir>/plugins`; built-ins materialize on first run; see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), `run_timeout` (default `120s`, `0s` = unbounded — a plugin exceeding it is abandoned loud and the wave continues), `max_consecutive_failures` (default `5`, `0` = unlimited — the circuit breaker; see below), `max_duplicate_percent` (nil = disabled by default; an explicit 0 disables; positive = auto-disable a plugin whose duplicate% exceeds the threshold), `min_live_percent` (nil = disabled by default; an explicit 0 disables; positive = auto-disable a plugin whose live% falls below the threshold). The old `[sources.*]` tables fail config load with a loud migration error. |
 | `[fetch]` | download client (the plugins' `github_files` engine) | `timeout`, `retries`, `concurrency`, `api_base`/`raw_base` (mirrors), `github_token`; `cache_max_age` is a W5-era leftover — unused by the plugin ingest |
 | `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
 | `[filter]` | ingest security | `source_cap`, `protocols` (allowlist — **W14 default: `vless,vmess,trojan,ss,hysteria2`**, the round-7 owner ruling), `allow_insecure` (default `false` — unchanged) |
 | `[probe]` | W14 real-xray wave | `threads` (parallel temp-instance workers, **default `32` since W19** — saturates the boot-serialization ceiling; the semaphore still bounds instantaneous load), `attempts` (default `3`), `url`, `timeout`, `speedtest` (**default `false` since round-8** — owner ruling «Только спидтест выключи», reversing the W10 default-on; explicit `true` keeps per-wave speed data; the weekly speedtest wave carries `-S` regardless), `speedtest_url` (default Cloudflare 25 MB sample), `speedtest_timeout`, `skip_fresh_within`; the removed knife keys (`path`/`db_path`/`check_preset`/`url_success_threshold`/`max_passed`) fail load loud |
 | `[geo]` | W11 self-report (automatic — no knob) | `doh_url` (DoH fallback endpoint, default `https://dns.google/resolve`), `ttl`, `timeout`; the batch-era `endpoint`/`batch_size`/`per_minute` are removed and fail load loud |
-| `[select]` | ranking caps (**W19: all default UNBOUNDED** — absent/`0` = ALL alive nodes go active; see [the load model](#️-unbounded-selection--the-load-model-w19)) | `per_country_cap` (K, `0` = unlimited), `soft_cap` (N, `0` = unbounded), `city_expand_threshold` (`0` = expansion off), `ceiling` (`0` = unbounded), `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`) |
+| `[select]` | ranking caps (**W19: all default UNBOUNDED** — absent/`0` = ALL alive nodes go active; see [the load model](#️-unbounded-selection--the-load-model-w19)) | `per_country_cap` (K, `0` = unlimited), `soft_cap` (N, `0` = unbounded), `city_expand_threshold` (`0` = expansion off), `ceiling` (`0` = unbounded), `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`), `only_clean` (nil/false = no filtering; true = keep only clean IPs — hosting=false && proxy=false; when enabled, render skips redundant clean-* balancers) |
 | `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes`, `pool_inbound_tags` (validated against template inbounds — missing tag fails the render loud), `observatory_interval` (verbatim string; **absent = ADAPTIVE since W19** — the render computes `max(60s, ceil(active×200ms))` so observatory probes stay ≤ 5/s at any pool size), `tcp_max_seg` (mandatory on every pool outbound), `tls_fingerprint` (default `firefox`), `balancer_tolerance` (default `0.2`) |
 | `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir`, `test_timeout` (`0s` = no deadline), `service_name` (names the printed manual-restart hint; the W13 auto path is byte-pinned to `xray-raw.service`), `backup_keep` (N newest, `0` = unlimited) |
 | `[maintain]` | wave schedule + the W13 auto-restart (the watch daemon reads it live) | `prune_dead_after` (default `48h`), `refresh_interval` (default **`1h`** since W10), `speedtest_interval` (default `168h`; **`"0s"` = no speedtest wave at all** — round-8; positive values below the 5m floor still fail loud), `stats_timeout` (default `10s`), `prune_backup_keep` (`0` = unlimited), `auto_restart` (**default `true`** since W13 — the daemon restarts the live client after every gated activation and health-checks it; `false` = print the manual restart hint instead) |

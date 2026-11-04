@@ -198,6 +198,36 @@ func TestWSHostRendersIndependentField(t *testing.T) {
 	assert.Empty(t, res.DroppedParams)
 }
 
+// TestEarlyDataWithoutPathFallsBackToRootPath pins the production panic
+// hotfix: a link carrying `ed` WITHOUT `path` made applyWSSettings /
+// applyHTTPUpgradeSettings read ws["path"] as an untyped nil, where the old
+// `base == ""` fallback is false for a nil interface{} — the following
+// `base.(string)` panicked with "interface conversion: interface {} is nil,
+// not string". Both renderers must fall back to the root path and append the
+// early-data query instead.
+func TestEarlyDataWithoutPathFallsBackToRootPath(t *testing.T) {
+	for _, tc := range []struct {
+		network  string
+		settings string
+	}{
+		{"ws", "wsSettings"},
+		{"httpupgrade", "httpupgradeSettings"},
+	} {
+		t.Run(tc.network, func(t *testing.T) {
+			n, sn := mkTransportNode("pool-nl-01", "vless", "n1.example.com", 443,
+				map[string]string{"type": tc.network, "ed": "2048", "security": "tls"})
+
+			m, res := renderOne(t, n, sn)
+			stream := poolOutbound(t, m, "pool-nl-01")["streamSettings"].(map[string]any)
+			settings, ok := stream[tc.settings].(map[string]any)
+			require.True(t, ok, "%s must render for ed without path", tc.settings)
+			assert.Equal(t, "/?ed=2048", settings["path"],
+				"ed without path falls back to the root path (no nil-interface panic)")
+			assert.Empty(t, res.DroppedParams, "ed is consumed, never dropped")
+		})
+	}
+}
+
 // TestGRPMMultiModeRenders pins serviceName + mode=multi → multiMode.
 func TestGRPMMultiModeRenders(t *testing.T) {
 	n, sn := mkTransportNode("pool-nl-01", "vless", "n1.example.com", 443,

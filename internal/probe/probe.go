@@ -9,10 +9,12 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"public_vpn/internal/checker"
@@ -28,7 +30,7 @@ import (
 // mutex remains the true bottleneck, and 32 workers keep every core busy
 // behind it. An explicit [probe].threads (the owner's live 20) is
 // untouched by this default.
-const DefaultConcurrency = 32
+const DefaultConcurrency = 12
 
 // exitIPURL is the through-tunnel endpoint the engine reads the D8 exit IP
 // from (the SAME ip-api self-report call the geo stage makes — one mental
@@ -39,50 +41,45 @@ const exitIPURL = "http://ip-api.com/json/"
 
 // Options configures one probe wave.
 type Options struct {
-	Timeout time.Duration // per-attempt HTTP timeout
-	// Threads is the parallel temp-instance worker count (0 = default 32).
-	// Boot windows serialize inside the factory; the HTTP phase is parallel.
-	Threads   int
-	URL       string // probe target URL
-	Attempts  int    // HTTP GET attempts per node (>= 1)
-	Speedtest bool   // measure download speed through the node's instance
-	// SpeedtestURL is the sample the speedtest downloads.
-	SpeedtestURL     string
-	SpeedtestTimeout time.Duration // download sample window
-	// SkipFreshWithin is [probe].skip_fresh_within: nodes whose LATEST probe
-	// result is exactly `passed` and newer than this window are skipped in
-	// the wave — no link, no probe-log entry (their passed history stays
-	// intact for rank's geo.ttl gate). 0 = probe everything (the default).
-	SkipFreshWithin time.Duration
-	// Latest carries the newest outcome per node key (store.LatestProbeByKey)
-	// the skip decision reads. nil/empty = nothing to skip on.
-	Latest map[string]store.ProbeResult
-	// Now is the clock seam (tests inject; nil = time.Now().UTC()).
-	Now func() time.Time
-	// Progress receives per-node progress lines ("probing …"). nil = discard.
-	Progress io.Writer
-	// ExitProbe controls the D8 exit-IP echo. nil = ON (the production
-	// default: every alive record carries its tunnel exit IP — the W10
-	// *bool precedent). Tests pass an explicit false to run without the
-	// echo double.
-	ExitProbe *bool
-	// ExitIPURL overrides the exit-IP echo endpoint (test seam; empty =
-	// exitIPURL).
-	ExitIPURL string
+	Timeout          time.Duration                     // per-attempt HTTP timeout
+	Threads          int                               // parallel temp-instance workers (0 = default 32)
+	BatchSize        int                               // nodes per xray process in batch mode (0 = default 10)
+	BatchConcurrency int                               // nodes probed concurrently inside one batch (0 = default 10)
+	URL              string                            // probe target URL
+	Attempts         int                               // HTTP GET attempts per node (>= 1)
+	Speedtest        bool                              // measure download speed through the node's instance
+	SpeedtestURL     string                            // the sample the speedtest downloads
+	SpeedtestTimeout time.Duration                     // download sample window
+	SkipFreshWithin  time.Duration                     // skip fresh passed nodes within this window (0 = probe all)
+	Latest           map[string]store.ProbeResult      // latest outcome per node key
+	KnownAlive       map[string]store.KnownAliveRecord // known-alive set (skip within TTL)
+	KnownAliveTTL    time.Duration                     // TTL for known-alive entries (0 = disabled)
+	KnownAliveMu     *sync.RWMutex                     // optional guard for KnownAlive (nil = unlocked)
+	Now              func() time.Time                  // clock seam (nil = time.Now().UTC())
+	Progress         io.Writer                         // progress output (nil = discard)
+	ExitProbe        *bool                             // D8 exit-IP echo (nil = ON)
+	ExitIPURL        string                            // exit-IP echo endpoint override
+	Limiter          *AdaptiveLimiter                  // optional dynamic concurrency limiter
 }
 
 // SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;
 // tests: an in-process server). Structural twin of the checker/geo seams —
 // the CLI adapter hands a checker.NewXrayFactory product over 1:1.
-type SocksInstance interface {
-	Addr() string
-	Close() error
-}
+type SocksInstance = checker.SocksInstance
+
+// BatchSocksInstance extends SocksInstance for multi-node batches.
+// A batch instance exposes multiple addresses (one per node in the batch).
+type BatchSocksInstance = checker.BatchSocksInstance
 
 // Factory spawns one instance per node (production: checker.NewXrayFactory
 // — one temp single-node xray per probed node, the SAME render.BuildOutbound
 // product the live renderer uses, hardening knobs included).
-type Factory func(ctx context.Context, n *model.Node) (SocksInstance, error)
+type Factory = checker.InstanceFactory
+
+// BatchFactory spawns ONE instance for a batch of nodes (production:
+// checker.NewXrayBatchFactory — one temp xray with N outbounds for N nodes).
+// Returns a BatchSocksInstance with N addresses matching the input node order.
+type BatchFactory = checker.BatchInstanceFactory
 
 // probeJob is one unique-link unit of work: every node carrying the link
 // takes the outcome.
@@ -94,6 +91,12 @@ type probeJob struct {
 	order int
 }
 
+// batchJob is a group of probeJobs processed by one batch instance.
+type batchJob struct {
+	jobs  []*probeJob
+	order int
+}
+
 // Run probes every node and appends outcomes to the probe log. Nodes without
 // an outcome are recorded as not-alive-this-wave. Nodes skipped by
 // [probe].skip_fresh_within (latest result exactly `passed`, newer than the
@@ -102,11 +105,30 @@ type probeJob struct {
 func Run(
 	ctx context.Context, nodes []*model.Node, f Factory, opts Options, resultsPath string,
 ) ([]store.ProbeResult, error) {
+	return RunWithBatchFactory(ctx, nodes, f, nil, opts, resultsPath)
+}
+
+// RunWithBatchFactory is like Run but accepts an optional BatchFactory for
+// multi-node batching. When batchFactory is non-nil, nodes are grouped into
+// batches of size opts.BatchSize (default 10) and processed with fewer
+// xray process spawns. The single-node factory `f` is used as a fallback for
+// any nodes not handled by the batch factory (e.g., remainder nodes).
+func RunWithBatchFactory(
+	ctx context.Context, nodes []*model.Node, f Factory, batchFactory BatchFactory, opts Options, resultsPath string,
+) ([]store.ProbeResult, error) {
 	now := time.Now().UTC()
 	if opts.Now != nil {
 		now = opts.Now().UTC()
 	}
 	skipped := freshSkipSet(nodes, opts, now)
+	if ks := knownAliveSkipSet(nodes, opts, now); ks != nil {
+		if skipped == nil {
+			skipped = map[string]bool{}
+		}
+		for k := range ks {
+			skipped[k] = true
+		}
+	}
 	byLink := make(map[string]*probeJob, len(nodes))
 	ordered := make([]*probeJob, 0, len(nodes))
 	for _, n := range nodes {
@@ -123,7 +145,17 @@ func Run(
 		byLink[link] = job
 		ordered = append(ordered, job)
 	}
-	outcomes := runJobs(ctx, f, ordered, opts)
+
+	var outcomes []*outcome
+	if batchFactory != nil && len(ordered) > 0 {
+		batchSize := opts.BatchSize
+		if batchSize <= 0 {
+			batchSize = 20 // default batch size (config.DefaultProbeBatchSize)
+		}
+		outcomes = runBatchJobs(ctx, batchFactory, ordered, opts, batchSize)
+	} else {
+		outcomes = runJobs(ctx, f, ordered, opts)
+	}
 
 	out := make([]store.ProbeResult, 0, len(nodes))
 	for _, job := range ordered {
@@ -187,6 +219,7 @@ func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*
 	if len(jobs) == 0 {
 		return out
 	}
+	limiter := opts.Limiter
 	sem := make(chan struct{}, concurrency)
 	done := make([]chan struct{}, len(jobs))
 	for i := range done {
@@ -194,9 +227,22 @@ func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*
 	}
 	for i := range jobs {
 		go func(i int) {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			out[i] = runJob(ctx, f, jobs[i], opts)
+			if limiter != nil {
+				if err := limiter.Acquire(ctx); err != nil {
+					close(done[i])
+					return
+				}
+				defer limiter.Release()
+			} else {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+			}
+			res := runJob(ctx, f, jobs[i], opts)
+			out[i] = res
+			if limiter != nil && res != nil {
+				rtt := time.Duration(res.rttMS * float64(time.Millisecond))
+				limiter.RecordOutcome(rtt, !res.alive)
+			}
 			close(done[i])
 		}(i)
 	}
@@ -204,6 +250,175 @@ func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*
 		<-done[i]
 	}
 	return out
+}
+
+// runBatchJobs executes jobs in batches using a BatchFactory. Each batch
+// shares one xray process. The concurrency limit applies to BATCHES, not
+// individual nodes.
+func runBatchJobs(ctx context.Context, bf BatchFactory, jobs []*probeJob, opts Options, batchSize int) []*outcome {
+	concurrency := opts.Threads
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
+
+	// Group jobs into batches
+	batches := make([]*batchJob, 0, (len(jobs)+batchSize-1)/batchSize)
+	for i := 0; i < len(jobs); i += batchSize {
+		end := min(i+batchSize, len(jobs))
+		batches = append(batches, &batchJob{jobs: jobs[i:end], order: i})
+	}
+
+	out := make([]*outcome, len(jobs))
+	if len(batches) == 0 {
+		return out
+	}
+
+	limiter := opts.Limiter
+	sem := make(chan struct{}, concurrency)
+	done := make([]chan struct{}, len(batches))
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+
+	for i := range batches {
+		go func(i int) {
+			if limiter != nil {
+				if err := limiter.Acquire(ctx); err != nil {
+					close(done[i])
+					return
+				}
+				defer limiter.Release()
+			} else {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+			}
+			batchOutcomes := runBatchJob(ctx, bf, batches[i], opts)
+			// Write outcomes back to the correct positions
+			for j, o := range batchOutcomes {
+				out[batches[i].order+j] = o
+				if limiter != nil && o != nil {
+					rtt := time.Duration(o.rttMS * float64(time.Millisecond))
+					limiter.RecordOutcome(rtt, !o.alive)
+				}
+			}
+			close(done[i])
+		}(i)
+	}
+
+	for i := range done {
+		<-done[i]
+	}
+	return out
+}
+
+// runBatchJob drives one batch: single temp instance → per-node attempts →
+// exit IP → speedtest → aggregation. Nodes within a batch are probed
+// CONCURRENTLY (up to BatchConcurrency limit) to avoid the sequential
+// bottleneck: batchSize=10 * 3 attempts * 10s = 300s/batch serial.
+// The shared xray process handles concurrent SOCKS5 connections natively.
+func runBatchJob(ctx context.Context, bf BatchFactory, bj *batchJob, opts Options) []*outcome {
+	// Collect nodes for the batch factory
+	nodes := make([]*model.Node, len(bj.jobs))
+	for i, job := range bj.jobs {
+		nodes[i] = job.node
+	}
+
+	progressf(opts.Progress, "probing batch of %d nodes (%s)…", len(nodes), bj.jobs[0].host)
+
+	inst, err := bf(ctx, nodes)
+	if err != nil {
+		return batchBootFailure(bj.jobs, opts, err)
+	}
+	defer func() { _ = inst.Close() }()
+
+	addrs := inst.Addrs()
+	if len(addrs) != len(bj.jobs) {
+		return batchBootFailure(bj.jobs, opts, errors.New("batch instance address count mismatch"))
+	}
+
+	// Probe nodes within the batch CONCURRENTLY.
+	// BatchConcurrency limits simultaneous probes per batch (0 = no limit, probe all at once).
+	// This avoids the sequential bottleneck: batchSize=10 * 3 attempts * 10s = 300s serial.
+	batchConcurrency := opts.BatchConcurrency
+	if batchConcurrency <= 0 {
+		batchConcurrency = 10 // default batch concurrency
+	}
+	if batchConcurrency > len(bj.jobs) {
+		batchConcurrency = len(bj.jobs)
+	}
+
+	results := make([]*outcome, len(bj.jobs))
+	sem := make(chan struct{}, batchConcurrency)
+	done := make([]chan struct{}, len(bj.jobs))
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+
+	for i, job := range bj.jobs {
+		go func(i int, job *probeJob, addr string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = probeNode(ctx, addr, job, opts)
+			close(done[i])
+		}(i, job, addrs[i])
+	}
+
+	for i := range done {
+		<-done[i]
+	}
+	return results
+}
+
+// batchBootFailure returns failure outcomes for all nodes in a batch.
+func batchBootFailure(jobs []*probeJob, opts Options, err error) []*outcome {
+	results := make([]*outcome, len(jobs))
+	for i, job := range jobs {
+		results[i] = &outcome{
+			host: job.host, alive: false, status: "failed",
+			reason: oneLine(err.Error()), failureKind: "instance-boot",
+			total: opts.Attempts,
+		}
+	}
+	return results
+}
+
+// probeNode probes a single node through the given address.
+func probeNode(ctx context.Context, addr string, job *probeJob, opts Options) *outcome {
+	o := &outcome{host: job.host}
+	var ttfbs, totals []float64
+	tc := checker.NewTunnelClient(addr, opts.Timeout)
+	for range opts.Attempts {
+		attempt, aerr := tc.Get(ctx, opts.URL)
+		if aerr != nil && attempt.Verdict == "" {
+			attempt.Verdict = checker.VerdictFor(aerr, attempt.ConnectMS > 0)
+		}
+		o.total++
+		if attempt.Verdict == checker.VerdictSuccess {
+			o.checks++
+			ttfbs = append(ttfbs, attempt.TTFBMS)
+			totals = append(totals, attempt.TotalMS)
+		} else {
+			o.noteFailure(attempt)
+		}
+	}
+
+	switch {
+	case o.checks == o.total && o.total > 0:
+		o.status, o.alive = "passed", true
+	case o.checks > 0:
+		o.status, o.alive = "semi-passed", true
+	default:
+		o.status, o.alive = "failed", false
+	}
+
+	if o.alive {
+		o.rttMS = median(ttfbs)
+		if o.rttMS <= 0 {
+			o.rttMS = median(totals)
+		}
+		measureAliveExtras(ctx, tc, o, opts)
+	}
+	return o
 }
 
 // runJob drives one unique link: temp instance → attempts → exit IP →
@@ -360,6 +575,47 @@ func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]b
 		}
 	}
 	return skipped
+}
+
+// knownAliveSkipSet resolves the KnownAlive skip list: a node present in the
+// KnownAlive set is skipped when its entry is still within KnownAliveTTL.
+// Both `passed` and `semi-passed` (and any non-failed known-alive) entries
+// are skipped — the whole point of the redesign. Every skip is logged.
+func knownAliveSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]bool {
+	if opts.KnownAliveTTL <= 0 || len(opts.KnownAlive) == 0 {
+		return nil
+	}
+	if opts.KnownAliveMu != nil {
+		opts.KnownAliveMu.RLock()
+		defer opts.KnownAliveMu.RUnlock()
+	}
+	var skipped map[string]bool
+	for _, n := range nodes {
+		rec, ok := opts.KnownAlive[n.Key]
+		if !ok {
+			continue
+		}
+		if age := now.Sub(rec.LastSeen); age < opts.KnownAliveTTL {
+			status := rec.LastStatus
+			if status == "failed" {
+				continue
+			}
+			if skipped == nil {
+				skipped = map[string]bool{}
+			}
+			skipped[n.Key] = true
+			progressf(opts.Progress,
+				"skipping known-alive node %s (%s): last seen %s ago",
+				n.Key, n.Host, age.Round(time.Second))
+		}
+	}
+	return skipped
+}
+
+// KnownAliveSkipSet is the exported form of knownAliveSkipSet (tests in
+// external packages).
+func KnownAliveSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]bool {
+	return knownAliveSkipSet(nodes, opts, now)
 }
 
 func progressf(w io.Writer, format string, args ...any) {

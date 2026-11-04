@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"os"
 	"path/filepath"
 
 	"public_vpn/internal/config"
@@ -57,7 +58,9 @@ type paths struct {
 	nodes        string
 	filtered     string
 	probeResults string
+	knownAlive   string
 	geoBase      string
+	waveState    string
 	selection    string
 	renderedDir  string
 	rendered     string
@@ -76,11 +79,13 @@ func newPaths(cfg *config.Config) paths {
 		nodes:        filepath.Join(dataDir, "nodes.jsonl"),
 		filtered:     filepath.Join(dataDir, "filtered.jsonl"),
 		probeResults: filepath.Join(dataDir, "probe-results.jsonl"),
+		knownAlive:   filepath.Join(dataDir, "known-alive.jsonl"),
 		geoBase:      filepath.Join(dataDir, "geo-base.jsonl"),
+		waveState:    filepath.Join(dataDir, "wave-state.json"),
 		selection:    filepath.Join(dataDir, "selection.json"),
 		renderedDir:  renderedDir,
 		rendered:     filepath.Join(renderedDir, "config.json"),
 		backupDir:    filepath.Join(dataDir, config.ExpandHome(cfg.Activate.BackupDir)),
-		workDir:      filepath.Join(dataDir, "probe-work"),
+		workDir:      filepath.Join(os.TempDir(), "opencode", "probe-work"),
 	}
 }
