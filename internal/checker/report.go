@@ -391,3 +391,6 @@ func FlagEmoji(cc string) string { return flagEmoji(cc) }
 // FormatMS is the exported millisecond cell formatter for `publicvpn list`
 // (same compact spellings as the check report: —, <1ms, 45ms).
 func FormatMS(ms float64) string { return fmtMS(ms) }
+
+// FormatBPS renders a bits-per-second value in human-readable form (MB/s).
+func FormatBPS(bps float64) string { return fmtBPS(bps) }

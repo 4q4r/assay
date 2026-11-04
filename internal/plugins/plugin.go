@@ -77,7 +77,9 @@ func pluginIdxErrf(id string, idx int, format string, a ...any) error {
 // reload into the registry (last-good semantics live in the watchdog).
 func Compile(id, path string, code []byte, log io.Writer) (*Plugin, error) {
 	eng := newEngine(engineOptions{Log: log, noNetwork: true})
-	l := eng.newState(context.Background(), id)
+	ctx := context.Background()
+	l := eng.newState(ctx, id)
+	l.SetContext(ctx)
 	defer l.Close()
 	chunk, err := l.Load(bytes.NewReader(code), "@"+path)
 	if err != nil {

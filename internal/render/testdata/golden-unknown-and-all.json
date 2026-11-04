@@ -213,6 +213,38 @@
         }
       },
       "tag": "pool-de-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "de2.example.com",
+            "port": 2053,
+            "users": [
+              {
+                "encryption": "none",
+                "flow": "xtls-rprx-vision",
+                "id": "pool-uuid-1"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "serverName": "donor.example",
+          "shortId": "b1"
+        },
+        "security": "reality",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        }
+      },
+      "tag": "pool-de-02"
     }
   ],
   "policy": {
@@ -265,6 +297,21 @@
           "type": "leastLoad"
         },
         "tag": "pool_de"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt"
       },
       {
         "fallbackTag": "block",

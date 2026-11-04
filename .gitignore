@@ -14,3 +14,10 @@
 
 # Editor crash snapshots (unsaved-buffer dumps like client.go.1234567890)
 *.go.[0-9]*
+
+# Lua plugins: bundled defaults + any runtime-generated plugin files
+internal/plugins/defaults/*.lua
+*.lua
+
+# Superpowers SDD session state (agent tooling, never committed)
+/.superpowers/

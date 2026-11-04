@@ -1034,7 +1034,7 @@ func applyWSSettings(stream map[string]any, p map[string]string, consumed map[st
 	if v := p["ed"]; v != "" {
 		consumed["ed"] = true
 		base := ws["path"]
-		if base == "" {
+		if s, ok := base.(string); !ok || s == "" {
 			base = "/"
 		}
 		ws["path"] = appendEarlyData(base.(string), v)
@@ -1067,7 +1067,7 @@ func applyHTTPUpgradeSettings(stream map[string]any, p map[string]string, consum
 	if v := p["ed"]; v != "" {
 		consumed["ed"] = true
 		base := hu["path"]
-		if base == "" {
+		if s, ok := base.(string); !ok || s == "" {
 			base = "/"
 		}
 		hu["path"] = appendEarlyData(base.(string), v)

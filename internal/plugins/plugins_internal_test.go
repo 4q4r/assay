@@ -534,3 +534,27 @@ func TestCompileSyntaxErrorNamesPlugin(t *testing.T) {
 		t.Fatalf("expected plugin-attributed syntax error, got: %v", err)
 	}
 }
+
+// TestPluginExecutionTimeoutCancelsInfiniteLoop verifies WP-3.2:
+// when a Lua plugin contains an infinite loop (e.g. while true do end),
+// canceling the context terminates the Lua interpreter execution cleanly
+// without leaking goroutines or hanging indefinitely.
+func TestPluginExecutionTimeoutCancelsInfiniteLoop(t *testing.T) {
+	eng := newEngine(engineOptions{Log: io.Discard})
+	pl := &Plugin{
+		ID:   "infinite_loop",
+		Path: "infinite_loop.lua",
+		Code: []byte("return function() while true do end end"), //nolint:dupword // Lua loop pattern
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := eng.Run(ctx, pl)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "execution must fail on context timeout")
+	require.Contains(t, err.Error(), "context deadline exceeded", "error must reflect context cancellation")
+	require.Less(t, elapsed, 1*time.Second, "execution must abort promptly once deadline expires")
+}

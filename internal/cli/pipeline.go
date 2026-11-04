@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ import (
 	"public_vpn/internal/restart"
 	"public_vpn/internal/stats"
 	"public_vpn/internal/store"
+	"public_vpn/internal/timeoutcal"
 	"public_vpn/internal/ui"
 
 	"github.com/spf13/cobra"
@@ -41,9 +43,25 @@ import (
 // fetch downloaded (source → cached files). Cache file names come from
 // fetch.SafePath — the single definition of the path→name mapping.
 type fetchManifest struct {
-	FetchedAt time.Time                      `json:"fetched_at"`
-	Sources   map[string][]fetch.FetchedFile `json:"sources"`
+	FetchedAt   time.Time                      `json:"fetched_at"`
+	Sources     map[string][]fetch.FetchedFile `json:"sources"`
+	PluginStats []plugins.PluginStats          `json:"plugin_stats,omitempty"`
 }
+
+// newSizingEngineFunc is the sizing-engine constructor seam (tests may swap).
+var newSizingEngineFunc = geo.NewSizingEngine
+
+// adaptConcurrencyFunc is the in-wave adaptation seam (tests may swap).
+var adaptConcurrencyFunc = AdaptConcurrency
+
+// recordStageStatFunc is the per-stage stat persistence seam (tests may swap).
+var recordStageStatFunc = RecordStageStat
+
+// adjustBaseConcurrencyFunc is the inter-wave EMA seam (tests may swap).
+var adjustBaseConcurrencyFunc = AdjustBaseConcurrency
+
+// adaptTickerInterval is the in-wave adaptation tick cadence.
+var adaptTickerInterval = 5 * time.Second
 
 // outf writes formatted output; terminal writes never fail in practice and a
 // broken pipe must not mask the command result — the error is deliberately
@@ -115,15 +133,29 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 		UserAgent:   cfg.HTTP.UserAgent,
 	}, out)
 
+	// Create stats collector for plugin statistics (geo records added later for enrichment)
+	statsCollector := plugins.NewPluginStatsCollector(nil)
+
 	collected, failed, hinted, totalNodes := runAllPlugins(out, engine, snapshot, pluginRunTimeout(cfg),
-		pluginMaxFailures(cfg), reg)
+		pluginMaxFailures(cfg), reg, statsCollector)
 	if failed == len(snapshot) {
 		return fmt.Errorf("all %d attempted plugins failed; nothing fetched", failed)
 	}
+
+	// Compute basic stats (TotalNodes, DuplicateCount) after all plugins have run
+	statsCollector.ComputeBasicStats()
+
+	// Threshold enforcement: check MaxDuplicatePercent
+	checkMaxDuplicatePercent(out, reg, cfg, statsCollector)
+
 	manifest, files, err := writePluginArtifacts(p.cacheDir, collected)
 	if err != nil {
 		return err
 	}
+	// Store plugin stats in manifest
+	manifest.PluginStats = statsCollector.GetStats()
+
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -134,6 +166,33 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 	outf(out, "fetch wave complete: %d nodes from %d plugins (%d source files, %d hinted) → %s\n",
 		totalNodes, len(snapshot)-failed, files, hinted, p.manifest)
 	return nil
+}
+
+// checkMaxDuplicatePercent checks if any plugin's duplicate percentage exceeds
+// the configured MaxDuplicatePercent threshold and disables them via the registry.
+func checkMaxDuplicatePercent(
+	out io.Writer,
+	reg *plugins.Registry,
+	cfg *config.Config,
+	statsCollector *plugins.PluginStatsCollector,
+) {
+	if reg == nil || cfg == nil || cfg.Plugins.MaxDuplicatePercent == nil {
+		return
+	}
+	maxDupPct := *cfg.Plugins.MaxDuplicatePercent
+	for _, st := range statsCollector.GetStats() {
+		if st.TotalNodes == 0 {
+			continue
+		}
+		dupPct := float64(st.DuplicateCount) * 100.0 / float64(st.TotalNodes)
+		if dupPct <= maxDupPct {
+			continue
+		}
+		if reg.RecordFailure(st.PluginID, 1) {
+			outf(out, "plugin %-10s DISABLED: duplicate%% %.1f > threshold %.1f (total=%d, duplicates=%d)\n",
+				st.PluginID, dupPct, maxDupPct, st.TotalNodes, st.DuplicateCount)
+		}
+	}
 }
 
 // pluginLinks carries one plugin's raw-link output plus its per-source
@@ -192,9 +251,12 @@ func pluginMaxFailures(cfg *config.Config) int {
 // listed in the wave's breaker summary. maxFailures <= 0 = unlimited: the
 // breaker never fires. The state lives in the registry (see Registry docs):
 // per-wave in one-shot runs, persistent across waves in the watch daemon.
+//
+// Plugin stats collection: if statsCollector is non-nil, it accumulates
+// per-plugin node counts and duplicate detection during the fetch wave.
 func runAllPlugins(
 	out io.Writer, engine *plugins.Engine, snapshot []*plugins.Plugin, runTimeout time.Duration,
-	maxFailures int, reg *plugins.Registry,
+	maxFailures int, reg *plugins.Registry, statsCollector *plugins.PluginStatsCollector,
 ) ([]pluginLinks, int, int, int) {
 	collected := []pluginLinks{}
 	failed, hinted, total := 0, 0, 0
@@ -230,6 +292,11 @@ func runAllPlugins(
 		collected = append(collected, pluginLinks{plugin: pl.ID, nodes: nodes})
 		total += len(nodes)
 		outf(out, "plugin %-10s ok: %d nodes\n", pl.ID, len(nodes))
+
+		// Collect plugin stats if collector provided
+		if statsCollector != nil {
+			statsCollector.AddPluginNodes(pl.ID, nodes)
+		}
 	}
 	if reg != nil {
 		if disabled := reg.DisabledPlugins(); len(disabled) > 0 {
@@ -249,29 +316,31 @@ func runAllPlugins(
 var errPluginAbandoned = errors.New("plugin run exceeded the timeout and was abandoned")
 
 // runOnePlugin bounds one plugin run. runTimeout <= 0 runs unbounded in the
-// caller's goroutine (explicit "0s" — the honest no-deadline mode). The
-// result channel is buffered so an ABANDONED run's goroutine never blocks on
-// send: it finishes (or spins forever) detached, leaking by documented
-// design; the wave never waits on it again.
+// caller's goroutine (explicit "0s" — the honest no-deadline mode).
+// When runTimeout > 0, execution is bound to a context with timeout and passed
+// to engine.Run. If the run exceeds the timeout, ctx cancellation terminates
+// the underlying Lua VM (via LState.SetContext) and unblocks engine.Run,
+// preventing goroutine and memory leaks.
 func runOnePlugin(engine *plugins.Engine, pl *plugins.Plugin, runTimeout time.Duration) ([]plugins.Node, error) {
 	if runTimeout <= 0 {
 		return engine.Run(context.Background(), pl)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+
 	type runResult struct {
 		nodes []plugins.Node
 		err   error
 	}
 	done := make(chan runResult, 1)
 	go func() {
-		nodes, err := engine.Run(context.Background(), pl)
+		nodes, err := engine.Run(ctx, pl)
 		done <- runResult{nodes: nodes, err: err}
 	}()
-	timer := time.NewTimer(runTimeout)
-	defer timer.Stop()
 	select {
 	case r := <-done:
 		return r.nodes, r.err
-	case <-timer.C:
+	case <-ctx.Done():
 		return nil, errPluginAbandoned
 	}
 }
@@ -346,6 +415,7 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 		return fmt.Errorf("no fetch manifest (%s) — run `publicvpn fetch` first", p.manifest)
 	}
 	var manifest fetchManifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
 	if err := json.Unmarshal(b, &manifest); err != nil {
 		return fmt.Errorf("decode fetch manifest: %w", err)
 	}
@@ -499,6 +569,8 @@ func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 	return probe.Options{
 		Timeout:          cfg.Probe.Timeout.Duration,
 		Threads:          cfg.Probe.Threads,
+		BatchSize:        cfg.Probe.BatchSize,
+		BatchConcurrency: cfg.Probe.BatchConcurrency,
 		URL:              cfg.Probe.URL,
 		Attempts:         cfg.Probe.Attempts,
 		Speedtest:        speedtestFlag || cfg.Probe.IsSpeedtest(),
@@ -508,8 +580,64 @@ func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 	}
 }
 
+func newProbeBatchFactory(cfg *config.Config, p paths) probe.BatchFactory {
+	return probe.BatchFactory(func(ctx context.Context, nodes []*model.Node) (probe.BatchSocksInstance, error) {
+		outbounds := make([]map[string]any, len(nodes))
+		for i, n := range nodes {
+			rcfg := render.Config{
+				TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+				TLSFingerprint: cfg.Render.TLSFingerprint,
+			}
+			if rcfg.TCPMaxSeg == 0 {
+				rcfg.TCPMaxSeg = config.DefaultTCPMaxSeg
+			}
+			if rcfg.TLSFingerprint == "" {
+				rcfg.TLSFingerprint = config.DefaultTLSFingerprint
+			}
+			ob, _, err := render.BuildOutbound(n, fmt.Sprintf("probe-out-%d", i), rcfg)
+			if err != nil {
+				return nil, fmt.Errorf("render outbound for batch node %d: %w", i, err)
+			}
+			outbounds[i] = ob
+		}
+		return checker.StartTempXrayBatch(ctx, config.ExpandHome(cfg.Activate.XrayBin), p.workDir, outbounds)
+	})
+}
+
+func loadKnownAliveForProbe(p paths, opts probe.Options) (map[string]store.KnownAliveRecord, probe.Options, error) {
+	ka, err := store.ReadKnownAlive(p.knownAlive)
+	if err != nil {
+		return nil, opts, err
+	}
+	opts.KnownAlive = ka
+	if opts.KnownAliveTTL <= 0 {
+		opts.KnownAliveTTL = 2 * time.Hour
+	}
+	if opts.SkipFreshWithin > 0 {
+		latest, err := store.LatestProbeByKey(p.probeResults)
+		if err != nil {
+			return nil, opts, err
+		}
+		opts.Latest = latest
+	}
+	return ka, opts, nil
+}
+
+//nolint:cyclop,gocognit // runProbe orchestrates the whole probe stage
 func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool) error {
 	p := newPaths(cfg)
+	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
+	defer func() { _ = os.RemoveAll(p.workDir) }()
+	// Increment the global wave sequence (run-count liveness).
+	_, _ = store.IncrementWaveState(p.waveState)
+	// Apply calibrated timeout from previous wave, if enabled.
+	if cfg.Probe.CalibrationEnabled {
+		if st, err := timeoutcal.Load(p.dataDir); err == nil {
+			if v := st.Probe.TimeoutFor("global"); v > 0 {
+				cfg.Probe.Timeout.Duration = v
+			}
+		}
+	}
 	nodes, err := store.ReadNodes(p.filtered)
 	if err != nil {
 		return err
@@ -532,18 +660,66 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	factory := probe.Factory(func(ctx context.Context, n *model.Node) (probe.SocksInstance, error) {
 		return xrayFactory(ctx, n)
 	})
+	batchFactory := newProbeBatchFactory(cfg, p)
 	opts := probeOptions(cfg, speedtest)
-	opts.Progress = cmd.OutOrStdout()
-	if opts.SkipFreshWithin > 0 {
-		// The freshness skip reads the recorded history: skipped nodes keep
-		// their last passed outcome for rank's geo.ttl gate.
-		latest, err := store.LatestProbeByKey(p.probeResults)
-		if err != nil {
-			return err
-		}
-		opts.Latest = latest
+	// Apply the wave-start resource budget (CPU/RAM/ports) to probe
+	// concurrency (threads + batch concurrency) — the scarcest resource wins.
+	portBudget := cfg.Probe.Threads
+	if portBudget < 1 {
+		portBudget = cfg.Resources.EffectiveCPUCores()
 	}
-	results, err := probe.Run(context.Background(), nodes, factory, opts, p.probeResults)
+	budget := ComputeConcurrencyBudget(cfg, portBudget)
+	if budget > 0 {
+		if opts.Threads <= 0 || budget < opts.Threads {
+			opts.Threads = budget
+		}
+		if opts.BatchConcurrency <= 0 || budget < opts.BatchConcurrency {
+			opts.BatchConcurrency = budget
+		}
+	}
+	opts.Progress = cmd.OutOrStdout()
+	// Wire AdaptConcurrency: in-wave adaptation goroutine ticks every 5s,
+	// sampling memory/CPU/port pressure and adjusting the worker count.
+	adaptCtx, cancelAdapt := context.WithCancel(context.Background())
+	defer cancelAdapt()
+	go func() {
+		runAdapt := func(current int) int {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			maxRAM := uint64(512 * 1024 * 1024)
+			memUsedPct := 0.0
+			if maxRAM > 0 {
+				memUsedPct = float64(ms.HeapAlloc) / float64(maxRAM) * 100.0
+			}
+			cpuIdle := runtime.NumGoroutine() < 1000
+			portExhausted := false
+			return adaptConcurrencyFunc(current, memUsedPct, cpuIdle, portExhausted)
+		}
+		current := max(opts.Threads, 1)
+		// immediate tick
+		if next := runAdapt(current); next != current {
+			outf(cmd.OutOrStdout(), "probe concurrency adapted: %d -> %d\n", current, next)
+			current = next
+		}
+		ticker := time.NewTicker(adaptTickerInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-adaptCtx.Done():
+				return
+			case <-ticker.C:
+				if next := runAdapt(current); next != current {
+					outf(cmd.OutOrStdout(), "probe concurrency adapted: %d -> %d\n", current, next)
+					current = next
+				}
+			}
+		}
+	}()
+	ka, opts, err := loadKnownAliveForProbe(p, opts)
+	if err != nil {
+		return err
+	}
+	results, err := probe.RunWithBatchFactory(context.Background(), nodes, factory, batchFactory, opts, p.probeResults)
 	if err != nil {
 		return err
 	}
@@ -553,7 +729,85 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 			alive++
 		}
 	}
+	if cfg.Probe.CalibrationEnabled {
+		agg := probe.Aggregate(results)
+		tc := timeoutcal.Config{
+			Margin:               cfg.Probe.CalibrationMargin,
+			Alpha:                0.3,
+			MinSamples:           50,
+			HighTimeoutRate:      0.15,
+			HistorySize:          20,
+			MinHistory:           3,
+			MaxHistory:           50,
+			StabilityCVThreshold: 0.10,
+			MinChange:            0.5,
+		}
+		_ = timeoutcal.UpdateWithConfig(p.dataDir, "probe", timeoutcal.Observation{
+			Key:      "global",
+			Stage:    "probe",
+			Total:    len(results),
+			TimedOut: agg.TimedOutCount,
+			RTTsMs:   agg.ObservedRTTMs,
+			At:       time.Now().UTC(),
+		}, tc)
+	}
+	// (entries absent from the current source list) with TTL decay + log.
+	now := time.Now().UTC()
+	nodeKeys := map[string]bool{}
+	for _, n := range nodes {
+		nodeKeys[n.Key] = true
+	}
+	if err := updateKnownAliveSet(cmd, opts, ka, nodeKeys, results, now); err != nil {
+		return err
+	}
+	if err := store.WriteKnownAlive(p.knownAlive, ka); err != nil {
+		return err
+	}
 	outf(cmd.OutOrStdout(), "probe complete: %d/%d alive → %s\n", alive, len(results), p.probeResults)
+	return nil
+}
+
+// updateKnownAliveSet merges probe results into the known-alive set, logs
+// orphaned entries, prunes expired ones, and persists the set.
+func updateKnownAliveSet(
+	cmd *cobra.Command,
+	opts probe.Options,
+	ka map[string]store.KnownAliveRecord,
+	nodeKeys map[string]bool,
+	results []store.ProbeResult,
+	now time.Time,
+) error {
+	for _, r := range results {
+		if !r.Alive {
+			continue
+		}
+		rec := ka[r.Key]
+		if rec.Key == "" {
+			rec.Key = r.Key
+		}
+		rec.Host = r.Host
+		rec.LastSeen = r.CheckedAt
+		if rec.LastSeen.IsZero() {
+			rec.LastSeen = now
+		}
+		rec.LastStatus = r.Status
+		if rec.LastStatus == "" {
+			rec.LastStatus = "passed"
+		}
+		rec.AliveStreak++
+		rec.AliveWaveSeq++
+		ka[r.Key] = rec
+	}
+	for k, rec := range ka {
+		if nodeKeys[k] {
+			continue
+		}
+		remaining := opts.KnownAliveTTL - now.Sub(rec.LastSeen)
+		remaining = max(remaining, 0)
+		outf(cmd.OutOrStdout(), "known-alive but absent from sources — retained (TTL %s remaining): %s\n",
+			remaining.Round(time.Second), k)
+	}
+	store.PruneKnownAlive(ka, now, opts.KnownAliveTTL)
 	return nil
 }
 
@@ -572,8 +826,18 @@ func newGeoCommand(cfgPath *string) *cobra.Command {
 	}
 }
 
+//nolint:cyclop // runGeo orchestrates the geo stage
 func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 	p := newPaths(cfg)
+	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
+	defer func() { _ = os.RemoveAll(p.workDir) }()
+	if cfg.Probe.CalibrationEnabled {
+		if st, err := timeoutcal.Load(p.dataDir); err == nil {
+			if v := st.Geo.TimeoutFor("global"); v > 0 {
+				cfg.Geo.Timeout.Duration = v
+			}
+		}
+	}
 	nodes, err := store.ReadNodes(p.filtered)
 	if err != nil {
 		return err
@@ -601,15 +865,94 @@ func runGeo(cmd *cobra.Command, cfg *config.Config) error {
 	factory := geo.Factory(func(ctx context.Context, n *model.Node) (geo.SocksInstance, error) {
 		return xrayFactory(ctx, n)
 	})
-	records, summary, err := geo.Run(context.Background(), geo.Input{
-		DataDir:    p.dataDir,
-		Nodes:      nodes,
-		ProbeByKey: probeByKey,
-		Cfg:        cfg.Geo,
-		UserAgent:  cfg.HTTP.UserAgent,
-		Factory:    factory,
-		Progress:   cmd.OutOrStdout(),
+	portBudget := cfg.Probe.Threads
+	if portBudget < 1 {
+		portBudget = cfg.Resources.EffectiveCPUCores()
+	}
+	dynConc := ComputeConcurrencyBudget(cfg, portBudget)
+	// Wave state: read current seq (0 if absent).
+	ws, _ := store.ReadWaveState(p.waveState)
+	// Construct + rehydrate hot exit-IP cache.
+	exitCache := geo.NewExitGeoCache(geo.ExitCacheConfig{
+		TTL: cfg.Geo.TTL.Duration,
 	})
+	if exitCache == nil {
+		exitCache = geo.NewExitGeoCache()
+	}
+	defer func() { _ = exitCache.Close() }()
+	if recs, err := store.ReadGeo(p.geoBase); err == nil {
+		exitCache.Rehydrate(recs)
+	}
+	// Wire SizingEngine: compute the cache cap from memory + inputs + stats,
+	// apply via Resize, and log the resize decision (reason, old cap, new cap).
+	prevCap := exitCache.Capacity()
+	memSnap := newSizingEngineFunc().MeasureMemory()
+	distinctExitIPs := 0
+	seenExitIPs := map[string]bool{}
+	for _, n := range nodes {
+		if pr, ok := probeByKey[n.Key]; ok && pr.Alive && pr.ExitIP != "" {
+			if !seenExitIPs[pr.ExitIP] {
+				seenExitIPs[pr.ExitIP] = true
+				distinctExitIPs++
+			}
+		}
+	}
+	sizingInputs := geo.SizingInputs{
+		DistinctExitIPs: distinctExitIPs,
+		TotalNodes:      len(nodes),
+		MemLimitBytes:   memSnap.MemLimitBytes,
+		HeapAllocBytes:  memSnap.HeapAllocBytes,
+		ReserveBytes:    0,
+		HardCeiling:     0,
+		CurrentWave:     ws.CurrentWaveSeq,
+		ProviderClass:   "",
+	}
+	sizingMetrics := exitCache.Stats()
+	prevSnap := geo.CapacitySnapshot{Cap: prevCap, LastResizeWave: 0}
+	newCap, resizeReason := newSizingEngineFunc().RecomputeCap(prevSnap, sizingInputs, sizingMetrics)
+	exitCache.SetSizingMeta(sizingMetrics.ProviderClass, distinctExitIPs, len(nodes), memSnap.MemLimitBytes,
+		memSnap.MemLimitBytes-memSnap.HeapAllocBytes, sizingMetrics.SharingRatio, ws.CurrentWaveSeq)
+	exitCache.SetLastResizeReason(resizeReason)
+	exitCache.Resize(newCap)
+	outf(cmd.OutOrStdout(), "geo cache resize: reason=%s old=%d new=%d\n", resizeReason, prevCap, newCap)
+	exitCache.SetCurrentWave(ws.CurrentWaveSeq)
+	records, summary, err := geo.Run(context.Background(), geo.Input{
+		DataDir:            p.dataDir,
+		Nodes:              nodes,
+		ProbeByKey:         probeByKey,
+		Cfg:                cfg.Geo,
+		UserAgent:          cfg.HTTP.UserAgent,
+		Factory:            factory,
+		Progress:           cmd.OutOrStdout(),
+		Concurrency:        dynConc,
+		DynamicConcurrency: dynConc,
+		ExitCache:          exitCache,
+		WaveSeq:            ws.CurrentWaveSeq,
+	})
+	if err != nil {
+		return err
+	}
+	if cfg.Probe.CalibrationEnabled {
+		tc := timeoutcal.Config{
+			Margin:               cfg.Probe.CalibrationMargin,
+			Alpha:                0.3,
+			MinSamples:           50,
+			HighTimeoutRate:      0.15,
+			HistorySize:          20,
+			MinHistory:           3,
+			MaxHistory:           50,
+			StabilityCVThreshold: 0.10,
+			MinChange:            0.5,
+		}
+		_ = timeoutcal.UpdateWithConfig(p.dataDir, "geo", timeoutcal.Observation{
+			Key:      "global",
+			Stage:    "geo",
+			Total:    summary.Eligible,
+			TimedOut: summary.TimedOutCount,
+			RTTsMs:   summary.RequestRTTMs,
+			At:       time.Now().UTC(),
+		}, tc)
+	}
 	if err != nil {
 		return err
 	}
@@ -671,7 +1014,19 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	sel := rank.Select(nodes, geoRecs, probeByKey, cfg.Select, cfg.Geo.TTL.Duration)
+	ka, err := store.ReadKnownAlive(p.knownAlive)
+	if err != nil {
+		outf(cmd.OutOrStdout(), "WARNING: failed to read known-alive set (%s): %v\n", p.knownAlive, err)
+		// If file exists and failed to decode, preserve a copy for diagnostics
+		if !os.IsNotExist(err) {
+			corruptPath := fmt.Sprintf("%s.corrupt.%d", p.knownAlive, time.Now().Unix())
+			if cpErr := os.Rename(p.knownAlive, corruptPath); cpErr == nil {
+				outf(cmd.OutOrStdout(), "backed up corrupt known-alive file to %s\n", corruptPath)
+			}
+		}
+		ka = map[string]store.KnownAliveRecord{}
+	}
+	sel := rank.Select(nodes, geoRecs, probeByKey, cfg.Select, cfg.Geo.TTL.Duration, ka)
 	if err := store.WriteSelection(p.selection, sel); err != nil {
 		return err
 	}
@@ -769,8 +1124,12 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	}
 	// 0600 deliberate: the rendered config carries pool node credentials
 	// (UUIDs/passwords). The live target keeps ITS OWN mode — atomicReplace
-	// preserves it (review finding 11).
-	if err := os.WriteFile(p.rendered, res.Config, 0o600); err != nil {
+	// preserves it (review finding 11). Atomic+synced write: a crash during
+	// write must never leave a truncated rendered config.
+	if err := store.WriteFileAtomic(p.rendered, func(f *os.File) error {
+		_, err := f.Write(res.Config)
+		return err
+	}); err != nil {
 		return err
 	}
 	outf(cmd.OutOrStdout(), "render complete: %d pool outbounds → %s\n", len(sel.Nodes), p.rendered)
@@ -1023,16 +1382,17 @@ type maintainOptions struct {
 // orchestration is testable without network/tooling. Production stages are
 // the W1–W3 runners — the wave reuses them 1:1, never duplicating logic.
 type maintainStages struct {
-	fetch    func(*cobra.Command, *config.Config) error
-	parse    func(*cobra.Command, *config.Config) error
-	filter   func(*cobra.Command, *config.Config) error
-	probe    func(*cobra.Command, *config.Config) error
-	geo      func(*cobra.Command, *config.Config) error
-	stats    func(*cobra.Command, *config.Config) error
-	prune    func(*cobra.Command, *config.Config) error
-	selectS  func(*cobra.Command, *config.Config) error
-	render   func(*cobra.Command, *config.Config) error
-	activate func(*cobra.Command, *config.Config) error
+	fetch             func(*cobra.Command, *config.Config) error
+	parse             func(*cobra.Command, *config.Config) error
+	filter            func(*cobra.Command, *config.Config) error
+	probe             func(*cobra.Command, *config.Config) error
+	geo               func(*cobra.Command, *config.Config) error
+	pluginStatsEnrich func(*cobra.Command, *config.Config) error
+	stats             func(*cobra.Command, *config.Config) error
+	prune             func(*cobra.Command, *config.Config) error
+	selectS           func(*cobra.Command, *config.Config) error
+	render            func(*cobra.Command, *config.Config) error
+	activate          func(*cobra.Command, *config.Config) error
 }
 
 // defaultMaintainStages wires the real runners. filter runs with the config
@@ -1043,15 +1403,16 @@ type maintainStages struct {
 // [maintain].auto_restart is disabled.
 func defaultMaintainStages(opts maintainOptions) *maintainStages {
 	return &maintainStages{
-		fetch:   runFetch,
-		parse:   runParse,
-		filter:  func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
-		probe:   func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest) },
-		geo:     runGeo,
-		stats:   runStatsStage,
-		prune:   runPruneStage,
-		selectS: runSelect,
-		render:  runRender,
+		fetch:             runFetch,
+		parse:             runParse,
+		filter:            func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
+		probe:             func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest) },
+		geo:               runGeo,
+		pluginStatsEnrich: runPluginStatsEnrichment,
+		stats:             runStatsStage,
+		prune:             runPruneStage,
+		selectS:           runSelect,
+		render:            runRender,
 		activate: func(c *cobra.Command, cfg *config.Config) error {
 			return runActivateStage(c, cfg, productionRestartWiring())
 		},
@@ -1139,9 +1500,25 @@ func (s *waveRunState) runStage(name string, stage func(*cobra.Command, *config.
 		s.waveErr = errWavePaused
 		return false
 	}
+	start := time.Now()
 	if err := stage(s.cmd, s.cfg); err != nil {
 		s.waveErr = fmt.Errorf("maintain stage %s: %w", name, err)
 		return false
+	}
+	// Wire RecordStageStat: persist per-stage cost for inter-wave EMA.
+	costMs := time.Since(start).Milliseconds()
+	p := newPaths(s.cfg)
+	wave := 0
+	if ws, err := store.ReadWaveState(p.waveState); err == nil {
+		wave = int(ws.CurrentWaveSeq) //nolint:gosec
+	}
+	conc := ComputeConcurrencyBudget(s.cfg, 0)
+	conc = max(conc, 1)
+	if err := recordStageStatFunc(p.dataDir, StageStat{
+		Stage: name, CostMs: costMs, Concurrency: conc,
+		Wave: wave, At: time.Now().UTC(),
+	}); err != nil {
+		outf(s.w, "ERROR: stage-stats write failed: %v\n", err)
 	}
 	return true
 }
@@ -1154,12 +1531,38 @@ func (s *waveRunState) pauseOrErr() error {
 }
 
 // runTail executes the accounting + selection + activation half of the wave
-// (stats → prune → select → render → activate-if-changed).
+// (plugin-stats-enrich → stats → prune → select → render → activate-if-changed).
+//
+//nolint:cyclop // runTail orchestrates the tail half of the wave
 func (s *waveRunState) runTail(opts maintainOptions) error {
-	if s.between != nil && s.between() {
-		outln(s.w, "maintain: shutdown requested — wave paused before stage stats (completed stages are flushed)")
+	if s.checkpoint("plugin-stats-enrich") {
 		return nil
 	}
+	if s.stages.pluginStatsEnrich != nil {
+		psStart := time.Now()
+		if err := s.stages.pluginStatsEnrich(s.cmd, s.cfg); err != nil {
+			// Plugin stats enrichment is accounting, not correctness — warn but continue
+			outf(s.w, "WARNING: plugin stats enrichment failed: %v (continuing)\n", err)
+		}
+		psCost := time.Since(psStart).Milliseconds()
+		psP := newPaths(s.cfg)
+		psWave := 0
+		if ws, e := store.ReadWaveState(psP.waveState); e == nil {
+			psWave = int(ws.CurrentWaveSeq) //nolint:gosec
+		}
+		psConc := ComputeConcurrencyBudget(s.cfg, 0)
+		psConc = max(psConc, 1)
+		if err := recordStageStatFunc(psP.dataDir, StageStat{
+			Stage: "plugin-stats-enrich", CostMs: psCost,
+			Concurrency: psConc, Wave: psWave, At: time.Now().UTC(),
+		}); err != nil {
+			outf(s.w, "ERROR: stage-stats write failed: %v\n", err)
+		}
+	}
+	if s.checkpoint("stats") {
+		return nil
+	}
+	statsStart := time.Now()
 	if err := s.stages.stats(s.cmd, s.cfg); err != nil {
 		// W7 item 9: the stats stage classifies its own failures (see
 		// reportStatsFailure). Injected stages returning plain errors keep
@@ -1168,27 +1571,160 @@ func (s *waveRunState) runTail(opts maintainOptions) error {
 			return fatal
 		}
 	}
+	statsCost := time.Since(statsStart).Milliseconds()
+	statsP := newPaths(s.cfg)
+	statsWave := 0
+	if ws, e := store.ReadWaveState(statsP.waveState); e == nil {
+		statsWave = int(ws.CurrentWaveSeq) //nolint:gosec
+	}
+	statsConc := max(ComputeConcurrencyBudget(s.cfg, 0), 1)
+	if err := recordStageStatFunc(statsP.dataDir, StageStat{
+		Stage: "stats", CostMs: statsCost, Concurrency: statsConc,
+		Wave: statsWave, At: time.Now().UTC(),
+	}); err != nil {
+		outf(s.w, "ERROR: stage-stats write failed: %v\n", err)
+	}
 	if !s.runStage("prune", s.stages.prune) {
 		return s.pauseOrErr()
 	}
 	if !s.runStage("select", s.stages.selectS) {
 		return s.pauseOrErr()
 	}
+	// Config reconciliation (wave 1): surface configured pool_routes whose
+	// target country has no live node in the (just-selected) cold base, so the
+	// owner can drop stale entries (pool_us, pool_fr, pool_sg_singapore) instead
+	// of discovering them as blocked routes at render time. Non-fatal: a stale
+	// entry is dropped to "block" at render and the wave keeps going.
+	s.reconcilePoolRoutes()
 	if !s.runStage("render", s.stages.render) {
 		return s.pauseOrErr()
+	}
+	// Inter-wave EMA: adjust base concurrency from stage stats and persist,
+	// even when activation is skipped (--no-activate).
+	{
+		emaP := newPaths(s.cfg)
+		base := 0
+		if b, err := os.ReadFile(filepath.Join(emaP.dataDir, "base-concurrency.txt")); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				base = n
+			}
+		}
+		if base < 1 {
+			base = ComputeConcurrencyBudget(s.cfg, 0)
+		}
+		base = max(base, 1)
+		allStats, _ := ReadStageStats(emaP.dataDir)
+		newBase := adjustBaseConcurrencyFunc(base, allStats)
+		_ = os.WriteFile(filepath.Join(emaP.dataDir, "base-concurrency.txt"), []byte(strconv.Itoa(newBase)), 0o600)
 	}
 	if opts.noActivate {
 		outln(s.w, "maintain: --no-activate — live config not touched")
 		return nil
 	}
-	if s.between != nil && s.between() {
-		outln(s.w, "maintain: shutdown requested — wave paused before stage activate (completed stages are flushed)")
+	if s.checkpoint("activate") {
 		return nil
 	}
+	actStart := time.Now()
 	if err := s.stages.activate(s.cmd, s.cfg); err != nil {
 		return fmt.Errorf("maintain stage activate: %w", err)
 	}
+	actCost := time.Since(actStart).Milliseconds()
+	actP := newPaths(s.cfg)
+	actWave := 0
+	if ws, e := store.ReadWaveState(actP.waveState); e == nil {
+		actWave = int(ws.CurrentWaveSeq) //nolint:gosec
+	}
+	actConc := max(ComputeConcurrencyBudget(s.cfg, 0), 1)
+	if err := recordStageStatFunc(actP.dataDir, StageStat{
+		Stage: "activate", CostMs: actCost, Concurrency: actConc,
+		Wave: actWave, At: time.Now().UTC(),
+	}); err != nil {
+		outf(s.w, "ERROR: stage-stats write failed: %v\n", err)
+	}
 	return nil
+}
+
+// reconcilePoolRoutes logs configured pool_routes whose target country has no
+// live node in the just-selected cold base. Non-fatal: render drops such routes
+// to "block" and the wave keeps going. The reconciliation is keyed on the
+// selection file the select stage just wrote.
+func (s *waveRunState) reconcilePoolRoutes() {
+	p := newPaths(s.cfg)
+	sel, err := store.ReadSelection(p.selection)
+	if err != nil || sel == nil {
+		return
+	}
+	selected := map[string]bool{}
+	for _, n := range sel.Nodes {
+		selected[n.Country] = true
+	}
+	for _, route := range s.cfg.Render.PoolRoutes {
+		bal := route.Balancer
+		// Global balancers are rendered whenever any pool node exists; they are
+		// not country-keyed, so country-level reconciliation does not apply.
+		if bal == "pool_all" || bal == "pool_all_clean" {
+			continue
+		}
+		country := balancerCountry(bal)
+		if selected[country] {
+			continue
+		}
+		const msg = "WARNING: config reconciliation: pool route %q references balancer %q " +
+			"but country %q has no live nodes — consider removing or changing this route\n"
+		outf(s.w, msg, bal, bal, country)
+	}
+}
+
+// balancerCountry extracts the ISO-ish country code a pool balancer/outbound is
+// keyed on. Unknown-geo balancers map to "" (the selection's unknown-country
+// bucket); global balancers are handled by the caller.
+func balancerCountry(balancer string) string {
+	if rest, ok := strings.CutPrefix(balancer, "pool-"); ok {
+		parts := strings.SplitN(rest, "-", 2)
+		if len(parts) == 0 {
+			return ""
+		}
+		cc := parts[0]
+		if strings.EqualFold(cc, "xx") {
+			return ""
+		}
+		return strings.ToLower(cc)
+	}
+	if rest, ok := strings.CutPrefix(balancer, "pool_"); ok {
+		// Strip a trailing "_clean" suffix so clean balancers key on the same
+		// country as their all-variant.
+		rest = strings.TrimSuffix(rest, "_clean")
+		if rest == "unknown" {
+			return ""
+		}
+		if rest == "all" {
+			return ""
+		}
+		parts := strings.SplitN(rest, "_", 2)
+		if len(parts) == 0 {
+			return ""
+		}
+		cc := parts[0]
+		if strings.EqualFold(cc, "xx") {
+			return ""
+		}
+		return strings.ToLower(cc)
+	}
+	return ""
+}
+
+// checkpoint checks the shutdown signal before a stage; returns true if the
+// wave should pause (prints the pause message and returns true).
+func (s *waveRunState) checkpoint(stage string) bool {
+	if s.between == nil {
+		return false
+	}
+	if s.between() {
+		outf(s.w, "maintain: shutdown requested — wave paused before stage %s (completed stages are flushed)\n", stage)
+		s.waveErr = errWavePaused
+		return true
+	}
+	return false
 }
 
 // reportStatsFailure surfaces one stats-stage failure by its class
@@ -1289,6 +1825,205 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 	return nil
 }
 
+// runPluginStatsEnrichment enriches the plugin stats in the fetch manifest
+// with live nodes (from probe) and hosting/proxy/clean counts (from geo).
+// Called after probe and geo stages have completed.
+func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config) error {
+	p := newPaths(cfg)
+
+	// Read the fetch manifest to get existing plugin stats
+	b, err := os.ReadFile(p.manifest)
+	if err != nil {
+		// No manifest yet - nothing to enrich (not an error)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read fetch manifest for plugin stats enrichment: %w", err)
+	}
+	var manifest fetchManifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	if err := json.Unmarshal(b, &manifest); err != nil {
+		return fmt.Errorf("decode fetch manifest for plugin stats enrichment: %w", err)
+	}
+	if len(manifest.PluginStats) == 0 {
+		// No plugin stats to enrich
+		return nil
+	}
+
+	// Read probe results for liveness
+	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+	if err != nil {
+		return fmt.Errorf("read probe results for plugin stats: %w", err)
+	}
+	liveByKey := make(map[string]bool, len(probeByKey))
+	for k, pr := range probeByKey {
+		if pr.Alive {
+			liveByKey[k] = true
+		}
+	}
+
+	// Read geo records for the collector projection.
+	_, pluginGeoRecords, err := readGeoRecords(p)
+	if err != nil {
+		return err
+	}
+
+	// Recreate collector with existing stats and enrich
+	statsCollector := plugins.NewPluginStatsCollector(pluginGeoRecords)
+	// Pre-populate with existing stats from manifest
+	for _, st := range manifest.PluginStats {
+		statsCollector.Stats[st.PluginID] = &st
+	}
+
+	// Read filtered nodes to get keys for matching
+	filtered, err := store.ReadNodes(p.filtered)
+	if err != nil {
+		return fmt.Errorf("read filtered nodes for plugin stats enrichment: %w", err)
+	}
+
+	// Compute LiveNodes for each plugin
+	computePluginLiveNodes(statsCollector, manifest, filtered, liveByKey)
+
+	// Compute hosting/proxy/clean from geo records
+	computePluginGeoCounts(statsCollector, filtered)
+
+	// Update manifest with enriched stats
+	manifest.PluginStats = statsCollector.GetStats()
+
+	// Threshold enforcement: check MinLivePercent
+	checkMinLivePercent(cmd, cfg, statsCollector)
+
+	// Write back the manifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	b, err = json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal enriched manifest: %w", err)
+	}
+	if err := store.WriteManifest(p.manifest, b); err != nil {
+		return fmt.Errorf("write enriched manifest: %w", err)
+	}
+
+	outf(cmd.OutOrStdout(), "plugin-stats: enriched %d plugins with live/geo data\n", len(manifest.PluginStats))
+	return nil
+}
+
+// readGeoRecords reads the geo base once and returns both views: the model
+// records (the Phase-1 unlock evidence source) and the plugins-package
+// projection the stats collector consumes.
+func readGeoRecords(p paths) ([]*model.GeoRecord, []*plugins.GeoRecord, error) {
+	geoRecords, err := store.ReadGeo(p.geoBase)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read geo records for plugin stats: %w", err)
+	}
+
+	pluginGeoRecords := make([]*plugins.GeoRecord, len(geoRecords))
+	for i, gr := range geoRecords {
+		pluginGeoRecords[i] = &plugins.GeoRecord{
+			Scheme:      gr.Scheme,
+			Host:        gr.Host,
+			Port:        gr.Port,
+			IP:          gr.IP,
+			Country:     gr.Country,
+			City:        gr.City,
+			ASN:         gr.ASN,
+			ASName:      gr.ASName,
+			ISP:         gr.ISP,
+			ProxyFlag:   gr.ProxyFlag,
+			HostingFlag: gr.HostingFlag,
+			GeoSource:   gr.GeoSource,
+			FirstSeen:   gr.FirstSeen,
+			LastSeen:    gr.LastSeen,
+			LastProbe:   gr.LastProbe,
+			RTTMs:       gr.RTTMs,
+			SpeedBPS:    gr.SpeedBPS,
+			Alive:       gr.Alive,
+			BytesUp:     gr.BytesUp,
+			BytesDown:   gr.BytesDown,
+			Tag:         gr.Tag,
+			Source:      gr.Source,
+		}
+	}
+	return geoRecords, pluginGeoRecords, nil
+}
+
+// computePluginLiveNodes computes LiveNodes for each plugin by matching filtered nodes against probe results.
+func computePluginLiveNodes(
+	statsCollector *plugins.PluginStatsCollector,
+	manifest fetchManifest,
+	filtered []*model.Node,
+	liveByKey map[string]bool,
+) {
+	for _, st := range manifest.PluginStats {
+		liveCount := 0
+		for _, n := range filtered {
+			if n.Source == st.PluginID && liveByKey[n.Key] {
+				liveCount++
+			}
+		}
+		if statsCollector.Stats[st.PluginID] != nil {
+			statsCollector.Stats[st.PluginID].LiveNodes = liveCount
+		}
+	}
+}
+
+// computePluginGeoCounts computes HostingCount, ProxyCount, CleanCount for each plugin from geo records.
+func computePluginGeoCounts(statsCollector *plugins.PluginStatsCollector, filtered []*model.Node) {
+	for pluginID, st := range statsCollector.Stats {
+		hosting, proxy, clean := 0, 0, 0
+		for _, n := range filtered {
+			if n.Source != pluginID {
+				continue
+			}
+			geoKey := plugins.GeoIdentityKey(n.Scheme, n.Host, n.Port)
+			if gr, ok := statsCollector.GeoByKey[geoKey]; ok {
+				if gr.HostingFlag {
+					hosting++
+				}
+				if gr.ProxyFlag {
+					proxy++
+				}
+				if !gr.HostingFlag && !gr.ProxyFlag {
+					clean++
+				}
+			} else {
+				clean++
+			}
+		}
+		st.HostingCount = hosting
+		st.ProxyCount = proxy
+		st.CleanCount = clean
+	}
+}
+
+// checkMinLivePercent checks if any plugin's live percentage falls below
+// the configured MinLivePercent threshold and disables them via the registry.
+func checkMinLivePercent(cmd *cobra.Command, cfg *config.Config, statsCollector *plugins.PluginStatsCollector) {
+	if cfg == nil || cfg.Plugins.MinLivePercent == nil {
+		return
+	}
+	minLivePct := *cfg.Plugins.MinLivePercent
+	if err := plugins.EnsureDefaults(config.ExpandHome(cfg.Plugins.Dir)); err != nil {
+		return
+	}
+	enrichReg, err := plugins.LoadDir(config.ExpandHome(cfg.Plugins.Dir), io.Discard)
+	if err != nil || enrichReg == nil {
+		return
+	}
+	for _, st := range statsCollector.GetStats() {
+		if st.TotalNodes == 0 {
+			continue
+		}
+		livePct := float64(st.LiveNodes) * 100.0 / float64(st.TotalNodes)
+		if livePct >= minLivePct {
+			continue
+		}
+		if enrichReg.RecordFailure(st.PluginID, 1) {
+			outf(cmd.OutOrStdout(), "plugin %-10s DISABLED: live%% %.1f < threshold %.1f (total=%d, live=%d)\n",
+				st.PluginID, livePct, minLivePct, st.TotalNodes, st.LiveNodes)
+		}
+	}
+}
+
 // runPruneStage removes dead/ttl-stale-orphan records from the geo-base and
 // reports the wave's filter set as "still referenced" (package prune owns the
 // rules). A pruning pass that removes anything leaves a .bak-<ts> backup of
@@ -1359,10 +2094,10 @@ func newStatusCommand(cfgPath *string) *cobra.Command {
 		Use:   "status",
 		Short: "Pipeline state summary (read-only)",
 		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
-selection, render) plus the install state: installed binary, unit files,
-enablement, and the wave periods read live from the config. The resolved
-config source is printed as the config line (explicit -c, home default, cwd
-default, or configless built-in defaults).
+		selection, render) plus the install state: installed binary, unit files,
+		enablement, and the wave periods read live from the config. The resolved
+		config source is printed as the config line (explicit -c, home default, cwd
+		default, or configless built-in defaults).
 
 Install detection reads the directories given via --bin-dir / --unit-dir
 (defaults identical to ` + "`install`" + `: ~/.local/bin and
@@ -1399,6 +2134,7 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 	printStageCounts(out, p, color)
 	printProbeStatus(out, p, color)
 	printGeoStatus(out, p, color)
+	printCalibrationStatus(out, p, res.Config, color)
 	printSelectionStatus(out, p, color)
 	printRenderStatus(out, p, color)
 	binDir, unitDir := statusInstallDirs(cmd)
@@ -1428,6 +2164,7 @@ func printFetchStatus(out io.Writer, p paths, color bool) {
 		return
 	}
 	var m fetchManifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
 	if json.Unmarshal(b, &m) != nil {
 		outln(out, ui.ChipKV("fetch:    ", "manifest unreadable", color))
 		return
@@ -1488,6 +2225,68 @@ func printGeoStatus(out io.Writer, p paths, color bool) {
 	outf(out, "%s\n", ui.ChipKV("geo:      ",
 		fmt.Sprintf("%d records, %d alive, %d countries, traffic folded: %d up / %d down bytes",
 			len(recs), alive, len(countries), up, down), color))
+}
+
+func printCalibrationStatus(out io.Writer, p paths, cfg *config.Config, color bool) {
+	if !cfg.Probe.CalibrationEnabled {
+		outln(out, ui.ChipKV("calibration:", "disabled", color))
+		return
+	}
+	st, err := timeoutcal.Load(p.dataDir)
+	if err != nil {
+		outln(out, ui.ChipKV("calibration:", "state unreadable", color))
+		return
+	}
+	// probe
+	probeCur := st.Probe.TimeoutFor("global")
+	if probeCur == 0 {
+		probeCur = time.Duration(cfg.Probe.CalibrationBase * float64(time.Second))
+	}
+	probeBase := time.Duration(cfg.Probe.CalibrationBase * float64(time.Second))
+	probeCV := 0.0
+	hist := make([]float64, 0, len(st.Probe.Global.History))
+	for _, h := range st.Probe.Global.History {
+		hist = append(hist, h.P95Ms)
+	}
+	if len(hist) > 0 {
+		probeCV = timeoutcal.CV(hist)
+	}
+	outf(out, "%s\n", ui.ChipKV("calibration:",
+		fmt.Sprintf("probe: %s (base %s, floor %s, ceiling %s, CV %.3f, wave %d)", probeCur, probeBase,
+			time.Duration(timeoutcal.FloorMs)*time.Millisecond,
+			time.Duration(timeoutcal.CeilingMs)*time.Millisecond,
+			probeCV,
+			st.Probe.Global.Waves), color))
+	// geo
+	geoCur := st.Geo.TimeoutFor("global")
+	if geoCur == 0 {
+		geoCur = probeBase
+	}
+	outf(out, "%s\n", ui.ChipKV("  geo:     ",
+		fmt.Sprintf("%s (base %s, wave %d)", geoCur, probeBase, st.Geo.Global.Waves), color))
+	// regions slowest 3
+	type regionKV struct {
+		key string
+		dur time.Duration
+	}
+	var regions []regionKV
+	for k, v := range st.Probe.Regions {
+		regions = append(regions, regionKV{k, v.Current})
+	}
+	sort.Slice(regions, func(i, j int) bool { return regions[i].dur > regions[j].dur })
+	if len(regions) > 3 {
+		regions = regions[:3]
+	}
+	if len(regions) > 0 {
+		parts := make([]string, 0, len(regions))
+		for _, r := range regions {
+			parts = append(parts, fmt.Sprintf("%s %s", r.key, r.dur))
+		}
+		msg := fmt.Sprintf("%d calibrated; slowest: %s", len(st.Probe.Regions), strings.Join(parts, ", "))
+		outf(out, "%s\n", ui.ChipKV("  regions:", msg, color))
+	}
+	// state file path
+	outf(out, "%s\n", ui.ChipKV("  state:", filepath.Join(p.dataDir, "timeout-calibration.json"), color))
 }
 
 func printSelectionStatus(out io.Writer, p paths, color bool) {

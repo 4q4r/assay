@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -26,9 +27,20 @@ type SocksInstance interface {
 	Close() error
 }
 
+// BatchSocksInstance extends SocksInstance for multi-node batches.
+// A batch instance exposes multiple addresses (one per node in the batch).
+type BatchSocksInstance interface {
+	SocksInstance
+	Addrs() []string
+}
+
 // InstanceFactory spawns one instance per node (production: a temp xray with
 // the node's rendered outbound).
 type InstanceFactory func(ctx context.Context, n *model.Node) (SocksInstance, error)
+
+// BatchInstanceFactory spawns ONE instance for a batch of nodes (production:
+// one temp xray with N outbounds for N nodes).
+type BatchInstanceFactory func(ctx context.Context, nodes []*model.Node) (BatchSocksInstance, error)
 
 // Temp-instance geometry: boot gets 10s; a killed child's inherited pipes
 // get 5s to release Wait (activate.go M-3 landmine).
@@ -49,7 +61,7 @@ const (
 // Production callers never reassign it — the production scan is unchanged.
 var (
 	instancePortMin = 18500
-	instancePortMax = 18799
+	instancePortMax = 18999
 )
 
 // SetTestPortBand re-pins the temp-instance port scan band. FOR TEST SUITES
@@ -105,13 +117,43 @@ type xrayInstance struct {
 
 func (x *xrayInstance) Addr() string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(x.port)) }
 
+// batchXrayInstance holds a single xray process with multiple inbound ports.
+type batchXrayInstance struct {
+	cmd       *exec.Cmd
+	ports     []int
+	dir       string
+	waitOnce  sync.Once
+	done      chan struct{}
+	waitErr   error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// Addr returns the first port for backward compatibility with SocksInstance.
+// Use Addrs() for all ports in a batch.
+func (b *batchXrayInstance) Addr() string {
+	if len(b.ports) == 0 {
+		return "127.0.0.1:0"
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(b.ports[0]))
+}
+
+// Addrs returns all socks inbound addresses in the batch.
+func (b *batchXrayInstance) Addrs() []string {
+	addrs := make([]string, len(b.ports))
+	for i, p := range b.ports {
+		addrs[i] = net.JoinHostPort("127.0.0.1", strconv.Itoa(p))
+	}
+	return addrs
+}
+
 // Close kills the instance by its EXACT captured PID (never name-based — the
 // owner runs live processes), reaps it, and removes the temp config dir.
 // Idempotent: a second Close is a no-op (the first already waited for the
 // reap and cleaned the dir).
 func (x *xrayInstance) Close() error {
 	x.closeOnce.Do(func() {
-		if x.cmd.Process != nil {
+		if x.cmd != nil && x.cmd.Process != nil {
 			_ = x.cmd.Process.Kill()
 		}
 		<-x.waitDone() // Wait returns after the kill; WaitDelay bounds lingering pipes
@@ -130,7 +172,9 @@ func (x *xrayInstance) waitDone() <-chan struct{} {
 	x.waitOnce.Do(func() {
 		x.done = make(chan struct{})
 		go func() {
-			x.waitErr = x.cmd.Wait()
+			if x.cmd != nil {
+				x.waitErr = x.cmd.Wait()
+			}
 			close(x.done)
 		}()
 	})
@@ -156,6 +200,7 @@ var bootMu sync.Mutex
 //
 //nolint:ireturn // SocksInstance is the seam: engine and tests stay implementation-agnostic
 func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[string]any) (SocksInstance, error) {
+	// Single outbound: use the original xrayInstance path for backward compatibility with tests.
 	if xrayBin == "" {
 		return nil, errors.New("xray binary path is empty (activate.xray_bin)")
 	}
@@ -193,8 +238,6 @@ func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[st
 	}
 	//nolint:gosec // the binary comes from the owner's config.toml — the config file IS the trust root
 	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", cfgPath)
-	// The child must not inherit a proxy environment (L5 hygiene), and Wait
-	// must never block forever on inherited pipes (M-3 landmine).
 	cmd.Env = dropProxyEnv(os.Environ())
 	cmd.WaitDelay = instanceKillDelay
 	stderr := &limitedWriter{max: instanceLogBuffers}
@@ -205,6 +248,117 @@ func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[st
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("start %s: %w", xrayBin, err)
 	}
+	if err := inst.awaitReadiness(ctx, stderr); err != nil {
+		_ = inst.Close()
+		return nil, err
+	}
+	return inst, nil
+}
+
+// StartTempXrayBatch spawns ONE temporary xray instance with MULTIPLE outbounds,
+// each reachable via a dedicated socks inbound on a unique port. Routing rules
+// connect inbound tag "socks-in-N" to outbound tag "probe-out-N" for perfect
+// per-node isolation within a single process. Returns a BatchSocksInstance
+// exposing all N addresses. The boot mutex serializes port allocation + boot
+// for the entire batch (one process boot instead of N).
+//
+//nolint:ireturn // SocksInstance is the seam: engine and tests stay implementation-agnostic
+func StartTempXrayBatch(
+	ctx context.Context,
+	xrayBin, workDir string,
+	outbounds []map[string]any,
+) (BatchSocksInstance, error) {
+	if xrayBin == "" {
+		return nil, errors.New("xray binary path is empty (activate.xray_bin)")
+	}
+	if len(outbounds) == 0 {
+		return nil, errors.New("StartTempXrayBatch: at least one outbound required")
+	}
+	bootMu.Lock()
+	defer bootMu.Unlock()
+	if err := os.MkdirAll(workDir, 0o750); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(workDir, "check-batch-")
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate consecutive ports for the batch
+	ports := make([]int, len(outbounds))
+	for i := range outbounds {
+		p, err := freeInstancePort(ctx)
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
+		ports[i] = p
+	}
+
+	// Build inbounds: one socks inbound per outbound
+	inbounds := make([]any, len(outbounds))
+	for i, port := range ports {
+		inbounds[i] = map[string]any{
+			"tag":      fmt.Sprintf("socks-in-%d", i),
+			"listen":   "127.0.0.1",
+			"port":     port,
+			"protocol": "socks",
+			"settings": map[string]any{"udp": false},
+		}
+	}
+
+	// Build outbounds with probe tags
+	taggedOutbounds := make([]any, len(outbounds))
+	for i, ob := range outbounds {
+		// Copy and set the tag
+		taggedOB := maps.Clone(ob)
+		taggedOB["tag"] = fmt.Sprintf("probe-out-%d", i)
+		taggedOutbounds[i] = taggedOB
+	}
+
+	// Build routing rules: inboundTag -> outboundTag
+	routingRules := make([]any, len(outbounds))
+	for i := range outbounds {
+		routingRules[i] = map[string]any{
+			"type":        "field",
+			"inboundTag":  []any{fmt.Sprintf("socks-in-%d", i)},
+			"outboundTag": fmt.Sprintf("probe-out-%d", i),
+		}
+	}
+
+	cfg := map[string]any{
+		"log":       map[string]any{"loglevel": "warning"},
+		"inbounds":  inbounds,
+		"outbounds": taggedOutbounds,
+		"routing": map[string]any{
+			"rules": routingRules,
+		},
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	//nolint:gosec // the binary comes from the owner's config.toml — the config file IS the trust root
+	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", cfgPath)
+	// The child must not inherit a proxy environment (L5 hygiene), and Wait
+	// must never block forever on inherited pipes (M-3 landmine).
+	cmd.Env = dropProxyEnv(os.Environ())
+	cmd.WaitDelay = instanceKillDelay
+	stderr := &limitedWriter{max: instanceLogBuffers}
+	cmd.Stderr = stderr
+
+	inst := &batchXrayInstance{cmd: cmd, ports: ports, dir: dir}
+	if err := cmd.Start(); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("start %s: %w", xrayBin, err)
+	}
+	// Wait for ALL inbounds to be ready
 	if err := inst.awaitReadiness(ctx, stderr); err != nil {
 		_ = inst.Close()
 		return nil, err
@@ -234,6 +388,83 @@ func (x *xrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter
 			if err == nil {
 				_ = conn.Close()
 				return nil
+			}
+		}
+	}
+}
+
+// batchXrayInstance methods
+
+// Close kills the batch instance by its EXACT captured PID, reaps it, and
+// removes the temp config dir. Idempotent.
+func (b *batchXrayInstance) Close() error {
+	b.closeOnce.Do(func() {
+		if b.cmd != nil && b.cmd.Process != nil {
+			_ = b.cmd.Process.Kill()
+		}
+		<-b.waitDone()
+		b.closeErr = os.RemoveAll(b.dir)
+	})
+	return b.closeErr
+}
+
+// waitDone reaps the child exactly once and closes done when Wait returns.
+func (b *batchXrayInstance) waitDone() <-chan struct{} {
+	b.waitOnce.Do(func() {
+		b.done = make(chan struct{})
+		go func() {
+			if b.cmd != nil {
+				b.waitErr = b.cmd.Wait()
+			}
+			close(b.done)
+		}()
+	})
+	return b.done
+}
+
+// awaitReadiness polls ALL socks inbounds until they all accept.
+func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter) error {
+	deadline := time.After(instanceBootBound)
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	dialer := &net.Dialer{Timeout: 400 * time.Millisecond}
+
+	// Track readiness per port
+	ready := make([]bool, len(b.ports))
+	readyCount := 0
+
+	for {
+		select {
+		case <-b.waitDone():
+			return fmt.Errorf("xray exited during startup: %w\n%s", b.waitErr, tailStr(stderr.String(), 400))
+		case <-ctx.Done():
+			return fmt.Errorf("instance boot canceled: %w", ctx.Err())
+		case <-deadline:
+			// Find which ports aren't ready
+			var notReady []string
+			for i, r := range ready {
+				if !r {
+					notReady = append(notReady, net.JoinHostPort("127.0.0.1", strconv.Itoa(b.ports[i])))
+				}
+			}
+			return fmt.Errorf("xray socks inbounds %v not ready within %s\n%s",
+				notReady, instanceBootBound, tailStr(stderr.String(), 400))
+		case <-tick.C:
+			// Check all non-ready ports
+			for i := range b.ports {
+				if ready[i] {
+					continue
+				}
+				addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(b.ports[i]))
+				conn, err := dialer.DialContext(ctx, "tcp", addr)
+				if err == nil {
+					_ = conn.Close()
+					ready[i] = true
+					readyCount++
+					if readyCount == len(b.ports) {
+						return nil // All ready
+					}
+				}
 			}
 		}
 	}
@@ -275,6 +506,7 @@ func dropProxyEnv(env []string) []string {
 	return out
 }
 
+//nolint:unparam // n is used in the function body
 func tailStr(s string, n int) string {
 	if len(s) <= n {
 		return s
