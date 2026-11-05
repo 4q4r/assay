@@ -125,15 +125,64 @@ func LivenessRate(s WaveSnapshot) float64 {
 	return float64(s.Live) / float64(s.Total)
 }
 
+// SparklineScale selects the value→glyph mapping of the zero-anchored
+// 8-level ladder.
+type SparklineScale int
+
+const (
+	// SparklineAbsolute maps the fixed 0..1 rate scale (never min-max
+	// stretched): level = round(rate×7), so 50% liveness is always the mid
+	// glyph regardless of the window's spread.
+	SparklineAbsolute SparklineScale = iota
+	// SparklineMaxRelative maps each value against the provider's OWN window
+	// maximum: level = round(value/max×7). Per-series scaling reveals the
+	// SHAPE of a flat-lived pool (Stephen Few, "Best Practices for Scaling
+	// Sparklines" — per-series scaling = shape; magnitude is carried by the
+	// adjacent numeric column, which the provider table's alive% cell does).
+	// Domain precedent (metacubexd node scoring) anchors on absolute
+	// thresholds — rejected here because this pool's regime (alive ~1.5%)
+	// renders any absolute ladder a single bottom glyph: the shape would be
+	// dead pixels. The zero glyph renders ONLY for a true 0 value; a small
+	// positive value never collapses into it.
+	SparklineMaxRelative
+)
+
 // ComputeSparkline maps liveness rates onto the zero-anchored 8-level glyph
-// ladder at the ABSOLUTE 0..1 scale (never min-max stretched): level =
-// round(rate×7), so 50% liveness is always the mid glyph regardless of the
-// window's spread.
+// ladder at the ABSOLUTE 0..1 scale.
 func ComputeSparkline(rates []float64) string {
+	return ComputeSparklineScaled(rates, SparklineAbsolute)
+}
+
+// ComputeSparklineScaled renders the ladder under the given scale. Both
+// variants clamp into the ladder and keep the zero glyph for empty/zero
+// values; the max-relative variant additionally guarantees that any positive
+// value renders at least level 1 (round-to-zero would lie about a nonzero
+// hour).
+func ComputeSparklineScaled(rates []float64, scale SparklineScale) string {
 	glyphs := []rune(SparklineGlyphs)
+	top := float64(len(glyphs) - 1)
+	if scale == SparklineMaxRelative {
+		top = 0
+		for _, r := range rates {
+			if r > top {
+				top = r
+			}
+		}
+	}
 	out := make([]rune, 0, len(rates))
 	for _, r := range rates {
-		level := int(math.Round(r * float64(len(glyphs)-1)))
+		var level int
+		switch {
+		case scale == SparklineMaxRelative && r > 0:
+			level = int(math.Round(r / top * float64(len(glyphs)-1)))
+			if level == 0 {
+				level = 1 // a positive value never reads as the zero glyph
+			}
+		case scale == SparklineMaxRelative:
+			level = 0 // true 0 (or defensive negative) → the zero glyph
+		default:
+			level = int(math.Round(r * float64(len(glyphs)-1)))
+		}
 		level = min(max(level, 0), len(glyphs)-1)
 		out = append(out, glyphs[level])
 	}
@@ -303,8 +352,14 @@ func (s *ProviderSeries) CurrentRate() float64 {
 }
 
 // Sparkline renders the newest n waves' liveness rates (all of them when n
-// exceeds the ring).
+// exceeds the ring) at the absolute scale.
 func (s *ProviderSeries) Sparkline(n int) string {
+	return s.SparklineScaled(n, SparklineAbsolute)
+}
+
+// SparklineScaled renders the newest n waves under the given scale (all of
+// them when n exceeds the ring).
+func (s *ProviderSeries) SparklineScaled(n int, scale SparklineScale) string {
 	if n < 0 || len(s.Waves) == 0 {
 		return ""
 	}
@@ -313,7 +368,7 @@ func (s *ProviderSeries) Sparkline(n int) string {
 	for _, w := range s.Waves[start:] {
 		rates = append(rates, LivenessRate(w))
 	}
-	return ComputeSparkline(rates)
+	return ComputeSparklineScaled(rates, scale)
 }
 
 // Trend classifies the last six waves: OLS slope over their liveness rates
