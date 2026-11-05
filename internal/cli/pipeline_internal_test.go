@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -698,4 +699,178 @@ func TestRunPluginStatsEnrichmentHistoryFailureNonFatal(t *testing.T) {
 	for _, st := range manifest.PluginStats {
 		assert.Positive(t, st.LiveNodes, "enriched stats still landed despite the history failure")
 	}
+}
+
+// TestRunFetchWithCarriesOverEnrichedStats pins the fetch × enrichment merge
+// contract. The enrichment tail (runPluginStatsEnrichment) rewrites the
+// manifest once per full wave cycle, ~2h after fetch; the NEXT wave's fetch
+// must PRESERVE those enrichment-layer fields instead of clobbering them
+// with fresh basic stats (production incident: `publicvpn status` showed
+// live=0 / n-a / NONE for the entire cycle except the seconds between the
+// enrichment tail and the next fetch). Table-driven:
+//
+//   - carries_enrichment_and_refreshes_fetch_fields: enriched manifest on
+//     disk → runFetchWith → manifest still carries enriched fields for
+//     plugins the new fetch still runs, while TotalNodes/DuplicateCount/
+//     fetched_at/sources refresh; a plugin the enrichment never saw starts
+//     unenriched; plugin_overlap carries over;
+//   - drops_stats_of_plugins_absent_from_fetch: a dropped plugin takes its
+//     stale stats with it;
+//   - corrupt_prior_manifest_warns_and_starts_fresh: loud WARNING, wave
+//     proceeds, fresh manifest;
+//   - cold_start_without_prior_manifest: silent, behaves exactly as the
+//     pre-fix code.
+func TestRunFetchWithCarriesOverEnrichedStats(t *testing.T) {
+	// runFetch runs one fetch wave with the given registry and returns the
+	// manifest now on disk plus the wave output (for WARNING assertions).
+	runFetch := func(t *testing.T, dir string, reg *plugins.Registry) (fetchManifest, string) {
+		t.Helper()
+		cfg := &config.Config{DataDir: dir}
+		out := &bytes.Buffer{}
+		cmd := &cobra.Command{}
+		cmd.SetOut(out)
+		_, err := runFetchWith(cmd, cfg, reg)
+		require.NoError(t, err)
+		b, err := os.ReadFile(newPaths(cfg).manifest)
+		require.NoError(t, err)
+		var m fetchManifest
+		//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+		require.NoError(t, json.Unmarshal(b, &m))
+		return m, out.String()
+	}
+
+	// stubRegistry returns a registry whose plugins each return one node —
+	// no network, deterministic fetch-layer stats.
+	stubRegistry := func(ids ...string) *plugins.Registry {
+		reg := plugins.NewRegistry()
+		for _, id := range ids {
+			code := fmt.Sprintf(
+				`return function() return { publicvpn.node{ raw = "vless://n@%s.example:443?s=1" } } end`, id)
+			reg.Set(&plugins.Plugin{ID: id, Path: id + ".lua", Code: []byte(code)})
+		}
+		return reg
+	}
+
+	// enrichedPrior builds the manifest shape the enrichment tail leaves
+	// behind: fetch-layer stats plus a full enrichment overlay for two
+	// plugins and the pairwise overlap matrix.
+	enrichedPrior := func() fetchManifest {
+		return fetchManifest{
+			FetchedAt: time.Now().UTC().Add(-2 * time.Hour),
+			Sources: map[string][]fetch.FetchedFile{
+				"alpha": {{Source: "alpha", Path: "alpha.txt", URL: "plugin://alpha",
+					Body: []byte("stale\n"), FetchedAt: time.Now().UTC().Add(-2 * time.Hour)}},
+			},
+			PluginStats: []plugins.PluginStats{
+				{
+					PluginID: "alpha", TotalNodes: 999, DuplicateCount: 7,
+					LiveNodes: 42, HostingCount: 5, ProxyCount: 3,
+					CleanCount: 34, ClassifiedCount: 40, UnlockCount: 9,
+					UniqueYield: 75,
+					TopOverlaps: []plugins.OverlapPair{{PluginID: "beta", Percent: 25}},
+				},
+				{
+					PluginID: "beta", TotalNodes: 10, DuplicateCount: 2,
+					LiveNodes: 4, HostingCount: 1, ProxyCount: 1,
+					CleanCount: 2, ClassifiedCount: 4, UnlockCount: 0,
+					UniqueYield: 50,
+					TopOverlaps: []plugins.OverlapPair{{PluginID: "alpha", Percent: 50}},
+				},
+			},
+			PluginOverlap: &plugins.OverlapMatrix{
+				Sets:  map[string]int{"alpha": 4, "beta": 2},
+				Cells: map[string]map[string]float64{"alpha": {"beta": 25}, "beta": {"alpha": 50}},
+			},
+		}
+	}
+
+	writePrior := func(t *testing.T, dir string, m fetchManifest) {
+		t.Helper()
+		//nolint:musttag // fetchManifest has JSON tags; musttag false positive (same as production sites)
+		b, err := json.MarshalIndent(m, "", "  ")
+		require.NoError(t, err)
+		require.NoError(t, store.WriteManifest(newPaths(&config.Config{DataDir: dir}).manifest, b))
+	}
+
+	statsByID := func(m fetchManifest) map[string]plugins.PluginStats {
+		out := map[string]plugins.PluginStats{}
+		for _, st := range m.PluginStats {
+			out[st.PluginID] = st
+		}
+		return out
+	}
+
+	t.Run("carries_enrichment_and_refreshes_fetch_fields", func(t *testing.T) {
+		dir := t.TempDir()
+		prior := enrichedPrior()
+		writePrior(t, dir, prior)
+
+		m, _ := runFetch(t, dir, stubRegistry("alpha", "charlie"))
+
+		byID := statsByID(m)
+		require.Contains(t, byID, "alpha")
+		require.Contains(t, byID, "charlie")
+
+		alpha := byID["alpha"]
+		assert.Equal(t, 1, alpha.TotalNodes, "fetch-layer TotalNodes refreshes from the new wave")
+		assert.Equal(t, 0, alpha.DuplicateCount, "fetch-layer DuplicateCount refreshes from the new wave")
+		assert.Equal(t, 42, alpha.LiveNodes, "enrichment-layer fields survive the next fetch")
+		assert.Equal(t, 5, alpha.HostingCount)
+		assert.Equal(t, 3, alpha.ProxyCount)
+		assert.Equal(t, 34, alpha.CleanCount)
+		assert.Equal(t, 40, alpha.ClassifiedCount)
+		assert.Equal(t, 9, alpha.UnlockCount)
+		assert.InDelta(t, 75.0, alpha.UniqueYield, 1e-9)
+		require.Len(t, alpha.TopOverlaps, 1)
+		assert.Equal(t, "beta", alpha.TopOverlaps[0].PluginID)
+		assert.InDelta(t, 25.0, alpha.TopOverlaps[0].Percent, 1e-9)
+
+		charlie := byID["charlie"]
+		assert.Equal(t, 1, charlie.TotalNodes)
+		assert.Zero(t, charlie.LiveNodes,
+			"a plugin the enrichment never saw starts unenriched (pending until the next enrichment tail)")
+		assert.Zero(t, charlie.HostingCount)
+		assert.Zero(t, charlie.ClassifiedCount)
+
+		require.NotNil(t, m.PluginOverlap, "plugin_overlap carries over until the next enrichment recomputes it")
+		assert.Equal(t, map[string]int{"alpha": 4, "beta": 2}, m.PluginOverlap.Sets)
+
+		require.Contains(t, m.Sources, "alpha", "sources refresh with the new fetch")
+		assert.True(t, m.FetchedAt.After(prior.FetchedAt), "fetched_at refreshes")
+	})
+
+	t.Run("drops_stats_of_plugins_absent_from_fetch", func(t *testing.T) {
+		dir := t.TempDir()
+		writePrior(t, dir, enrichedPrior())
+
+		m, _ := runFetch(t, dir, stubRegistry("alpha"))
+
+		require.Len(t, m.PluginStats, 1,
+			"a plugin the fetch no longer carries takes its stale stats with it")
+		assert.Equal(t, "alpha", m.PluginStats[0].PluginID)
+	})
+
+	t.Run("corrupt_prior_manifest_warns_and_starts_fresh", func(t *testing.T) {
+		dir := t.TempDir()
+		p := newPaths(&config.Config{DataDir: dir})
+		require.NoError(t, os.MkdirAll(p.cacheDir, 0o750))
+		require.NoError(t, os.WriteFile(p.manifest, []byte("{not json"), 0o600))
+
+		m, text := runFetch(t, dir, stubRegistry("alpha"))
+
+		assert.Contains(t, text, "WARNING", "a corrupt prior manifest must be loud:\n"+text)
+		require.Len(t, m.PluginStats, 1)
+		assert.Zero(t, m.PluginStats[0].LiveNodes, "no carry-over from garbage: fresh basic stats")
+		assert.Equal(t, 1, m.PluginStats[0].TotalNodes, "the wave itself is unaffected")
+	})
+
+	t.Run("cold_start_without_prior_manifest", func(t *testing.T) {
+		dir := t.TempDir()
+
+		m, text := runFetch(t, dir, stubRegistry("alpha"))
+
+		assert.NotContains(t, text, "WARNING", "a cold start is not a warning condition")
+		require.Len(t, m.PluginStats, 1)
+		assert.Zero(t, m.PluginStats[0].LiveNodes)
+	})
 }
