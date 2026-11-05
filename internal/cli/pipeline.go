@@ -2294,15 +2294,22 @@ func newStatusCommand(cfgPath *string) *cobra.Command {
 	var (
 		binDir  string
 		unitDir string
+		jsonOut bool
+		overlap bool
 	)
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Pipeline state summary (read-only)",
 		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
-		selection, render) plus the install state: installed binary, unit files,
-		enablement, and the wave periods read live from the config. The resolved
-		config source is printed as the config line (explicit -c, home default, cwd
-		default, or configless built-in defaults).
+selection, render) plus the intelligence dashboard: the pipeline funnel,
+global pool quality, the provider intelligence table, and the media/unlock
+summary. The resolved config source is printed as the config line (explicit
+-c, home default, cwd default, or configless built-in defaults).
+
+--overlap (-v) appends the pairwise provider-overlap matrix view with
+pruning recommendations. --json bypasses the dashboard entirely and emits
+one machine-readable JSON document (schema_version 1.0); both flags
+compose — the overlap matrix is always part of the JSON.
 
 Install detection reads the directories given via --bin-dir / --unit-dir
 (defaults identical to ` + "`install`" + `: ~/.local/bin and
@@ -2320,8 +2327,26 @@ passing the same values here — publicvpn keeps no state file by design.`,
 		"directory to inspect for the installed publicvpn binary (same default as install)")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
 		"systemd user unit directory to inspect (same default as install)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false,
+		"emit one machine-readable JSON document instead of the dashboard (schema_version 1.0)")
+	cmd.Flags().BoolVarP(&overlap, "overlap", "v", false,
+		"append the pairwise provider-overlap matrix view with pruning recommendations")
 	attachColorFlags(cmd)
 	return cmd
+}
+
+// statusOutputFlags reads the Phase-4 dashboard flags off the command
+// (round-7 pattern: direct runStatus callers with a bare cobra command get
+// the zero-value dashboard behavior).
+func statusOutputFlags(cmd *cobra.Command) (bool, bool) {
+	var jsonOut, overlap bool
+	if f := cmd.Flags().Lookup("json"); f != nil {
+		jsonOut, _ = strconv.ParseBool(f.Value.String())
+	}
+	if f := cmd.Flags().Lookup("overlap"); f != nil {
+		overlap, _ = strconv.ParseBool(f.Value.String())
+	}
+	return jsonOut, overlap
 }
 
 func runStatus(cmd *cobra.Command, res *config.Resolved) error {
@@ -2331,15 +2356,35 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 	if err != nil {
 		return err
 	}
+	jsonOut, overlap := statusOutputFlags(cmd)
+
+	configSource := res.Source.String()
+	if res.Path != "" {
+		configSource += " " + res.Path
+	}
+	si, err := collectStatusIntel(p, configSource)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return emitStatusJSON(out, si)
+	}
 
 	outln(out, ui.Header("publicvpn pipeline status", color))
 	reportConfigSourceStyled(out, res, color)
 	outln(out, ui.Chip("data dir:", p.dataDir, color))
 	printFetchStatus(out, p, color)
-	printStageCounts(out, p, color)
+	printStageCounts(out, si.stages, color)
 	printProbeStatus(out, p, color)
 	printGeoStatus(out, p, color)
 	printCalibrationStatus(out, p, res.Config, color)
+	printPipelineFunnel(out, si, color)
+	printGlobalQuality(out, &si.geo, color)
+	printMediaSummary(out, &si.geo.Media, color)
+	printPluginLivenessStatus(out, si, res.Config, color)
+	if overlap {
+		printOverlapMatrix(out, si, color)
+	}
 	printSelectionStatus(out, p, color)
 	printRenderStatus(out, p, color)
 	binDir, unitDir := statusInstallDirs(cmd)
@@ -2382,16 +2427,9 @@ func printFetchStatus(out io.Writer, p paths, color bool) {
 		fmt.Sprintf("%d files from %d sources at %s", files, len(m.Sources), m.FetchedAt.Format(time.RFC3339)), color))
 }
 
-func printStageCounts(out io.Writer, p paths, color bool) {
-	for label, path := range map[string]string{"nodes": p.nodes, "filtered": p.filtered} {
-		n, err := countLines(path)
-		if err != nil || n == 0 {
-			outf(out, "%s\n", ui.ChipKV(fmt.Sprintf("%-9s ", label+":"), "empty", color))
-			continue
-		}
-		outf(out, "%s\n", ui.ChipKV(fmt.Sprintf("%-9s ", label+":"), strconv.Itoa(n), color))
-	}
-}
+// printStageCounts and printPluginLivenessStatus live in status_intel.go
+// (Phase 4 — the intelligence dashboard owns the whole status rendering
+// chain alongside the funnel/quality/media sections).
 
 func printProbeStatus(out io.Writer, p paths, color bool) {
 	results, err := store.ReadProbeResults(p.probeResults)
