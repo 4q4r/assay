@@ -46,7 +46,8 @@ func breakerRunWave(t *testing.T, cfg *config.Config, reg *plugins.Registry) str
 	out := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(out)
-	require.NoError(t, runFetchWith(cmd, cfg, reg))
+	_, err := runFetchWith(cmd, cfg, reg)
+	require.NoError(t, err)
 	return out.String()
 }
 

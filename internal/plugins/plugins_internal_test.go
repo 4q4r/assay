@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"public_vpn/internal/fetch"
@@ -533,4 +534,58 @@ func TestCompileSyntaxErrorNamesPlugin(t *testing.T) {
 	if !errors.As(err, &le) || le.Plugin != "broken" || !strings.Contains(err.Error(), "syntax") {
 		t.Fatalf("expected plugin-attributed syntax error, got: %v", err)
 	}
+}
+
+// TestRunRecoversLuaRuntimePanic pins F11: gopher-lua's runtime can PANIC
+// (not RaiseError) on plugin-controlled input — the recorded W10
+// inline-gmatch landmine. The scoped recover at the engine's run boundary
+// converts the panic into a loud, plugin-attributed error so the fetch
+// boundary's RecordFailure breaker path fires and the wave continues;
+// without it the whole daemon crashes and re-crash-loops via the watchdog.
+func TestRunRecoversLuaRuntimePanic(t *testing.T) {
+	eng := newEngine(engineOptions{Log: io.Discard})
+	pl := &Plugin{
+		ID:   "panicky",
+		Path: "panicky.lua",
+		// The pinned gopher-lua v1.1.2 panic: a for-in iterator fed an
+		// INLINE call-chain expression — nil dereference inside the VM.
+		Code: []byte(`local function bl()
+	local ok, d = pcall(publicvpn.base64.decode, "dmxlc3M6Ly9h")
+	return d
+end
+return function()
+	local n = 0
+	for w in (bl() .. "X\n"):gmatch("([^\n]*)\n") do n = n + 1 end
+	return {}
+end`),
+	}
+	nodes, err := eng.Run(context.Background(), pl)
+	require.Error(t, err, "the runtime panic must become a loud plugin-attributed error")
+	assert.Nil(t, nodes)
+	assert.Contains(t, err.Error(), "panicky", "the error must name the plugin")
+	assert.Contains(t, err.Error(), "runtime error", "the error must carry the panic signature, not a fake clean failure")
+}
+
+// TestPluginExecutionTimeoutCancelsInfiniteLoop verifies WP-3.2:
+// when a Lua plugin contains an infinite loop (e.g. while true do end),
+// canceling the context terminates the Lua interpreter execution cleanly
+// without leaking goroutines or hanging indefinitely.
+func TestPluginExecutionTimeoutCancelsInfiniteLoop(t *testing.T) {
+	eng := newEngine(engineOptions{Log: io.Discard})
+	pl := &Plugin{
+		ID:   "infinite_loop",
+		Path: "infinite_loop.lua",
+		Code: []byte("return function() while true do end end"), //nolint:dupword // Lua loop pattern
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := eng.Run(ctx, pl)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "execution must fail on context timeout")
+	require.Contains(t, err.Error(), "context deadline exceeded", "error must reflect context cancellation")
+	require.Less(t, elapsed, 1*time.Second, "execution must abort promptly once deadline expires")
 }

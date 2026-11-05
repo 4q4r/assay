@@ -433,3 +433,162 @@ func TestOwnProbeFailureNeverRidesSharedIdentity(t *testing.T) {
 		assert.NotEqual(t, dead.Key, sn.Key, "a node whose own probe failed is never selectable")
 	}
 }
+
+// TestProbeAllowsOwnProbeBranches pins F7 (owner ruling 2026-11-04: KEEP
+// the knownAlive escape) at all three own-probe branches of probeAllows:
+// the node's geo record says alive, the OWN latest probe decides.
+//   - own probe alive → admitted;
+//   - own probe dead + a known-alive record → admitted (anti-flake for
+//     temp-xray boots; the in-client observatory is the second dead-node
+//     layer);
+//   - own probe dead + no known-alive record → rejected (fail-closed).
+func TestProbeAllowsOwnProbeBranches(t *testing.T) {
+	f := newFixture()
+	live := f.add(t, "de", "Berlin", true, 3, 1_000_000, 100)
+	escape := f.add(t, "de", "Munich", true, 3, 1_000_000, 100)
+	dropped := f.add(t, "de", "Hamburg", true, 3, 1_000_000, 100)
+	// All three geo records say alive; the OWN latest probes decide.
+	f.probe[live.Key] = store.ProbeResult{Key: live.Key, Alive: true, Checks: 3, TotalChecks: 3}
+	f.probe[escape.Key] = store.ProbeResult{Key: escape.Key, Alive: false, Checks: 0, TotalChecks: 3}
+	f.probe[dropped.Key] = store.ProbeResult{Key: dropped.Key, Alive: false, Checks: 0, TotalChecks: 3}
+
+	ka := map[string]store.KnownAliveRecord{
+		escape.Key: {Key: escape.Key, Host: escape.Host, LastSeen: time.Now().UTC()},
+	}
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(5), 0, ka)
+	active := map[string]bool{}
+	for _, sn := range sel.Nodes {
+		active[sn.Key] = true
+	}
+	assert.True(t, active[live.Key], "own probe alive → admitted")
+	assert.True(t, active[escape.Key],
+		"own probe dead + known-alive record → admitted (the owner-ruled anti-flake escape)")
+	assert.False(t, active[dropped.Key],
+		"own probe dead + no known-alive record → rejected (fail-closed)")
+}
+
+// TestSharedGeoRecordMutationIsolation pins WP-2.1:
+// Two candidates share an identical GeoRecord pointer with Alive=false.
+// Candidate A has a knownAlive record (or is verified alive), while Candidate B has no knownAlive and no probe success.
+// Evaluating/admitting candidate A must NOT mutate the shared *model.GeoRecord in a way that falsely
+// marks candidate B as alive. Candidate A must be selected and candidate B must be filtered out.
+func TestSharedGeoRecordMutationIsolation(t *testing.T) {
+	nodeA := model.NewNode("s", "vless", "uuid-a", "shared-host.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	nodeB := model.NewNode("s", "vless", "uuid-b", "shared-host.example.com", 443,
+		map[string]string{"security": "tls", "type": "ws"})
+
+	sharedGeo := &model.GeoRecord{
+		Source:  "s",
+		Scheme:  "vless",
+		Host:    "shared-host.example.com",
+		Port:    443,
+		Country: "de",
+		City:    "Frankfurt",
+		Alive:   false, // Initially not alive in cold base
+	}
+
+	nodes := []*model.Node{nodeA, nodeB}
+	geo := []*model.GeoRecord{sharedGeo}
+
+	// Candidate A is known alive, Candidate B is not.
+	ka := map[string]store.KnownAliveRecord{
+		nodeA.Key: {
+			Key:      nodeA.Key,
+			Host:     nodeA.Host,
+			LastSeen: time.Now().UTC(),
+		},
+	}
+
+	sel := rank.Select(nodes, geo, nil, config.SelectConfig{}, 0, ka)
+	require.Len(t, sel.Nodes, 1, "only candidate A should be admitted; candidate B must not ride candidate A's knownAlive mutation")
+	assert.Equal(t, nodeA.Key, sel.Nodes[0].Key, "candidate A must be selected")
+	assert.False(t, sharedGeo.Alive, "original input GeoRecord must not be mutated in-place by Select")
+}
+
+// TestProbeAllowsFailClosedOnUnprobedWhenProbesActive pins WP-2.2:
+// When probeByKey is non-empty (probes ran for this wave), unprobed nodes whose keys are
+// absent from probeByKey MUST fail-closed: return true ONLY if ka[n.Key] exists.
+// If absent from probeByKey AND absent from ka, the unprobed node MUST be rejected.
+// When probeByKey is nil or empty, cold base / bootstrap behavior is preserved.
+func TestProbeAllowsFailClosedOnUnprobedWhenProbesActive(t *testing.T) {
+	nodeProbedAlive := model.NewNode("s", "vless", "uuid-probed-alive", "probed-alive.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	nodeUnprobed := model.NewNode("s", "vless", "uuid-unprobed", "unprobed.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+	nodeUnprobedKnownAlive := model.NewNode("s", "vless", "uuid-unprobed-ka", "unprobed-ka.example.com", 443,
+		map[string]string{"security": "tls", "type": "tcp"})
+
+	geoProbedAlive := &model.GeoRecord{
+		Source:  "s",
+		Scheme:  "vless",
+		Host:    "probed-alive.example.com",
+		Port:    443,
+		Country: "de",
+		City:    "Berlin",
+		Alive:   true,
+	}
+	geoUnprobed := &model.GeoRecord{
+		Source:  "s",
+		Scheme:  "vless",
+		Host:    "unprobed.example.com",
+		Port:    443,
+		Country: "nl",
+		City:    "Amsterdam",
+		Alive:   true,
+	}
+	geoUnprobedKA := &model.GeoRecord{
+		Source:  "s",
+		Scheme:  "vless",
+		Host:    "unprobed-ka.example.com",
+		Port:    443,
+		Country: "fr",
+		City:    "Paris",
+		Alive:   true,
+	}
+
+	nodes := []*model.Node{nodeProbedAlive, nodeUnprobed, nodeUnprobedKnownAlive}
+	geo := []*model.GeoRecord{geoProbedAlive, geoUnprobed, geoUnprobedKA}
+
+	// Active wave with at least one probe result
+	probeByKey := map[string]store.ProbeResult{
+		nodeProbedAlive.Key: {
+			Key:         nodeProbedAlive.Key,
+			Alive:       true,
+			Checks:      3,
+			TotalChecks: 3,
+		},
+	}
+
+	// knownAlive contains only nodeUnprobedKnownAlive
+	ka := map[string]store.KnownAliveRecord{
+		nodeUnprobedKnownAlive.Key: {
+			Key:      nodeUnprobedKnownAlive.Key,
+			Host:     nodeUnprobedKnownAlive.Host,
+			LastSeen: time.Now().UTC(),
+		},
+	}
+
+	// 1. When probes ran (probeByKey non-empty):
+	// - nodeProbedAlive is admitted (pr.Alive == true)
+	// - nodeUnprobedKnownAlive is admitted (absent from probeByKey, but present in ka)
+	// - nodeUnprobed MUST be rejected (absent from probeByKey, absent from ka -> fail-closed)
+	selActive := rank.Select(nodes, geo, probeByKey, config.SelectConfig{}, 0, ka)
+	require.Len(t, selActive.Nodes, 2, "unprobed node absent from ka must be rejected in active wave")
+	keysActive := map[string]bool{}
+	for _, sn := range selActive.Nodes {
+		keysActive[sn.Key] = true
+	}
+	assert.True(t, keysActive[nodeProbedAlive.Key], "probed alive node must be selected")
+	assert.True(t, keysActive[nodeUnprobedKnownAlive.Key], "unprobed node with fresh knownAlive record must be admitted")
+	assert.False(t, keysActive[nodeUnprobed.Key], "unprobed node without probe or knownAlive must be rejected (fail-closed)")
+
+	// 2. When probeByKey is nil (bootstrap / cold base):
+	// All nodes with alive geo records can be admitted
+	selBootstrapNil := rank.Select(nodes, geo, nil, config.SelectConfig{}, 0, ka)
+	assert.Len(t, selBootstrapNil.Nodes, 3, "bootstrap path with nil probeByKey preserves admission for valid geo nodes")
+
+	// 3. When probeByKey is empty map (bootstrap / cold base):
+	selBootstrapEmpty := rank.Select(nodes, geo, map[string]store.ProbeResult{}, config.SelectConfig{}, 0, ka)
+	assert.Len(t, selBootstrapEmpty.Nodes, 3, "bootstrap path with empty probeByKey preserves admission for valid geo nodes")
+}

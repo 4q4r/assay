@@ -47,6 +47,8 @@ linters:
     # Render walks a JSON tree it built itself; shapes are pinned by golden
     # tests, so `, ok`-guards on every assertion would only mask defects.
     - forcetypeassert
+    # Test packages are internal (package foo_test not used) — this repo's convention.
+    - testpackage
 
   settings:
     cyclop:

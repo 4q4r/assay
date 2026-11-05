@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -137,6 +138,19 @@ type waveScheduler struct {
 	runWave           waveRunner
 	deps              watchDeps
 	out               io.Writer
+
+	// Self-update state (shared with the binary watcher when present).
+	restartPending   atomic.Bool
+	restartArmed     atomic.Bool
+	restartWaves     int
+	restartRequested atomic.Bool
+
+	exePath           string
+	selfWatcher       *binarySelfWatcher
+	selfUpdateEnabled bool
+
+	lastWaveCompletedAt time.Time
+	onRestart           func(string)
 }
 
 type waveKind int
@@ -150,6 +164,8 @@ const (
 // immediately at startup (daemon start = fresh data now; systemd's old
 // OnBootSec role). Wave failures are loud but never kill the daemon — the
 // schedule re-arms and the next wave retries.
+//
+//nolint:gocognit,cyclop // serial scheduler loop; complexity inherent
 func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKind {
 	speedtestEnabled := s.speedtestInterval > 0
 	if speedtestEnabled {
@@ -164,10 +180,23 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 	// every wave's duration shift the whole schedule later (drift); from
 	// the start, the period between wave STARTS is exactly the interval.
 	start := s.deps.now()
-	if err := s.runWave(s.cfg, maintainOptions{}, between); err != nil {
+	combinedBetween := func() bool {
+		if between != nil && between() {
+			return true
+		}
+		if s.restartPending.Load() && s.restartWaves > 3 {
+			return true
+		}
+		return false
+	}
+	if err := s.runWave(s.cfg, maintainOptions{}, combinedBetween); err != nil {
 		outf(s.out, "WARNING: initial wave failed: %v (the schedule re-arms — continuing)\n", err)
 	}
 	ran = append(ran, waveRefresh)
+	s.lastWaveCompletedAt = s.deps.now()
+	if s.checkSelfUpdate() {
+		return ran
+	}
 	nextRefresh := start.Add(s.refreshInterval)
 	nextSpeedtest := start.Add(s.speedtestInterval)
 	if !speedtestEnabled {
@@ -193,19 +222,27 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 		switch {
 		case speedtestDue:
 			start := s.deps.now()
-			if err := s.runWave(s.cfg, maintainOptions{speedtest: true}, between); err != nil {
+			if err := s.runWave(s.cfg, maintainOptions{speedtest: true}, combinedBetween); err != nil {
 				outf(s.out, "WARNING: speedtest wave failed: %v (the schedule re-arms — continuing)\n", err)
 			}
 			ran = append(ran, waveSpeedtest)
 			nextSpeedtest = start.Add(s.speedtestInterval)
 			nextRefresh = start.Add(s.refreshInterval)
+			s.lastWaveCompletedAt = s.deps.now()
+			if s.checkSelfUpdate() {
+				return ran
+			}
 		case refreshDue:
 			start := s.deps.now()
-			if err := s.runWave(s.cfg, maintainOptions{}, between); err != nil {
+			if err := s.runWave(s.cfg, maintainOptions{}, combinedBetween); err != nil {
 				outf(s.out, "WARNING: refresh wave failed: %v (the schedule re-arms — continuing)\n", err)
 			}
 			ran = append(ran, waveRefresh)
 			nextRefresh = start.Add(s.refreshInterval)
+			s.lastWaveCompletedAt = s.deps.now()
+			if s.checkSelfUpdate() {
+				return ran
+			}
 		}
 	}
 }
@@ -226,15 +263,35 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	stopSdNotify := deps.sdNotify(out)
 	defer stopSdNotify()
 
+	// Resolve the running binary path once (fail loud if it cannot be
+	// determined — no guessing).
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("watch: resolve executable: %w", err)
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return fmt.Errorf("watch: eval symlinks for executable: %w", err)
+	}
+	exeDir := filepath.Dir(exe)
+	exeBase := filepath.Base(exe)
+
 	// The waves share the watchdog-maintained registry: the fetch stage
 	// snapshots it once at wave start, so a mid-wave hot-reload never
 	// disturbs the running wave (the registry's snapshot contract). The
 	// fetch runner is swapped through the W4 stages seam — no duplicated
 	// pipeline logic; every other stage is the exact production runner.
+	// The enrichment seam gets the SAME registry (F1): the MinLivePercent
+	// breaker lands on the long-lived watchdog registry and actually
+	// disables plugins across waves.
 	runWave := func(cfg *config.Config, opts maintainOptions, between func() bool) error {
 		stages := defaultMaintainStages(opts)
 		stages.fetch = func(c *cobra.Command, cc *config.Config) error {
-			return runFetchWith(c, cc, reg)
+			_, err := runFetchWith(c, cc, reg)
+			return err
+		}
+		stages.pluginStatsEnrich = func(c *cobra.Command, cc *config.Config) error {
+			return runPluginStatsEnrichment(c, cc, reg)
 		}
 		return runMaintainGraceful(out, cfg, opts, stages, between)
 	}
@@ -250,6 +307,26 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		runWave:           runWave,
 		deps:              deps,
 		out:               out,
+		exePath:           exe,
+		selfUpdateEnabled: cfg.SelfUpdate.Enabled,
+	}
+	// Self-update watcher (binary change detection) — started alongside the
+	// plugin watchdog when enabled.
+	if cfg.SelfUpdate.Enabled {
+		bw, werr := startBinarySelfWatcherWith(
+			exeDir, exeBase,
+			&sched.restartPending, &sched.restartArmed,
+			out, cfg.SelfUpdate.CheckInterval.Duration, exe,
+		)
+		if werr != nil {
+			outf(out, "WARNING: self-update watcher failed to start: %v\n", werr)
+		} else {
+			sched.selfWatcher = bw
+			defer bw.close()
+		}
+	}
+	sched.onRestart = func(reason string) {
+		outf(out, "watch: %s — graceful self-restart\n", reason)
 	}
 	schedDone := make(chan struct{})
 	go func() {
@@ -258,8 +335,15 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	}()
 
 	outf(out, "watch: plugin watchdog live on %s (%d plugins loaded)\n", dir, reg.Len())
+	if cfg.SelfUpdate.Enabled {
+		outf(out, "watch: self-update enabled — watching %s\n", exe)
+	}
 	select {
 	case <-schedDone:
+		if sched.restartRequested.Load() {
+			_ = sdnotify.Stopping()
+			return nil
+		}
 		return nil
 	case sig := <-deps.signals:
 		outf(out, "watch: %v — finishing the current stage, then exiting\n", sig)
@@ -269,4 +353,39 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		outln(out, "watch: clean shutdown")
 		return nil
 	}
+}
+
+// checkSelfUpdate is called at every wave boundary. It promotes a pending
+// binary change to an armed restart (after verification) and, once armed or
+// escalated past 3 waves, triggers a graceful self-restart. Returns true when
+// a restart was triggered (caller should stop the loop).
+func (s *waveScheduler) checkSelfUpdate() bool {
+	if !s.restartPending.Load() {
+		s.restartWaves = 0
+		return false
+	}
+	s.restartWaves++
+	// Verify (stat-stability + ELF magic) once.
+	if !s.restartArmed.Load() && s.exePath != "" {
+		if ok, reason := verifyBinary(s.exePath); ok {
+			s.restartArmed.Store(true)
+		} else if reason != "" {
+			outf(s.out, "self-update: binary not yet armed (%s) — waiting\n", reason)
+		}
+	}
+	armed := s.restartArmed.Load()
+	escalated := s.restartWaves > 3
+	if !armed && !escalated {
+		outf(s.out, "self-update: restart pending (wave %d/3) — waiting for verification/escalation\n", s.restartWaves)
+		return false
+	}
+	if escalated && !armed {
+		outf(s.out, "self-update: escalation — pending for %d waves, forcing restart\n", s.restartWaves)
+	}
+	outf(s.out, "binary updated on disk, restarting\n")
+	s.restartRequested.Store(true)
+	if s.onRestart != nil {
+		s.onRestart("binary updated on disk")
+	}
+	return true
 }

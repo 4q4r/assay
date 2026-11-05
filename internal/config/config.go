@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -34,7 +35,8 @@ type PluginsConfig struct {
 	// and removals persist. A removed/re-named plugin = source disabled.
 	Dir string `toml:"dir"`
 	// RunTimeout bounds ONE plugin's entire fetch run (the Lua chunk + the
-	// discover call, network included). gopher-lua has no hook/budget API, so
+	// discover call, network included). Execution is bound by context
+	// cancellation via gopher-lua LState.SetContext, terminating runaway scripts.
 	// a spinning plugin (`while true do end`) cannot be interrupted from
 	// inside the VM — the run timeout abandons it instead: the wave logs
 	// LOUD, continues with the healthy plugins, and the abandoned goroutine
@@ -56,6 +58,18 @@ type PluginsConfig struct {
 	// the breaker is OFF (same owner no-floor/ceiling ruling class as
 	// run_timeout "0s"). Negative values are structurally invalid.
 	MaxConsecutiveFailures *int `toml:"max_consecutive_failures"`
+	// MaxDuplicatePercent is the per-plugin duplicate threshold: percent of
+	// nodes that have the same key as nodes from other plugins. Nil = unset
+	// (disabled by default); an explicit 0 means DISABLED; a positive value
+	// enables the check. Negative values are structurally invalid. No upper
+	// bound (owner ruling).
+	MaxDuplicatePercent *float64 `toml:"max_duplicate_percent"`
+	// MinLivePercent is the per-plugin minimum live nodes threshold: percent
+	// of nodes that are alive after probing. Nil = unset (disabled by
+	// default); an explicit 0 means DISABLED; a positive value enables the
+	// check. Negative values are structurally invalid. No upper bound (owner
+	// ruling).
+	MinLivePercent *float64 `toml:"min_live_percent"`
 }
 
 // FetchConfig controls the fetch-stage client shared by pipeline discovery
@@ -107,9 +121,9 @@ type ProbeConfig struct {
 	Timeout Duration `toml:"timeout"`
 	// Threads is the parallel temp-instance worker count (each worker owns
 	// one node's probe; instance BOOTs are serialized by the factory's boot
-	// mutex, the HTTP phase runs fully parallel). Default 32 (W19: raised
-	// from 8 — 32 workers saturate the ~10 boots/sec serialization ceiling,
-	// keeping wave wall time bounded-minutes per 1000 nodes).
+	// mutex, the HTTP phase runs fully parallel). Default 12 (wave3: lowered
+	// from 32 — 12 concurrent batches keep the boot ceiling saturated while
+	// bounding the instantaneous process count).
 	Threads int `toml:"threads"`
 	// Attempts is the HTTP GET count per node per wave. Default 3 (checker
 	// parity): all attempts success = `passed`, some = `semi-passed`, none =
@@ -134,6 +148,25 @@ type ProbeConfig struct {
 	// and NEWER than this window (0s = probe everything, the default).
 	// Negative values are structurally invalid.
 	SkipFreshWithin Duration `toml:"skip_fresh_within"`
+	// BatchSize is the number of nodes sharing one xray process in batch
+	// probe mode (0 = unset → DefaultProbeBatchSize). Negative values are
+	// structurally invalid. No upper bound (owner ruling).
+	BatchSize int `toml:"batch_size"`
+	// BatchConcurrency is the number of nodes probed concurrently inside
+	// one batch (0 = unset → DefaultProbeBatchConcurrency). Negative values
+	// are structurally invalid. No upper bound (owner ruling).
+	BatchConcurrency int `toml:"batch_concurrency"`
+	// CalibrationEnabled turns dynamic timeout calibration on/off (default true).
+	CalibrationEnabled bool `toml:"calibration_enabled"`
+	// CalibrationBase is the base timeout in seconds used when no calibration
+	// state exists yet (default 10).
+	CalibrationBase float64 `toml:"calibration_base"`
+	// CalibrationMargin is the safety margin in seconds added to p95 (default 1).
+	CalibrationMargin float64 `toml:"calibration_margin"`
+	// Granularity selects the calibration key granularity: "global", "country"
+	// (default), or "city". The fallback chain city -> country -> global ->
+	// base protects against sparse data.
+	Granularity string `toml:"granularity"`
 }
 
 // IsSpeedtest resolves the speedtest default: OFF unless explicitly enabled
@@ -164,11 +197,29 @@ type GeoConfig struct {
 	// source). Structural https check only — ANY https endpoint is accepted
 	// verbatim (owner ruling: a plain string knob, no allowlist). Default:
 	// DefaultGeoHTTPSURL.
-	HTTPSURL string   `toml:"https_url"`
-	TTL      Duration `toml:"ttl"`
+	HTTPSURL      string   `toml:"https_url"`
+	ExitIPEchoURL string   `toml:"exit_ip_echo_url"`
+	TTL           Duration `toml:"ttl"`
+	// MaxTTL caps the rate-limit retry sleep (the X-Ttl honor on a 429
+	// batch fallback). 0 = unset → DefaultGeoMaxTTL; an explicit 0 after
+	// defaults? defaults apply only on absent, so 0 stays 0 = no cap (owner
+	// no-floor ruling; the default is the safety net).
+	MaxTTL Duration `toml:"max_ttl"`
 	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
 	// (self-report and each fallback hop alike).
 	Timeout Duration `toml:"timeout"`
+	// SelfReportConcurrency is the maximum number of concurrent temp
+	// instances during geo self-report (each is a full xray process; 0 =
+	// unset → DefaultGeoSelfReportConcurrency). Negative values are
+	// structurally invalid. No upper bound (owner ruling).
+	SelfReportConcurrency int `toml:"self_report_concurrency"`
+	// UnlockProbes gates the Phase-1 IP quality & media unlock stage: once
+	// per distinct exit IP whose cached state is older than 7 days, probe
+	// ChatGPT/Netflix/YouTube/Disney+/TikTok unlocks and IP quality THROUGH
+	// that exit's own tunnel (3s per request; results keyed by exit IP and
+	// persisted in geo-base.jsonl). Default false = stage off (zero
+	// production behavior change until explicitly enabled).
+	UnlockProbes bool `toml:"unlock_probes"`
 }
 
 // SelectConfig controls the ranking caps (D5/D7; W19 unbounded flip):
@@ -199,6 +250,12 @@ type SelectConfig struct {
 	// Deliberately unbounded (owner ruling — the analyst's 1.0–3.0 range is
 	// rejected).
 	TieBandRTTTolerance float64 `toml:"tie_band_rtt_tolerance"`
+	// OnlyClean filters the candidate pool to nodes whose geo record has
+	// hosting_flag=false AND proxy_flag=false (clean IPs only). Nil/unset =
+	// false (no filtering); explicit true = filter. When enabled, all
+	// selected nodes are clean, so render skips the redundant clean-*
+	// balancers and renders only the common (all) balancers.
+	OnlyClean *bool `toml:"only_clean"`
 }
 
 // PoolRoute is one owner-configured routing rule that steers traffic into the
@@ -329,6 +386,17 @@ func (m MaintainConfig) SpeedtestWaveEnabled() bool {
 	return m.SpeedtestWavePeriod() > 0
 }
 
+// SelfUpdateConfig controls the watch daemon's self-update detection: it
+// watches its own binary on disk and, on a confirmed change, restarts via
+// systemd at the next wave boundary.
+type SelfUpdateConfig struct {
+	// Enabled turns binary-change detection on/off. Default: true.
+	Enabled bool `toml:"enabled"`
+	// CheckInterval is how often the daemon stat-checks its own binary in
+	// addition to fsnotify (default 30s).
+	CheckInterval Duration `toml:"check_interval"`
+}
+
 // HTTPConfig carries settings shared by every pipeline HTTP client (fetch
 // discovery/downloads and geo enrichment) — one knob per concern, so the
 // User-Agent exists in exactly one place.
@@ -370,6 +438,9 @@ const (
 	// no-aggregate-limit argument as the W11 self-report (every node is its
 	// own source). Field surface verified live 2026-10-29.
 	DefaultGeoHTTPSURL = "https://ipinfo.io/json"
+	// DefaultGeoExitIPEchoURL is the [geo].exit_ip_echo_url default: an
+	// HTTPS endpoint that echoes the caller's exit IP (keyless, TLS-only).
+	DefaultGeoExitIPEchoURL = "https://icanhazip.com"
 	// DefaultPluginRunTimeout bounds one plugin's whole fetch run (the
 	// [plugins].run_timeout default): generous enough for a nested
 	// multi-subscription fetch, small enough that a hung plugin wastes one
@@ -382,19 +453,32 @@ const (
 	// DefaultRefreshInterval is the W10 owner ruling: the refresh wave
 	// rechecks hourly (was 6h in the timer era).
 	DefaultRefreshInterval = time.Hour
-	// DefaultProbeThreads is the W14 probe default, RAISED in W19: parallel
-	// temp-instance workers. 32 saturates the factory's boot-serialization
-	// ceiling (~10 boots/sec — the readiness window is the only serialized
-	// phase; the HTTP checks stay fully parallel), keeping wave wall time at
-	// bounded-minutes per 1000 nodes as the pool grows. The semaphore still
-	// bounds instantaneous load (32 concurrent real xray processes max).
-	DefaultProbeThreads = 32
+	// DefaultProbeThreads is the W14 probe default: parallel temp-instance
+	// workers (batches in flight). 12 saturates the factory's
+	// boot-serialization ceiling (~10 boots/sec) while keeping the
+	// instantaneous process count bounded (12 concurrent real xray processes
+	// max). The owner's explicit value in prod config (20) is untouched.
+	DefaultProbeThreads = 12
 	// DefaultProbeAttempts is the W14 probe default (checker parity): all
 	// attempts success = `passed`, some = `semi-passed`, none = `failed`.
 	DefaultProbeAttempts = 3
 	// DefaultProbeSpeedtestURL is the W14 speedtest sample: the Cloudflare
 	// 25 MB down endpoint, downloaded through each node's tunnel.
 	DefaultProbeSpeedtestURL = "https://speed.cloudflare.com/__down?bytes=25000000"
+	// DefaultProbeBatchSize is the default number of nodes sharing one xray
+	// process in batch probe mode (0 in config → this default).
+	DefaultProbeBatchSize = 20
+	// DefaultProbeBatchConcurrency is the default number of nodes probed
+	// concurrently inside one batch (0 in config → this default).
+	DefaultProbeBatchConcurrency = 10
+	// DefaultGeoSelfReportConcurrency is the default number of concurrent
+	// temp instances during geo self-report (0 in config → this default).
+	DefaultGeoSelfReportConcurrency = 8
+	// DefaultGeoMaxTTL caps the rate-limit retry sleep (the X-Ttl honor on a
+	// 429 batch fallback) when [geo].max_ttl is unset.
+	DefaultGeoMaxTTL = 30 * time.Second
+	// DefaultMaxTTL is an alias for DefaultGeoMaxTTL.
+	DefaultMaxTTL = DefaultGeoMaxTTL
 )
 
 // defaultPoolInboundTags is the render.pool_inbound_tags default (the tags
@@ -406,19 +490,41 @@ func DefaultPoolInboundTags() []string {
 	return append([]string(nil), defaultPoolInboundTags...)
 }
 
+// ResourceConfig describes the machine resource envelope the pipeline may
+// spend on concurrent work (temp xray instances, geo self-report workers,
+// probe threads). A zero value means "auto-detect": MaxCPUCores falls back
+// to runtime.NumCPU() and MaxRAMMB to the host's total RAM. HeadroomPct
+// reserves that percentage of the detected/declared RAM for the OS and other
+// processes (default 10 when unset).
+type ResourceConfig struct {
+	// MaxCPUCores caps the CPU side of the wave budget (concurrent workers).
+	// 0 = auto-detect (runtime.NumCPU()). Negative values are structurally
+	// invalid.
+	MaxCPUCores int `toml:"max_cpu_cores"`
+	// MaxRAMMB caps the RAM side of the wave budget (MB). 0 = auto-detect
+	// (host total RAM). Negative values are structurally invalid.
+	MaxRAMMB int `toml:"max_ram_mb"`
+	// HeadroomPct reserves this percentage of RAM for the OS/other processes
+	// (default 10). 0 = default. Negative values are structurally invalid.
+	HeadroomPct int `toml:"headroom_pct"`
+}
+
 // Config is the pipeline configuration root.
 type Config struct {
-	DataDir  string         `toml:"data_dir"`
-	Plugins  PluginsConfig  `toml:"plugins"`
-	Fetch    FetchConfig    `toml:"fetch"`
-	Filter   FilterConfig   `toml:"filter"`
-	Probe    ProbeConfig    `toml:"probe"`
-	Geo      GeoConfig      `toml:"geo"`
-	Select   SelectConfig   `toml:"select"`
-	Render   RenderConfig   `toml:"render"`
-	Activate ActivateConfig `toml:"activate"`
-	Maintain MaintainConfig `toml:"maintain"`
-	HTTP     HTTPConfig     `toml:"http"`
+	DataDir    string           `toml:"data_dir"`
+	Resources  ResourceConfig   `toml:"resources"`
+	Resource   ResourceConfig   `toml:"resource"`
+	Plugins    PluginsConfig    `toml:"plugins"`
+	Fetch      FetchConfig      `toml:"fetch"`
+	Filter     FilterConfig     `toml:"filter"`
+	Probe      ProbeConfig      `toml:"probe"`
+	Geo        GeoConfig        `toml:"geo"`
+	Select     SelectConfig     `toml:"select"`
+	Render     RenderConfig     `toml:"render"`
+	Activate   ActivateConfig   `toml:"activate"`
+	Maintain   MaintainConfig   `toml:"maintain"`
+	HTTP       HTTPConfig       `toml:"http"`
+	SelfUpdate SelfUpdateConfig `toml:"self_update"`
 }
 
 // Duration wraps time.Duration for TOML string values like "30s", "24h".
@@ -451,13 +557,18 @@ func Load(path string) (*Config, error) {
 	if err := checkRemovedSections(raw); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
-	cfg := &Config{}
+	cfg := &Config{
+		SelfUpdate: SelfUpdateConfig{Enabled: true, CheckInterval: Duration{Duration: 30 * time.Second}},
+		Probe:      ProbeConfig{CalibrationEnabled: true},
+	}
 	dec := toml.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	syncResourceConfig(cfg)
 	applyDefaults(cfg, false)
+	syncResourceConfig(cfg)
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -530,6 +641,9 @@ func checkRemovedSections(raw []byte) error {
 }
 
 func applyDefaults(c *Config, configless bool) {
+	syncResourceConfig(c)
+	applyResourceDefaults(&c.Resources)
+	applyResourceDefaults(&c.Resource)
 	applyPluginsDefaults(c)
 	applyFetchDefaults(&c.Fetch)
 	applyFilterDefaults(&c.Filter)
@@ -540,11 +654,13 @@ func applyDefaults(c *Config, configless bool) {
 	applyActivateDefaults(&c.Activate, configless)
 	applyMaintainDefaults(&c.Maintain)
 	applyHTTPDefaults(&c.HTTP)
+	applySelfUpdateDefaults(&c.SelfUpdate)
 }
 
 // applyPluginsDefaults resolves the plugins dir default: <data_dir>/plugins,
 // and the run timeout default (nil = unset → DefaultPluginRunTimeout; an
-// explicit "0s" stays 0 = unbounded).
+// explicit "0s" stays 0 = unbounded). The threshold knobs (max_duplicate_percent,
+// min_live_percent) stay nil by default — disabled unless explicitly set.
 func applyPluginsDefaults(c *Config) {
 	if c.Plugins.Dir == "" {
 		c.Plugins.Dir = filepath.Join(c.DataDir, "plugins")
@@ -556,6 +672,9 @@ func applyPluginsDefaults(c *Config) {
 		def := DefaultMaxConsecutiveFailures
 		c.Plugins.MaxConsecutiveFailures = &def
 	}
+	// MaxDuplicatePercent and MinLivePercent: nil stays nil (disabled by default).
+	// An explicit 0 in the config means disabled; a positive value enables the check.
+	// No default application — the owner must opt in.
 }
 
 // defaultProtocols is the protocol acceptance allowlist applied when
@@ -614,6 +733,21 @@ func applyProbeDefaults(p *ProbeConfig) {
 	}
 	// SkipFreshWithin: no default application — 0s IS the default (probe
 	// everything); an explicit 0s and an absent key are the same behavior.
+	if p.BatchSize == 0 {
+		p.BatchSize = DefaultProbeBatchSize
+	}
+	if p.BatchConcurrency == 0 {
+		p.BatchConcurrency = DefaultProbeBatchConcurrency
+	}
+	if p.CalibrationBase == 0 {
+		p.CalibrationBase = 10
+	}
+	if p.CalibrationMargin == 0 {
+		p.CalibrationMargin = 1
+	}
+	if p.Granularity == "" {
+		p.Granularity = "country"
+	}
 }
 
 func applyGeoDefaults(g *GeoConfig) {
@@ -623,11 +757,20 @@ func applyGeoDefaults(g *GeoConfig) {
 	if g.HTTPSURL == "" {
 		g.HTTPSURL = DefaultGeoHTTPSURL
 	}
+	if g.ExitIPEchoURL == "" {
+		g.ExitIPEchoURL = DefaultGeoExitIPEchoURL
+	}
 	if g.TTL.Duration == 0 {
 		g.TTL.Duration = 24 * time.Hour
 	}
 	if g.Timeout.Duration == 0 {
-		g.Timeout.Duration = 15 * time.Second
+		g.Timeout.Duration = 8 * time.Second
+	}
+	if g.SelfReportConcurrency == 0 {
+		g.SelfReportConcurrency = DefaultGeoSelfReportConcurrency
+	}
+	if g.MaxTTL.Duration == 0 {
+		g.MaxTTL.Duration = DefaultGeoMaxTTL
 	}
 }
 
@@ -749,8 +892,78 @@ func applyHTTPDefaults(h *HTTPConfig) {
 	}
 }
 
+func applySelfUpdateDefaults(s *SelfUpdateConfig) {
+	// Enabled default (true) is pre-set in Load/configless before decode so
+	// an explicit false survives; nothing to do here.
+	if s.CheckInterval.Duration == 0 {
+		s.CheckInterval.Duration = 30 * time.Second
+	}
+}
+
+func applyResourceDefaults(r *ResourceConfig) {
+	if r.HeadroomPct == 0 {
+		r.HeadroomPct = 10
+	}
+}
+
+// syncResourceConfig keeps the singular and plural resource fields in sync so
+// either spelling works (ResourceConfig lives under both [resources] and
+// [resource] for compatibility with callers/tests).
+func syncResourceConfig(c *Config) {
+	rZero := c.Resources.MaxCPUCores == 0 && c.Resources.MaxRAMMB == 0 && c.Resources.HeadroomPct == 0
+	sZero := c.Resource.MaxCPUCores == 0 && c.Resource.MaxRAMMB == 0 && c.Resource.HeadroomPct == 0
+	if rZero && !sZero {
+		c.Resources = c.Resource
+	}
+	if sZero && !rZero {
+		c.Resource = c.Resources
+	}
+	if !rZero && !sZero {
+		// both set: prefer resources
+		c.Resource = c.Resources
+	}
+}
+
+// EffectiveCPUCores resolves MaxCPUCores: 0 = auto-detect (runtime.NumCPU()).
+func (r ResourceConfig) EffectiveCPUCores() int {
+	if r.MaxCPUCores > 0 {
+		return r.MaxCPUCores
+	}
+	n := runtime.NumCPU()
+	return max(n, 1)
+}
+
+// EffectiveRAMMB resolves MaxRAMMB: 0 = auto-detect (host total RAM in MB).
+func (r ResourceConfig) EffectiveRAMMB() int {
+	if r.MaxRAMMB > 0 {
+		return r.MaxRAMMB
+	}
+	return detectTotalRAMMB()
+}
+
+// HeadroomFraction returns the reserved fraction (HeadroomPct/100).
+func (r ResourceConfig) HeadroomFraction() float64 {
+	if r.HeadroomPct <= 0 {
+		return 0.10
+	}
+	return float64(r.HeadroomPct) / 100.0
+}
+
+// UsableRAMMB returns the RAM available to the pipeline after headroom.
+func (r ResourceConfig) UsableRAMMB() int {
+	total := r.EffectiveRAMMB()
+	usable := int(float64(total) * (1 - r.HeadroomFraction()))
+	return max(usable, 1)
+}
+
 func validate(c *Config) error {
 	if err := validateBasics(c); err != nil {
+		return err
+	}
+	if err := validateResource(c.Resources); err != nil {
+		return err
+	}
+	if err := validateResource(c.Resource); err != nil {
 		return err
 	}
 	if err := validateSelect(c.Select); err != nil {
@@ -776,15 +989,8 @@ func validate(c *Config) error {
 			return err
 		}
 	}
-	if c.Plugins.RunTimeout != nil {
-		if err := validateNonNegative("plugins.run_timeout", c.Plugins.RunTimeout.Duration); err != nil {
-			return err
-		}
-	}
-	if c.Plugins.MaxConsecutiveFailures != nil {
-		if err := validateNonNegative("plugins.max_consecutive_failures", *c.Plugins.MaxConsecutiveFailures); err != nil {
-			return err
-		}
+	if err := validatePlugins(c.Plugins); err != nil {
+		return err
 	}
 	if err := validateProbe(c.Probe); err != nil {
 		return err
@@ -799,7 +1005,41 @@ func validateProbe(p ProbeConfig) error {
 	if err := validateNonNegative("probe.attempts", p.Attempts); err != nil {
 		return err
 	}
-	return validateNonNegative("probe.threads", p.Threads)
+	if err := validateNonNegative("probe.threads", p.Threads); err != nil {
+		return err
+	}
+	if err := validateNonNegative("probe.batch_size", p.BatchSize); err != nil {
+		return err
+	}
+	return validateNonNegative("probe.batch_concurrency", p.BatchConcurrency)
+}
+
+// validatePlugins carries the structural checks for the [plugins] section:
+// every tunable knob is sign-checked (negative = invalid) and otherwise
+// unbounded (owner ruling). Extracted from validate to keep its cyclomatic
+// complexity under the cyclop limit.
+func validatePlugins(p PluginsConfig) error {
+	if p.RunTimeout != nil {
+		if err := validateNonNegative("plugins.run_timeout", p.RunTimeout.Duration); err != nil {
+			return err
+		}
+	}
+	if p.MaxConsecutiveFailures != nil {
+		if err := validateNonNegative("plugins.max_consecutive_failures", *p.MaxConsecutiveFailures); err != nil {
+			return err
+		}
+	}
+	if p.MaxDuplicatePercent != nil {
+		if err := validateNonNegative("plugins.max_duplicate_percent", *p.MaxDuplicatePercent); err != nil {
+			return err
+		}
+	}
+	if p.MinLivePercent != nil {
+		if err := validateNonNegative("plugins.min_live_percent", *p.MinLivePercent); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // validateNonNegative is the W6 structural check: a negative number is
@@ -880,6 +1120,16 @@ func validateBasics(c *Config) error {
 	return nil
 }
 
+func validateResource(r ResourceConfig) error {
+	if err := validateNonNegative("resources.max_cpu_cores", r.MaxCPUCores); err != nil {
+		return err
+	}
+	if err := validateNonNegative("resources.max_ram_mb", r.MaxRAMMB); err != nil {
+		return err
+	}
+	return validateNonNegative("resources.headroom_pct", r.HeadroomPct)
+}
+
 func validateSelect(s SelectConfig) error {
 	// W19 doctrine: 0 = UNBOUNDED is legal on every cap knob; only sign
 	// correctness is structural (owner no-floor/no-ceiling ruling — the
@@ -915,7 +1165,13 @@ func validateGeo(g GeoConfig) error {
 	if !strings.HasPrefix(g.HTTPSURL, "https://") {
 		return fmt.Errorf("geo.https_url must use https (the self-geo endpoint answers over TLS), got %q", g.HTTPSURL)
 	}
-	return nil
+	if g.ExitIPEchoURL != "" && !strings.HasPrefix(g.ExitIPEchoURL, "https://") {
+		return fmt.Errorf("geo.exit_ip_echo_url must use https (the echo endpoint answers over TLS), got %q", g.ExitIPEchoURL)
+	}
+	if err := validateNonNegative("geo.self_report_concurrency", g.SelfReportConcurrency); err != nil {
+		return err
+	}
+	return validateNonNegative("geo.max_ttl", g.MaxTTL.Duration)
 }
 
 func validateRender(r RenderConfig) error {
@@ -949,6 +1205,26 @@ func validateActivate(a ActivateConfig) error {
 		}
 	}
 	return validateNonNegative("activate.backup_keep", a.BackupKeep)
+}
+
+// detectTotalRAMMB best-effort reads host total RAM in MB. Falls back to
+// 4096 MB when the platform or /proc is unavailable (no new dependencies).
+func detectTotalRAMMB() int {
+	// Linux: /proc/meminfo MemTotal (kB).
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for line := range strings.SplitSeq(string(b), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[0] == "MemTotal:" {
+				// fields[1] is kB
+				var kb int
+				_, _ = fmt.Sscanf(fields[1], "%d", &kb)
+				if kb > 0 {
+					return kb / 1024
+				}
+			}
+		}
+	}
+	return 4096
 }
 
 // ExpandHome replaces a leading ~ with the user home directory.

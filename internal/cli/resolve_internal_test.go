@@ -229,7 +229,8 @@ func TestConfiglessWaveDataStagesWorkThenRenderLoud(t *testing.T) {
 	cmd := &cobra.Command{}
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
-	require.NoError(t, runFetchWith(cmd, cfg, reg), "configless fetch must work from plugins")
+	_, err = runFetchWith(cmd, cfg, reg)
+	require.NoError(t, err, "configless fetch must work from plugins")
 	require.Contains(t, out.String(), "plugin stub       ok: 2 nodes")
 
 	require.NoError(t, runParse(cmd, cfg), "configless parse must work")

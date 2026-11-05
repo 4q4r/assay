@@ -35,8 +35,13 @@ func Select(
 	probeByKey map[string]store.ProbeResult,
 	cfg config.SelectConfig,
 	maxAliveAge time.Duration,
+	knownAlive ...map[string]store.KnownAliveRecord,
 ) *model.Selection {
-	cands := collectCandidates(nodes, geo, probeByKey, maxAliveAge)
+	ka := map[string]store.KnownAliveRecord{}
+	if len(knownAlive) > 0 && knownAlive[0] != nil {
+		ka = knownAlive[0]
+	}
+	cands := collectCandidates(nodes, geo, probeByKey, cfg, maxAliveAge, ka)
 	sortByPrimaryMetrics(cands)
 	capApplied := effectiveCap(cands, cfg)
 	selected := greedySelect(cands, cfg, capApplied)
@@ -58,42 +63,140 @@ type candidate struct {
 // node); their tags carry the xx pseudo-code and the pool_unknown balancer
 // groups them at render time.
 func collectCandidates(
-	nodes []*model.Node, geo []*model.GeoRecord, probeByKey map[string]store.ProbeResult, maxAliveAge time.Duration,
+	nodes []*model.Node,
+	geo []*model.GeoRecord,
+	probeByKey map[string]store.ProbeResult,
+	cfg config.SelectConfig,
+	maxAliveAge time.Duration,
+	knownAlive ...map[string]store.KnownAliveRecord,
 ) []candidate {
+	ka := map[string]store.KnownAliveRecord{}
+	if len(knownAlive) > 0 && knownAlive[0] != nil {
+		ka = knownAlive[0]
+	}
 	geoByKey := map[string]*model.GeoRecord{}
 	for _, g := range geo {
 		geoByKey[model.GeoIdentity(g)] = g
 	}
 	var cands []candidate
+	now := time.Now()
 	for _, n := range nodes {
-		g, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
-		if !ok || !g.Alive {
-			continue
+		c, ok := admitCandidate(n, geoByKey, probeByKey, cfg, maxAliveAge, ka, now)
+		if ok {
+			cands = append(cands, c)
 		}
-		if maxAliveAge > 0 && !AliveDataFresh(g.LastProbe, maxAliveAge, time.Now()) {
-			continue
-		}
-		c := candidate{node: n, rec: g}
-		if pr, ok := probeByKey[n.Key]; ok {
-			// W19 own-result liveness gate: the geo record is PER IDENTITY
-			// (scheme+host+port) but a link variant's liveness belongs to its
-			// OWN latest probe. Several parse records can share one identity;
-			// without this gate a variant whose own probe failed (unrenderable
-			// link, dead transport) rides the sibling's alive geo record into
-			// the selection — the caps used to hide it (it ranks last on
-			// checks=0), the unbounded default would hand it to the renderer
-			// and fail the whole wave loud (L9). A node with NO probe entry
-			// stays admissible (checks 1,1 — the documented cold-base path).
-			if !pr.Alive {
-				continue
-			}
-			c.checks, c.total = pr.Checks, pr.TotalChecks
-		} else {
-			c.checks, c.total = 1, 1
-		}
-		cands = append(cands, c)
 	}
 	return cands
+}
+
+// admitCandidate evaluates one node for inclusion. Returns (candidate, true)
+// when the node should be admitted.
+func admitCandidate(
+	n *model.Node,
+	geoByKey map[string]*model.GeoRecord,
+	probeByKey map[string]store.ProbeResult,
+	cfg config.SelectConfig,
+	maxAliveAge time.Duration,
+	ka map[string]store.KnownAliveRecord,
+	now time.Time,
+) (candidate, bool) {
+	orig, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+	if !ok {
+		return candidate{}, false
+	}
+	// Clone GeoRecord so mutations (e.g. from knownAlive or node-specific probe status)
+	// do not leak across distinct candidates sharing the same pointer or identity.
+	gCopy := *orig
+	g := &gCopy
+
+	if !ensureAlive(g, n, ka) {
+		return candidate{}, false
+	}
+	if !ensureFresh(g, n, ka, maxAliveAge, now) {
+		return candidate{}, false
+	}
+	if cfg.OnlyClean != nil && *cfg.OnlyClean && !cleanIP(g) {
+		return candidate{}, false
+	}
+	if !probeAllows(n, probeByKey, ka) {
+		return candidate{}, false
+	}
+	c := candidate{node: n, rec: g}
+	applyProbeOutcome(&c, n, probeByKey, ka)
+	return c, true
+}
+
+// probeAllows gates candidates by their OWN latest probe result. The
+// knownAlive escape is DELIBERATE (owner ruling 2026-11-04, F7): a node
+// whose own latest probe is dead still admits when a ≤2h known-alive record
+// exists — anti-flake protection for temp-xray boots, where a single probe
+// wave racing a boot must not evict a node the in-client observatory
+// (burstObservatory) will drop independently if it is truly dead. The
+// in-client observatory is the second dead-node layer.
+func probeAllows(n *model.Node, probeByKey map[string]store.ProbeResult, ka map[string]store.KnownAliveRecord) bool {
+	if len(probeByKey) == 0 {
+		return true
+	}
+	pr, ok := probeByKey[n.Key]
+	if !ok {
+		_, ok2 := ka[n.Key]
+		return ok2
+	}
+	if pr.Alive {
+		return true
+	}
+	_, ok2 := ka[n.Key]
+	return ok2
+}
+
+func ensureAlive(g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord) bool {
+	if g.Alive {
+		return true
+	}
+	rec, ok2 := ka[n.Key]
+	if !ok2 {
+		return false
+	}
+	g.Alive = true
+	if g.LastProbe == "" {
+		g.LastProbe = rec.LastSeen.UTC().Format(time.RFC3339)
+	}
+	return true
+}
+
+func ensureFresh(
+	g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord,
+	maxAliveAge time.Duration, now time.Time,
+) bool {
+	if maxAliveAge <= 0 || AliveDataFresh(g.LastProbe, maxAliveAge, now) {
+		return true
+	}
+	rec, ok2 := ka[n.Key]
+	if !ok2 || rec.LastSeen.IsZero() || time.Since(rec.LastSeen) > maxAliveAge {
+		return false
+	}
+	g.LastProbe = rec.LastSeen.UTC().Format(time.RFC3339)
+	return true
+}
+
+func cleanIP(g *model.GeoRecord) bool {
+	return g.FlagsVerified && !g.HostingFlag && !g.ProxyFlag
+}
+
+func applyProbeOutcome(
+	c *candidate, n *model.Node, probeByKey map[string]store.ProbeResult,
+	_ map[string]store.KnownAliveRecord,
+) {
+	pr, ok := probeByKey[n.Key]
+	if !ok {
+		c.checks, c.total = 1, 1
+		return
+	}
+	if !pr.Alive {
+		c.checks, c.total = 1, 1
+		return
+	}
+	c.checks, c.total = pr.Checks, pr.TotalChecks
 }
 
 // AliveDataFresh reports whether the record's last_probe timestamp is present
@@ -262,6 +365,7 @@ func assignTags(selected []candidate, capApplied int, all []candidate) *model.Se
 		if tagCC == "" {
 			tagCC = model.UnknownCountryCode
 		}
+		isClean := c.rec.FlagsVerified && !c.rec.HostingFlag && !c.rec.ProxyFlag
 		sel.Nodes = append(sel.Nodes, model.SelectedNode{
 			Tag:     model.PoolTag(tagCC, seqByCountry[c.rec.Country]),
 			Key:     c.node.Key,
@@ -271,6 +375,7 @@ func assignTags(selected []candidate, capApplied int, all []candidate) *model.Se
 			Speed:   c.rec.SpeedBPS,
 			Checks:  c.checks,
 			Total:   c.total,
+			IsClean: isClean,
 		})
 	}
 	return sel
