@@ -1110,10 +1110,24 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("read template %s: %w", templatePath, err)
 	}
+	// Phase-3 service pools ride the Phase-1 unlock evidence: one geo read,
+	// keyed by the shared identity — the same join the stats enrichment uses
+	// (model.GeoIdentity). A missing geo base is the documented empty state
+	// (unlock pools render absent, pool_clean falls back to flags-only); a
+	// corrupt one fails the render loud.
+	geoRecords, err := store.ReadGeo(p.geoBase)
+	if err != nil {
+		return fmt.Errorf("read geo records for render: %w", err)
+	}
+	geoByKey := make(map[string]*model.GeoRecord, len(geoRecords))
+	for _, gr := range geoRecords {
+		geoByKey[model.GeoIdentity(gr)] = gr
+	}
 	res, err := render.Render(render.Input{
 		Template:   template,
 		Selection:  sel,
 		NodesByKey: byKey,
+		GeoByKey:   geoByKey,
 		Cfg: render.Config{
 			StatsPort:           cfg.Render.StatsPort,
 			PoolRoutes:          toRenderRoutes(cfg.Render.PoolRoutes),
@@ -1133,6 +1147,9 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	for _, w := range res.DroppedParams {
 		outf(cmd.OutOrStdout(), "WARNING: %s (%s): link params not renderable, left out of the outbound: %v\n",
 			w.Tag, w.Host, w.Params)
+	}
+	for _, b := range res.BlockedRoutes {
+		outf(cmd.OutOrStdout(), "WARNING: %s\n", b)
 	}
 	if err := os.MkdirAll(p.renderedDir, 0o750); err != nil {
 		return err

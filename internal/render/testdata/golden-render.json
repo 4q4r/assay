@@ -423,6 +423,164 @@
           "type": "leastLoad"
         },
         "tag": "pool_all"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_amsterdam_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_amsterdam_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_youtube"
       }
     ],
     "domainMatcher": "hybrid",

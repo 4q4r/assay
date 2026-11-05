@@ -184,7 +184,21 @@ func TestUnknownAndAllGoldenPassesXrayTest(t *testing.T) {
 		Template:   testTemplate(t),
 		Selection:  sel,
 		NodesByKey: byKey,
-		Cfg:        renderCfg(nil),
+		GeoByKey: geoEvidence(nodes, map[string]model.GeoRecord{
+			// Phase-3 evidence: the unknown-geo exit qualifies for the GLOBAL
+			// service pools only (chatgpt + youtube; no xx country tier);
+			// de1 carries netflix-full + a checked DE region, de2 chatgpt.
+			"unknown1.example.com": {RiskScore: -1, MediaUnlocks: model.MediaUnlockStatus{
+				ChatGPT: model.UnlockYes, YouTubeRegion: "US", CheckedAt: "2026-11-04T12:00:00Z",
+			}},
+			"de1.example.com": {RiskScore: 20, MediaUnlocks: model.MediaUnlockStatus{
+				Netflix: model.UnlockNetflixFull, YouTubeRegion: "DE", CheckedAt: "2026-11-04T12:00:00Z",
+			}},
+			"de2.example.com": {RiskScore: -1, MediaUnlocks: model.MediaUnlockStatus{
+				ChatGPT: model.UnlockYes, CheckedAt: "2026-11-04T12:00:00Z",
+			}},
+		}),
+		Cfg: renderCfg(nil),
 	})
 	require.NoError(t, err)
 	assert.Empty(t, res.DroppedParams)
