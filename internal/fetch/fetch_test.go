@@ -118,7 +118,7 @@ func TestFetchSourceDownloadsAllDiscoveredFiles(t *testing.T) {
 		Discovery: "github-contents",
 		Include:   []string{"Splitted-By-Protocol/vless.txt", "Splitted-By-Protocol/trojan.txt"},
 	}
-	got, err := cl.Source(context.Background(), "epodonios", src)
+	got, err := cl.Source(context.Background(), "radikal", src)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	bodies := make([]string, 0, len(got))

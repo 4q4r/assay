@@ -163,7 +163,7 @@ discovery = "github-contents"
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "[sources.*] section was removed")
 		assert.Contains(t, err.Error(), "[plugins]")
-		assert.Contains(t, err.Error(), "matin, epodonios, radikal, haker, stintikvpn")
+		assert.Contains(t, err.Error(), "matin, radikal, stintikvpn, etc.")
 	})
 
 	t.Run("unknown key still fails loud", func(t *testing.T) {

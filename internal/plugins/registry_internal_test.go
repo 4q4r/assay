@@ -23,8 +23,8 @@ func TestEmbeddedDefaultsCompile(t *testing.T) {
 			}
 		})
 	}
-	if len(defaultSources()) != 16 {
-		t.Fatalf("expected 16 embedded defaults (matin, epodonios, radikal, haker, stintikvpn, "+
+	if len(defaultSources()) != 14 {
+		t.Fatalf("expected 14 embedded defaults (matin, radikal, stintikvpn, "+
 			"hidashimora, kort0881, au1rxx, barryfar, nirevil, mehdirzfx, mhditaheri, "+
 			"flat447, luxxuria, igareck, nodesradar), got %d",
 			len(defaultSources()))
@@ -41,8 +41,8 @@ func TestEnsureDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(entries) != 16 {
-			t.Fatalf("expected 16 materialized defaults, got %d", len(entries))
+		if len(entries) != 14 {
+			t.Fatalf("expected 14 materialized defaults, got %d", len(entries))
 		}
 		for _, entry := range entries {
 			info, err := entry.Info()
@@ -63,7 +63,7 @@ func TestEnsureDefaults(t *testing.T) {
 		if err := os.WriteFile(ownerEdited, []byte("-- owner edit\nreturn function() end"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Remove(filepath.Join(dir, "haker.lua")); err != nil {
+		if err := os.Remove(filepath.Join(dir, "radikal.lua")); err != nil {
 			t.Fatal(err)
 		}
 		if err := EnsureDefaults(dir); err != nil {
@@ -76,7 +76,7 @@ func TestEnsureDefaults(t *testing.T) {
 		if string(b) != "-- owner edit\nreturn function() end" {
 			t.Fatalf("owner edit was overwritten: %q", b)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "haker.lua")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(dir, "radikal.lua")); !os.IsNotExist(err) {
 			t.Fatal("removed default was re-materialized — removal must persist")
 		}
 	})
