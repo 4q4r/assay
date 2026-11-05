@@ -95,12 +95,23 @@ const (
 
 // Override thresholds. A provider is DEAD when zero live nodes AND the 24h
 // volume-weighted average is under 1% (a long-dead source, not a diurnal
-// dip). Pools with fewer than verdictMinPoolSize scored providers cannot
-// rank meaningfully — the absolute fallback applies instead.
+// dip) — and ONLY once it has enough recorded history to prove death: the
+// 3-wave floor is stats.ColdStartMin, the same floor the Z-score cold start
+// applies (fix round 1, 2026-11-06: freshly-ingested sources carry
+// fetch-stage live=0 with ZERO history waves — scoring them DEAD on zero
+// evidence fabricated a verdict the pool had never earned). Pools with
+// fewer than verdictMinPoolSize scored providers cannot rank meaningfully —
+// the absolute fallback applies instead.
 const (
 	verdictDeadAlive24Pct = 1.0
 	verdictMinPoolSize    = 3
 )
+
+// verdictMinHistoryWaves is the recorded-wave floor under which an
+// enriched row is NEW (not DEAD, not composite-scored): one constant with
+// the Z-score cold start so "enough waves to conclude anything" has a
+// single definition.
+const verdictMinHistoryWaves = stats.ColdStartMin
 
 // recUniqueDeadFloorPct gates the "unique but dead" recommendation class:
 // a dead provider still contributing ≥25% unique identities is worth a
@@ -126,19 +137,22 @@ const (
 	verdictWeak = "WEAK"
 	verdictPoor = "POOR"
 	verdictDead = "DEAD"
+	verdictNew  = "NEW"
 	verdictTrip = "TRIP"
 	verdictNone = "NONE"
 )
 
 // asciiVerdicts maps the colored verdict words onto the plain-mode fallbacks
 // pinned in the tests. The pool-relative vocabulary is self-describing, so
-// plain mode renders the word itself; NONE keeps its n/a cold-start bytes.
+// plain mode renders the word itself; NONE keeps its n/a cold-start bytes
+// and NEW keeps its bracketed [NEW] badge (controller fix-round-1 spec).
 var asciiVerdicts = map[string]string{
 	verdictGood: "GOOD",
 	verdictFair: "FAIR",
 	verdictWeak: "WEAK",
 	verdictPoor: "POOR",
 	verdictDead: "DEAD",
+	verdictNew:  "[NEW]",
 	verdictTrip: "TRIP",
 	verdictNone: "n/a",
 }
@@ -733,17 +747,33 @@ func bandVerdict(score float64) (string, string) {
 	}
 }
 
-// isDead renders the DEAD override: zero live nodes AND a 24h volume-
-// weighted average under 1% — long-dead, not a diurnal dip.
+// isDead renders the DEAD override: ENOUGH recorded history to prove death
+// (≥ verdictMinHistoryWaves — a brand-new source's fetch-stage live=0 is
+// not evidence), zero live nodes, and a 24h volume-weighted average under
+// 1% — long-dead, not a diurnal dip. Shared by the verdict engine and the
+// recommendation classes so "dead" has one definition.
 func isDead(row *providerRow) bool {
-	return row.stats.LiveNodes == 0 && row.alive24 < verdictDeadAlive24Pct
+	return verdictWaves(row) >= verdictMinHistoryWaves &&
+		row.stats.LiveNodes == 0 && row.alive24 < verdictDeadAlive24Pct
+}
+
+// verdictWaves is the provider's recorded provider-history wave count (a
+// missing series = zero waves — the brand-new source shape).
+func verdictWaves(row *providerRow) int {
+	if row.history == nil {
+		return 0
+	}
+	return len(row.history.Waves)
 }
 
 // computeVerdicts derives the pool-relative verdicts in place. Priority:
 // unenriched rows keep NONE (no evidence — nothing to score, nothing to
-// override); scored rows first face the DEAD override; the remainder either
-// falls back absolutely (fewer than 3 scored providers — percentiles are
-// meaningless in a tiny pool: live=0 → DEAD, alive>0 → FAIR) or lands on
+// override); enriched rows with fewer than verdictMinHistoryWaves recorded
+// waves are NEW (a brand-new source — death cannot be concluded from the
+// fetch-stage zeros, fix round 1 2026-11-06); the remainder first faces the
+// DEAD override (which itself requires the same wave floor); the survivors
+// either fall back absolutely (fewer than 3 scored providers — percentiles
+// are meaningless in a tiny pool: live=0 → DEAD, alive>0 → FAIR) or land on
 // the composite: score = Σ(w_f × percentile) over available factors,
 // renormalized, + trend modifier, clamped [0,100], banded. TRIP stays
 // reserved (breaker persistence is a future wave). Verdicts are
@@ -753,6 +783,13 @@ func computeVerdicts(rows []providerRow) {
 	for i := range rows {
 		if !rows[i].enriched {
 			continue // NONE stays
+		}
+		if verdictWaves(&rows[i]) < verdictMinHistoryWaves {
+			// NEW: a neutral badge in the ui dim palette — the source has
+			// not been through enough scoring waves to earn ANY measured
+			// verdict.
+			rows[i].verdict, rows[i].verdictCol = verdictNew, ui.ColorPlainName
+			continue
 		}
 		if isDead(&rows[i]) {
 			rows[i].verdict, rows[i].verdictCol = verdictDead, ui.Red
