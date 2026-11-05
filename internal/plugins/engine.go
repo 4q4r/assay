@@ -53,7 +53,7 @@ type engineOptions struct {
 
 // Engine is the per-process host runtime: it owns the host clients and
 // executes plugins. One Engine is shared by all plugins in a process; each
-// Run gets a fresh sandboxed Lua state (no cross-plugin state, no leaks).
+// Run gets a fresh sandboxed Lua state bound to ctx (no cross-plugin state, no leaks).
 type Engine struct {
 	opt engineOptions
 }
@@ -131,8 +131,14 @@ var strippedGlobals = []string{
 // newState builds one sandboxed Lua state with the full host API registered.
 // Opened libraries: base, string, table, math — all pure computation. Never
 // opened: os, io, package, debug, coroutine.
+//
+//nolint:contextcheck // fallback to background context if caller passes nil
 func (e *Engine) newState(ctx context.Context, pluginID string) *lua.LState {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	l := lua.NewState(lua.Options{SkipOpenLibs: true})
+	l.SetContext(ctx)
 	_ = lua.OpenBase(l)
 	_ = lua.OpenString(l)
 	_ = lua.OpenTable(l)
@@ -167,7 +173,25 @@ func (e *Engine) newState(ctx context.Context, pluginID string) *lua.LState {
 // Run executes one plugin snapshot: fresh sandbox, chunk execution (must be
 // side-effect-free and return the discover function), discover call, node
 // collection. Every failure is a loud, plugin-attributed error.
-func (e *Engine) Run(ctx context.Context, p *Plugin) ([]Node, error) {
+//
+// Scoped panic breaker (F11, the recorded W10 gopher-lua landmine): the Lua
+// runtime can PANIC on plugin-controlled input, and a panic escaping this
+// seam would kill the whole daemon and re-crash-loop via the watchdog with
+// no breaker path. ONLY this execution seam converts a panic into a loud,
+// plugin-attributed error — never a blanket recover elsewhere: the fetch
+// boundary (runAllPlugins) then feeds the error into the registry's
+// RecordFailure breaker and the wave continues.
+//
+//nolint:contextcheck,nonamedreturns // background-context fallback; the deferred recover must write the named results
+func (e *Engine) Run(ctx context.Context, p *Plugin) (nodes []Node, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			nodes, err = nil, pluginErrf(p.ID, "lua runtime panic: %v", r)
+		}
+	}()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	l := e.newState(ctx, p.ID)
 	defer l.Close()
 	chunk, err := l.Load(bytes.NewReader(p.Code), "@"+p.Path)

@@ -41,13 +41,14 @@ func TestPoolBalancersCarryBlockFallback(t *testing.T) {
 		}
 	}
 	// twoCountrySelection: nl = 2 Amsterdam nodes (country + city balancer),
-	// de = 1 node, us = 1 node → 2 country balancers + 1 city balancer, plus
-	// the W16 pool-wide balancer (pool_all renders with any non-empty pool).
+	// de = 2 Frankfurt nodes (country + city balancer), us = 1 node →
+	// 3 country balancers (nl, de, us) + 2 city balancers + pool_all (us has 1 node, still gets pool_us)
 	require.Equal(t, map[string]bool{
 		model.CountryBalancerTag("nl"):           true,
 		model.CityBalancerTag("nl", "Amsterdam"): true,
 		model.CountryBalancerTag("de"):           true,
+		model.CityBalancerTag("de", "Frankfurt"): true,
 		model.CountryBalancerTag("us"):           true,
 		model.PoolAllBalancerTag:                 true,
-	}, poolSeen, "expected 2 country balancers + 1 city balancer + the pool-wide balancer")
+	}, poolSeen, "expected 3 country balancers + 2 city balancers + the pool-wide balancer")
 }

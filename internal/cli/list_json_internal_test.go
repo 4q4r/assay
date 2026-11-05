@@ -40,22 +40,22 @@ func TestListJSONGolden(t *testing.T) {
 		Countries: []listJSONCountry{
 			{
 				Code: "DE", Name: "Germany", Flag: "🇩🇪",
-				Nodes: 2, Alive: 1, MedianRTTms: 45.5,
+				Nodes: 2, Alive: 1, MinRTTms: 40,
 				Cities: []listJSONCity{
-					{City: "Berlin", Nodes: 1, Alive: 0, MedianRTTms: 51},
-					{City: "Frankfurt", Nodes: 1, Alive: 1, MedianRTTms: 40},
+					{City: "Berlin", Nodes: 1, Alive: 0, MinRTTms: 51},
+					{City: "Frankfurt", Nodes: 1, Alive: 1, MinRTTms: 40},
 				},
 			},
-			{Code: "FR", Name: "France", Flag: "🇫🇷", Nodes: 1, Alive: 1, MedianRTTms: 60},
-			{Code: "US", Name: "United States", Flag: "🇺🇸", Nodes: 1, Alive: 0, MedianRTTms: 149},
+			{Code: "FR", Name: "France", Flag: "🇫🇷", Nodes: 1, Alive: 1, MinRTTms: 60},
+			{Code: "US", Name: "United States", Flag: "🇺🇸", Nodes: 1, Alive: 0, MinRTTms: 149},
 		},
 		ColdBase: &listJSONColdBase{
 			Path:    p.geoBase,
 			Records: 4,
 			Countries: []listJSONCountry{
-				{Code: "DE", Name: "Germany", Flag: "🇩🇪", Nodes: 2, Alive: 1, MedianRTTms: 45.5},
-				{Code: "FR", Name: "France", Flag: "🇫🇷", Nodes: 1, Alive: 1, MedianRTTms: 60},
-				{Code: "NL", Name: "Netherlands", Flag: "🇳🇱", Nodes: 1, Alive: 0, MedianRTTms: 30},
+				{Code: "DE", Name: "Germany", Flag: "🇩🇪", Nodes: 2, Alive: 1, MinRTTms: 40},
+				{Code: "FR", Name: "France", Flag: "🇫🇷", Nodes: 1, Alive: 1, MinRTTms: 60},
+				{Code: "NL", Name: "Netherlands", Flag: "🇳🇱", Nodes: 1, Alive: 0, MinRTTms: 30},
 			},
 		},
 		Balancers: []balancerTarget{
@@ -81,7 +81,7 @@ func TestListJSONWithoutCitiesOmitsCityArrays(t *testing.T) {
 	cfg, _ := listFixture(t)
 	out := runListCapture(t, cfg, listOptions{json: true})
 	assert.NotContains(t, out, `"cities"`, "no --cities: no city arrays")
-	assert.Contains(t, out, `"median_rtt_ms"`, "country-level aggregates are always present")
+	assert.Contains(t, out, `"min_rtt_ms"`, "country-level aggregates are always present")
 }
 
 // TestListJSONCitiesMirrorTableSuppression pins the parity contract (review

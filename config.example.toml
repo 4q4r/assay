@@ -48,6 +48,11 @@ data_dir = "~/.local/share/publicvpn"
 #                               # line, excluded from future waves; a
 #                               # successful run or a file edit resets and
 #                               # re-enables. 0 = unlimited (breaker off).
+# max_duplicate_percent = 50   # per-plugin duplicate threshold: percent of
+#                               # nodes whose key collides with another
+#                               # plugin's nodes. Unset/0 = disabled.
+# min_live_percent = 10        # per-plugin minimum live nodes: percent of
+#                               # nodes alive after probing. Unset/0 = disabled.
 
 [fetch]
 timeout = "30s"
@@ -91,6 +96,13 @@ threads = 32                         # parallel temp-instance workers (each is a
                                      # process; W19 default — saturates the boot-serialization
                                      # ceiling so wave wall time stays bounded-minutes per 1000
                                      # nodes; the semaphore still bounds instantaneous load)
+batch_size = 10                      # nodes per xray process in batch mode (W20+):
+                                     # one xray with N outbounds + N inbounds + routing rules,
+                                     # reducing process count by ~batch_size. The boot mutex
+                                     # serializes per-BATCH instead of per-node.
+batch_concurrency = 10               # nodes probed concurrently inside one batch (each is a
+                                     # real probe attempt through the shared xray process).
+                                     # 0 = default 10. Negative = invalid.
 attempts = 3                         # HTTP GETs per node: all success = passed, some =
                                      # semi-passed, none = failed (skip_fresh_within is strict)
 url = "https://cloudflare.com/cdn-cgi/trace"  # the liveness target
@@ -132,9 +144,19 @@ https_url = "https://ipinfo.io/json"   # W16 hop-2 HTTPS self-geo: a keyless end
 ttl = "24h"                            # alive-data freshness: records whose last_probe is
                                        # older are not selectable until re-probed
                                        # (W4 maintain extends this into physical pruning)
-timeout = "15s"                        # bounds ONE through-tunnel HTTP request (self-report
+exit_ip_echo_url = "https://icanhazip.com" # HTTPS echo fallback for exit-IP recovery when
+                                       # self-report fails entirely (keyless, TLS-only);
+                                       # empty disables the fallback
+timeout = "8s"                         # bounds ONE through-tunnel HTTP request (self-report
                                        # and each fallback hop alike)
-
+self_report_concurrency = 8           # max concurrent temp instances during geo self-report
+                                       # (each is a full xray process). 0 = default 8.
+                                       # Negative = invalid.
+max_ttl = "30s"                       # cap for the rate-limit retry sleep (X-Ttl honor)
+# unlock_probes = true                 # Phase 1 (default off): probe ChatGPT/Netflix/YouTube/
+#                                      # Disney+/TikTok unlocks + IP quality THROUGH each
+#                                      # distinct exit's own tunnel (3s per request), cached
+#                                      # per exit IP for 7 days in geo-base.jsonl
 [select]
 # W19 (owner order): every cap defaults to UNBOUNDED — absent/0 = ALL alive
 # nodes go active (the unknown-geo group included) and land in the country/
@@ -146,6 +168,9 @@ timeout = "15s"                        # bounds ONE through-tunnel HTTP request 
 #                          # (0/absent = expansion off)
 # ceiling = 40             # expansion bound (0/absent = bounded only by the alive count)
 tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance joins the band
+# only_clean = true        # filter selection to clean IPs only (hosting=false && proxy=false);
+                           # when enabled, all selected nodes are clean, so render skips the
+                           # redundant clean-* balancers and renders only the common (all) ones
 
 [render]
 template = "~/path/to/template.json"  # PLACEHOLDER — read-only structure reference to
@@ -235,3 +260,17 @@ auto_restart = true
 # user_agent = "public_vpn (pipeline; contact: owner)"
 # THE pipeline User-Agent — every HTTP client (fetch discovery + downloads,
 # geo batch enrichment) sends exactly this string.
+
+[resources]
+# Machine resource envelope for concurrent work (temp xray instances, geo
+# self-report workers, probe threads). Zero = auto-detect (CPU = NumCPU,
+# RAM = host total); headroom_pct reserves RAM for the OS/other processes.
+# max_cpu_cores = 0
+# max_ram_mb = 0
+# headroom_pct = 10
+
+[self_update]
+# Watch-daemon self-update detection: it stat-checks its own binary on disk
+# and, on a confirmed change, restarts via systemd at the next wave boundary.
+enabled = true
+# check_interval = "30s"

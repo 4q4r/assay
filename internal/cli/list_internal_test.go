@@ -103,10 +103,10 @@ func TestListGroupsActiveCoreByCountry(t *testing.T) {
 	// Alive counts: de 1/2, fr 1/1, us 0/1.
 	require.Contains(t, out, "1")
 	require.Contains(t, out, "0")
-	// Median RTT of de = the single alive probe's 40ms (median over nodes
-	// CARRYING an RTT: 40, 51 → 45.5); formatted by the shared formatter.
-	require.Contains(t, out, "46ms", "de median of [40,51] = 45.5 → 46ms")
-	require.Contains(t, out, "60ms", "fr median is the single 60ms probe")
+	// Min RTT of de = the smallest RTT among nodes CARRYING an RTT:
+	// 40, 51 → 40; formatted by the shared formatter.
+	require.Contains(t, out, "40ms", "de min of [40,51] = 40ms")
+	require.Contains(t, out, "60ms", "fr min is the single 60ms probe")
 }
 
 func TestListCitiesExpansion(t *testing.T) {
@@ -235,7 +235,7 @@ func TestListJSONPurity(t *testing.T) {
 	out := runListCapture(t, cfg, listOptions{json: true})
 	require.NotContains(t, out, "\x1b", "JSON must never carry ANSI styling")
 	require.True(t, json.Valid([]byte(out)), "output is valid JSON")
-	require.Contains(t, out, `"median_rtt_ms": 45.5`, "JSON numbers unchanged (color-independent twin)")
+	require.Contains(t, out, `"min_rtt_ms": 40`, "JSON numbers unchanged (color-independent twin)")
 }
 
 func TestListAllColdSection(t *testing.T) {
@@ -327,7 +327,7 @@ func TestListUnknownGroupAndBalancers(t *testing.T) {
 	require.NoError(t, store.WriteGeo(filepath.Join(dir, "geo-base.jsonl"), cold))
 	cfg := &config.Config{DataDir: dir}
 
-	out := runListCapture(t, cfg, listOptions{all: true})
+	out := runListCapture(t, cfg, listOptions{all: true, verbose: true})
 	require.Contains(t, out, "🏳 unknown", "the unknown group renders as its own location row")
 	require.Contains(t, out,
 		"⚖️ pools: pool_all (3 nodes), pool_de (1), pool_unknown (2)",
@@ -339,7 +339,7 @@ func TestListUnknownGroupAndBalancers(t *testing.T) {
 // known countries names NO pool_unknown target (it would not render).
 func TestListBalancersLineKnownOnly(t *testing.T) {
 	cfg, _ := listFixture(t)
-	out := runListCapture(t, cfg, listOptions{})
+	out := runListCapture(t, cfg, listOptions{cities: true, verbose: true})
 	require.Contains(t, out, "⚖️ pools: pool_all (4 nodes), pool_de (2), pool_fr (1), pool_us (1)")
 	require.NotContains(t, out, "pool_unknown", "no unknown-geo nodes — no pool_unknown target")
 }

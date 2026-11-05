@@ -34,8 +34,9 @@ const (
 	checkFakeSiteEnv      = "CHECKFAKE_SITE_ADDR"
 	checkFakeDeadMarkEnv  = "CHECKFAKE_DEAD_MARKER"
 
-	checkFakeModeExit  = "exit"  // exit(1) instantly during boot (C1 geometry)
-	checkFakeModeServe = "serve" // bind the config's socks port, serve socks5
+	checkFakeModeExit       = "exit"        // exit(1) instantly during boot (C1 geometry)
+	checkFakeModeExitStderr = "exit_stderr" // exit(1) with stderr message
+	checkFakeModeServe      = "serve"       // bind the config's socks port, serve socks5
 )
 
 // TestMain doubles as the fake-xray entrypoint: when the test binary is
@@ -44,6 +45,9 @@ const (
 func TestMain(m *testing.M) {
 	switch os.Getenv(checkFakeModeEnv) {
 	case checkFakeModeExit:
+		os.Exit(1)
+	case checkFakeModeExitStderr:
+		_, _ = fmt.Fprintln(os.Stderr, "FATAL: custom diagnostic message from fake xray on stderr")
 		os.Exit(1)
 	case checkFakeModeServe:
 		runCheckFakeServe()
@@ -241,6 +245,77 @@ func TestStartTempXrayBootDeathTerminatesBoundedly(t *testing.T) {
 	assert.Empty(t, entries, "a failed boot must leave ZERO temp config dirs")
 }
 
+// TestStartTempXrayBatchBootDeathCapturesStderr verifies that when a batch
+// xray instance exits with error during startup, its stderr output is captured
+// and present in the returned error message.
+func TestStartTempXrayBatchBootDeathCapturesStderr(t *testing.T) {
+	workDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	outbounds := []map[string]any{
+		freedomOutbound(),
+		freedomOutbound(),
+	}
+
+	inst, err := StartTempXrayBatch(ctx, fakeBin(t, checkFakeModeExitStderr), workDir, outbounds)
+	require.Error(t, err, "exiting fake xray batch must return error")
+	assert.Nil(t, inst)
+	assert.Contains(t, err.Error(), "FATAL: custom diagnostic message from fake xray on stderr",
+		"batch startup error must contain stderr output")
+
+	entries, rerr := os.ReadDir(workDir)
+	require.NoError(t, rerr)
+	assert.Empty(t, entries, "failed batch boot must clean temp config dir")
+}
+
+// TestBatchXrayInstanceConcurrentCloseAndCancel verifies that concurrent Close()
+// and context cancellation during/after startup does not race, double-close,
+// panic on closed channels, or leak temp directories under -race.
+func TestBatchXrayInstanceConcurrentCloseAndCancel(t *testing.T) {
+	workDir := t.TempDir()
+	t.Setenv(checkFakeDelayEnv, "50")
+	bin := fakeBin(t, checkFakeModeServe)
+
+	for range 5 {
+		ctx, cancel := context.WithCancel(context.Background())
+		outbounds := []map[string]any{
+			freedomOutbound(),
+			freedomOutbound(),
+		}
+
+		inst, err := StartTempXrayBatch(ctx, bin, workDir, outbounds)
+		if err != nil {
+			cancel()
+			continue
+		}
+
+		// Fire concurrent Close() calls and context cancellation
+		const workers = 10
+		var wg sync.WaitGroup
+		wg.Add(workers + 1)
+
+		go func() {
+			defer wg.Done()
+			cancel()
+		}()
+
+		for range workers {
+			go func() {
+				defer wg.Done()
+				_ = inst.Close()
+			}()
+		}
+
+		wg.Wait()
+		cancel()
+	}
+
+	entries, rerr := os.ReadDir(workDir)
+	require.NoError(t, rerr)
+	assert.Empty(t, entries, "all batch temp directories must be cleaned up without leaks")
+}
+
 // C2 invariant pin (direct): two concurrent boots must never be handed the
 // same port. Pre-fix, the loser's port scan landed inside the winner's
 // boot-to-bind window and BOTH instances claimed one port — the loser's
@@ -338,12 +413,12 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 		rep, err := Run(ctx, Options{
 			Targets:  []string{httpTargetURL(t, site)},
 			Attempts: 1,
-			// 15s: the full -race suite saturates the box (packages run
+			// 30s: the full -race suite saturates the box (packages run
 			// concurrently) and the W14 boot-smoke adds real xray boots to
 			// that load — a 5s attempt deadline flaked the healthy-control
 			// sanity under that peak. Success is milliseconds; the larger
 			// deadline only buys headroom under saturation.
-			Timeout:          15 * time.Second,
+			Timeout:          30 * time.Second,
 			Concurrency:      2,
 			XrayBin:          os.Args[0], // the PRODUCTION factory path, no override
 			GeoBasePath:      filepath.Join(cfgDir, "geo-base.jsonl"),
@@ -380,21 +455,23 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 		// load-flaky half: under full -race package-pair load either the
 		// dead boot can fail (round 5, witnessed live pre-I4) or the
 		// control's single attempt can starve (1-in-3). A degenerate round
-		// exercises nothing. Retry the round ONCE, for the SANITY ONLY; the
-		// invariant above keeps its single-shot semantics on the original
-		// round and on any retry.
-		if deadRow.InstanceFailed || deadRow.Total != 1 || okRow.OK != 1 {
-			t.Logf("round %d: fixture sanity failed under suite load (dead boot failed=%v, total=%d, control ok=%d) — retrying the round once (sanity only)",
-				round, deadRow.InstanceFailed, deadRow.Total, okRow.OK)
+		// exercises nothing. Retry the round up to 3 times, for the SANITY
+		// ONLY; the invariant above keeps its single-shot semantics on the
+		// original round and on any retry. The dead-node OK==0 invariant is
+		// checked on EVERY attempt (including retries) — only the boot/total/
+		// control-ok sanity is retried.
+		for sanityRetry := 0; sanityRetry < 3 && (deadRow.InstanceFailed || deadRow.Total != 1 || okRow.OK != 1); sanityRetry++ {
+			t.Logf("round %d: fixture sanity failed under suite load (dead boot failed=%v, total=%d, control ok=%d) — retrying (sanity only, attempt %d)",
+				round, deadRow.InstanceFailed, deadRow.Total, okRow.OK, sanityRetry+1)
 			okRow, deadRow = runRound(round)
 			require.Equal(t, 0, deadRow.OK,
-				"round %d (sanity retry): the dead-node invariant holds on the retry too", round)
-			require.False(t, deadRow.InstanceFailed,
-				"round %d (sanity retry): the dead node must BOOT — failing twice is real breakage", round)
-			require.Equal(t, 1, deadRow.Total, "round %d (sanity retry)", round)
-			require.Equal(t, 1, okRow.OK,
-				"round %d (sanity retry): the healthy control failed twice under load — real fixture breakage, not a flake", round)
+				"round %d (sanity retry %d): the dead-node invariant holds on the retry too", round, sanityRetry+1)
 		}
+		require.False(t, deadRow.InstanceFailed,
+			"round %d: the dead node must BOOT — failing all retries is real breakage", round)
+		require.Equal(t, 1, deadRow.Total, "round %d", round)
+		require.Equal(t, 1, okRow.OK,
+			"round %d: the healthy control failed all retries under load — real fixture breakage, not a flake", round)
 	}
 
 	entries, rerr := os.ReadDir(workDir)

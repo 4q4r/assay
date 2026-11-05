@@ -30,6 +30,7 @@ func newListCommand(cfgPath *string) *cobra.Command {
 	var (
 		cities  bool
 		all     bool
+		verbose bool
 		jsonOut bool
 	)
 	cmd := &cobra.Command{
@@ -50,7 +51,7 @@ func newListCommand(cfgPath *string) *cobra.Command {
 				reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
 			}
 			return runList(cmd.OutOrStdout(), res, listOptions{
-				cities: cities, all: all, color: color, json: jsonOut,
+				cities: cities, all: all, verbose: verbose, color: color, json: jsonOut,
 			})
 		},
 	}
@@ -58,6 +59,8 @@ func newListCommand(cfgPath *string) *cobra.Command {
 		"show indented city sub-rows under multi-city countries (the D5 two-layer view)")
 	cmd.Flags().BoolVar(&all, "all", false,
 		"append the cold base (geo-base) as a separate section, grouped the same way")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false,
+		"show the pool balancer summary line (routing targets)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false,
 		"emit one machine-readable JSON document instead of the table (schema in the README)")
 	attachColorFlags(cmd)
@@ -66,10 +69,11 @@ func newListCommand(cfgPath *string) *cobra.Command {
 
 // listOptions carries the list flags (seam for tests).
 type listOptions struct {
-	cities bool
-	all    bool
-	color  bool
-	json   bool
+	cities  bool
+	all     bool
+	verbose bool
+	color   bool
+	json    bool
 }
 
 // selectedStat is one country row of the active core plus its nodes (the
@@ -77,24 +81,27 @@ type listOptions struct {
 // the row was grouped by ("DE"; "" = the unknown-geo pseudo-group) — the
 // wire structs consume it directly instead of re-parsing display labels.
 type selectedStat struct {
-	code   string
-	flag   string
-	nodes  []model.SelectedNode
-	alive  int
-	median float64
+	code        string
+	flag        string
+	nodes       []model.SelectedNode
+	alive       int
+	min         float64
+	TopSpeedBPS float64
 }
 
 // coldStat is one cold-base country row (code: see selectedStat).
 type coldStat struct {
-	code   string
-	flag   string
-	count  int
-	alive  int
-	median float64
+	code        string
+	flag        string
+	count       int
+	alive       int
+	min         float64
+	TopSpeedBPS float64
 }
 
 func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 	cfg := res.Config
+	speedtest := cfg.Probe.IsSpeedtest()
 	p := newPaths(cfg)
 	sel, err := store.ReadSelection(p.selection)
 	if err != nil {
@@ -120,7 +127,11 @@ func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 	outln(w, ui.Header("📦 pool inventory — active core: "+strconv.Itoa(len(sel.Nodes))+" nodes", opts.color))
 	_, _ = fmt.Fprintln(w, ui.Chip("selection:", sel.GeneratedAt.Format(time.RFC3339), opts.color))
 
-	_, _ = io.WriteString(w, ui.Table(listColumns(), listRows(countries, opts.cities, probeByKey), opts.color))
+	_, _ = io.WriteString(w, ui.Table(
+		listColumns(speedtest),
+		listRows(countries, opts.cities, probeByKey, speedtest),
+		opts.color,
+	))
 
 	if opts.all {
 		records, err := store.ReadGeo(p.geoBase)
@@ -128,7 +139,7 @@ func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 			return err
 		}
 		_, _ = fmt.Fprintf(w, "\ncold base: %d records (%s)\n", len(records), p.geoBase)
-		_, _ = io.WriteString(w, ui.Table(listColumns(), coldRows(groupCold(records)), opts.color))
+		_, _ = io.WriteString(w, ui.Table(listColumns(speedtest), coldRows(groupCold(records), speedtest), opts.color))
 	}
 
 	// W16 balancer awareness: the routing targets the current selection will
@@ -136,46 +147,71 @@ func runList(w io.Writer, res *config.Resolved, opts listOptions) error {
 	// balancers, and the unknown-geo pseudo-location when selected. City
 	// balancers are render-time decisions (>= 2 live nodes per city) and are
 	// not listed here.
-	_, _ = fmt.Fprintln(w, "\n"+ui.Chip("⚖️ pools:", balancerSummary(sel.Nodes), opts.color))
+	if opts.verbose {
+		_, _ = fmt.Fprintln(w, "\n"+ui.Chip("⚖️ pools:", balancerSummary(sel.Nodes), opts.color))
+	}
 	return nil
 }
 
 // listColumns is the shape every list section renders (countries, expanded
 // cities, cold base): one column set for the whole screen.
-func listColumns() []ui.Column {
-	return []ui.Column{
+func listColumns(speedtest ...bool) []ui.Column {
+	st := false
+	if len(speedtest) > 0 {
+		st = speedtest[0]
+	}
+	cols := []ui.Column{
 		{Header: "loc", Width: 6},
 		{Header: "nodes", Width: 5, Right: true},
 		{Header: "alive", Width: 5, Right: true},
-		{Header: "median", Width: 7, Right: true},
+		{Header: "min", Width: 7, Right: true},
 	}
+	if st {
+		cols = append(cols, ui.Column{Header: "topspd", Width: 8, Right: true})
+	}
+	return cols
 }
 
 // listRows builds the active-core table rows: one row per country and —
 // under --cities — tree-glyph city sub-rows directly beneath their country
 // (the D5 two-layer view in ONE table; no duplicate header blocks).
-func listRows(countries []selectedStat, cities bool, probeByKey map[string]store.ProbeResult) [][]ui.Cell {
+func listRows(
+	countries []selectedStat, cities bool, probeByKey map[string]store.ProbeResult,
+	speedtest ...bool,
+) [][]ui.Cell {
+	st := false
+	if len(speedtest) > 0 {
+		st = speedtest[0]
+	}
 	rows := make([][]ui.Cell, 0, len(countries))
-	for _, st := range countries {
-		rows = append(rows, []ui.Cell{
-			{S: st.flag},
-			{S: strconv.Itoa(len(st.nodes))},
-			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, len(st.nodes))},
-			{S: checker.FormatMS(st.median), Color: ui.TrafficName(st.median)},
-		})
+	for _, s := range countries {
+		cells := []ui.Cell{
+			{S: s.flag},
+			{S: strconv.Itoa(len(s.nodes))},
+			{S: strconv.Itoa(s.alive), Color: aliveColor(s.alive, len(s.nodes))},
+			{S: checker.FormatMS(s.min), Color: ui.TrafficName(s.min)},
+		}
+		if st {
+			cells = append(cells, ui.Cell{S: checker.FormatBPS(s.TopSpeedBPS)})
+		}
+		rows = append(rows, cells)
 		if !cities {
 			continue
 		}
-		cityStats := cityView(st, probeByKey)
+		cityStats := cityView(s, probeByKey)
 		for i, city := range cityStats {
-			rows = append(rows, []ui.Cell{
+			cityCells := []ui.Cell{
 				// RAW glyph (the dim styling applies through the cell color —
 				// glyph and city name are dim 240 together, owner spec).
 				{S: ui.TreeGlyph(i, len(cityStats), false) + city.flag, Color: ui.ColorPlainName},
 				{S: strconv.Itoa(len(city.nodes))},
 				{S: strconv.Itoa(city.alive), Color: aliveColor(city.alive, len(city.nodes))},
-				{S: checker.FormatMS(city.median), Color: ui.TrafficName(city.median)},
-			})
+				{S: checker.FormatMS(city.min), Color: ui.TrafficName(city.min)},
+			}
+			if st {
+				cityCells = append(cityCells, ui.Cell{S: checker.FormatBPS(city.TopSpeedBPS)})
+			}
+			rows = append(rows, cityCells)
 		}
 	}
 	return rows
@@ -225,15 +261,17 @@ type listJSONCountry struct {
 	Flag        string         `json:"flag"` // the country's flag emoji
 	Nodes       int            `json:"nodes"`
 	Alive       int            `json:"alive"`
-	MedianRTTms float64        `json:"median_rtt_ms"`
-	Cities      []listJSONCity `json:"cities,omitempty"` // present only under --cities
+	MinRTTms    float64        `json:"min_rtt_ms"`
+	TopSpeedBPS float64        `json:"top_speed_bps,omitempty"` // present only when speedtest enabled
+	Cities      []listJSONCity `json:"cities,omitempty"`        // present only under --cities
 }
 
 type listJSONCity struct {
 	City        string  `json:"city"`
 	Nodes       int     `json:"nodes"`
 	Alive       int     `json:"alive"`
-	MedianRTTms float64 `json:"median_rtt_ms"`
+	MinRTTms    float64 `json:"min_rtt_ms"`
+	TopSpeedBPS float64 `json:"top_speed_bps,omitempty"` // present only when speedtest enabled
 }
 
 type listJSONColdBase struct {
@@ -276,23 +314,31 @@ func writeListJSON(
 		Countries:   make([]listJSONCountry, 0, len(countries)),
 		Balancers:   balancerTargets(sel.Nodes),
 	}
+	speedtest := res.Config.Probe.IsSpeedtest()
 	for _, cs := range countries {
 		jc := listJSONCountry{
-			Code:        cs.code,
-			Name:        jsonCountryName(cs.code),
-			Flag:        checker.FlagEmoji(cs.code),
-			Nodes:       len(cs.nodes),
-			Alive:       cs.alive,
-			MedianRTTms: cs.median,
+			Code:     cs.code,
+			Name:     jsonCountryName(cs.code),
+			Flag:     checker.FlagEmoji(cs.code),
+			Nodes:    len(cs.nodes),
+			Alive:    cs.alive,
+			MinRTTms: cs.min,
+		}
+		if speedtest {
+			jc.TopSpeedBPS = cs.TopSpeedBPS
 		}
 		if opts.cities {
 			for _, city := range cityView(cs, probeByKey) {
-				jc.Cities = append(jc.Cities, listJSONCity{
-					City:        city.flag,
-					Nodes:       len(city.nodes),
-					Alive:       city.alive,
-					MedianRTTms: city.median,
-				})
+				jcity := listJSONCity{
+					City:     city.flag,
+					Nodes:    len(city.nodes),
+					Alive:    city.alive,
+					MinRTTms: city.min,
+				}
+				if speedtest {
+					jcity.TopSpeedBPS = city.TopSpeedBPS
+				}
+				jc.Cities = append(jc.Cities, jcity)
 			}
 		}
 		doc.Countries = append(doc.Countries, jc)
@@ -304,14 +350,18 @@ func writeListJSON(
 		}
 		cold := &listJSONColdBase{Path: p.geoBase, Records: len(records)}
 		for _, st := range groupCold(records) {
-			cold.Countries = append(cold.Countries, listJSONCountry{
-				Code:        st.code,
-				Name:        jsonCountryName(st.code),
-				Flag:        checker.FlagEmoji(st.code),
-				Nodes:       st.count,
-				Alive:       st.alive,
-				MedianRTTms: st.median,
-			})
+			jc := listJSONCountry{
+				Code:     st.code,
+				Name:     jsonCountryName(st.code),
+				Flag:     checker.FlagEmoji(st.code),
+				Nodes:    st.count,
+				Alive:    st.alive,
+				MinRTTms: st.min,
+			}
+			if speedtest {
+				jc.TopSpeedBPS = st.TopSpeedBPS
+			}
+			cold.Countries = append(cold.Countries, jc)
 		}
 		doc.ColdBase = cold
 	}
@@ -336,11 +386,11 @@ func groupSelected(sel []model.SelectedNode, probeByKey map[string]store.ProbeRe
 	out := make([]selectedStat, 0, len(byCountry))
 	for cc, nodes := range byCountry {
 		st := selectedStat{code: cc, flag: locationLabel(cc), nodes: nodes}
-		st.alive, st.median = aggregate(nodes, func(n model.SelectedNode) (bool, float64) {
+		st.alive, st.min, st.TopSpeedBPS = aggregate(nodes, func(n model.SelectedNode) (bool, float64, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
-				return pr.Alive, pr.RTTMs
+				return pr.Alive, pr.RTTMs, float64(pr.SpeedBPS)
 			}
-			return false, n.RTTMs
+			return false, n.RTTMs, float64(n.Speed)
 		})
 		out = append(out, st)
 	}
@@ -391,11 +441,11 @@ func groupCities(nodes []model.SelectedNode, probeByKey map[string]store.ProbeRe
 		// flag = the deterministic display name (no prefix — the table adds
 		// the tree glyph at render time, the JSON twin uses the name as-is).
 		st := selectedStat{flag: display[k], nodes: group}
-		st.alive, st.median = aggregate(group, func(n model.SelectedNode) (bool, float64) {
+		st.alive, st.min, st.TopSpeedBPS = aggregate(group, func(n model.SelectedNode) (bool, float64, float64) {
 			if pr, ok := probeByKey[n.Key]; ok {
-				return pr.Alive, pr.RTTMs
+				return pr.Alive, pr.RTTMs, float64(pr.SpeedBPS)
 			}
-			return false, n.RTTMs
+			return false, n.RTTMs, float64(n.Speed)
 		})
 		out = append(out, st)
 	}
@@ -418,8 +468,8 @@ func groupCold(records []*model.GeoRecord) []coldStat {
 			flag:  locationLabel(cc),
 			count: len(group),
 		}
-		st.alive, st.median = aggregate(group, func(r *model.GeoRecord) (bool, float64) {
-			return r.Alive, r.RTTMs
+		st.alive, st.min, st.TopSpeedBPS = aggregate(group, func(r *model.GeoRecord) (bool, float64, float64) {
+			return r.Alive, r.RTTMs, float64(r.SpeedBPS)
 		})
 		out = append(out, st)
 	}
@@ -481,20 +531,33 @@ func balancerSummary(sel []model.SelectedNode) string {
 	return strings.Join(parts, ", ")
 }
 
-// aggregate folds one group into (alive count, median RTT).
-func aggregate[T any](group []T, liveness func(T) (bool, float64)) (int, float64) {
+// aggregate folds one group into (alive count, min RTT, top speed).
+func aggregate[T any](group []T, liveness func(T) (bool, float64, float64)) (int, float64, float64) {
 	alive := 0
 	var rtts []float64
+	var aliveTop, anyTop float64
 	for _, n := range group {
-		ok, rtt := liveness(n)
+		ok, rtt, speed := liveness(n)
 		if ok {
 			alive++
 		}
 		if rtt > 0 {
 			rtts = append(rtts, rtt)
 		}
+		if speed > 0 {
+			if speed > anyTop {
+				anyTop = speed
+			}
+			if ok && speed > aliveTop {
+				aliveTop = speed
+			}
+		}
 	}
-	return alive, median(rtts)
+	top := aliveTop
+	if top == 0 {
+		top = anyTop
+	}
+	return alive, minVal(rtts), top
 }
 
 // sortSelected orders by node count descending, then display flag (stable,
@@ -508,30 +571,38 @@ func sortSelected(stats []selectedStat) {
 	})
 }
 
-func median(values []float64) float64 {
+func minVal(values []float64) float64 {
 	if len(values) == 0 {
 		return 0
 	}
-	sorted := append([]float64(nil), values...)
-	sort.Float64s(sorted)
-	mid := len(sorted) / 2
-	if len(sorted)%2 == 1 {
-		return sorted[mid]
+	m := values[0]
+	for _, v := range values[1:] {
+		if v < m {
+			m = v
+		}
 	}
-	return (sorted[mid-1] + sorted[mid]) / 2
+	return m
 }
 
 // coldRows builds the cold-base section rows (same columns as the active
 // core table).
-func coldRows(stats []coldStat) [][]ui.Cell {
+func coldRows(stats []coldStat, speedtest ...bool) [][]ui.Cell {
+	st := false
+	if len(speedtest) > 0 {
+		st = speedtest[0]
+	}
 	rows := make([][]ui.Cell, 0, len(stats))
-	for _, st := range stats {
-		rows = append(rows, []ui.Cell{
-			{S: st.flag},
-			{S: strconv.Itoa(st.count)},
-			{S: strconv.Itoa(st.alive), Color: aliveColor(st.alive, st.count)},
-			{S: checker.FormatMS(st.median), Color: ui.TrafficName(st.median)},
-		})
+	for _, s := range stats {
+		cells := []ui.Cell{
+			{S: s.flag},
+			{S: strconv.Itoa(s.count)},
+			{S: strconv.Itoa(s.alive), Color: aliveColor(s.alive, s.count)},
+			{S: checker.FormatMS(s.min), Color: ui.TrafficName(s.min)},
+		}
+		if st {
+			cells = append(cells, ui.Cell{S: checker.FormatBPS(s.TopSpeedBPS)})
+		}
+		rows = append(rows, cells)
 	}
 	return rows
 }

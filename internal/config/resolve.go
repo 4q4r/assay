@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // SourceKind identifies where the effective configuration came from. The
@@ -257,8 +258,16 @@ func configless(home string) (*Resolved, error) {
 	if home == "" {
 		return nil, errors.New("configless: empty home is API misuse — inject a real home directory")
 	}
-	cfg := &Config{DataDir: DefaultDataDir(home)}
+	cfg := &Config{
+		DataDir: DefaultDataDir(home),
+		SelfUpdate: SelfUpdateConfig{
+			Enabled:       true,
+			CheckInterval: Duration{Duration: 30 * time.Second},
+		},
+		Probe: ProbeConfig{CalibrationEnabled: true},
+	}
 	applyDefaults(cfg, true)
+	syncResourceConfig(cfg)
 	res := &Resolved{Config: cfg, Source: SourceConfigless}
 	if violation := XDGDataDirViolation(); violation != "" {
 		res.Warnings = append(res.Warnings, violation)

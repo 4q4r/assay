@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,6 +281,102 @@ func TestKeepNewestBackupsLoudOnDeletionFailure(t *testing.T) {
 	err := store.KeepNewestBackups(dir, "config.json", 1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "20200101-000000", "the undeletable backup must be named")
+}
+
+// TestRewriteGeoWithBackupStatErrorIsLoud pins F10: a stat error other than
+// not-exist is NOT "nothing to back up" — it must fail loud instead of
+// silently reducing the rollback depth. A store path under a REGULAR FILE
+// fails stat with ENOTDIR (not IsNotExist).
+func TestRewriteGeoWithBackupStatErrorIsLoud(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
+	storePath := filepath.Join(blocker, "geo-base.jsonl")
+
+	records := []*model.GeoRecord{{Host: "new.example.com", Scheme: "vless", Port: 443}}
+	_, err := store.RewriteGeoWithBackup(storePath, records, time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC), 0)
+	require.Error(t, err, "a stat error other than not-exist must not skip the backup silently")
+	assert.Contains(t, err.Error(), "stat pre-prune store", "the error names the refused operation")
+
+	// The missing-store contract stays: no file → no backup, clean write.
+	missing := filepath.Join(dir, "geo-base.jsonl")
+	bp, err := store.RewriteGeoWithBackup(missing, records, time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC), 0)
+	require.NoError(t, err)
+	assert.Empty(t, bp, "a missing store has nothing to back up")
+}
+
+// captureStderr swaps os.Stderr for a pipe around fn — the loud-warning
+// channel for library code without a writer seam.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		n, _ := r.Read(buf)
+		done <- string(buf[:n])
+	}()
+	fn()
+	require.NoError(t, w.Close())
+	os.Stderr = old
+	return <-done
+}
+
+// TestReadWaveStateCorruptBacksUpAndWarns pins F9: a corrupt wave-state.json
+// is backed up (wave-state.json.corrupt-<unix-ts>), the reset is announced
+// loud, and availability is preserved (reset to 0 — never a wave-blocking
+// error).
+func TestReadWaveStateCorruptBacksUpAndWarns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wave-state.json")
+	require.NoError(t, os.WriteFile(path, []byte("{corrupt"), 0o600))
+
+	var st store.WaveState
+	var err error
+	warning := captureStderr(t, func() {
+		st, err = store.ReadWaveState(path)
+	})
+	require.NoError(t, err, "availability is preserved: a corrupt state never fails the wave")
+	assert.Equal(t, uint64(0), st.CurrentWaveSeq, "corrupt state resets to 0")
+	assert.Contains(t, warning, "corrupt", "the reset is announced loud, not silent")
+
+	// The corrupt bytes survive in the backup; the original path is gone.
+	entries, readErr := os.ReadDir(dir)
+	require.NoError(t, readErr)
+	var backups []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "wave-state.json.corrupt-") {
+			backups = append(backups, e.Name())
+		}
+	}
+	require.Len(t, backups, 1, "exactly one corrupt backup lands")
+	b, readErr := os.ReadFile(filepath.Join(dir, backups[0]))
+	require.NoError(t, readErr)
+	assert.Equal(t, "{corrupt", string(b), "the corrupt bytes are preserved for the operator")
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr), "the corrupt file is renamed away, not left in place")
+}
+
+// TestReadWaveStateHealthyFileUntouched pins that the F9 backup path only
+// fires on corruption: a healthy state file is read in place, unrenamed.
+func TestReadWaveStateHealthyFileUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wave-state.json")
+	require.NoError(t, store.WriteWaveState(path, store.WaveState{CurrentWaveSeq: 42}))
+
+	warning := captureStderr(t, func() {
+		st, err := store.ReadWaveState(path)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(42), st.CurrentWaveSeq)
+	})
+	assert.Empty(t, warning, "a healthy file never warns")
+	entries, readErr := os.ReadDir(dir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, 1, "no corrupt backup appears")
+	assert.Equal(t, "wave-state.json", entries[0].Name())
 }
 
 // TestRewriteGeoWithBackupAppliesRetention pins the prune-side wiring: the
