@@ -372,9 +372,33 @@ func TestRenderIsDeterministicForGoldenRegression(t *testing.T) {
 	cfg := renderCfg([]render.PoolRoute{
 		{Balancer: "pool_nl", Domains: []string{"geosite:netflix"}},
 	})
-	res1, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: cfg})
+	// Phase-3 unlock evidence for the fixture exits: de1 qualifies for every
+	// service pool, nl1 is netflix-full only (webonly chatgpt excluded),
+	// nl2 is chatgpt only (originals netflix), de2 is UNCHECKED (fail-closed
+	// pin), us1 is fully blocked. No node is flags-clean, so pool_clean
+	// stays absent in this golden.
+	geo := geoEvidence(nodes, map[string]model.GeoRecord{
+		"nl1.example.com": {RiskScore: 55, MediaUnlocks: model.MediaUnlockStatus{
+			ChatGPT: model.UnlockWebOnly, Netflix: model.UnlockNetflixFull, YouTubeRegion: "NL",
+			CheckedAt: "2026-11-04T12:00:00Z",
+		}},
+		"nl2.example.com": {RiskScore: 40, MediaUnlocks: model.MediaUnlockStatus{
+			ChatGPT: model.UnlockYes, Netflix: model.UnlockNetflixOriginals, YouTubeRegion: "NL",
+			CheckedAt: "2026-11-04T12:00:00Z",
+		}},
+		"de1.example.com": {RiskScore: 10, MediaUnlocks: model.MediaUnlockStatus{
+			ChatGPT: model.UnlockYes, Netflix: model.UnlockNetflixFull, YouTubeRegion: "DE",
+			CheckedAt: "2026-11-04T12:00:00Z",
+		}},
+		"de2.example.com": {RiskScore: -1},
+		"us1.example.com": {RiskScore: 70, MediaUnlocks: model.MediaUnlockStatus{
+			ChatGPT: model.UnlockBlocked, Netflix: model.UnlockBlocked, YouTubeRegion: model.UnlockBlocked,
+			CheckedAt: "2026-11-04T12:00:00Z",
+		}},
+	})
+	res1, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, GeoByKey: geo, Cfg: cfg})
 	require.NoError(t, err)
-	res2, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: cfg})
+	res2, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, GeoByKey: geo, Cfg: cfg})
 	require.NoError(t, err)
 	assert.Equal(t, string(res1.Config), string(res2.Config), "render must be byte-deterministic (golden regression basis)")
 
@@ -446,37 +470,59 @@ func TestPoolRouteDirectOutboundTagIsIdempotent(t *testing.T) {
 	assert.Equal(t, 1, count, "re-render must not duplicate the direct-tag pool rule")
 }
 
-func TestUnknownPoolRouteBalancerIsLoud(t *testing.T) {
+func TestUnknownPoolRouteBalancerGraceful(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	_, err := render.Render(render.Input{
+	res, err := render.Render(render.Input{
 		Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
 		Cfg: renderCfg([]render.PoolRoute{{Balancer: "pool_fr", Domains: []string{"domain:x.com"}}}),
 	})
-	require.Error(t, err, "routing to a balancer that was not rendered = dead rule — fail loud")
-	assert.Contains(t, err.Error(), "pool_fr")
+	require.NoError(t, err, "render must succeed even when a pool balancer was not rendered")
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(res.Config, &m))
+	rules := m["routing"].(map[string]any)["rules"].([]any)
+	found := false
+	for _, r := range rules {
+		rm := r.(map[string]any)
+		if domains, _ := rm["domain"].([]any); len(domains) == 1 && domains[0] == "domain:x.com" {
+			assert.Equal(t, "block", rm["outboundTag"])
+			found = true
+		}
+	}
+	assert.True(t, found, "blocked pool route rule must be present")
+	assert.Contains(t, res.BlockedRoutes, "pool route balancer \"pool_fr\" not rendered -> block")
 }
 
 // TestUnknownPoolRouteDirectTagIsLoud pins the loud failure for a direct-tag
 // target that was not rendered (no live node there): the error must name the
 // tag and the not-rendered reason (M-a), not fall through to the namespace
 // message.
-func TestUnknownPoolRouteDirectTagIsLoud(t *testing.T) {
+func TestUnknownPoolRouteDirectTagGraceful(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	_, err := render.Render(render.Input{
+	res, err := render.Render(render.Input{
 		Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
 		Cfg: renderCfg([]render.PoolRoute{{Balancer: "pool-de-09", Domains: []string{"domain:x.com"}}}),
 	})
-	require.Error(t, err, "routing to an outbound tag that was not rendered = dead rule — fail loud")
-	assert.Contains(t, err.Error(), "pool-de-09")
-	assert.Contains(t, err.Error(), "not rendered")
+	require.NoError(t, err, "render must succeed even when a pool outbound was not rendered")
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(res.Config, &m))
+	rules := m["routing"].(map[string]any)["rules"].([]any)
+	found := false
+	for _, r := range rules {
+		rm := r.(map[string]any)
+		if domains, _ := rm["domain"].([]any); len(domains) == 1 && domains[0] == "domain:x.com" {
+			assert.Equal(t, "block", rm["outboundTag"])
+			found = true
+		}
+	}
+	assert.True(t, found)
 }
 
 // TestEmptyPoolStillValidatesPoolRoutes pins the W7 hoist: [render.pool_routes]
@@ -494,10 +540,9 @@ func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 		name   string
 		target string
 	}{
-		{"balancer target not rendered", "pool_de"},
-		{"direct tag target not rendered", "pool-de-01"},
 		{"namespace violation", "best_rtt"},
 		{"direct tag into the template", "proxy-0"},
+		{"namespace violation direct", "direct"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,8 +552,33 @@ func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 				NodesByKey: map[string]*model.Node{},
 				Cfg:        renderCfg([]render.PoolRoute{{Balancer: tc.target, Domains: []string{"domain:x.com"}}}),
 			})
-			require.Error(t, err, "empty pool + route target %q must fail loud", tc.target)
+			require.Error(t, err, "empty pool + route target %q must fail loud (namespace wall)", tc.target)
 			assert.Contains(t, err.Error(), tc.target, "the loud failure must name the offending target")
+		})
+	}
+
+	// pool-prefixed targets on an empty pool are not rendered -> graceful block.
+	for _, target := range []string{"pool_de", "pool-de-01"} {
+		t.Run("empty pool graceful "+target, func(t *testing.T) {
+			res, err := render.Render(render.Input{
+				Template:   testTemplate(t),
+				Selection:  &model.Selection{},
+				NodesByKey: map[string]*model.Node{},
+				Cfg:        renderCfg([]render.PoolRoute{{Balancer: target, Domains: []string{"domain:x.com"}}}),
+			})
+			require.NoError(t, err)
+			var m map[string]any
+			require.NoError(t, json.Unmarshal(res.Config, &m))
+			rules := m["routing"].(map[string]any)["rules"].([]any)
+			found := false
+			for _, r := range rules {
+				rm := r.(map[string]any)
+				if domains, _ := rm["domain"].([]any); len(domains) == 1 && domains[0] == "domain:x.com" {
+					assert.Equal(t, "block", rm["outboundTag"])
+					found = true
+				}
+			}
+			assert.True(t, found)
 		})
 	}
 
@@ -776,4 +846,83 @@ func TestPoolRulesGoBeforeAllTrailingBalancerRules(t *testing.T) {
 	assert.Greater(t, firstGerman, lastPool,
 		"the german balancer block starts only AFTER the last pool rule — no wedging between balancerTag rules")
 	assert.Less(t, firstPool, firstGerman, "pool rules precede the entire trailing balancer block")
+}
+
+// TestCleanAndAllBalancers verifies the clean/all balancer separation:
+// - Clean balancers only get nodes with IsClean=true (hosting=false && proxy=false).
+// - All balancers get all nodes regardless of clean status.
+// - Both country and city levels are split.
+// - pool_all always renders; pool_all_clean renders when clean nodes exist.
+func TestCleanAndAllBalancers(t *testing.T) {
+	// Create nodes: 2 clean NL nodes, 1 dirty NL node, 2 clean DE nodes, 1 dirty US node
+	nlClean1, sn1 := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443, nodeOpts{network: "xhttp"})
+	nlClean2, sn2 := mkSelected(t, "pool-nl-02", "nl", "Amsterdam", "nl2.example.com", 443, nodeOpts{network: "xhttp"})
+	nlDirty, sn3 := mkSelected(t, "pool-nl-03", "nl", "Amsterdam", "nl3.example.com", 443, nodeOpts{network: "xhttp"})
+	deClean1, sn4 := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp"})
+	deClean2, sn5 := mkSelected(t, "pool-de-02", "de", "Frankfurt", "de2.example.com", 2053, nodeOpts{network: "tcp"})
+	usDirty, sn6 := mkSelected(t, "pool-us-01", "us", "Seattle", "us1.example.com", 443, nodeOpts{network: "tcp"})
+
+	// Mark clean nodes explicitly (mkSelected doesn't set IsClean, so we modify after)
+	sn1.IsClean = true
+	sn2.IsClean = true
+	sn4.IsClean = true
+	sn5.IsClean = true
+	// sn3 (nlDirty), sn6 (usDirty) remain IsClean=false
+
+	nodes := []*model.Node{nlClean1, nlClean2, nlDirty, deClean1, deClean2, usDirty}
+	sel := &model.Selection{Nodes: []model.SelectedNode{sn1, sn2, sn3, sn4, sn5, sn6}}
+	m := doRender(t, nodes, sel)
+
+	balancers := m["routing"].(map[string]any)["balancers"].([]any)
+	balancerTags := map[string]bool{}
+	for _, b := range balancers {
+		if bm, ok := b.(map[string]any); ok {
+			if tag, _ := bm["tag"].(string); strings.HasPrefix(tag, "pool_") {
+				balancerTags[tag] = true
+			}
+		}
+	}
+
+	// Clean country balancers (>=1 clean node per country)
+	assert.True(t, balancerTags["pool_nl_clean"], "clean country balancer for NL (2 clean nodes)")
+	assert.True(t, balancerTags["pool_de_clean"], "clean country balancer for DE (2 clean nodes)")
+	assert.False(t, balancerTags["pool_us_clean"], "no clean country balancer for US (0 clean nodes)")
+
+	// All country balancers (>=1 all nodes per country — restored: every
+	// country with at least one node keeps its country balancer)
+	assert.True(t, balancerTags["pool_nl"], "all country balancer for NL (3 all nodes)")
+	assert.True(t, balancerTags["pool_de"], "all country balancer for DE (2 all nodes)")
+	assert.True(t, balancerTags["pool_us"], "all country balancer for US (1 all node)")
+
+	// Clean city balancers (>=2 clean nodes per city)
+	assert.True(t, balancerTags["pool_nl_amsterdam_clean"], "clean city balancer for Amsterdam (2 clean nodes)")
+	assert.True(t, balancerTags["pool_de_frankfurt_clean"], "clean city balancer for Frankfurt (2 clean nodes)")
+
+	// All city balancers (>=2 all nodes per city)
+	assert.True(t, balancerTags["pool_nl_amsterdam"], "all city balancer for Amsterdam (3 all nodes)")
+	assert.True(t, balancerTags["pool_de_frankfurt"], "all city balancer for Frankfurt (2 all nodes)")
+
+	// pool_all always renders
+	assert.True(t, balancerTags["pool_all"], "pool_all always renders")
+
+	// pool_all_clean renders when clean nodes exist
+	assert.True(t, balancerTags["pool_all_clean"], "pool_all_clean renders when clean nodes exist")
+
+	// Verify clean balancer selectors only contain clean node tags
+	for _, b := range balancers {
+		bm := b.(map[string]any)
+		tag, _ := bm["tag"].(string)
+		if strings.HasSuffix(tag, "_clean") && tag != "pool_all_clean" {
+			selectors := bm["selector"].([]any)
+			for _, s := range selectors {
+				stag := s.(string)
+				// Clean balancer selectors should only contain clean node tags
+				assert.True(t, strings.HasPrefix(stag, "pool-nl-01") ||
+					strings.HasPrefix(stag, "pool-nl-02") ||
+					strings.HasPrefix(stag, "pool-de-01") ||
+					strings.HasPrefix(stag, "pool-de-02"),
+					"clean balancer %s should only select clean nodes, got %s", tag, stag)
+			}
+		}
+	}
 }
