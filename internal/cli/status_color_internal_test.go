@@ -8,6 +8,8 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -159,4 +161,141 @@ func TestConfigSourceChipColored(t *testing.T) {
 	reportConfigSourceStyled(out, res, false)
 	require.Equal(t, "config: local-share default /tmp/cfg.toml\nwarning: relative XDG_DATA_HOME treated as unset\n",
 		out.String(), "color-off is the exact legacy provenance block")
+}
+
+// TestStatusPluginLiveness tests the plugin liveness section of the status command.
+// It verifies that the section appears with correct format showing plugin name,
+// total nodes, live nodes, live %, duplicate count, duplicate %, hosting %,
+// proxy %, clean %, and status (OK/WARNING/DISABLED) with threshold violations highlighted.
+func TestStatusPluginLiveness(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "run", "systemd"), 0o755))
+
+	// Create a minimal config with plugin thresholds
+	cfgPath := filepath.Join(home, "config.toml")
+	body := fmt.Sprintf(`
+data_dir = %q
+
+[maintain]
+refresh_interval = "6h"
+speedtest_interval = "168h"
+
+[plugins]
+max_duplicate_percent = 20.0
+min_live_percent = 50.0
+`, filepath.Join(home, "data"))
+	require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0o600))
+
+	// Create fetch manifest with plugin stats in the correct location (cache/manifest.json)
+	dataDir := filepath.Join(home, "data")
+	cacheDir := filepath.Join(dataDir, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
+	manifestPath := filepath.Join(cacheDir, "manifest.json")
+	manifest := map[string]any{
+		"fetched_at": time.Now().UTC().Format(time.RFC3339),
+		"sources":    map[string]any{},
+		"plugin_stats": []map[string]any{
+			{
+				"PluginID":       "plugin_a",
+				"TotalNodes":     100,
+				"LiveNodes":      80,
+				"DuplicateCount": 10,
+				"HostingCount":   30,
+				"ProxyCount":     20,
+				"CleanCount":     50,
+			},
+			{
+				"PluginID":       "plugin_b",
+				"TotalNodes":     50,
+				"LiveNodes":      20,
+				"DuplicateCount": 25,
+				"HostingCount":   10,
+				"ProxyCount":     5,
+				"CleanCount":     35,
+			},
+			{
+				"PluginID":       "plugin_c",
+				"TotalNodes":     200,
+				"LiveNodes":      180,
+				"DuplicateCount": 5,
+				"HostingCount":   50,
+				"ProxyCount":     30,
+				"CleanCount":     120,
+			},
+		},
+	}
+	require.NoError(t, os.WriteFile(manifestPath, mustMarshalJSON(t, manifest), 0o600))
+
+	// Create minimal nodes files (jsonl format)
+	nodesPath := filepath.Join(dataDir, "nodes.jsonl")
+	filteredPath := filepath.Join(dataDir, "filtered.jsonl")
+	selectionPath := filepath.Join(dataDir, "selection.json")
+	require.NoError(t, os.WriteFile(nodesPath, []byte(""), 0o600))
+	require.NoError(t, os.WriteFile(filteredPath, []byte(""), 0o600))
+	require.NoError(t, os.WriteFile(selectionPath, []byte("{}"), 0o600))
+
+	// Create minimal probe results (jsonl format)
+	probePath := filepath.Join(dataDir, "probe-results.jsonl")
+	require.NoError(t, os.WriteFile(probePath, []byte(""), 0o600))
+
+	// Create minimal geo base (jsonl format)
+	geoPath := filepath.Join(dataDir, "geo-base.jsonl")
+	require.NoError(t, os.WriteFile(geoPath, []byte(""), 0o600))
+
+	// Run status command
+	res := explicitResolved(t, cfgPath)
+	out := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(out)
+	attachColorFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("color", "always"))
+	require.NoError(t, runStatus(cmd, res))
+
+	s := out.String()
+
+	// Verify plugin liveness section header
+	require.Contains(t, s, "plugins:", "plugin liveness section should appear")
+
+	// Verify plugin_a (OK - live% 80% > 50%, dup% 10% < 20%)
+	require.Contains(t, s, "plugin_a", "plugin_a should appear")
+	require.Contains(t, s, "OK", "plugin_a should show OK status")
+
+	// Verify plugin_b (WARNING - live% 40% < 50%, dup% 50% > 20%)
+	require.Contains(t, s, "plugin_b", "plugin_b should appear")
+	require.Contains(t, s, "WARNING", "plugin_b should show WARNING status")
+
+	// Verify plugin_c (OK - live% 90% > 50%, dup% 2.5% < 20%)
+	require.Contains(t, s, "plugin_c", "plugin_c should appear")
+	require.Contains(t, s, "OK", "plugin_c should show OK status")
+
+	// Verify key metrics appear
+	require.Contains(t, s, "total=100", "total nodes should appear")
+	require.Contains(t, s, "live=80", "live nodes should appear")
+	require.Contains(t, s, "dup=10", "duplicate count should appear")
+	require.Contains(t, s, "hosting=30", "hosting count should appear")
+	require.Contains(t, s, "proxy=20", "proxy count should appear")
+	require.Contains(t, s, "clean=50", "clean count should appear")
+
+	// Verify percentages appear (format: X.Y%)
+	require.Contains(t, s, "80.0%", "live percent should appear")
+	require.Contains(t, s, "10.0%", "duplicate percent should appear")
+	require.Contains(t, s, "30.0%", "hosting percent should appear")
+	require.Contains(t, s, "20.0%", "proxy percent should appear")
+	require.Contains(t, s, "50.0%", "clean percent should appear")
+
+	// Verify colored output (dim labels, info values, status colors)
+	require.Contains(t, s, "38;5;241", "labels should be dim 241")
+	require.Contains(t, s, "38;5;45", "values should be info 45")
+	require.Contains(t, s, "38;5;46", "OK status should be green")
+	require.Contains(t, s, "38;5;214", "WARNING status should be amber")
+}
+
+// mustMarshalJSON marshals v to JSON for test fixtures.
+func mustMarshalJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.MarshalIndent(v, "", "  ")
+	require.NoError(t, err)
+	return b
 }
