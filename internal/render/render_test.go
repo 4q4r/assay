@@ -113,10 +113,11 @@ func twoCountrySelection(t *testing.T) ([]*model.Node, *model.Selection) {
 	nl1, sn1 := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443, nodeOpts{network: "xhttp", extra: map[string]string{"mode": "packet-up", "host": "cdn.example", "path": "/pool"}})
 	nl2, sn2 := mkSelected(t, "pool-nl-02", "nl", "Amsterdam", "nl2.example.com", 443, nodeOpts{network: "xhttp", extra: map[string]string{"mode": "packet-up", "host": "cdn.example", "path": "/pool"}})
 	de1, sn3 := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	de2, sn3b := mkSelected(t, "pool-de-02", "de", "Frankfurt", "de2.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
 	us1, sn4 := mkSelected(t, "pool-us-01", "us", "Seattle", "us1.example.com", 443, nodeOpts{scheme: "trojan", network: "ws", extra: map[string]string{"path": "/tj", "host": "ws.example", "security": "tls"}})
-	nodes := []*model.Node{nl1, nl2, de1, us1}
+	nodes := []*model.Node{nl1, nl2, de1, de2, us1}
 	sel := &model.Selection{
-		Nodes: []model.SelectedNode{sn1, sn2, sn3, sn4},
+		Nodes: []model.SelectedNode{sn1, sn2, sn3, sn3b, sn4},
 	}
 	return nodes, sel
 }
@@ -261,9 +262,14 @@ func TestCountryAndCityBalancers(t *testing.T) {
 	assert.InDelta(t, 1, st["expected"], 0.001)
 	assert.InDelta(t, 0.2, st["tolerance"], 0.001)
 	// Amsterdam has 2 live nodes → city balancer required (D5).
-	require.Len(t, cities, 1, "one city balancer (Amsterdam, 2 nodes)")
-	assert.Equal(t, "pool_nl_amsterdam", cities[0]["tag"])
-	assert.ElementsMatch(t, []any{"pool-nl-01", "pool-nl-02"}, cities[0]["selector"], "city balancer pins exact tags")
+	// Frankfurt has 2 live nodes → city balancer required (D5).
+	require.Len(t, cities, 2, "two city balancers (Amsterdam 2 nodes, Frankfurt 2 nodes)")
+	cityTags := map[string]bool{}
+	for _, c := range cities {
+		cityTags[c["tag"].(string)] = true
+	}
+	assert.True(t, cityTags["pool_nl_amsterdam"], "Amsterdam city balancer rendered")
+	assert.True(t, cityTags["pool_de_frankfurt"], "Frankfurt city balancer rendered")
 	// Frankfurt/Seattle have 1 node each → no city balancer (direct tag override).
 }
 

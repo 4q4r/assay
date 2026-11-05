@@ -106,6 +106,16 @@ func pingLoop(ctx context.Context, sock string, interval time.Duration, log io.W
 	}
 }
 
+// Stopping sends the STOPPING=1 state to systemd (used for graceful self-restart).
+// Without NOTIFY_SOCKET this is a documented no-op success.
+func Stopping() error {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	if sock == "" {
+		return nil
+	}
+	return sendState(sock, "STOPPING=1")
+}
+
 // sendState delivers one state datagram to the NOTIFY_SOCKET socket.
 func sendState(sock, state string) error {
 	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: sock, Net: "unixgram"})

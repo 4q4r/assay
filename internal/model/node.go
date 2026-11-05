@@ -156,19 +156,20 @@ func (n *Node) ssLink() string {
 // GeoRecord is the DESIGN.md §5 cold-base record. The JSON field set is a
 // regression contract with geo-base.jsonl on disk.
 type GeoRecord struct {
-	Tag         string `json:"tag"`
-	Source      string `json:"source"`
-	Scheme      string `json:"scheme"`
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	IP          string `json:"ip"`
-	Country     string `json:"country"`
-	City        string `json:"city"`
-	ASN         string `json:"asn"`
-	ASName      string `json:"asname"`
-	ISP         string `json:"isp"`
-	ProxyFlag   bool   `json:"proxy_flag"`
-	HostingFlag bool   `json:"hosting_flag"`
+	Tag           string `json:"tag"`
+	Source        string `json:"source"`
+	Scheme        string `json:"scheme"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	IP            string `json:"ip"`
+	Country       string `json:"country"`
+	City          string `json:"city"`
+	ASN           string `json:"asn"`
+	ASName        string `json:"asname"`
+	ISP           string `json:"isp"`
+	ProxyFlag     bool   `json:"proxy_flag"`
+	HostingFlag   bool   `json:"hosting_flag"`
+	FlagsVerified bool   `json:"flags_verified"`
 	// GeoSource marks the provenance of the geo fields: "self-report" (the
 	// node answered ip-api through its own tunnel — the strongest exit-geo
 	// evidence), "doh-fallback" (the through-tunnel DoH view, indirect), or
@@ -183,7 +184,57 @@ type GeoRecord struct {
 	Alive     bool    `json:"alive"`
 	BytesUp   int64   `json:"bytes_up"`
 	BytesDown int64   `json:"bytes_down"`
+	// Run-count liveness (W8): wave sequence in which this node was last
+	// confirmed alive, and the consecutive-alive streak. Time-based TTL is
+	// superseded by these for liveness decisions.
+	AliveWaveSeq int    `json:"alive_wave_seq"`
+	AliveStreak  int    `json:"alive_streak"`
+	LastAliveAt  string `json:"last_alive_at"`
+	// Phase-1 IP quality & media unlock (populated by the geo unlock stage;
+	// -1/""/false = unchecked — a record that never ran the stage carries
+	// these zero/unset values, and the store's blank-fold keeps a later
+	// evidence-less wave from clobbering a checked value).
+	RiskScore        int               `json:"risk_score"`        // 0..100 composite; -1 = unchecked
+	IsResidential    bool              `json:"is_residential"`    // !hosting && !proxy && (isp || mobile)
+	IsHosting        bool              `json:"is_hosting"`        // hosting evidence (ip-api hosting | widget privacy/asn)
+	IsProxy          bool              `json:"is_proxy"`          // proxy/vpn/tor evidence
+	IsMobile         bool              `json:"is_mobile"`         // mobile-network evidence
+	ScamalyticsScore int               `json:"scamalytics_score"` // 0..100; -1 = unchecked (Phase 1 probes no such source)
+	AbuseScore       int               `json:"abuse_score"`       // 0..100; -1 = unchecked (Phase 1 probes no such source)
+	IPType           string            `json:"ip_type"`           // IPType* constants; "" = unchecked
+	MediaUnlocks     MediaUnlockStatus `json:"media_unlocks"`
 }
+
+// MediaUnlockStatus is the Phase-1 per-exit-IP media/AI unlock probe result.
+// CheckedAt (RFC3339 UTC) is the cache-TTL stamp: "" = never probed. Every
+// other field is one of the vocabulary constants below; UnlockUnknown means
+// the probe ran but could not produce a definite answer (non-fatal failure).
+type MediaUnlockStatus struct {
+	ChatGPT       string `json:"chatgpt"`        // UnlockYes|UnlockWebOnly|UnlockAppOnly|UnlockBlocked|UnlockUnknown
+	Netflix       string `json:"netflix"`        // UnlockNetflixFull|UnlockNetflixOriginals|UnlockBlocked|UnlockUnknown
+	YouTubeRegion string `json:"youtube_region"` // ISO-3166-1 alpha-2 | UnlockBlocked | UnlockUnknown
+	Disney        string `json:"disney"`         // UnlockYes|UnlockBlocked|UnlockUnknown
+	TikTok        string `json:"tiktok"`         // UnlockYes|UnlockTikTokIDC|UnlockBlocked|UnlockUnknown
+	CheckedAt     string `json:"checked_at"`
+}
+
+// Unlock/IP-type vocabulary (the stored contract for MediaUnlockStatus and
+// GeoRecord.IPType — defined once so producer and consumer never drift).
+const (
+	UnlockUnknown          = "unknown"
+	UnlockYes              = "yes"
+	UnlockBlocked          = "blocked"
+	UnlockWebOnly          = "webonly"
+	UnlockAppOnly          = "apponly"
+	UnlockNetflixFull      = "full"
+	UnlockNetflixOriginals = "originals"
+	UnlockTikTokIDC        = "idc"
+	IPTypeResidential      = "Residential"
+	IPTypeDataCenter       = "DataCenter"
+	IPTypeBusiness         = "Business"
+	IPTypeMobile           = "Mobile"
+	IPTypeUnknown          = "Unknown"
+)
 
 // ApplyProbe merges a probe wave outcome into the cold record.
 func (g *GeoRecord) ApplyProbe(alive bool, rttMs float64, speedBPS int64, probedAt time.Time) {
@@ -216,6 +267,7 @@ type SelectedNode struct {
 	Speed   int64   `json:"speed"`
 	Checks  int     `json:"checks"`
 	Total   int     `json:"total_checks"`
+	IsClean bool    `json:"is_clean"` // true when hosting_flag=false && proxy_flag=false
 }
 
 // PoolTag renders the flat outbound tag per D5: pool-<cc>-NN with cc lowered.
@@ -259,6 +311,21 @@ const (
 // CityBalancerTag renders the per-city balancer tag: pool_<cc>_<city-slug>.
 func CityBalancerTag(cc, city string) string {
 	return fmt.Sprintf("pool_%s_%s", strings.ToLower(cc), CitySlug(city))
+}
+
+// KnownAliveRecord is the durable liveness record persisted in
+// known-alive.jsonl. It tracks nodes that have been confirmed alive across
+// waves so that (a) probing can skip them within the TTL window and
+// (b) nodes removed from source lists are retained ("orphaned but known
+// alive") for N waves instead of being dropped immediately.
+type KnownAliveRecord struct {
+	Key          string    `json:"key"`
+	Host         string    `json:"host"`
+	Link         string    `json:"link"`
+	LastSeen     time.Time `json:"last_seen"`
+	LastStatus   string    `json:"last_status"`
+	AliveStreak  int       `json:"alive_streak"`
+	AliveWaveSeq int       `json:"alive_wave_seq"`
 }
 
 // CitySlug lowercases a city name and maps spaces to underscores so it is safe

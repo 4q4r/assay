@@ -14,7 +14,8 @@ import (
 )
 
 // knobFixture is a small selection + template with the socks-in/http-in
-// inbounds (the default pool_inbound_tags) and one reality node.
+// inbounds (the default pool_inbound_tags) and two reality nodes in DE
+// (so the pool_de country balancer renders per the >=2 threshold).
 func knobFixture(t *testing.T, inbounds string) (render.Input, func(t *testing.T) map[string]any) {
 	t.Helper()
 	tmpl := `{
@@ -31,15 +32,18 @@ func knobFixture(t *testing.T, inbounds string) (render.Input, func(t *testing.T
     ]
   }
 }`
-	node := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000009", "knob.example.com", 443,
+	node1 := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000009", "knob1.example.com", 443,
 		map[string]string{"security": "reality", "type": "xhttp", "pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": "AA"})
-	sel := &model.Selection{Nodes: []model.SelectedNode{{
-		Tag: "pool-de-01", Key: node.Key, Country: "de",
-	}}}
+	node2 := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000010", "knob2.example.com", 443,
+		map[string]string{"security": "reality", "type": "xhttp", "pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": "BB"})
+	sel := &model.Selection{Nodes: []model.SelectedNode{
+		{Tag: "pool-de-01", Key: node1.Key, Country: "de"},
+		{Tag: "pool-de-02", Key: node2.Key, Country: "de"},
+	}}
 	in := render.Input{
 		Template:   []byte(tmpl),
 		Selection:  sel,
-		NodesByKey: map[string]*model.Node{node.Key: node},
+		NodesByKey: map[string]*model.Node{node1.Key: node1, node2.Key: node2},
 		Cfg: render.Config{
 			StatsPort: 15490,
 			PoolRoutes: []render.PoolRoute{{
@@ -263,14 +267,9 @@ func TestObservatoryIntervalAdaptive(t *testing.T) {
 func TestBalancerToleranceAppliesToCityBalancersToo(t *testing.T) {
 	in, _ := knobFixture(t, twoInbounds)
 	in.Cfg.BalancerTolerance = 0.7
-	// Two nodes in one city → a city balancer renders (D5).
-	second := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000008", "knob2.example.com", 443,
-		map[string]string{"security": "reality", "type": "xhttp", "pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": "AA"})
-	in.NodesByKey[second.Key] = second
-	in.Selection.Nodes = append(in.Selection.Nodes, model.SelectedNode{
-		Tag: "pool-de-02", Key: second.Key, Country: "de", City: "Frankfurt",
-	})
+	// The fixture now has 2 DE nodes; set both to same city → city balancer renders (D5).
 	in.Selection.Nodes[0].City = "Frankfurt"
+	in.Selection.Nodes[1].City = "Frankfurt"
 
 	res, err := render.Render(in)
 	require.NoError(t, err)

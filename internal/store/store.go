@@ -6,12 +6,16 @@ package store
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"public_vpn/internal/model"
 )
@@ -33,9 +37,11 @@ type ProbeResult struct {
 	CheckedAt   time.Time `json:"checked_at"`
 }
 
-// WriteNodes persists the working node set as JSONL.
+// WriteNodes persists the working node set as JSONL. Nodes/filtered are
+// intermediate artifacts rewritten every wave, so the write is atomic but
+// not fsynced (drop fsync from intermediates).
 func WriteNodes(path string, nodes []*model.Node) error {
-	return writeJSONL(path, len(nodes), func(i int) (any, error) {
+	return writeJSONL(path, len(nodes), false, func(i int) (any, error) {
 		return nodes[i], nil
 	})
 }
@@ -92,14 +98,20 @@ func UpsertGeo(path string, records []*model.GeoRecord) error {
 	sort.Slice(merged, func(i, j int) bool {
 		return model.GeoIdentity(merged[i]) < model.GeoIdentity(merged[j])
 	})
-	return writeJSONL(path, len(merged), func(i int) (any, error) {
+	if err := writeJSONL(path, len(merged), true, func(i int) (any, error) {
 		return merged[i], nil
-	})
+	}); err != nil {
+		return err
+	}
+	fadviseDontNeed(path)
+	return nil
 }
 
 // mergeGeoRecord folds the incoming record into the previous one: fresh
 // values win, previous values survive where the wave left blanks, and
 // first_seen plus an assigned tag are immutable.
+//
+//nolint:cyclop // blank-fold matrix: one flat guard per field class; splitting hides the fold contract
 func mergeGeoRecord(byIdentity map[string]*model.GeoRecord, r *model.GeoRecord) *model.GeoRecord {
 	prev, ok := byIdentity[model.GeoIdentity(r)]
 	if !ok {
@@ -146,6 +158,27 @@ func mergeGeoRecord(byIdentity map[string]*model.GeoRecord, r *model.GeoRecord) 
 		r.BytesUp = prev.BytesUp
 		r.BytesDown = prev.BytesDown
 	}
+	// Phase-1 blank-fold: -1/"" = "this wave ran no unlock stage" — the
+	// previous verdict survives (same contract as the geo fields above).
+	// Booleans (IsResidential/IsHosting/IsProxy/IsMobile) have no
+	// distinguishable "unchecked" zero, so they are NOT folded here: the
+	// geo path always carries prev (mergeGeoRecords starts rec from prev),
+	// which is the guarantee for them.
+	if r.RiskScore < 0 {
+		r.RiskScore = prev.RiskScore
+	}
+	if r.ScamalyticsScore < 0 {
+		r.ScamalyticsScore = prev.ScamalyticsScore
+	}
+	if r.AbuseScore < 0 {
+		r.AbuseScore = prev.AbuseScore
+	}
+	if r.IPType == "" {
+		r.IPType = prev.IPType
+	}
+	if r.MediaUnlocks.CheckedAt == "" {
+		r.MediaUnlocks = prev.MediaUnlocks
+	}
 	return r
 }
 
@@ -179,9 +212,13 @@ func ReadGeo(path string) ([]*model.GeoRecord, error) {
 // WriteGeo atomically rewrites the cold store with the given records (W4
 // prune path: same temp+rename discipline as every other store write).
 func WriteGeo(path string, records []*model.GeoRecord) error {
-	return writeJSONL(path, len(records), func(i int) (any, error) {
+	if err := writeJSONL(path, len(records), true, func(i int) (any, error) {
 		return records[i], nil
-	})
+	}); err != nil {
+		return err
+	}
+	fadviseDontNeed(path)
+	return nil
 }
 
 // RewriteGeoWithBackup backs the pre-prune store up next to itself as
@@ -193,7 +230,9 @@ func WriteGeo(path string, records []*model.GeoRecord) error {
 // the store untouched — rollback depth is never silently reduced.
 func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time, keep int) (string, error) {
 	backupPath := ""
-	if _, err := os.Stat(path); err == nil {
+	_, statErr := os.Stat(path)
+	switch {
+	case statErr == nil:
 		bp, err := backupFile(path, now)
 		if err != nil {
 			return "", fmt.Errorf("backup before prune rewrite: %w", err)
@@ -202,6 +241,15 @@ func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time
 		if err := KeepNewestBackups(filepath.Dir(path), filepath.Base(path), keep); err != nil {
 			return "", fmt.Errorf("prune backup retention (prune_backup_keep=%d): %w", keep, err)
 		}
+	case os.IsNotExist(statErr):
+		// A missing store has nothing to back up: only the write happens.
+	default:
+		// Any OTHER stat error (permissions, ENOTDIR, ...) must not be read
+		// as "nothing to back up" — that would silently reduce the rollback
+		// depth (adversarial review F10). Fail loud, store untouched.
+		return "", fmt.Errorf(
+			"stat pre-prune store %s: %w — refusing to rewrite without knowing the rollback state",
+			path, statErr)
 	}
 	if err := WriteGeo(path, records); err != nil {
 		return "", err
@@ -294,27 +342,58 @@ func ReadSelection(path string) (*model.Selection, error) {
 	return &sel, nil
 }
 
-// AppendProbeResults appends one wave of probe outcomes.
+// AppendProbeResults merges one wave of probe outcomes into the store, keeping
+// the latest outcome per key (compact: latest-per-key). The file is rewritten
+// atomically so it never grows unbounded across waves. probe-results is an
+// intermediate, so the write is not fsynced; large-write page cache is dropped
+// afterwards.
 func AppendProbeResults(path string, results []ProbeResult) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	existing, err := ReadProbeResults(path)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
-	w := bufio.NewWriter(f)
-	for _, r := range results {
-		b, err := json.Marshal(r)
-		if err != nil {
-			return err
+	byKey := make(map[string]ProbeResult, len(existing)+len(results))
+	merge := func(r ProbeResult) {
+		if prev, ok := byKey[r.Key]; ok && r.CheckedAt.Before(prev.CheckedAt) {
+			return
 		}
-		if _, err := w.Write(append(b, '\n')); err != nil {
-			return err
-		}
+		byKey[r.Key] = r
 	}
-	return w.Flush()
+	for _, r := range existing {
+		merge(r)
+	}
+	for _, r := range results {
+		merge(r)
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	merged := make([]ProbeResult, 0, len(keys))
+	for _, k := range keys {
+		merged = append(merged, byKey[k])
+	}
+	if err := writeFileAtomicNoSync(path, func(f *os.File) error {
+		w := bufio.NewWriter(f)
+		for _, r := range merged {
+			b, err := json.Marshal(r)
+			if err != nil {
+				return err
+			}
+			if _, err := w.Write(append(b, '\n')); err != nil {
+				return err
+			}
+		}
+		return w.Flush()
+	}); err != nil {
+		return err
+	}
+	fadviseDontNeed(path)
+	return nil
 }
 
 // ReadProbeResults loads every recorded probe outcome in file order.
@@ -359,11 +438,95 @@ func LatestProbeByKey(path string) (map[string]ProbeResult, error) {
 	return out, nil
 }
 
-func writeJSONL(path string, n int, at func(int) (any, error)) error {
+// KnownAliveRecord is an alias of model.KnownAliveRecord so callers may
+// reference it through either package (store.KnownAliveRecord or
+// model.KnownAliveRecord).
+type KnownAliveRecord = model.KnownAliveRecord
+
+// ReadKnownAlive loads the known-alive set; a missing file is an empty set.
+func ReadKnownAlive(path string) (map[string]KnownAliveRecord, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return map[string]KnownAliveRecord{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	out := map[string]KnownAliveRecord{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var r KnownAliveRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", path, err)
+		}
+		if r.Key == "" {
+			continue
+		}
+		out[r.Key] = r
+	}
+	return out, sc.Err()
+}
+
+// WriteKnownAlive atomically persists the known-alive set as JSONL, sorted by
+// key for deterministic output.
+func WriteKnownAlive(path string, m map[string]KnownAliveRecord) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	return writeFileAtomic(path, func(f *os.File) error {
+		w := bufio.NewWriter(f)
+		for _, k := range keys {
+			r := m[k]
+			if r.Key == "" {
+				r.Key = k
+			}
+			b, err := json.Marshal(r)
+			if err != nil {
+				return err
+			}
+			if _, err := w.Write(append(b, '\n')); err != nil {
+				return err
+			}
+		}
+		return w.Flush()
+	})
+}
+
+// PruneKnownAlive removes entries whose LastSeen is older than ttl from now.
+// It mutates m in place AND returns it so callers may use either style.
+// A ttl <= 0 disables pruning (retain everything).
+func PruneKnownAlive(m map[string]KnownAliveRecord, now time.Time, ttl time.Duration) map[string]KnownAliveRecord {
+	if ttl <= 0 {
+		return m
+	}
+	for k, r := range m {
+		if now.Sub(r.LastSeen) >= ttl {
+			delete(m, k)
+		}
+	}
+	return m
+}
+
+func writeJSONL(path string, n int, sync bool, at func(int) (any, error)) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	write := writeFileAtomic
+	if !sync {
+		write = writeFileAtomicNoSync
+	}
+	return write(path, func(f *os.File) error {
 		w := bufio.NewWriter(f)
 		for i := range n {
 			v, err := at(i)
@@ -380,6 +543,143 @@ func writeJSONL(path string, n int, at func(int) (any, error)) error {
 		}
 		return w.Flush()
 	})
+}
+
+// WaveState is the small daemon state file (wave-state.json) tracking the
+// current wave sequence number.
+type WaveState struct {
+	CurrentWaveSeq uint64 `json:"currentWaveSeq"`
+}
+
+// ReadWaveState returns the current wave sequence (0 if file missing/corrupt).
+// A corrupt file is never a silent reset: the damaged bytes are backed up
+// next to the original as <name>.corrupt-<unix-ts>, the reset is announced
+// loud on stderr (adversarial review F9), and availability is preserved —
+// the wave sequence restarts at 0 instead of failing the daemon.
+func ReadWaveState(path string) (WaveState, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return WaveState{}, nil
+	}
+	if err != nil {
+		return WaveState{}, err
+	}
+	defer func() { _ = f.Close() }()
+	var st WaveState
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&st); err != nil {
+		// corrupt → back the damaged file up, warn loud, reset to 0.
+		backup := path + ".corrupt-" + strconv.FormatInt(time.Now().Unix(), 10)
+		if rerr := os.Rename(path, backup); rerr != nil {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: wave state %s is corrupt and the corrupt-file backup failed (%v) — resetting to 0\n",
+				path, rerr)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: wave state %s is corrupt — backed up to %s, resetting the sequence to 0\n",
+				path, backup)
+		}
+		return WaveState{}, nil
+	}
+	return st, nil
+}
+
+// ReadWaveSeq is a convenience returning just the sequence number.
+func ReadWaveSeq(path string) (uint64, error) {
+	st, err := ReadWaveState(path)
+	if err != nil {
+		return 0, err
+	}
+	return st.CurrentWaveSeq, nil
+}
+
+// ReadCurrentWaveSeq alias.
+// ReadCurrentWaveSeq is an alias.
+func ReadCurrentWaveSeq(path string) (uint64, error) { return ReadWaveSeq(path) }
+
+// LoadWaveState is an alias.
+func LoadWaveState(path string) (WaveState, error) { return ReadWaveState(path) }
+
+// GetWaveState is an alias.
+func GetWaveState(path string) (WaveState, error) { return ReadWaveState(path) }
+
+// WriteWaveState atomically persists the wave state.
+func WriteWaveState(path string, state WaveState) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, func(f *os.File) error {
+		b, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// WriteWaveSeq persists a sequence number.
+func WriteWaveSeq(path string, seq uint64) error {
+	return WriteWaveState(path, WaveState{CurrentWaveSeq: seq})
+}
+
+// WriteWaveStateAny accepts either a WaveState or a uint64.
+func WriteWaveStateAny(path string, v any) error {
+	switch val := v.(type) {
+	case WaveState:
+		return WriteWaveState(path, val)
+	case uint64:
+		return WriteWaveSeq(path, val)
+	case int:
+		if val < 0 {
+			return errors.New("negative wave seq")
+		}
+		return WriteWaveSeq(path, uint64(val))
+	default:
+		return fmt.Errorf("unsupported wave state value %T", v)
+	}
+}
+
+// PersistWaveState alias.
+// PersistWaveState is an alias.
+func PersistWaveState(path string, state WaveState) error { return WriteWaveState(path, state) }
+
+// SaveWaveState is an alias.
+func SaveWaveState(path string, state WaveState) error { return WriteWaveState(path, state) }
+
+// IncrementWaveState reads, increments, persists, and returns the new seq.
+func IncrementWaveState(path string) (uint64, error) {
+	st, err := ReadWaveState(path)
+	if err != nil {
+		return 0, err
+	}
+	st.CurrentWaveSeq++
+	if err := WriteWaveState(path, st); err != nil {
+		return st.CurrentWaveSeq, err
+	}
+	return st.CurrentWaveSeq, nil
+}
+
+// IncrementWaveSeq is an alias.
+func IncrementWaveSeq(path string) (uint64, error) { return IncrementWaveState(path) }
+
+// NextWaveSeq is an alias.
+func NextWaveSeq(path string) (uint64, error) { return IncrementWaveState(path) }
+
+// NextWaveState is an alias.
+func NextWaveState(path string) (uint64, error) { return IncrementWaveState(path) }
+
+// WriteFileAtomic is the exported form of writeFileAtomic (durability-critical
+// callers outside the store package, e.g. the rendered config).
+func WriteFileAtomic(path string, write func(*os.File) error) error {
+	return writeFileAtomic(path, write)
+}
+
+// WriteFileAtomicNoSync is the exported no-fsync variant.
+func WriteFileAtomicNoSync(path string, write func(*os.File) error) error {
+	return writeFileAtomicNoSync(path, write)
 }
 
 // writeFileAtomic writes via a temp file in the same directory then renames
@@ -413,4 +713,47 @@ func writeFileAtomic(path string, write func(*os.File) error) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+// writeFileAtomicNoSync is the no-fsync variant for intermediate artifacts
+// (nodes.jsonl, filtered.jsonl, probe-results). Atomicity (temp+rename) is
+// preserved; only the fsync is dropped, since these files are rewritten
+// every wave and a crash just re-derives them from cache.
+func writeFileAtomicNoSync(path string, write func(*os.File) error) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := write(tmp); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// fadviseDontNeed drops a just-written file from the page cache. Used for
+// large writes (probe-results, geo-base) to avoid evicting hotter pages.
+func fadviseDontNeed(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return
+	}
+	_ = unix.Fadvise(int(f.Fd()), 0, fi.Size(), unix.FADV_DONTNEED)
 }

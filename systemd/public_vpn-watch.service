@@ -36,7 +36,9 @@ TimeoutStopSec=1800
 ExecStart={{ .BinaryPath }} watch{{ if .ConfigPath }} -c {{ .ConfigPath }}{{ end }}
 # A daemon crash restarts automatically; waves themselves are serialized by
 # the scheduler and touch the live xray config only through the -test gate.
-# The daemon never restarts the client — it prints the restart hint instead.
+# Self-update: the daemon watches its own binary on disk and, on a confirmed
+# change, exits 0 at the next wave boundary; Restart=always + RestartSec=5
+# brings up the new binary automatically. No manual restart needed.
 Restart=always
 RestartSec=5
 

@@ -45,13 +45,14 @@ func balancerByTag(t *testing.T, m map[string]any, tag string) map[string]any {
 
 // unknownSelection builds a selection mixing one unknown-geo node (raw
 // empty country/city, pool-xx tag — the rank stage's W16 output shape) with
-// one known-country node.
+// two known-country nodes in DE (so pool_de country balancer renders per >=2 threshold).
 func unknownSelection(t *testing.T) ([]*model.Node, *model.Selection) {
 	t.Helper()
 	nu, snu := mkSelected(t, "pool-xx-01", "", "", "unknown1.example.com", 443, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
-	de, sde := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
-	nodes := []*model.Node{nu, de}
-	sel := &model.Selection{Nodes: []model.SelectedNode{snu, sde}}
+	de1, sde1 := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	de2, sde2 := mkSelected(t, "pool-de-02", "de", "Frankfurt", "de2.example.com", 2053, nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	nodes := []*model.Node{nu, de1, de2}
+	sel := &model.Selection{Nodes: []model.SelectedNode{snu, sde1, sde2}}
 	return nodes, sel
 }
 
@@ -161,7 +162,7 @@ func TestPoolBalancersCarryBlockFallbackOnNewBalancers(t *testing.T) {
 			assert.Equal(t, "block", b["fallbackTag"], "pool balancer %s must carry the block fallback", tag)
 		}
 	}
-	assert.Equal(t, map[string]int{"pool_unknown": 1, "pool_all": 1, "pool_de": 1},
+	assert.Equal(t, map[string]int{"pool_unknown": 1, "pool_all": 1, "pool_de": 1, "pool_de_frankfurt": 1},
 		counts, "re-render must not duplicate the new balancers")
 }
 

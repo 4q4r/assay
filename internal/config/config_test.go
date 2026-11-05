@@ -110,7 +110,7 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.False(t, cfg.Probe.IsSpeedtest(), "speedtest defaults OFF (round-8 owner ruling — supersedes the W10 default-ON)")
 	assert.Nil(t, cfg.Probe.Speedtest)
 	assert.Equal(t, 10*time.Second, cfg.Probe.Timeout.Duration)
-	assert.Equal(t, 32, cfg.Probe.Threads, "W19: default raised 8→32 to saturate the boot-serialization ceiling (bounded wave wall time)")
+	assert.Equal(t, 12, cfg.Probe.Threads, "wave3: default lowered 32→12 (12 concurrent batches saturate the boot ceiling)")
 	assert.Equal(t, 3, cfg.Probe.Attempts)
 	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
 	assert.Equal(t, "https://ipinfo.io/json", cfg.Geo.HTTPSURL, "https_url defaults to the keyless ipinfo.io/json self-geo endpoint")
@@ -127,6 +127,10 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Render.Template)
 	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Activate.Target)
 	assert.Equal(t, "/usr/bin/xray", cfg.Activate.XrayBin)
+	assert.True(t, cfg.Probe.CalibrationEnabled, "calibration defaults ON")
+	assert.InDelta(t, 10.0, cfg.Probe.CalibrationBase, 1e-9)
+	assert.InDelta(t, 1.0, cfg.Probe.CalibrationMargin, 1e-9)
+	assert.Equal(t, "country", cfg.Probe.Granularity)
 }
 
 func TestUnknownSourceKeyFailsLoud(t *testing.T) {
@@ -778,7 +782,7 @@ func TestW14ProbeKnobsDefaults(t *testing.T) {
 	cfg := load(t, w6Base)
 	p := cfg.Probe
 	assert.Equal(t, 3, p.Attempts)
-	assert.Equal(t, 32, p.Threads)
+	assert.Equal(t, 12, p.Threads)
 	assert.Equal(t, "https://speed.cloudflare.com/__down?bytes=25000000", p.SpeedtestURL)
 	assert.Equal(t, 10*time.Second, p.Timeout.Duration)
 	assert.Equal(t, 30*time.Second, p.SpeedtestTimeout.Duration)
@@ -857,4 +861,150 @@ func TestW14ProbeKnobValidation(t *testing.T) {
 	_, err = config.Load(writeCfg(t, w6Base+"[probe]\nthreads = -1\n"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "probe.threads")
+}
+
+// TestProbeBatchKnobsDefaults pins the 0 → default semantics for the new
+// batch knobs (no artificial floor/ceiling — 0 means "unset → default").
+func TestProbeBatchKnobsDefaults(t *testing.T) {
+	cfg := load(t, w6Base)
+	assert.Equal(t, config.DefaultProbeBatchSize, cfg.Probe.BatchSize)
+	assert.Equal(t, config.DefaultProbeBatchConcurrency, cfg.Probe.BatchConcurrency)
+}
+
+// TestProbeBatchKnobsExplicitLoad pins that explicit values load unchanged.
+func TestProbeBatchKnobsExplicitLoad(t *testing.T) {
+	cfg := load(t, w6Base+`[probe]
+batch_size = 25
+batch_concurrency = 7
+`)
+	assert.Equal(t, 25, cfg.Probe.BatchSize)
+	assert.Equal(t, 7, cfg.Probe.BatchConcurrency)
+}
+
+// TestProbeBatchKnobsValidation pins the structural sign checks.
+func TestProbeBatchKnobsValidation(t *testing.T) {
+	_, err := config.Load(writeCfg(t, w6Base+"[probe]\nbatch_size = -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "probe.batch_size")
+
+	_, err = config.Load(writeCfg(t, w6Base+"[probe]\nbatch_concurrency = -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "probe.batch_concurrency")
+}
+
+// TestGeoSelfReportConcurrencyDefault pins the 0 → default semantics.
+func TestGeoSelfReportConcurrencyDefault(t *testing.T) {
+	cfg := load(t, w6Base)
+	assert.Equal(t, config.DefaultGeoSelfReportConcurrency, cfg.Geo.SelfReportConcurrency)
+}
+
+// TestGeoSelfReportConcurrencyExplicit pins that explicit values load unchanged.
+func TestGeoSelfReportConcurrencyExplicit(t *testing.T) {
+	cfg := load(t, w6Base+`[geo]
+self_report_concurrency = 12
+`)
+	assert.Equal(t, 12, cfg.Geo.SelfReportConcurrency)
+}
+
+// TestGeoSelfReportConcurrencyValidation pins the structural sign check.
+func TestGeoSelfReportConcurrencyValidation(t *testing.T) {
+	_, err := config.Load(writeCfg(t, w6Base+"[geo]\nself_report_concurrency = -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "geo.self_report_concurrency")
+}
+
+// TestPluginsConfigThresholds pins the Task 1 plugin liveness thresholds:
+// max_duplicate_percent and min_live_percent. Both are nil by default
+// (disabled), explicit 0 means disabled, positive values enable the check,
+// negative values are structurally invalid. No upper bound (owner ruling).
+func TestPluginsConfigThresholds(t *testing.T) {
+	t.Run("nil defaults (disabled by default)", func(t *testing.T) {
+		cfg := load(t, w6Base)
+		assert.Nil(t, cfg.Plugins.MaxDuplicatePercent, "max_duplicate_percent must be nil by default")
+		assert.Nil(t, cfg.Plugins.MinLivePercent, "min_live_percent must be nil by default")
+	})
+
+	t.Run("explicit 0 means disabled", func(t *testing.T) {
+		cfg := load(t, w6Base+`
+[plugins]
+max_duplicate_percent = 0
+min_live_percent = 0
+`)
+		require.NotNil(t, cfg.Plugins.MaxDuplicatePercent)
+		require.NotNil(t, cfg.Plugins.MinLivePercent)
+		assert.InDelta(t, 0.0, *cfg.Plugins.MaxDuplicatePercent, 1e-9)
+		assert.InDelta(t, 0.0, *cfg.Plugins.MinLivePercent, 1e-9)
+	})
+
+	t.Run("positive values enable the check", func(t *testing.T) {
+		cfg := load(t, w6Base+`
+[plugins]
+max_duplicate_percent = 15.5
+min_live_percent = 80.0
+`)
+		require.NotNil(t, cfg.Plugins.MaxDuplicatePercent)
+		require.NotNil(t, cfg.Plugins.MinLivePercent)
+		assert.InDelta(t, 15.5, *cfg.Plugins.MaxDuplicatePercent, 1e-9)
+		assert.InDelta(t, 80.0, *cfg.Plugins.MinLivePercent, 1e-9)
+	})
+
+	t.Run("negative max_duplicate_percent fails validation", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+`
+[plugins]
+max_duplicate_percent = -1.0
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "plugins.max_duplicate_percent")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+
+	t.Run("negative min_live_percent fails validation", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+`
+[plugins]
+min_live_percent = -5.0
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "plugins.min_live_percent")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+
+	t.Run("no upper bound on thresholds (owner ruling)", func(t *testing.T) {
+		cfg := load(t, w6Base+`
+[plugins]
+max_duplicate_percent = 1000.0
+min_live_percent = 500.0
+`)
+		require.NotNil(t, cfg.Plugins.MaxDuplicatePercent)
+		require.NotNil(t, cfg.Plugins.MinLivePercent)
+		assert.InDelta(t, 1000.0, *cfg.Plugins.MaxDuplicatePercent, 1e-9)
+		assert.InDelta(t, 500.0, *cfg.Plugins.MinLivePercent, 1e-9)
+	})
+
+	t.Run("unknown plugins key fails strict decode", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+`
+[plugins]
+max_duplicate_percnt = 10.0
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "strict mode")
+	})
+}
+
+// TestSelectOnlyClean pins the only_clean knob: nil by default (no filter),
+// explicit true enables clean-only selection.
+func TestSelectOnlyClean(t *testing.T) {
+	t.Run("default nil (no filter)", func(t *testing.T) {
+		cfg := load(t, w6Base)
+		assert.Nil(t, cfg.Select.OnlyClean)
+	})
+	t.Run("explicit true enables filter", func(t *testing.T) {
+		cfg := load(t, w6Base+"[select]\nonly_clean = true\n")
+		require.NotNil(t, cfg.Select.OnlyClean)
+		assert.True(t, *cfg.Select.OnlyClean)
+	})
+	t.Run("explicit false disables filter", func(t *testing.T) {
+		cfg := load(t, w6Base+"[select]\nonly_clean = false\n")
+		require.NotNil(t, cfg.Select.OnlyClean)
+		assert.False(t, *cfg.Select.OnlyClean)
+	})
 }
