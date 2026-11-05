@@ -519,3 +519,49 @@ func TestProviderHistoryVersionPinned(t *testing.T) {
 	assert.InDelta(t, float64(HistoryVersion), raw["version"].(float64), 1e-9, "schema is versioned")
 	assert.Contains(t, raw, "providers")
 }
+
+// --- Max-relative scale (owner ruling 2026-11-05, Stephen Few): per-series
+// scaling reveals SHAPE; the adjacent numeric alive% column carries the
+// magnitude. The zero glyph renders ONLY for a true 0 value.
+
+func TestComputeSparklineMaxRelative(t *testing.T) {
+	tests := []struct {
+		name  string
+		rates []float64
+		want  string
+	}{
+		{"empty", nil, ""},
+		// Flat non-zero series: every point sits at the window max → full bars.
+		{"flat series is full bars", []float64{0.5, 0.5, 0.5}, "███"},
+		// A true 0 renders the zero glyph even in a max-relative window.
+		{"true zero stays level 0", []float64{0, 1.0}, " █"},
+		// A tiny positive value never collapses into the zero glyph
+		// (round(0.007×7)=0 → bumped to level 1).
+		{"positive never reads as zero", []float64{0.001, 1.0}, "▂█"},
+		// Shape ladder over a low-alive window (the production regime):
+		// rates/max = [.1 .2 .3 .4 .5 1] ×7 → [1 1 2 3 4 7].
+		{"low window shape ladder", []float64{0.01, 0.02, 0.03, 0.04, 0.05, 0.1}, "▂▂▃▄▅█"},
+		{"all zero window", []float64{0, 0, 0}, "   "},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ComputeSparklineScaled(tc.rates, SparklineMaxRelative))
+		})
+	}
+}
+
+func TestSeriesSparklineScaledWindow(t *testing.T) {
+	now := mustTime("2026-11-04T10:00:00Z")
+	s := &ProviderSeries{}
+	// Rates .1 .2 .3 .4 inside a 4-wave window: max-relative vs the WINDOW
+	// max (.4), not the absolute 1.0 — the shape fills the ladder.
+	for i := range 4 {
+		ts := now.Add(-time.Duration(4-i) * time.Hour).UTC().Format(time.RFC3339)
+		UpdateSeries(s, snapAt(ts, 100, 10*(i+1), 0, 0, 0), now)
+	}
+	assert.Equal(t, ComputeSparklineScaled([]float64{0.1, 0.2, 0.3, 0.4}, SparklineMaxRelative),
+		s.SparklineScaled(8, SparklineMaxRelative))
+	assert.Equal(t, ComputeSparkline([]float64{0.3, 0.4}), s.SparklineScaled(2, SparklineAbsolute),
+		"absolute scale via the scaled method matches the classic helper")
+	assert.Empty(t, s.SparklineScaled(0, SparklineMaxRelative), "n=0 renders nothing")
+}

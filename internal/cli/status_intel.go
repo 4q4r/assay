@@ -6,11 +6,24 @@ package cli
 //
 // Data sources are FILES ONLY (no network, read-only): the fetch manifest
 // (plugin stats + overlap matrix), the probe store, the geo cold base, the
-// selection, and provider-history.json (internal/stats owns the model). The
-// verdict thresholds follow the dashboard spec's traffic-light bands; the
-// per-plugin chip lines below the table keep the pre-Phase-4 bytes (their
-// OK/WARNING status stays config-threshold-driven — different semantics,
-// deliberately untouched).
+// selection, and provider-history.json (internal/stats owns the model).
+//
+// Verdict engine (owner ruling 2026-11-05, "pool-relative verdicts"): the
+// old absolute alive-bands are replaced by a composite score per provider,
+// score(P) = Σ w_f × percentile_rank(P.factor_f) over the provider's
+// AVAILABLE factors with weights renormalized to 1.0 when a factor drops
+// out. Normalization-before-aggregation with per-factor robustness follows
+// the OECD/JRC Handbook on Constructing Composite Indicators; absolute
+// anchors (metacubexd-style node scoring) are dead in this regime — the
+// pool's alive share (~1.5%) would pin every absolute band to its floor.
+// The verdict is POINT-IN-TIME: it is derived at render from the current
+// pool and never persisted into provider history.
+//
+// Clean% honesty (owner ruling 2026-11-05): the global quality section, the
+// provider table's clean% cell, and the JSON payload all gate on the SAME
+// phase1Evidence predicate over the cold geo base — one evidence definition
+// everywhere; a provider without Phase-1 evidence renders clean% n/a and
+// drops the cleanliness factor from its composite.
 //
 // Cold start: manifests written before the enrichment pass carry zero
 // liveness/quality/overlap data, and provider-history.json may not exist
@@ -20,8 +33,10 @@ package cli
 //
 // Color contract: internal/ui is the single styling owner. NO_COLOR /
 // --color=never switch the ASCII fallbacks pinned in the tests (sparkline
-// ladder " ..--==#", funnel bars "=-", verdicts [OK]/[!!]/[XX]); unicode
-// table borders stay in both modes (the repo's plain-mode convention).
+// ladder " ..--==#", funnel bars "=-"); unicode table borders stay in both
+// modes (the repo's plain-mode convention). Verdict words are
+// self-describing (GOOD/FAIR/WEAK/POOR/DEAD) and render verbatim in plain
+// mode; NONE renders n/a.
 
 import (
 	"encoding/json"
@@ -44,41 +59,87 @@ import (
 	"public_vpn/internal/ui"
 )
 
-// statusSchemaVersion is the --json document version (dashboard spec §4).
-const statusSchemaVersion = "1.0"
+// statusSchemaVersion is the --json document version. 1.1 (owner ruling
+// 2026-11-05): clean_pct and classified_coverage_pct are nullable floats —
+// null means "no Phase-1 evidence", never a fabricated 0.
+const statusSchemaVersion = "1.1"
 
-// Verdict bands (dashboard spec §3.1 traffic-light hierarchy). Alive bands
-// are spec-verbatim; the clean lower bands and the unique-yield bands are
-// code-owned completions of the spec's "overlapping → amber, 100% redundant
-// → red" semantics (reported as spec deltas, not hidden).
+// Verdict bands for the pool-relative composite score (0..100 after the
+// trend modifier, clamped): ≥75 GOOD, 50–75 FAIR, 25–50 WEAK, <25 POOR.
 const (
-	verdictAliveGreenPct  = 60.0
-	verdictAliveAmberPct  = 30.0
-	verdictCleanGreenPct  = 70.0
-	verdictCleanAmberPct  = 40.0
-	verdictUniqueGreenPct = 40.0
+	verdictGoodFloorPct = 75.0
+	verdictFairFloorPct = 50.0
+	verdictWeakFloorPct = 25.0
+)
+
+// Composite factor weights (owner-specified, Σ=1.0). The cleanliness weight
+// participates ONLY when Phase-1 evidence exists for the provider; the
+// remaining available weights renormalize to 1.0 (OECD/JRC: aggregate only
+// normalized, available dimensions).
+const (
+	verdictWeightLiveCount   = 0.30 // absolute live nodes
+	verdictWeightAliveShare  = 0.15 // alive %
+	verdictWeightGeoBreadth  = 0.20 // distinct countries+cities among live nodes
+	verdictWeightCleanliness = 0.20 // Phase-1 clean% — dropped without evidence
+	verdictWeightUniqueness  = 0.15 // unique %
+)
+
+// Trend modifier deltas (from stats.ClassifyTrend), applied to the composite
+// before banding and clamped to [0,100].
+const (
+	verdictTrendUpStrongDelta   = 5.0
+	verdictTrendUpDelta         = 2.5
+	verdictTrendDownDelta       = -2.5
+	verdictTrendDownStrongDelta = -5.0
+)
+
+// Override thresholds. A provider is DEAD when zero live nodes AND the 24h
+// volume-weighted average is under 1% (a long-dead source, not a diurnal
+// dip). Pools with fewer than verdictMinPoolSize scored providers cannot
+// rank meaningfully — the absolute fallback applies instead.
+const (
+	verdictDeadAlive24Pct = 1.0
+	verdictMinPoolSize    = 3
+)
+
+// recUniqueDeadFloorPct gates the "unique but dead" recommendation class:
+// a dead provider still contributing ≥25% unique identities is worth a
+// source-health check, not a prune.
+const recUniqueDeadFloorPct = 25.0
+
+// The dashboard's unique-yield bands (recommendations): <15% unique is a
+// prune candidate, ≥60% unique is the explicit keep band (keep additionally
+// requires liveness — see recommendations).
+const (
 	verdictUniqueAmberPct = 15.0
-	// verdictUniqueKeepPct opens the explicit KEEP band of the pruning
-	// recommendations (high-yield providers).
-	verdictUniqueKeepPct = 60.0
+	verdictUniqueKeepPct  = 60.0
 )
 
 // Verdict vocabulary (the exact words the table, JSON, and recommendations
 // render). NONE marks "no enrichment evidence yet" — a verdict that has not
-// been earned, never rendered as a measured OK/WARN/DROP.
+// been earned, never rendered as a measured class. TRIP is RESERVED for
+// breaker persistence (a future wave persists consecutive breaker trips and
+// renders TRIP); the engine never returns it today (pinned by test).
 const (
-	verdictOK   = "OK"
-	verdictWarn = "WARN"
-	verdictDrop = "DROP"
+	verdictGood = "GOOD"
+	verdictFair = "FAIR"
+	verdictWeak = "WEAK"
+	verdictPoor = "POOR"
+	verdictDead = "DEAD"
+	verdictTrip = "TRIP"
 	verdictNone = "NONE"
 )
 
-// asciiVerdicts maps the colored verdict words onto the ASCII fallbacks
-// pinned in the tests (dashboard spec §3.2).
+// asciiVerdicts maps the colored verdict words onto the plain-mode fallbacks
+// pinned in the tests. The pool-relative vocabulary is self-describing, so
+// plain mode renders the word itself; NONE keeps its n/a cold-start bytes.
 var asciiVerdicts = map[string]string{
-	verdictOK:   "[OK]",
-	verdictWarn: "[!!]",
-	verdictDrop: "[XX]",
+	verdictGood: "GOOD",
+	verdictFair: "FAIR",
+	verdictWeak: "WEAK",
+	verdictPoor: "POOR",
+	verdictDead: "DEAD",
+	verdictTrip: "TRIP",
 	verdictNone: "n/a",
 }
 
@@ -179,30 +240,48 @@ type funnelStage struct {
 	Note  string // the drop/transfer annotation entering this stage
 }
 
+// providerGeoIntel is one provider's Phase-1 evidence fold over the cold
+// geo base (the unified evidence definition — see phase1Evidence). Breadth
+// counts distinct country+city pairs among the provider's LIVE probe-store
+// nodes; records without country evidence carry no location and never
+// fabricate breadth.
+type providerGeoIntel struct {
+	Classified int // phase1Evidence-gated record count
+	Clean      int // classified ∧ ¬proxy ∧ ¬hosting (same switch as aggregateGeo)
+	Breadth    int // distinct (country, city) pairs among live nodes
+}
+
 // providerRow is one provider intelligence table row (manifest stats joined
-// with provider history). enriched=false marks a pre-upgrade manifest: the
-// liveness/quality columns have no evidence yet and render as pending.
+// with provider history and the provider's geo evidence). enriched=false
+// marks a pre-upgrade manifest: the liveness/quality columns have no
+// evidence yet and render as pending.
 type providerRow struct {
-	stats      plugins.PluginStats
-	history    *stats.ProviderSeries
-	alivePct   float64
-	alive24    float64
-	cleanPct   float64
-	uniquePct  float64
-	enriched   bool
-	verdict    string
-	verdictCol string // ui palette name; "" = no color (NONE)
+	stats         plugins.PluginStats
+	history       *stats.ProviderSeries
+	trend         string // stats.ClassifyTrend glyph; "" without history
+	alivePct      float64
+	alive24       float64
+	cleanPct      float64 // classified-only clean share
+	uniquePct     float64
+	classified    int // Phase-1 classified count (providerGeoIntel)
+	geoBreadth    int
+	cleanEvidence bool // classified > 0 — the cleanliness factor's availability
+	enriched      bool
+	verdict       string
+	verdictCol    string // ui palette name; "" = no color (NONE)
 }
 
 // statusIntel is everything one status run renders, collected once.
 type statusIntel struct {
-	stages       stageCounts
-	funnel       []funnelStage
-	geo          geoIntel
-	manifest     *fetchManifest
-	history      *stats.ProviderHistory
-	providers    []providerRow
-	configSource string
+	stages             stageCounts
+	funnel             []funnelStage
+	geo                geoIntel
+	manifest           *fetchManifest
+	history            *stats.ProviderHistory
+	providers          []providerRow
+	selectedCount      int
+	selectedUnknownGeo int // selected nodes without geo country evidence
+	configSource       string
 }
 
 // collectStatusIntel performs the whole read-only collection pass. A missing
@@ -238,9 +317,26 @@ func collectStatusIntel(p paths, configSource string) (*statusIntel, error) {
 	selected := 0
 	if sel != nil {
 		selected = len(sel.Nodes)
+		si.selectedCount = selected
+		for _, n := range sel.Nodes {
+			if n.Country == "" {
+				si.selectedUnknownGeo++
+			}
+		}
 	}
 
-	si.funnel = buildFunnel(si.stages, len(probes), alive, si.geo.GeoCleanAlive(), selected)
+	// Per-provider Phase-1 evidence: the SAME join the enrichment pass uses
+	// (filtered parse records → probe keys → geo identities), folded under
+	// the unified phase1Evidence predicate. The manifest's classified
+	// counters are NOT the dashboard's evidence source — one definition
+	// everywhere (owner ruling 2026-11-05).
+	pgeo, err := collectProviderGeo(p, geoRecs)
+	if err != nil {
+		return nil, err
+	}
+
+	si.funnel = buildFunnel(si.stages, len(probes), alive, si.geo.GeoCleanAlive(), selected,
+		si.geo.Hosting+si.geo.Proxy > 0)
 
 	if b, err := os.ReadFile(p.manifest); err == nil {
 		var m fetchManifest
@@ -259,8 +355,74 @@ func collectStatusIntel(p paths, configSource string) (*statusIntel, error) {
 	}
 	si.history = history
 
-	si.providers = buildProviderRows(si.manifest, history, time.Now())
+	si.providers = buildProviderRows(si.manifest, history, pgeo, time.Now())
 	return si, nil
+}
+
+// collectProviderGeo reads the wave artifacts the per-provider join needs
+// (filtered parse records + the latest-per-key probe view) and folds the
+// cold base into per-provider Phase-1 evidence.
+func collectProviderGeo(p paths, geoRecs []*model.GeoRecord) (map[string]providerGeoIntel, error) {
+	filteredNodes, err := store.ReadNodes(p.filtered) // missing file = cold start
+	if err != nil {
+		return nil, fmt.Errorf("status: read filtered nodes: %w", err)
+	}
+	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+	if err != nil {
+		return nil, fmt.Errorf("status: reduce probe results: %w", err)
+	}
+	geoByID := make(map[string]*model.GeoRecord, len(geoRecs))
+	for _, gr := range geoRecs {
+		geoByID[model.GeoIdentity(gr)] = gr
+	}
+	return aggregateProviderGeo(filteredNodes, geoByID, probeByKey), nil
+}
+
+// aggregateProviderGeo folds the cold base into per-provider Phase-1
+// evidence: classified/clean counts under the SAME phase1Evidence predicate
+// the global quality section uses, plus the geo-breadth factor (distinct
+// country+city pairs among the provider's LIVE nodes — probe-store truth,
+// the same liveness that feeds LiveNodes). The join mirrors the enrichment
+// pass exactly: per PARSE RECORD source (one geo identity may carry several
+// parse records across plugins — W19 landmine), keyed through GeoIdentity.
+func aggregateProviderGeo(
+	nodes []*model.Node,
+	geoByID map[string]*model.GeoRecord,
+	probeByKey map[string]store.ProbeResult,
+) map[string]providerGeoIntel {
+	out := make(map[string]providerGeoIntel)
+	breadth := make(map[string]map[string]bool)
+	for _, n := range nodes {
+		gr, ok := geoByID[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+		if !ok {
+			continue
+		}
+		pg := out[n.Source]
+		if phase1Evidence(gr) {
+			pg.Classified++
+			switch {
+			case gr.IsProxy:
+			case gr.IsHosting:
+			default:
+				pg.Clean++
+			}
+		}
+		if pr, seen := probeByKey[n.Key]; seen && pr.Alive && gr.Country != "" {
+			b := breadth[n.Source]
+			if b == nil {
+				b = map[string]bool{}
+				breadth[n.Source] = b
+			}
+			b[gr.Country+"\x00"+model.CityKey(gr.City)] = true
+		}
+		out[n.Source] = pg
+	}
+	for id, b := range breadth {
+		pg := out[id]
+		pg.Breadth = len(b)
+		out[id] = pg
+	}
+	return out
 }
 
 // aggregateGeo folds the cold base into quality, region, and media views.
@@ -370,8 +532,12 @@ func topRegions(countries map[string]int, unknown int) []regionCount {
 // Store inversions (a later stage holding more than the previous one —
 // probe results accumulate latest-per-key across waves while filtered is
 // one wave's output) render honestly as "+" transfers, never as negative
-// drops.
-func buildFunnel(stages stageCounts, probed, alive, geoClean, selected int) []funnelStage {
+// drops. The geo-clean drop note is DYNAMIC (owner ruling 2026-11-05): with
+// zero hosting/proxy evidence in the classified pool the drop is a
+// probe-store inversion plus the geo fold — naming dirty-IP exits would
+// fabricate evidence that does not exist; with evidence present the note
+// keeps the hosting/proxy wording (the transfer() prefix carries the count).
+func buildFunnel(stages stageCounts, probed, alive, geoClean, selected int, dirtyEvidence bool) []funnelStage {
 	transfer := func(delta int, drop, gain string) string {
 		switch {
 		case delta < 0:
@@ -382,6 +548,10 @@ func buildFunnel(stages stageCounts, probed, alive, geoClean, selected int) []fu
 			return "no change"
 		}
 	}
+	geoDrop := "hosting/proxy exits + geo fold"
+	if !dirtyEvidence {
+		geoDrop = "probe-store inversion + geo fold (no dirty-IP evidence)"
+	}
 	return []funnelStage{
 		{Name: "Fetched", Count: stages.Nodes},
 		{Name: "Filtered", Count: stages.Filtered,
@@ -391,20 +561,26 @@ func buildFunnel(stages stageCounts, probed, alive, geoClean, selected int) []fu
 		{Name: "Alive", Count: alive,
 			Note: transfer(alive-probed, "dead / unreachable", "store carries more alive keys")},
 		{Name: "Geo Clean", Count: geoClean,
-			Note: transfer(geoClean-alive, "hosting/proxy exits + geo fold", "geo fold ahead of probe store")},
+			Note: transfer(geoClean-alive, geoDrop, "geo fold ahead of probe store")},
 		{Name: "Selected", Count: selected,
 			Note: transfer(selected-geoClean, "rank cut", "rank admits beyond geo fold")},
 	}
 }
 
-// buildProviderRows joins manifest stats with provider history and computes
-// the verdict per the spec bands. Enrichment detection: a manifest from the
-// pre-upgrade binary carries zero LiveNodes/CleanCount in EVERY row — such
-// a manifest has no liveness evidence at all, so no row may present a
-// measured verdict. (The enrichment pass rewrites these fields after every
-// full wave; a genuine all-dead pool is a pathological corner that renders
-// as pending — documented, honest.)
-func buildProviderRows(m *fetchManifest, history *stats.ProviderHistory, now time.Time) []providerRow {
+// buildProviderRows joins manifest stats with provider history and the
+// provider's geo evidence, then derives the pool-relative verdicts.
+// Enrichment detection: a manifest from the pre-upgrade binary carries zero
+// LiveNodes/CleanCount in EVERY row — such a manifest has no liveness
+// evidence at all, so no row may present a measured verdict. (The
+// enrichment pass rewrites these fields after every full wave; a genuine
+// all-dead pool is a pathological corner that renders as pending —
+// documented, honest.)
+func buildProviderRows(
+	m *fetchManifest,
+	history *stats.ProviderHistory,
+	pgeo map[string]providerGeoIntel,
+	now time.Time,
+) []providerRow {
 	if m == nil || len(m.PluginStats) == 0 {
 		return nil
 	}
@@ -417,52 +593,212 @@ func buildProviderRows(m *fetchManifest, history *stats.ProviderHistory, now tim
 	}
 	rows := make([]providerRow, 0, len(m.PluginStats))
 	for _, st := range m.PluginStats {
-		row := providerRow{stats: st, enriched: enriched, verdict: verdictNone}
+		geo := pgeo[st.PluginID]
+		row := providerRow{
+			stats:      st,
+			enriched:   enriched,
+			verdict:    verdictNone,
+			trend:      "",
+			classified: geo.Classified,
+			geoBreadth: geo.Breadth,
+		}
 		if st.TotalNodes > 0 {
 			row.alivePct = float64(st.LiveNodes) * 100 / float64(st.TotalNodes)
 		}
-		// Honest clean share (owner ruling 2026-11-04, adversarial review
-		// F6): classified-only numerator AND denominator —
-		// CleanCount/ClassifiedCount; 0 when nothing is geo-classified.
-		// The old Clean/TotalNodes mixed a classified numerator into a
-		// pre-filter denominator and folded never-geo'd nodes into clean.
-		row.cleanPct = st.CleanPercent()
+		// Honest clean share, unified evidence definition: classified-only
+		// numerator AND denominator, Phase-1-gated (the old Clean/TotalNodes
+		// mixed a classified numerator into a pre-filter denominator and
+		// folded never-geo'd nodes into clean; the manifest ClassifiedCount
+		// counts geo-record presence, not Phase-1 evidence).
+		row.cleanEvidence = geo.Classified > 0
+		row.cleanPct = pctOf(geo.Clean, geo.Classified)
 		row.uniquePct = st.UniqueYield
 		if series := history.Providers[st.PluginID]; series != nil {
 			row.history = series
+			row.trend = series.Trend()
 			row.alive24 = stats.WeightedLiveness(series.Waves, now) * 100
-		}
-		if enriched {
-			row.verdict, row.verdictCol = providerVerdict(row.alivePct, row.cleanPct, row.uniquePct)
 		}
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].stats.PluginID < rows[j].stats.PluginID })
+	computeVerdicts(rows)
 	return rows
 }
 
-// providerVerdict applies the spec traffic-light bands: worst class wins.
-func providerVerdict(alivePct, cleanPct, uniquePct float64) (string, string) {
-	class := ui.Green
-	worst := func(pct, green, amber float64) {
-		switch {
-		case pct < amber:
-			class = ui.Red
-		case pct < green && class != ui.Red:
-			class = ui.Amber
+// verdictFactor is one composite input: its weight, the provider's
+// pool-relative percentile (0..1), and whether the factor is AVAILABLE
+// (dropped factors neither contribute weight nor value).
+type verdictFactor struct {
+	weight    float64
+	value     float64
+	available bool
+}
+
+// poolRelativeScore folds the available factors into the composite:
+// Σ(w_f × p_f) / Σ(w_f available). With all factors available the weights
+// sum to 1.0; a dropped factor renormalizes the rest (owner ruling:
+// "weights renormalized to 1.0 when a factor is dropped"). OECD/JRC
+// composite-indicator practice: never aggregate a missing dimension as a
+// zero — renormalize over what exists.
+func poolRelativeScore(factors []verdictFactor) float64 {
+	var acc, wsum float64
+	for _, f := range factors {
+		if !f.available {
+			continue
 		}
+		acc += f.weight * f.value
+		wsum += f.weight
 	}
-	worst(alivePct, verdictAliveGreenPct, verdictAliveAmberPct)
-	worst(cleanPct, verdictCleanGreenPct, verdictCleanAmberPct)
-	worst(uniquePct, verdictUniqueGreenPct, verdictUniqueAmberPct)
-	switch class {
-	case ui.Red:
-		return verdictDrop, ui.Red
-	case ui.Amber:
-		return verdictWarn, ui.Amber
+	if wsum == 0 {
+		return 0
+	}
+	return acc / wsum
+}
+
+// percentileRanks maps raw factor values onto pool-relative percentile
+// ranks in [0,1] using competition MIDRANKS for ties: each tied group gets
+// (rank_first + rank_last)/2 with 1-based ascending ranks, normalized by
+// (midrank−1)/(N−1). N=1 → 0.5 (defensive; the N<3 fallback handles solo
+// pools before percentiles ever run).
+func percentileRanks(values []float64) []float64 {
+	n := len(values)
+	out := make([]float64, n)
+	if n == 0 {
+		return out
+	}
+	if n == 1 {
+		out[0] = 0.5
+		return out
+	}
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return values[order[a]] < values[order[b]] })
+	for i := 0; i < n; {
+		j := i
+		for j+1 < n && values[order[j+1]] == values[order[i]] {
+			j++
+		}
+		midrank := float64(i+1+j+1) / 2 // 1-based (rank_first + rank_last)/2
+		rank := (midrank - 1) / float64(n-1)
+		for k := i; k <= j; k++ {
+			out[order[k]] = rank
+		}
+		i = j + 1
+	}
+	return out
+}
+
+// trendModifier maps the provider's ClassifyTrend glyph onto the composite
+// delta; no history (or a flat trend) contributes nothing.
+func trendModifier(row *providerRow) float64 {
+	if row.history == nil {
+		return 0
+	}
+	switch row.trend {
+	case stats.TrendUpStrong:
+		return verdictTrendUpStrongDelta
+	case stats.TrendUp:
+		return verdictTrendUpDelta
+	case stats.TrendDown:
+		return verdictTrendDownDelta
+	case stats.TrendDownStrong:
+		return verdictTrendDownStrongDelta
 	default:
-		return verdictOK, ui.Green
+		return 0
 	}
+}
+
+// applyTrendModifier adds the trend delta to the composite and clamps to
+// [0,100] — the modifier fine-tunes within the scale, never beyond it.
+func applyTrendModifier(score, delta float64) float64 {
+	return min(max(score+delta, 0), 100)
+}
+
+// bandVerdict maps the composite onto the owner-specified bands:
+// ≥75 GOOD, 50–75 FAIR, 25–50 WEAK, <25 POOR. Colors stay on the
+// internal/ui traffic-light palette (GOOD green; FAIR and WEAK amber; POOR
+// red).
+func bandVerdict(score float64) (string, string) {
+	switch {
+	case score >= verdictGoodFloorPct:
+		return verdictGood, ui.Green
+	case score >= verdictFairFloorPct:
+		return verdictFair, ui.Amber
+	case score >= verdictWeakFloorPct:
+		return verdictWeak, ui.Amber
+	default:
+		return verdictPoor, ui.Red
+	}
+}
+
+// isDead renders the DEAD override: zero live nodes AND a 24h volume-
+// weighted average under 1% — long-dead, not a diurnal dip.
+func isDead(row *providerRow) bool {
+	return row.stats.LiveNodes == 0 && row.alive24 < verdictDeadAlive24Pct
+}
+
+// computeVerdicts derives the pool-relative verdicts in place. Priority:
+// unenriched rows keep NONE (no evidence — nothing to score, nothing to
+// override); scored rows first face the DEAD override; the remainder either
+// falls back absolutely (fewer than 3 scored providers — percentiles are
+// meaningless in a tiny pool: live=0 → DEAD, alive>0 → FAIR) or lands on
+// the composite: score = Σ(w_f × percentile) over available factors,
+// renormalized, + trend modifier, clamped [0,100], banded. TRIP stays
+// reserved (breaker persistence is a future wave). Verdicts are
+// POINT-IN-TIME — derived here, never persisted to provider history.
+func computeVerdicts(rows []providerRow) {
+	pool := make([]int, 0, len(rows))
+	for i := range rows {
+		if !rows[i].enriched {
+			continue // NONE stays
+		}
+		if isDead(&rows[i]) {
+			rows[i].verdict, rows[i].verdictCol = verdictDead, ui.Red
+			continue
+		}
+		pool = append(pool, i)
+	}
+	if len(pool) < verdictMinPoolSize {
+		for _, i := range pool {
+			if rows[i].stats.LiveNodes == 0 {
+				rows[i].verdict, rows[i].verdictCol = verdictDead, ui.Red
+			} else {
+				rows[i].verdict, rows[i].verdictCol = verdictFair, ui.Amber
+			}
+		}
+		return
+	}
+	liveRank := percentileRanks(factorValues(rows, pool, func(r providerRow) float64 {
+		return float64(r.stats.LiveNodes)
+	}))
+	aliveRank := percentileRanks(factorValues(rows, pool, func(r providerRow) float64 { return r.alivePct }))
+	breadthRank := percentileRanks(factorValues(rows, pool, func(r providerRow) float64 {
+		return float64(r.geoBreadth)
+	}))
+	cleanRank := percentileRanks(factorValues(rows, pool, func(r providerRow) float64 { return r.cleanPct }))
+	uniqueRank := percentileRanks(factorValues(rows, pool, func(r providerRow) float64 { return r.uniquePct }))
+	for k, i := range pool {
+		row := &rows[i]
+		score := poolRelativeScore([]verdictFactor{
+			{weight: verdictWeightLiveCount, value: liveRank[k], available: true},
+			{weight: verdictWeightAliveShare, value: aliveRank[k], available: true},
+			{weight: verdictWeightGeoBreadth, value: breadthRank[k], available: true},
+			{weight: verdictWeightCleanliness, value: cleanRank[k], available: row.cleanEvidence},
+			{weight: verdictWeightUniqueness, value: uniqueRank[k], available: true},
+		}) * 100
+		row.verdict, row.verdictCol = bandVerdict(applyTrendModifier(score, trendModifier(row)))
+	}
+}
+
+// factorValues projects the pool rows through one factor extractor.
+func factorValues(rows []providerRow, pool []int, f func(providerRow) float64) []float64 {
+	out := make([]float64, 0, len(pool))
+	for _, i := range pool {
+		out = append(out, f(rows[i]))
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +844,14 @@ func printPipelineFunnel(out io.Writer, si *statusIntel, color bool) {
 		})
 	}
 	outf(out, "%s", ui.Table(cols, rows, color))
+	// Funnel honesty annotation (owner ruling 2026-11-05): how much of the
+	// active selection carries no geo country evidence at all. Skipped on
+	// the cold start (nothing selected — nothing to annotate).
+	if si.selectedCount > 0 {
+		pct := float64(si.selectedUnknownGeo) * 100 / float64(si.selectedCount)
+		outf(out, "%s\n", ui.ChipKV("geo unknown: ",
+			fmt.Sprintf("%d (%.1f%% of selected)", si.selectedUnknownGeo, pct), color))
+	}
 }
 
 // funnelBar renders the proportional bar: █/░ under color, =/- in the
@@ -676,15 +1020,16 @@ func printPluginLivenessStatus(out io.Writer, si *statusIntel, cfg *config.Confi
 			"liveness/quality columns fill after the plugin-stats enrichment pass (next full wave)", color))
 	}
 
-	// --- legacy chip lines (byte-stable) ---
-	outln(out, ui.ChipKV("plugins:  ", "", color))
+	// --- legacy chip lines (byte-stable except the owner-ordered
+	// dup-links rename, 2026-11-05) ---
 	printPluginChipsLegacy(out, si.manifest.PluginStats, cfg, color)
 }
 
 // printPluginChipsLegacy renders the pre-Phase-4 per-plugin chip lines
-// byte-stably (moved from pipeline.go; the OK/WARNING status stays driven by
-// the config's plugin thresholds — different semantics from the dashboard
-// verdict above, deliberately untouched).
+// byte-stably EXCEPT the owner-ordered `dup=` → `dup-links=` rename
+// (2026-11-05, deliberate byte-pin break). The OK/WARNING status stays
+// driven by the config's plugin thresholds — different semantics from the
+// dashboard verdict above (the breaker status), deliberately untouched.
 func printPluginChipsLegacy(out io.Writer, rows []plugins.PluginStats, cfg *config.Config, color bool) {
 	var maxDupPct, minLivePct *float64
 	if cfg != nil && cfg.Plugins.MaxDuplicatePercent != nil {
@@ -716,7 +1061,7 @@ func printPluginChipsLegacy(out io.Writer, rows []plugins.PluginStats, cfg *conf
 		}
 
 		statsLine := fmt.Sprintf(
-			"total=%d live=%d (%.1f%%) dup=%d (%.1f%%) hosting=%d (%.1f%%) proxy=%d (%.1f%%) clean=%d (%.1f%%) status=%s",
+			"total=%d live=%d (%.1f%%) dup-links=%d (%.1f%%) hosting=%d (%.1f%%) proxy=%d (%.1f%%) clean=%d (%.1f%%) status=%s",
 			st.TotalNodes, st.LiveNodes, livePct,
 			st.DuplicateCount, dupPct,
 			st.HostingCount, hostingPct,
@@ -737,6 +1082,80 @@ func printPluginChipsLegacy(out io.Writer, rows []plugins.PluginStats, cfg *conf
 	}
 }
 
+// printFetchStatus renders the fetch chip: file/source counts and the fetch
+// timestamp in the VIEWER'S LOCAL time (owner cosmetic ruling 2026-11-05;
+// RFC3339 carries the numeric offset so the stamp stays unambiguous).
+// Moved from pipeline.go — the intelligence dashboard owns the whole status
+// rendering chain.
+func printFetchStatus(out io.Writer, p paths, color bool) {
+	b, err := os.ReadFile(p.manifest)
+	if err != nil {
+		outln(out, ui.ChipKV("fetch:    ", "no manifest (never fetched)", color))
+		return
+	}
+	var m fetchManifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	if json.Unmarshal(b, &m) != nil {
+		outln(out, ui.ChipKV("fetch:    ", "manifest unreadable", color))
+		return
+	}
+	files := 0
+	for _, fs := range m.Sources {
+		files += len(fs)
+	}
+	// Local-time display is the owner-mandated cosmetic (2026-11-05): the
+	// machine TZ is the point, and the tests pin a fixed zone.
+	stamp := m.FetchedAt.Local().Format(time.RFC3339) //nolint:gosmopolitan // owner ruling 2026-11-05
+	outf(out, "%s\n", ui.ChipKV("fetch:    ",
+		fmt.Sprintf("%d files from %d sources at %s", files, len(m.Sources), stamp), color))
+}
+
+// printSelectionStatus renders the select chip. The bound label follows the
+// W19 unbounded semantics (owner cosmetic ruling 2026-11-05): CapApplied
+// equals the selection size when no cap bound the wave, and that state
+// renders "unbounded · N active" instead of the old tautological
+// "N active (cap N)". An explicit cap that binds EXACTLY is indistinguishable
+// on the persisted Selection (it carries only the applied bound) and renders
+// unbounded too — documented corner. Moved from pipeline.go.
+func printSelectionStatus(out io.Writer, p paths, color bool) {
+	sel, err := store.ReadSelection(p.selection)
+	if err != nil || sel == nil {
+		outln(out, ui.ChipKV("select:   ", "empty", color))
+		return
+	}
+	// Display label: unknown-geo nodes carry a raw empty country — shown as
+	// the pool_unknown pseudo-location they render under (W16).
+	byCountry := map[string]int{}
+	for _, n := range sel.Nodes {
+		label := n.Country
+		if label == "" {
+			label = "unknown"
+		}
+		byCountry[label]++
+	}
+	bound := fmt.Sprintf("cap %d", sel.CapApplied)
+	if sel.CapApplied == len(sel.Nodes) {
+		bound = "unbounded"
+	}
+	outf(out, "%s\n", ui.ChipKV("select:   ",
+		fmt.Sprintf("%s · %d active %v", bound, len(sel.Nodes), byCountry), color))
+}
+
+// printRenderStatus renders the render chip with the config mtime in the
+// viewer's local time (same cosmetic ruling as the fetch stamp).
+// Moved from pipeline.go.
+func printRenderStatus(out io.Writer, p paths, color bool) {
+	st, err := os.Stat(p.rendered)
+	if err != nil {
+		outln(out, ui.ChipKV("render:   ", "none", color))
+		return
+	}
+	// Same local-time cosmetic as the fetch stamp (owner ruling 2026-11-05).
+	stamp := st.ModTime().Local().Format(time.RFC3339) //nolint:gosmopolitan // owner ruling 2026-11-05
+	outf(out, "%s\n", ui.ChipKV("render:   ",
+		fmt.Sprintf("%s (%d bytes, %s)", p.rendered, st.Size(), stamp), color))
+}
+
 // printProviderIntelTable renders the spec §2.3 table: provider, total,
 // current alive with share, 24h volume-weighted average, the history
 // sparkline + trend (all history math lives in internal/stats), clean %,
@@ -755,20 +1174,31 @@ func printProviderIntelTable(out io.Writer, si *statusIntel, color bool) {
 	}
 	rows := make([][]ui.Cell, 0, len(si.providers))
 	for _, row := range si.providers {
-		aliveCell, avgCell, cleanCell, uniqueCell := "n/a", "n/a", "n/a", "n/a"
+		aliveCell, avgCell, uniqueCell := "n/a", "n/a", "n/a"
+		cleanCell := "n/a"
 		trendCell := "calibrating"
 		if row.enriched {
 			aliveCell = fmt.Sprintf("%d (%.1f%%)", row.stats.LiveNodes, row.alivePct)
 			avgCell = fmt.Sprintf("%.1f%%", row.alive24)
-			cleanCell = fmt.Sprintf("%.1f%%", row.cleanPct)
 			uniqueCell = fmt.Sprintf("%.1f%%", row.uniquePct)
 		}
+		// Clean% honesty (owner ruling 2026-11-05): classified>0 renders the
+		// clean share with its CLASSIFIED COVERAGE (classified/total) — the
+		// reader sees how much of the pool the share describes; classified=0
+		// renders n/a (no evidence, never a fabricated 0%).
+		if row.cleanEvidence {
+			cleanCell = fmt.Sprintf("%.1f%% ·%.1f%%·", row.cleanPct,
+				pctOf(row.classified, row.stats.TotalNodes))
+		}
 		if row.history != nil {
-			spark := row.history.Sparkline(sparklineTrendWaves)
+			// Max-relative scale (owner ruling 2026-11-05, Stephen Few): the
+			// sparkline shows the window's SHAPE; the alive% column carries
+			// the magnitude.
+			spark := row.history.SparklineScaled(sparklineTrendWaves, stats.SparklineMaxRelative)
 			if !color {
 				spark = asciiSparklineString(spark)
 			}
-			trendCell = strings.TrimRight(spark+" "+row.history.Trend(), " ")
+			trendCell = strings.TrimRight(spark+" "+row.trend, " ")
 		}
 		verdictCell := asciiVerdicts[row.verdict]
 		verdictColor := ""
@@ -882,28 +1312,38 @@ func overlapIDs(m *plugins.OverlapMatrix) []string {
 }
 
 // recommendations derives the pruning/keep advice from the provider rows
-// (deterministic: top-overlap percentage descending, id ascending on ties).
-// Bands: <15% unique = prune candidate, ≥60% unique = explicit keep. The
-// middle band stays silent — advice only where the signal is strong.
+// (deterministic: top-overlap percentage descending, LIVE ascending —
+// owner ruling 2026-11-05 — plugin-id ascending on full ties). Bands:
+// <15% unique = prune candidate, ≥60% unique = explicit keep — but a plain
+// keep REQUIRES liveness (dead ⇒ live==0 ∧ 24h-avg<1%): a dead high-yield
+// source becomes the "unique but dead" class (≥25% unique) instead — verify
+// the upstream source before trusting its exclusive nodes. The alive middle
+// band stays silent — advice only where the signal is strong.
 func recommendations(rows []providerRow) []string {
 	type cand struct {
 		id      string
 		unique  float64
+		live    int
 		topWith string
 		topPct  float64
+		dead    bool
 	}
 	var cands []cand
 	for _, r := range rows {
 		if !r.enriched || len(r.stats.TopOverlaps) == 0 {
 			continue
 		}
-		if r.uniquePct < verdictUniqueAmberPct || r.uniquePct >= verdictUniqueKeepPct {
+		dead := isDead(&r)
+		if r.uniquePct < verdictUniqueAmberPct || r.uniquePct >= verdictUniqueKeepPct ||
+			(dead && r.uniquePct >= recUniqueDeadFloorPct) {
 			top := r.stats.TopOverlaps[0]
 			cands = append(cands, cand{
 				id:      r.stats.PluginID,
 				unique:  r.uniquePct,
+				live:    r.stats.LiveNodes,
 				topWith: top.PluginID,
 				topPct:  top.Percent,
+				dead:    dead,
 			})
 		}
 	}
@@ -911,18 +1351,26 @@ func recommendations(rows []providerRow) []string {
 		if cands[i].topPct != cands[j].topPct {
 			return cands[i].topPct > cands[j].topPct
 		}
+		if cands[i].live != cands[j].live {
+			return cands[i].live < cands[j].live
+		}
 		return cands[i].id < cands[j].id
 	})
 	out := make([]string, 0, len(cands))
 	for _, c := range cands {
-		if c.unique < verdictUniqueAmberPct {
+		switch {
+		case c.dead && c.unique >= recUniqueDeadFloorPct:
+			out = append(out, fmt.Sprintf(
+				"'%s' is unique but dead — verify upstream source (%.1f%% unique, 0 live nodes)",
+				c.id, c.unique))
+		case c.unique >= verdictUniqueKeepPct:
+			out = append(out, fmt.Sprintf("keep '%s': %.1f%% unique nodes (low overlap, high yield)",
+				c.id, c.unique))
+		default:
 			out = append(out, fmt.Sprintf(
 				"prune candidate '%s': only %.1f%% unique — %.0f%% shared with %s",
 				c.id, c.unique, c.topPct, c.topWith))
-			continue
 		}
-		out = append(out, fmt.Sprintf("keep '%s': %.1f%% unique nodes (low overlap, high yield)",
-			c.id, c.unique))
 	}
 	return out
 }
@@ -978,16 +1426,17 @@ type statusJSONRegion struct {
 }
 
 type statusJSONProvider struct {
-	ID           string           `json:"id"`
-	TotalParsed  int              `json:"total_parsed"`
-	AliveCurrent int              `json:"alive_current"`
-	Alive24hAvg  float64          `json:"alive_24h_avg"`
-	AlivePct     float64          `json:"alive_pct"`
-	CleanPct     float64          `json:"clean_pct"`
-	UniquePct    float64          `json:"unique_pct"`
-	Sparkline    []float64        `json:"sparkline"`
-	Overlaps     []statusJSONPair `json:"overlaps"`
-	Verdict      string           `json:"verdict"`
+	ID                    string           `json:"id"`
+	TotalParsed           int              `json:"total_parsed"`
+	AliveCurrent          int              `json:"alive_current"`
+	Alive24hAvg           float64          `json:"alive_24h_avg"`
+	AlivePct              float64          `json:"alive_pct"`
+	CleanPct              *float64         `json:"clean_pct"`               // null = no Phase-1 evidence
+	ClassifiedCoveragePct *float64         `json:"classified_coverage_pct"` // null = no Phase-1 evidence
+	UniquePct             float64          `json:"unique_pct"`
+	Sparkline             []float64        `json:"sparkline"`
+	Overlaps              []statusJSONPair `json:"overlaps"`
+	Verdict               string           `json:"verdict"`
 }
 
 type statusJSONPair struct {
@@ -1050,7 +1499,9 @@ func jsonRegions(g geoIntel) []statusJSONRegion {
 }
 
 // jsonProviders maps the rows onto the wire shape; the sparkline carries the
-// last ≤6 waves' liveness rates in percent (empty history → []).
+// last ≤6 waves' liveness rates in percent (empty history → []). clean_pct
+// and classified_coverage_pct are nil (→ JSON null, no omitempty) whenever
+// the provider carries no Phase-1 evidence — the wire never fabricates a 0.
 func jsonProviders(rows []providerRow) []statusJSONProvider {
 	out := make([]statusJSONProvider, 0, len(rows))
 	for _, r := range rows {
@@ -1066,19 +1517,30 @@ func jsonProviders(rows []providerRow) []statusJSONProvider {
 			overlaps = append(overlaps, statusJSONPair{With: p.PluginID, Pct: round6(p.Percent)})
 		}
 		out = append(out, statusJSONProvider{
-			ID:           r.stats.PluginID,
-			TotalParsed:  r.stats.TotalNodes,
-			AliveCurrent: r.stats.LiveNodes,
-			Alive24hAvg:  round6(r.alive24),
-			AlivePct:     round6(r.alivePct),
-			CleanPct:     round6(r.cleanPct),
-			UniquePct:    round6(r.uniquePct),
-			Sparkline:    spark,
-			Overlaps:     overlaps,
-			Verdict:      r.verdict,
+			ID:                    r.stats.PluginID,
+			TotalParsed:           r.stats.TotalNodes,
+			AliveCurrent:          r.stats.LiveNodes,
+			Alive24hAvg:           round6(r.alive24),
+			AlivePct:              round6(r.alivePct),
+			CleanPct:              nullablePct(r.cleanPct, r.cleanEvidence),
+			ClassifiedCoveragePct: nullablePct(pctOf(r.classified, r.stats.TotalNodes), r.cleanEvidence),
+			UniquePct:             round6(r.uniquePct),
+			Sparkline:             spark,
+			Overlaps:              overlaps,
+			Verdict:               r.verdict,
 		})
 	}
 	return out
+}
+
+// nullablePct lifts a percentage into the nullable wire pointer: !ok → nil
+// (encodes as JSON null — the explicit "no evidence" value).
+func nullablePct(v float64, ok bool) *float64 {
+	if !ok {
+		return nil
+	}
+	f := round6(v)
+	return &f
 }
 
 // jsonOverlap flattens the upper triangle (a < b, both ascending) of the

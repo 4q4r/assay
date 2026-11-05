@@ -2427,7 +2427,7 @@ passing the same values here — publicvpn keeps no state file by design.`,
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
 		"systemd user unit directory to inspect (same default as install)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false,
-		"emit one machine-readable JSON document instead of the dashboard (schema_version 1.0)")
+		"emit one machine-readable JSON document instead of the dashboard (schema_version 1.1)")
 	cmd.Flags().BoolVarP(&overlap, "overlap", "v", false,
 		"append the pairwise provider-overlap matrix view with pruning recommendations")
 	attachColorFlags(cmd)
@@ -2506,29 +2506,11 @@ func statusInstallDirs(cmd *cobra.Command) (string, string) {
 	return config.ExpandHome(binDir), config.ExpandHome(unitDir)
 }
 
-func printFetchStatus(out io.Writer, p paths, color bool) {
-	b, err := os.ReadFile(p.manifest)
-	if err != nil {
-		outln(out, ui.ChipKV("fetch:    ", "no manifest (never fetched)", color))
-		return
-	}
-	var m fetchManifest
-	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
-	if json.Unmarshal(b, &m) != nil {
-		outln(out, ui.ChipKV("fetch:    ", "manifest unreadable", color))
-		return
-	}
-	files := 0
-	for _, fs := range m.Sources {
-		files += len(fs)
-	}
-	outf(out, "%s\n", ui.ChipKV("fetch:    ",
-		fmt.Sprintf("%d files from %d sources at %s", files, len(m.Sources), m.FetchedAt.Format(time.RFC3339)), color))
-}
-
-// printStageCounts and printPluginLivenessStatus live in status_intel.go
-// (Phase 4 — the intelligence dashboard owns the whole status rendering
-// chain alongside the funnel/quality/media sections).
+// printFetchStatus, printSelectionStatus and printRenderStatus join
+// printStageCounts and printPluginLivenessStatus in status_intel.go — the
+// intelligence dashboard owns the whole status rendering chain alongside
+// the funnel/quality/media sections (dashboard-honesty wave, 2026-11-05:
+// local-time stamps, unbounded select label).
 
 func printProbeStatus(out io.Writer, p paths, color bool) {
 	results, err := store.ReadProbeResults(p.probeResults)
@@ -2629,36 +2611,6 @@ func printCalibrationStatus(out io.Writer, p paths, cfg *config.Config, color bo
 	}
 	// state file path
 	outf(out, "%s\n", ui.ChipKV("  state:", filepath.Join(p.dataDir, "timeout-calibration.json"), color))
-}
-
-func printSelectionStatus(out io.Writer, p paths, color bool) {
-	sel, err := store.ReadSelection(p.selection)
-	if err != nil || sel == nil {
-		outln(out, ui.ChipKV("select:   ", "empty", color))
-		return
-	}
-	// Display label: unknown-geo nodes carry a raw empty country — shown as
-	// the pool_unknown pseudo-location they render under (W16).
-	byCountry := map[string]int{}
-	for _, n := range sel.Nodes {
-		label := n.Country
-		if label == "" {
-			label = "unknown"
-		}
-		byCountry[label]++
-	}
-	outf(out, "%s\n", ui.ChipKV("select:   ",
-		fmt.Sprintf("%d active (cap %d) %v", len(sel.Nodes), sel.CapApplied, byCountry), color))
-}
-
-func printRenderStatus(out io.Writer, p paths, color bool) {
-	st, err := os.Stat(p.rendered)
-	if err != nil {
-		outln(out, ui.ChipKV("render:   ", "none", color))
-		return
-	}
-	outf(out, "%s\n", ui.ChipKV("render:   ",
-		fmt.Sprintf("%s (%d bytes, %s)", p.rendered, st.Size(), st.ModTime().Format(time.RFC3339)), color))
 }
 
 func countLines(path string) (int, error) {
