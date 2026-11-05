@@ -13,9 +13,11 @@ import (
 // (MaxDuplicatePercent, MinLivePercent from PluginsConfig).
 //
 // Field lifecycle across the wave: TotalNodes and DuplicateCount are
-// fetch-stage facts; LiveNodes, HostingCount, ProxyCount and CleanCount
-// are enriched after probe+geo (runPluginStatsEnrichment) and reflect the
-// FULL wave cycle.
+// fetch-stage facts; LiveNodes, HostingCount, ProxyCount, CleanCount,
+// ClassifiedCount and UnlockCount are enriched after probe+geo
+// (runPluginStatsEnrichment) and reflect the FULL wave cycle; UniqueYield
+// and TopOverlaps come from the pairwise identity-overlap matrix computed
+// at enrichment time.
 type PluginStats struct {
 	PluginID       string
 	TotalNodes     int
@@ -23,13 +25,48 @@ type PluginStats struct {
 	DuplicateCount int // bidirectional: nodes with same key from other plugins
 	HostingCount   int
 	ProxyCount     int
-	CleanCount     int // !hosting && !proxy
+	// CleanCount counts the plugin's geo-CLASSIFIED nodes that are neither
+	// hosting nor proxy. Nodes without a geo record are unclassified —
+	// never folded into clean (owner ruling 2026-11-04, adversarial
+	// review F6).
+	CleanCount int
 	// ClassifiedCount is the number of the plugin's nodes WITH a geo
 	// record (geo-classified). The honest clean share is
 	// CleanCount/ClassifiedCount — classified-only numerator AND
 	// denominator (CleanPercent).
 	ClassifiedCount int
+	// UnlockCount counts the plugin's parse records whose geo record carries
+	// a CHECKED Phase-1 media-unlock status with at least one positive
+	// unlock signal (the [geo].unlock_probes stage must be on for any of
+	// these to exist).
+	UnlockCount int
+	// UniqueYield is the % of the plugin's DISTINCT geo identities that no
+	// other plugin also carries (the provider-pruning signal: a plugin whose
+	// yield is ~0 adds nothing to the pool).
+	UniqueYield float64
+	// TopOverlaps lists the strongest overlap partners (descending percent,
+	// plugin-id tie-break, max 2) — e.g. "matin (61%), mhd (18%)".
+	TopOverlaps []OverlapPair
 }
+
+// OverlapPair is one directional overlap share: Percent is the share of the
+// OWNING plugin's distinct identities that PluginID also carries.
+type OverlapPair struct {
+	PluginID string  `json:"plugin_id"`
+	Percent  float64 `json:"percent"`
+}
+
+// OverlapMatrix is the full pairwise identity-overlap structure. Sets maps
+// each plugin to its distinct GeoIdentity count; Cells[A][B] is
+// |A∩B| / |A| × 100. Phase 4's --overlap view consumes the whole matrix —
+// the per-plugin TopOverlaps are just its top-2 projection.
+type OverlapMatrix struct {
+	Sets  map[string]int                `json:"sets"`
+	Cells map[string]map[string]float64 `json:"cells"`
+}
+
+// topOverlapPartners is how many partners each PluginStats carries.
+const topOverlapPartners = 2
 
 // pluginsNode is an internal node wrapper carrying the plugin id.
 type pluginsNode struct {
@@ -240,4 +277,100 @@ func computeNodeKey(n Node) string {
 // GetPluginStats returns the stats for a specific plugin.
 func (c *PluginStatsCollector) GetPluginStats(pluginID string) *PluginStats {
 	return c.Stats[pluginID]
+}
+
+// ComputeOverlapMatrix builds the full pairwise overlap model from
+// per-plugin DISTINCT GeoIdentity sets (identity = scheme|lower(host)|port,
+// the model.GeoIdentity string format). Cells[A][B] = |A∩B|/|A|×100 with the
+// diagonal pinned at 100 and empty sets producing 0 (never a division by
+// zero). Values depend only on the sets — deterministic.
+func ComputeOverlapMatrix(identitiesByPlugin map[string]map[string]bool) OverlapMatrix {
+	m := OverlapMatrix{
+		Sets:  make(map[string]int, len(identitiesByPlugin)),
+		Cells: make(map[string]map[string]float64, len(identitiesByPlugin)),
+	}
+	for id, set := range identitiesByPlugin {
+		m.Sets[id] = len(set)
+		m.Cells[id] = make(map[string]float64, len(identitiesByPlugin))
+	}
+	for a, setA := range identitiesByPlugin {
+		for b, setB := range identitiesByPlugin {
+			switch {
+			case a == b:
+				m.Cells[a][b] = 100
+			case len(setA) == 0:
+				m.Cells[a][b] = 0
+			default:
+				shared := 0
+				for identity := range setA {
+					if setB[identity] {
+						shared++
+					}
+				}
+				m.Cells[a][b] = float64(shared) * 100 / float64(len(setA))
+			}
+		}
+	}
+	return m
+}
+
+// ApplyOverlap projects the overlap model onto the collector's stats.
+// identitiesByPlugin must be the SAME sets the matrix was computed from:
+// UniqueYield counts identities carried by no other plugin, and TopOverlaps
+// keeps the strongest topOverlapPartners partners from the matrix row
+// (descending percent, plugin-id ascending tie-break — deterministic).
+func (c *PluginStatsCollector) ApplyOverlap(m OverlapMatrix, identitiesByPlugin map[string]map[string]bool) {
+	for id, st := range c.Stats {
+		st.TopOverlaps = nil
+		distinct := m.Sets[id]
+		if distinct == 0 {
+			st.UniqueYield = 0
+			continue
+		}
+		unique := 0
+		for identity := range identitiesByPlugin[id] {
+			if !identityShared(identity, id, identitiesByPlugin) {
+				unique++
+			}
+		}
+		st.UniqueYield = float64(unique) * 100 / float64(distinct)
+
+		type pair struct {
+			id  string
+			pct float64
+		}
+		partners := make([]pair, 0, len(m.Cells))
+		for other := range m.Cells {
+			if other == id {
+				continue
+			}
+			// Direction: the share of THIS plugin's identities the partner
+			// also carries — Cells[id][other] = |id∩other| / |id| × 100.
+			if pct := m.Cells[id][other]; pct > 0 {
+				partners = append(partners, pair{id: other, pct: pct})
+			}
+		}
+		sort.Slice(partners, func(i, j int) bool {
+			if partners[i].pct != partners[j].pct {
+				return partners[i].pct > partners[j].pct
+			}
+			return partners[i].id < partners[j].id
+		})
+		for _, p := range partners[:min(len(partners), topOverlapPartners)] {
+			st.TopOverlaps = append(st.TopOverlaps, OverlapPair{PluginID: p.id, Percent: p.pct})
+		}
+	}
+}
+
+// identityShared reports whether any OTHER plugin also carries the identity.
+func identityShared(identity, owner string, identitiesByPlugin map[string]map[string]bool) bool {
+	for other, set := range identitiesByPlugin {
+		if other == owner {
+			continue
+		}
+		if set[identity] {
+			return true
+		}
+	}
+	return false
 }

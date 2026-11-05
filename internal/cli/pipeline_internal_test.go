@@ -14,6 +14,7 @@ import (
 	"public_vpn/internal/geo"
 	"public_vpn/internal/model"
 	"public_vpn/internal/plugins"
+	"public_vpn/internal/stats"
 	"public_vpn/internal/store"
 
 	"github.com/spf13/cobra"
@@ -455,6 +456,48 @@ func TestConfigReconciliationWarnsStaleBalancer(t *testing.T) {
 	assert.Contains(t, buf.String(), `"us"`)
 }
 
+// TestCheckMinLivePercentEnforcesOnWaveRegistry pins F1: the MinLivePercent
+// enforcement lands on the WAVE's real registry — the watchdog-maintained
+// one in the daemon — so RecordFailure actually disables the plugin for
+// subsequent waves. The old fake-enforcement path loaded a throwaway
+// registry inside the check, recorded the failure into it, and dropped it
+// (nothing was ever disabled; registry-load errors silently no-oped).
+func TestCheckMinLivePercentEnforcesOnWaveRegistry(t *testing.T) {
+	dir := t.TempDir()
+	enrichFixture(t, dir)
+	minLive := 100.0 // alpha 75% and beta 50% live — both breach
+	cfg := &config.Config{DataDir: dir, Plugins: config.PluginsConfig{MinLivePercent: &minLive}}
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+
+	reg := plugins.NewRegistry()
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, reg))
+
+	disabled := reg.DisabledPlugins()
+	assert.Contains(t, disabled, "alpha", "the breach must disable the plugin on the WAVE's registry")
+	assert.Contains(t, disabled, "beta")
+	assert.Contains(t, buf.String(), "DISABLED: live%", "the enforcement line stays loud")
+}
+
+// TestCheckMinLivePercentNilRegistrySkips pins the nil contract (same class
+// as checkMaxDuplicatePercent): threshold enforcement needs the wave's
+// registry; a nil one skips the check instead of loading a throwaway copy.
+func TestCheckMinLivePercentNilRegistrySkips(t *testing.T) {
+	dir := t.TempDir()
+	enrichFixture(t, dir)
+	minLive := 100.0
+	cfg := &config.Config{DataDir: dir, Plugins: config.PluginsConfig{MinLivePercent: &minLive}}
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil))
+	assert.NotContains(t, buf.String(), "DISABLED",
+		"no registry — no enforcement, and no throwaway reload")
+}
+
 func TestWireRecordStageStatPersistedAfterWave(t *testing.T) {
 	cfg := maintainCfg(t)
 	rec := &stageRecorder{}
@@ -480,4 +523,179 @@ func TestWireSizingEngineResizeAppliesCap(t *testing.T) {
 	assert.Equal(t, 42, c.Capacity())
 	// Need geo import
 	_ = geo.NewSizingEngine()
+}
+
+// enrichFixture builds one wave's worth of pipeline artifacts in dir:
+// a fetch manifest with fetch-stage plugin stats, filtered parse records,
+// probe outcomes, and geo records. The fixture exercises the W19 landmine:
+// alpha/n4 and beta/n5 share ONE geo identity (same scheme/host/port) while
+// carrying distinct credentials; n5's OWN probe is dead so it must never ride
+// the shared record's liveness.
+func enrichFixture(t *testing.T, dir string) {
+	t.Helper()
+	cfg := &config.Config{DataDir: dir}
+	p := newPaths(cfg)
+	require.NoError(t, os.MkdirAll(p.cacheDir, 0o750))
+
+	mkNode := func(source, host, cred string) *model.Node {
+		return model.NewNode(source, "vless", cred, host, 443, map[string]string{"security": "tls"})
+	}
+	n1 := mkNode("alpha", "a1.example", "u1")     // alive, clean, positive unlock evidence
+	n2 := mkNode("alpha", "a2.example", "u2")     // alive, hosting
+	n3 := mkNode("alpha", "a3.example", "u3")     // dead, hosting
+	n4 := mkNode("alpha", "shared.example", "u4") // alive, clean identity (shared with n5)
+	n5 := mkNode("beta", "shared.example", "u5")  // dead own probe — W19 gate must hold
+	n6 := mkNode("beta", "b6.example", "u6")      // alive, proxy
+	nodes := []*model.Node{n1, n2, n3, n4, n5, n6}
+	require.NoError(t, store.WriteNodes(p.filtered, nodes))
+
+	now := time.Now().UTC()
+	probe := func(n *model.Node, alive bool, rtt float64) store.ProbeResult {
+		return store.ProbeResult{Key: n.Key, Host: n.Host, Alive: alive, RTTMs: rtt, CheckedAt: now}
+	}
+	results := []store.ProbeResult{
+		probe(n1, true, 100), probe(n2, true, 200), probe(n3, false, 0),
+		probe(n4, true, 300), probe(n5, false, 0), probe(n6, true, 400),
+	}
+	var buf strings.Builder
+	for _, r := range results {
+		b, err := json.Marshal(r)
+		require.NoError(t, err)
+		buf.WriteString(string(b) + "\n")
+	}
+	require.NoError(t, os.WriteFile(p.probeResults, []byte(buf.String()), 0o600))
+
+	unlocked := model.MediaUnlockStatus{CheckedAt: now.Format(time.RFC3339), ChatGPT: model.UnlockYes}
+	geoRec := func(host string, hosting, proxy bool, ms model.MediaUnlockStatus) *model.GeoRecord {
+		return &model.GeoRecord{
+			Scheme: "vless", Host: host, Port: 443, Alive: true,
+			HostingFlag: hosting, ProxyFlag: proxy,
+			FlagsVerified: true, Country: "DE", MediaUnlocks: ms,
+		}
+	}
+	require.NoError(t, store.WriteGeo(p.geoBase, []*model.GeoRecord{
+		geoRec("a1.example", false, false, unlocked),
+		geoRec("a2.example", true, false, model.MediaUnlockStatus{}),
+		geoRec("a3.example", true, false, model.MediaUnlockStatus{}),
+		geoRec("shared.example", false, false, model.MediaUnlockStatus{}),
+		geoRec("b6.example", false, true, model.MediaUnlockStatus{}),
+	}))
+
+	manifest := fetchManifest{
+		FetchedAt: now,
+		Sources:   map[string][]fetch.FetchedFile{},
+		PluginStats: []plugins.PluginStats{
+			{PluginID: "alpha", TotalNodes: 4, DuplicateCount: 1},
+			{PluginID: "beta", TotalNodes: 2},
+		},
+	}
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive (same as production sites)
+	b, err := json.MarshalIndent(manifest, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, store.WriteManifest(p.manifest, b))
+}
+
+func enrichmentCommand() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	return cmd
+}
+
+// TestRunPluginStatsEnrichmentFullCycle pins the owner-approved contract:
+// live/clean/hosting/unlock metrics reflect the FULL wave cycle with plugin
+// attribution preserved at every stage, the pairwise overlap matrix lands in
+// the manifest, and the provider time-series snapshot is recorded — all in
+// one enrichment pass at the wave tail.
+func TestRunPluginStatsEnrichmentFullCycle(t *testing.T) {
+	dir := t.TempDir()
+	enrichFixture(t, dir)
+	cfg := &config.Config{DataDir: dir}
+
+	require.NoError(t, runPluginStatsEnrichment(enrichmentCommand(), cfg, nil))
+
+	var manifest fetchManifest
+	b, err := os.ReadFile(newPaths(cfg).manifest)
+	require.NoError(t, err)
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	require.NoError(t, json.Unmarshal(b, &manifest))
+
+	byID := map[string]plugins.PluginStats{}
+	for _, st := range manifest.PluginStats {
+		byID[st.PluginID] = st
+	}
+	require.Contains(t, byID, "alpha")
+	require.Contains(t, byID, "beta")
+
+	alpha := byID["alpha"]
+	assert.Equal(t, 4, alpha.TotalNodes, "fetch-stage total survives")
+	assert.Equal(t, 3, alpha.LiveNodes, "n1+n2+n4 alive by their OWN probe results")
+	assert.Equal(t, 2, alpha.HostingCount, "n2+n3 hosting per parse record")
+	assert.Equal(t, 0, alpha.ProxyCount)
+	assert.Equal(t, 2, alpha.CleanCount, "n1+n4 clean")
+	assert.Equal(t, 1, alpha.UnlockCount, "n1 carries a checked positive unlock")
+	assert.InDelta(t, 75.0, alpha.UniqueYield, 1e-9, "3/4 identities are alpha-exclusive")
+	require.Len(t, alpha.TopOverlaps, 1)
+	assert.Equal(t, "beta", alpha.TopOverlaps[0].PluginID)
+	assert.InDelta(t, 25.0, alpha.TopOverlaps[0].Percent, 1e-9, "1/4 of alpha is covered by beta")
+
+	beta := byID["beta"]
+	assert.Equal(t, 2, beta.TotalNodes)
+	assert.Equal(t, 1, beta.LiveNodes,
+		"W19 landmine: n5's OWN probe is dead — it must not ride the shared identity's liveness")
+	assert.Equal(t, 1, beta.ProxyCount, "n6")
+	assert.Equal(t, 1, beta.CleanCount, "n5 rides the shared CLEAN geo record for the quality count")
+	assert.Equal(t, 0, beta.UnlockCount)
+	assert.InDelta(t, 50.0, beta.UniqueYield, 1e-9, "1/2 identities are beta-exclusive")
+	require.Len(t, beta.TopOverlaps, 1)
+	assert.Equal(t, "alpha", beta.TopOverlaps[0].PluginID)
+	assert.InDelta(t, 50.0, beta.TopOverlaps[0].Percent, 1e-9, "beta is fully covered by alpha")
+
+	require.NotNil(t, manifest.PluginOverlap, "the overlap matrix is stored for the --overlap view")
+	assert.Equal(t, map[string]int{"alpha": 4, "beta": 2}, manifest.PluginOverlap.Sets)
+	assert.InDelta(t, 25.0, manifest.PluginOverlap.Cells["alpha"]["beta"], 1e-9)
+	assert.InDelta(t, 50.0, manifest.PluginOverlap.Cells["beta"]["alpha"], 1e-9)
+
+	h, err := stats.ReadProviderHistory(filepath.Join(dir, "provider-history.json"))
+	require.NoError(t, err, "the enrichment pass records the provider time-series")
+	require.Len(t, h.Providers, 2)
+	aw := h.Providers["alpha"].Waves
+	require.Len(t, aw, 1)
+	assert.Equal(t, 4, aw[0].Total)
+	assert.Equal(t, 3, aw[0].Live)
+	assert.Equal(t, 2, aw[0].Clean)
+	assert.Equal(t, 2, aw[0].Hosting)
+	assert.Equal(t, int64(200), aw[0].MedianRTT, "median over n1/n2/n4 RTTs")
+	bw := h.Providers["beta"].Waves
+	require.Len(t, bw, 1)
+	assert.Equal(t, int64(400), bw[0].MedianRTT, "median over the single alive record")
+}
+
+// TestRunPluginStatsEnrichmentHistoryFailureNonFatal pins the integration
+// contract: the time-series recording is accounting, not correctness — a
+// failing write leaves a loud WARNING and the wave's enrichment still lands.
+func TestRunPluginStatsEnrichmentHistoryFailureNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	enrichFixture(t, dir)
+	cfg := &config.Config{DataDir: dir}
+	// A DIRECTORY at the history path makes every read/write fail — the
+	// loudest non-fatal failure mode available without root games.
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "provider-history.json"), 0o750))
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil),
+		"history failure must not fail the enrichment stage")
+	assert.Contains(t, buf.String(), "WARNING: provider history update failed",
+		"the failure surfaces loud before the wave continues")
+
+	var manifest fetchManifest
+	b, err := os.ReadFile(newPaths(cfg).manifest)
+	require.NoError(t, err)
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	require.NoError(t, json.Unmarshal(b, &manifest))
+	require.NotEmpty(t, manifest.PluginStats)
+	for _, st := range manifest.PluginStats {
+		assert.Positive(t, st.LiveNodes, "enriched stats still landed despite the history failure")
+	}
 }
