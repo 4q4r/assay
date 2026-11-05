@@ -34,12 +34,10 @@ Extend the owner's laptop xray client (`~/projects/xray-raw`) with a curated poo
 | id | source | cadence | why |
 | :-- | :-- | :-- | :-- |
 | `matin` | `MatinGhanbari/v2ray-configs` — per-protocol `vless.txt`, `all_sub.txt`, `super-sub.txt` | 15 min | no-wipe 404 semantics; `super-sub` = pre-tested best |
-| `epodonios` | `Epodonios/v2ray-configs` — `Splitted-By-Protocol/vless.txt` (+ base64) | ~5 min | largest pool, protocol-split files |
 | `radikal` | `0xRadikal/Free-v2ray-Configs` — `secure/configs.txt` + per-protocol | 15 min | pre-filtered forward secrecy (no `allowInsecure`, no PSK-only); 404-never-empty-wipes semantics |
-| `haker` | `haker23378-netizen/free-vpn-telegram` — per-protocol incl. `vless.txt` | hourly | RF-native; per-config REAL verification (xray-knife tunnel + HTTP fetch, ping cap) — strongest RF signal |
 | `tvc` | `xtoolkit/TVC` — per-protocol files | hourly | Telegram-channel breadth (continuation of yebekhe/TVC) |
 
-Default enabled: `matin`, `epodonios`, `radikal`, `haker`. `tvc` optional. **D9: URLs are NOT pinned** — the registry stores repo ids + a discovery method (GitHub contents API listing / upstream manifest files such as 0xRadikal's `index.json`); fetch resolves current raw paths at every wave, so upstream reorganizations and new split files propagate automatically. Skipping `mahdibland/V2RayAggregator` full merge (their own README warns it crashes clients). **RF reality check:** most public VLESS is `tcp+vision` — exactly the profile TSPU blocks post-handshake (net4people/bbs#546). The working subset is small; the pool is a *location* source, never a primary transport.
+Default enabled (current, 14): `matin`, `radikal`, `stintikvpn`, `hidashimora`, `kort0881`, `au1rxx`, `barryfar`, `nirevil`, `mehdirzfx`, `mhditaheri`, `flat447`, `luxxuria`, `igareck`, `nodesradar`. `tvc` optional. **D9: URLs are NOT pinned** — the registry stores repo ids + a discovery method (GitHub contents API listing / upstream manifest files such as 0xRadikal's `index.json`); fetch resolves current raw paths at every wave, so upstream reorganizations and new split files propagate automatically. Skipping `mahdibland/V2RayAggregator` full merge (their own README warns it crashes clients). **RF reality check:** most public VLESS is `tcp+vision` — exactly the profile TSPU blocks post-handshake (net4people/bbs#546). The working subset is small; the pool is a *location* source, never a primary transport.
 
 ## 4. Pipeline
 
