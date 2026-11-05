@@ -593,7 +593,7 @@ func checkRemovedSections(raw []byte) error {
 				"the [sources.*] section was removed — the source-ingest layer is now Lua plugins " +
 					"(W10). Delete every [sources.<id>] table and use the [plugins] section " +
 					"([plugins] dir = \"...\", default <data_dir>/plugins). The built-in plugins " +
-					"(matin, epodonios, radikal, haker, stintikvpn) materialize into the plugins " +
+					"(matin, radikal, stintikvpn, etc.) materialize into the plugins " +
 					"dir on first run — edit or add .lua files there; a new provider is a new " +
 					".lua file, no Go rebuild")
 		}

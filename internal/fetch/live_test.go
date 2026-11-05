@@ -32,16 +32,3 @@ func TestLiveDiscoverRadikalManifest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"secure/configs.txt"}, got)
 }
-
-func TestLiveFetchEpodoniosVless(t *testing.T) {
-	cl := fetch.NewClient(fetch.ClientConfig{Timeout: 60 * time.Second, Retries: 2, Concurrency: 2})
-	src := config.Source{
-		Repo:      "Epodonios/v2ray-configs",
-		Discovery: "github-contents",
-		Include:   []string{"Splitted-By-Protocol/vless.txt"},
-	}
-	files, err := cl.Source(context.Background(), "epodonios", src)
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-	assert.Greater(t, len(files[0].Body), 1000, "the vless split file carries real content")
-}
