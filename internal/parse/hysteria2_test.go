@@ -20,7 +20,7 @@ import (
 
 func TestParseHysteria2Link(t *testing.T) {
 	link := "hysteria2://secretpw@hy1.example.com:8443/?insecure=0&sni=real.example.com&pinSHA256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef&ech=AEz%2BDQBIAAAg#hy-node"
-	n, err := parse.Link("haker", link)
+	n, err := parse.Link("parse-test", link)
 	require.NoError(t, err)
 
 	assert.Equal(t, "hysteria2", n.Scheme, "the canonical scheme is hysteria2")
