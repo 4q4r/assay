@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -46,7 +47,15 @@ type fetchManifest struct {
 	FetchedAt   time.Time                      `json:"fetched_at"`
 	Sources     map[string][]fetch.FetchedFile `json:"sources"`
 	PluginStats []plugins.PluginStats          `json:"plugin_stats,omitempty"`
+	// PluginOverlap carries the full pairwise identity-overlap matrix the
+	// enrichment pass computes (Phase 4's --overlap view consumes it; the
+	// per-plugin TopOverlaps/UniqueYield are its top-2 projection).
+	PluginOverlap *plugins.OverlapMatrix `json:"plugin_overlap,omitempty"`
 }
+
+// providerHistoryFile is the provider time-series artifact under the data
+// directory (internal/stats owns its schema and atomic persistence).
+const providerHistoryFile = "provider-history.json"
 
 // newSizingEngineFunc is the sizing-engine constructor seam (tests may swap).
 var newSizingEngineFunc = geo.NewSizingEngine
@@ -1882,10 +1891,16 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 		}
 	}
 
-	// Read geo records for the collector projection.
-	_, pluginGeoRecords, err := readGeoRecords(p)
+	// Read geo records once: the plugins-package projection feeds the
+	// collector; the model records carry the Phase-1 unlock evidence the
+	// counts need.
+	modelGeoRecords, pluginGeoRecords, err := readGeoRecords(p)
 	if err != nil {
 		return err
+	}
+	modelGeoByKey := make(map[string]*model.GeoRecord, len(modelGeoRecords))
+	for _, gr := range modelGeoRecords {
+		modelGeoByKey[model.GeoIdentity(gr)] = gr
 	}
 
 	// Recreate collector with existing stats and enrich
@@ -1907,8 +1922,27 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 	// Compute hosting/proxy/clean from geo records
 	computePluginGeoCounts(statsCollector, filtered)
 
+	// Compute unlock counts from the Phase-1 media-unlock evidence
+	computePluginUnlockCounts(statsCollector, modelGeoByKey, filtered)
+
+	// Pairwise overlap matrix: per-plugin DISTINCT GeoIdentity sets (the W19
+	// multi-parse-record landmine dedupes within a plugin first), then the
+	// full matrix for the --overlap view and the top-2/unique-yield
+	// projection onto each plugin's stats.
+	identities := identitySetsFromNodes(filtered)
+	overlapMatrix := plugins.ComputeOverlapMatrix(identities)
+	statsCollector.ApplyOverlap(overlapMatrix, identities)
+	manifest.PluginOverlap = &overlapMatrix
+
 	// Update manifest with enriched stats
 	manifest.PluginStats = statsCollector.GetStats()
+
+	// Provider time-series: one snapshot per provider, recorded AFTER the
+	// stats are fully enriched. Accounting, not correctness — a failure is a
+	// loud WARNING and the wave continues (same class as the stats poll).
+	if err := updateProviderTimeSeriesHistory(cmd, p.dataDir, statsCollector, filtered, probeByKey); err != nil {
+		outf(cmd.OutOrStdout(), "WARNING: provider history update failed: %v (continuing)\n", err)
+	}
 
 	// Threshold enforcement: check MinLivePercent — on the WAVE's registry.
 	checkMinLivePercent(cmd, cfg, statsCollector, reg)
@@ -1986,16 +2020,22 @@ func computePluginLiveNodes(
 	}
 }
 
-// computePluginGeoCounts computes HostingCount, ProxyCount, CleanCount for each plugin from geo records.
+// computePluginGeoCounts computes HostingCount, ProxyCount, CleanCount and
+// ClassifiedCount for each plugin from geo records. Classified-only counting
+// (owner ruling 2026-11-04): a node without a geo record is UNCLASSIFIED —
+// never folded into clean (the old else-branch fabricated clean evidence,
+// adversarial review F6). The honest clean share is CleanPercent =
+// CleanCount/ClassifiedCount, derived at reporting points.
 func computePluginGeoCounts(statsCollector *plugins.PluginStatsCollector, filtered []*model.Node) {
 	for pluginID, st := range statsCollector.Stats {
-		hosting, proxy, clean := 0, 0, 0
+		hosting, proxy, clean, classified := 0, 0, 0, 0
 		for _, n := range filtered {
 			if n.Source != pluginID {
 				continue
 			}
 			geoKey := plugins.GeoIdentityKey(n.Scheme, n.Host, n.Port)
 			if gr, ok := statsCollector.GeoByKey[geoKey]; ok {
+				classified++
 				if gr.HostingFlag {
 					hosting++
 				}
@@ -2005,14 +2045,140 @@ func computePluginGeoCounts(statsCollector *plugins.PluginStatsCollector, filter
 				if !gr.HostingFlag && !gr.ProxyFlag {
 					clean++
 				}
-			} else {
-				clean++
 			}
 		}
 		st.HostingCount = hosting
 		st.ProxyCount = proxy
 		st.CleanCount = clean
+		st.ClassifiedCount = classified
 	}
+}
+
+// computePluginUnlockCounts counts, per plugin, the parse records whose geo
+// record carries a CHECKED Phase-1 media-unlock status with at least one
+// positive unlock signal. Attribution is per parse record (the W19 landmine:
+// one GeoIdentity may carry several records across plugins — each plugin's
+// records count for that plugin via the record's own source).
+func computePluginUnlockCounts(
+	statsCollector *plugins.PluginStatsCollector,
+	modelGeoByKey map[string]*model.GeoRecord,
+	filtered []*model.Node,
+) {
+	for _, n := range filtered {
+		st := statsCollector.Stats[n.Source]
+		if st == nil {
+			continue
+		}
+		geoKey := model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})
+		gr := modelGeoByKey[geoKey]
+		if gr == nil {
+			continue
+		}
+		if unlockPositive(gr.MediaUnlocks) {
+			st.UnlockCount++
+		}
+	}
+}
+
+// unlockPositive reports whether a Phase-1 media-unlock status carries at
+// least one positive unlock signal (model.Unlock* vocabulary). An unchecked
+// status (empty CheckedAt) is never positive; blocked/unknown and a missing
+// YouTube region are not unlocks.
+func unlockPositive(ms model.MediaUnlockStatus) bool {
+	if ms.CheckedAt == "" {
+		return false
+	}
+	switch ms.ChatGPT {
+	case model.UnlockYes, model.UnlockWebOnly, model.UnlockAppOnly:
+		return true
+	}
+	switch ms.Netflix {
+	case model.UnlockNetflixFull, model.UnlockNetflixOriginals:
+		return true
+	}
+	if ms.Disney == model.UnlockYes || ms.TikTok == model.UnlockYes {
+		return true
+	}
+	if ms.YouTubeRegion != "" &&
+		ms.YouTubeRegion != model.UnlockBlocked && ms.YouTubeRegion != model.UnlockUnknown {
+		return true
+	}
+	return false
+}
+
+// identitySetsFromNodes builds the per-plugin DISTINCT GeoIdentity sets the
+// overlap matrix consumes: identity = scheme|lower(host)|port (the
+// model.GeoIdentity format — plugins.GeoIdentityKey produces the same
+// string), deduped within each plugin before any pairwise math.
+func identitySetsFromNodes(filtered []*model.Node) map[string]map[string]bool {
+	sets := make(map[string]map[string]bool)
+	for _, n := range filtered {
+		set := sets[n.Source]
+		if set == nil {
+			set = make(map[string]bool)
+			sets[n.Source] = set
+		}
+		set[plugins.GeoIdentityKey(n.Scheme, n.Host, n.Port)] = true
+	}
+	return sets
+}
+
+// updateProviderTimeSeriesHistory records one WaveSnapshot per provider into
+// <dataDir>/provider-history.json (ring ≤48, 48h prune, diurnal + momentum
+// state inside internal/stats). Median RTT is taken over the plugin's ALIVE
+// parse records' own probe results (even counts average the two middles); a
+// provider with no RTT evidence records 0.
+func updateProviderTimeSeriesHistory(
+	cmd *cobra.Command,
+	dataDir string,
+	statsCollector *plugins.PluginStatsCollector,
+	filtered []*model.Node,
+	probeByKey map[string]store.ProbeResult,
+) error {
+	now := time.Now().UTC()
+	rttsByPlugin := map[string][]float64{}
+	for _, n := range filtered {
+		pr, ok := probeByKey[n.Key]
+		if !ok || !pr.Alive {
+			continue
+		}
+		rttsByPlugin[n.Source] = append(rttsByPlugin[n.Source], pr.RTTMs)
+	}
+	historyPath := filepath.Join(dataDir, providerHistoryFile)
+	for _, st := range statsCollector.GetStats() {
+		snap := stats.WaveSnapshot{
+			Timestamp: now.Unix(),
+			Total:     st.TotalNodes,
+			Live:      st.LiveNodes,
+			Clean:     st.CleanCount,
+			Hosting:   st.HostingCount,
+			MedianRTT: medianRTT(rttsByPlugin[st.PluginID]),
+		}
+		if _, err := stats.RecordWaveSnapshot(historyPath, st.PluginID, snap, now); err != nil {
+			return fmt.Errorf("record %s wave snapshot: %w", st.PluginID, err)
+		}
+	}
+	outf(cmd.OutOrStdout(), "provider-history: recorded %d provider snapshots → %s\n",
+		len(statsCollector.Stats), historyPath)
+	return nil
+}
+
+// medianRTT is the standard median (even counts average the two middles);
+// no evidence → 0.
+func medianRTT(values []float64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	var median float64
+	if len(sorted)%2 == 1 {
+		median = sorted[mid]
+	} else {
+		median = (sorted[mid-1] + sorted[mid]) / 2
+	}
+	return int64(math.Round(median))
 }
 
 // checkMinLivePercent checks if any plugin's live percentage falls below
