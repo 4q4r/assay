@@ -43,6 +43,17 @@ import (
 // fetchManifest records what a fetch wave stored, so parse reads exactly what
 // fetch downloaded (source → cached files). Cache file names come from
 // fetch.SafePath — the single definition of the path→name mapping.
+//
+// Merge contract (fetch × enrichment layering): the fetch stage owns and
+// refreshes the fetch-layer fields every wave (FetchedAt, Sources; on each
+// PluginStats row TotalNodes and DuplicateCount). The enrichment tail
+// (runPluginStatsEnrichment) owns the enrichment-layer fields (LiveNodes,
+// HostingCount, ProxyCount, CleanCount, ClassifiedCount, UnlockCount,
+// UniqueYield, TopOverlaps, PluginOverlap) and refreshes them once per full
+// wave cycle. The fetch stage PRESERVES the enrichment layer via
+// carryOverEnrichment (carry-over is at most one wave interval stale until
+// the next enrichment tail refreshes it) — without it the next fetch would
+// clobber the enriched manifest seconds after the tail wrote it.
 type fetchManifest struct {
 	FetchedAt   time.Time                      `json:"fetched_at"`
 	Sources     map[string][]fetch.FetchedFile `json:"sources"`
@@ -170,6 +181,15 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 	// Store plugin stats in manifest
 	manifest.PluginStats = statsCollector.GetStats()
 
+	// Merge contract (see fetchManifest): preserve the previous manifest's
+	// enrichment-layer fields for plugins the new fetch still carries — the
+	// enrichment tail rewrote them ~2h ago and the next tail is ~2h away.
+	// Missing prior manifest = cold start (as before); corrupt prior
+	// manifest = loud WARNING, then also as before (never fails the wave).
+	if prior := loadPriorFetchManifest(p.manifest, out); prior != nil {
+		carryOverEnrichment(&manifest, prior)
+	}
+
 	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -181,6 +201,73 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 	outf(out, "fetch wave complete: %d nodes from %d plugins (%d source files, %d hinted) → %s\n",
 		totalNodes, len(snapshot)-failed, files, hinted, p.manifest)
 	return reg, nil
+}
+
+// loadPriorFetchManifest reads the fetch manifest the previous wave left at
+// path. A missing file is a cold start (nil, silent — every deployment's
+// first wave lands here). A corrupt or otherwise unreadable file is a loud
+// WARNING and a cold start too: a broken stats overlay must never fail the
+// fetch wave, it only degrades the manifest to fresh-basic-stats shape
+// until the next enrichment tail refills it.
+func loadPriorFetchManifest(path string, out io.Writer) *fetchManifest {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			outf(out, "WARNING: read prior fetch manifest %s: %v — continuing without enrichment carry-over\n", path, err)
+		}
+		return nil
+	}
+	var m fetchManifest
+	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
+	if err := json.Unmarshal(b, &m); err != nil {
+		outf(out, "WARNING: prior fetch manifest %s is corrupt (%v) — continuing without enrichment carry-over\n", path, err)
+		return nil
+	}
+	return &m
+}
+
+// carryOverEnrichment merges the prior manifest's enrichment-layer fields
+// into the fresh fetch manifest, per plugin id, for plugins the new fetch
+// still carries:
+//
+//   - fetch layer (refreshed every wave by THIS stage): TotalNodes,
+//     DuplicateCount, fetched_at, sources;
+//   - enrichment layer (refreshed by runPluginStatsEnrichment once per full
+//     wave cycle): LiveNodes, HostingCount, ProxyCount, CleanCount,
+//     ClassifiedCount, UnlockCount, UniqueYield, TopOverlaps, plugin_overlap.
+//
+// A plugin absent from the prior manifest starts unenriched (status renders
+// it pending until the next enrichment tail observes it — honest, not
+// fake); a plugin dropped from the new fetch takes its stale stats with it
+// (only fresh-fetch plugins exist in the merged stats). Freshness bound:
+// carried values are at most one wave interval stale.
+func carryOverEnrichment(fresh *fetchManifest, prior *fetchManifest) {
+	if fresh == nil || prior == nil {
+		return
+	}
+	if fresh.PluginOverlap == nil {
+		fresh.PluginOverlap = prior.PluginOverlap
+	}
+	priorByID := make(map[string]plugins.PluginStats, len(prior.PluginStats))
+	for _, st := range prior.PluginStats {
+		priorByID[st.PluginID] = st
+	}
+	for i := range fresh.PluginStats {
+		p, ok := priorByID[fresh.PluginStats[i].PluginID]
+		if !ok {
+			continue
+		}
+		fresh.PluginStats[i].LiveNodes = p.LiveNodes
+		fresh.PluginStats[i].HostingCount = p.HostingCount
+		fresh.PluginStats[i].ProxyCount = p.ProxyCount
+		fresh.PluginStats[i].CleanCount = p.CleanCount
+		fresh.PluginStats[i].ClassifiedCount = p.ClassifiedCount
+		fresh.PluginStats[i].UnlockCount = p.UnlockCount
+		fresh.PluginStats[i].UniqueYield = p.UniqueYield
+		if len(p.TopOverlaps) > 0 {
+			fresh.PluginStats[i].TopOverlaps = append([]plugins.OverlapPair(nil), p.TopOverlaps...)
+		}
+	}
 }
 
 // checkMaxDuplicatePercent checks if any plugin's duplicate percentage exceeds
@@ -2043,6 +2130,18 @@ func computePluginLiveNodes(
 // never folded into clean (the old else-branch fabricated clean evidence,
 // adversarial review F6). The honest clean share is CleanPercent =
 // CleanCount/ClassifiedCount, derived at reporting points.
+//
+// Hosting/proxy evidence honesty: a zero HostingCount with a non-zero
+// ClassifiedCount is a TRUE reading, not an attribution bug — the identity
+// join below is the same one clean counts ride (verified against
+// production: classified counts match exactly). Zeroes mean the cold base
+// itself carries no flags: ip-api hosting/proxy evidence exists only on
+// records that went through self-report (geo_source set), and the Phase-1
+// is_hosting/is_proxy evidence only lands when [geo].unlock_probes is on.
+// The status funnel's "hosting/proxy exits" transfer line is NOT a
+// counter-source here: its magnitude is dominated by probe-store
+// inversions (alive probe keys outnumber alive geo records), so never
+// reconcile the two numbers against each other.
 func computePluginGeoCounts(statsCollector *plugins.PluginStatsCollector, filtered []*model.Node) {
 	for pluginID, st := range statsCollector.Stats {
 		hosting, proxy, clean, classified := 0, 0, 0, 0
