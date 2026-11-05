@@ -313,6 +313,19 @@ func CityBalancerTag(cc, city string) string {
 	return fmt.Sprintf("pool_%s_%s", strings.ToLower(cc), CitySlug(city))
 }
 
+// CleanCountryBalancerTag renders the clean per-country balancer tag: pool_<cc>_clean.
+func CleanCountryBalancerTag(cc string) string {
+	return "pool_" + strings.ToLower(cc) + "_clean"
+}
+
+// CleanCityBalancerTag renders the clean per-city balancer tag: pool_<cc>_<city-slug>_clean.
+func CleanCityBalancerTag(cc, city string) string {
+	return fmt.Sprintf("pool_%s_%s_clean", strings.ToLower(cc), CitySlug(city))
+}
+
+// CleanPoolAllBalancerTag is the clean pool-wide balancer tag.
+const CleanPoolAllBalancerTag = "pool_all_clean"
+
 // KnownAliveRecord is the durable liveness record persisted in
 // known-alive.jsonl. It tracks nodes that have been confirmed alive across
 // waves so that (a) probing can skip them within the TTL window and
