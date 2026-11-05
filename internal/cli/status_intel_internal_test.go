@@ -126,6 +126,19 @@ min_live_percent = 50.0
 				},
 			},
 			{
+				// The fix-round-1 defect shape: a freshly-ingested source
+				// whose wave has NOT reached its enrichment tail — fetch-
+				// stage live=0, ZERO provider-history waves. Verdict must be
+				// NEW (never DEAD on zero evidence).
+				"PluginID": "plugin_e_fresh", "TotalNodes": 500, "LiveNodes": 0,
+				"DuplicateCount": 40, "HostingCount": 0, "ProxyCount": 0, "CleanCount": 0,
+				"ClassifiedCount": 0,
+				"UniqueYield":     20.0,
+				"TopOverlaps": []map[string]any{
+					{"plugin_id": "plugin_a", "percent": 30.0},
+				},
+			},
+			{
 				"PluginID": "plugin_d_mid", "TotalNodes": 80, "LiveNodes": 8,
 				"DuplicateCount": 8, "HostingCount": 0, "ProxyCount": 0, "CleanCount": 0,
 				// The manifest CLAIMS 80 classified for plugin_d — but the
@@ -168,6 +181,23 @@ min_live_percent = 50.0
 		stats.UpdateSeries(flat, stats.WaveSnapshot{Timestamp: ts.Unix(), Total: 100, Live: 60}, ts)
 	}
 	hist.Providers["plugin_d_mid"] = flat
+	// plugin_c_dead: exactly 3 recorded dead waves — death EARNED (the
+	// 3-wave floor of the DEAD override).
+	dead := &stats.ProviderSeries{}
+	for i := range 3 {
+		ts := base.Add(time.Duration(i) * time.Hour)
+		stats.UpdateSeries(dead, stats.WaveSnapshot{Timestamp: ts.Unix(), Total: 200, Live: 0}, ts)
+	}
+	hist.Providers["plugin_c_dead"] = dead
+	// plugin_b_redundant: 3 recorded waves — a scored provider (past the
+	// NEW gate; its 10% liveness history feeds the 24h-avg column).
+	young := &stats.ProviderSeries{}
+	for i := range 3 {
+		ts := base.Add(time.Duration(i) * time.Hour)
+		stats.UpdateSeries(young, stats.WaveSnapshot{Timestamp: ts.Unix(), Total: 50, Live: 5}, ts)
+	}
+	hist.Providers["plugin_b_redundant"] = young
+	// plugin_e_fresh: deliberately NO history entry — the brand-new source.
 	require.NoError(t, stats.WriteProviderHistory(
 		filepath.Join(dataDir, providerHistoryFile), &hist))
 	return cfgPath
@@ -194,8 +224,11 @@ func runStatusCaptured(t *testing.T, cfgPath string, setFlags func(*cobra.Comman
 // Pool-relative verdict engine (owner ruling 2026-11-05)
 // ---------------------------------------------------------------------------
 
-// engineRow builds a synthetic scored row for engine-level tests.
-func engineRow(id string, live int, alivePct float64, breadth int, cleanPct float64, cleanEvidence bool, unique float64, trend string, withHistory bool) providerRow {
+// engineRow builds a synthetic scored row for engine-level tests. waves
+// seeds that many recorded history waves (0 = no series — the brand-new
+// source shape); every seeded wave is 50/100 liveness inside the 24h window,
+// so alive24 stays a test-set field (it is not a composite factor).
+func engineRow(id string, live int, alivePct float64, breadth int, cleanPct float64, cleanEvidence bool, unique float64, trend string, waves int) providerRow {
 	r := providerRow{
 		stats:         plugins.PluginStats{PluginID: id, TotalNodes: 100, LiveNodes: live},
 		enriched:      true,
@@ -206,8 +239,15 @@ func engineRow(id string, live int, alivePct float64, breadth int, cleanPct floa
 		uniquePct:     unique,
 		trend:         trend,
 	}
-	if withHistory {
-		r.history = &stats.ProviderSeries{}
+	if waves > 0 {
+		s := &stats.ProviderSeries{}
+		for i := range waves {
+			stats.UpdateSeries(s, stats.WaveSnapshot{
+				Timestamp: time.Now().UTC().Add(-time.Duration(waves-i) * time.Hour).Unix(),
+				Total:     100, Live: 50,
+			}, time.Now().UTC())
+		}
+		r.history = s
 	}
 	return r
 }
@@ -326,11 +366,11 @@ func TestTrendModifierDeltas(t *testing.T) {
 		{"", 0}, // unknown glyph contributes nothing
 	}
 	for _, tc := range tests {
-		row := engineRow("p", 10, 10, 1, 100, true, 50, tc.trend, true)
+		row := engineRow("p", 10, 10, 1, 100, true, 50, tc.trend, verdictMinHistoryWaves)
 		assert.InDelta(t, tc.want, trendModifier(&row), 1e-9, "trend %q", tc.trend)
 	}
 	// No history: no modifier even with a (stale) glyph set.
-	row := engineRow("p", 10, 10, 1, 100, true, 50, stats.TrendUpStrong, false)
+	row := engineRow("p", 10, 10, 1, 100, true, 50, stats.TrendUpStrong, 0)
 	assert.InDelta(t, 0.0, trendModifier(&row), 1e-9)
 
 	// Clamp: the modifier fine-tunes within the scale, never beyond it.
@@ -355,8 +395,8 @@ func TestComputeVerdictsOverridesAndFallback(t *testing.T) {
 	})
 	t.Run("DEAD override: 0 live and dead 24h average", func(t *testing.T) {
 		rows := []providerRow{
-			engineRow("dead", 0, 0, 0, 0, false, 30, "", false),
-			engineRow("alive", 4, 4, 0, 0, false, 30, "", false),
+			engineRow("dead", 0, 0, 0, 0, false, 30, "", verdictMinHistoryWaves),
+			engineRow("alive", 4, 4, 0, 0, false, 30, "", verdictMinHistoryWaves),
 		}
 		computeVerdicts(rows)
 		assert.Equal(t, verdictDead, rows[0].verdict)
@@ -367,30 +407,30 @@ func TestComputeVerdictsOverridesAndFallback(t *testing.T) {
 		// live==0 but the 24h average is above the floor: the DEAD override
 		// does NOT fire — in a scoreable pool the row composite-scores
 		// instead (and a composite verdict is never DEAD).
-		dying := engineRow("dying", 0, 0, 0, 0, false, 30, "", true)
+		dying := engineRow("dying", 0, 0, 0, 0, false, 30, "", verdictMinHistoryWaves)
 		dying.alive24 = 2.0 // history says it was alive until recently
 		rows := []providerRow{
 			dying,
-			engineRow("a", 40, 40, 1, 100, true, 50, "", true),
-			engineRow("b", 20, 20, 1, 100, true, 50, "", true),
+			engineRow("a", 40, 40, 1, 100, true, 50, "", verdictMinHistoryWaves),
+			engineRow("b", 20, 20, 1, 100, true, 50, "", verdictMinHistoryWaves),
 		}
 		computeVerdicts(rows)
 		assert.NotEqual(t, verdictDead, rows[0].verdict,
 			"alive24 above the floor escapes the DEAD override")
 	})
 	t.Run("N=1 alive pool → FAIR; N=1 dead pool → DEAD (design fallback)", func(t *testing.T) {
-		rows := []providerRow{engineRow("solo", 4, 4, 0, 0, false, 99, "", false)}
+		rows := []providerRow{engineRow("solo", 4, 4, 0, 0, false, 99, "", verdictMinHistoryWaves)}
 		computeVerdicts(rows)
 		assert.Equal(t, verdictFair, rows[0].verdict)
-		dead := []providerRow{engineRow("corpse", 0, 0, 0, 0, false, 99, "", false)}
+		dead := []providerRow{engineRow("corpse", 0, 0, 0, 0, false, 99, "", verdictMinHistoryWaves)}
 		computeVerdicts(dead)
 		assert.Equal(t, verdictDead, dead[0].verdict, "N<3 fallback: live==0 → DEAD")
 	})
 	t.Run("N=3 crosses into the composite", func(t *testing.T) {
 		three := []providerRow{
-			engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, true),
-			engineRow("b", 5, 10, 1, 0, true, 8, "", false),
-			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, true),
+			engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, verdictMinHistoryWaves),
+			engineRow("b", 5, 10, 1, 0, true, 8, "", verdictMinHistoryWaves),
+			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, verdictMinHistoryWaves),
 		}
 		computeVerdicts(three)
 		assert.Equal(t, verdictGood, three[0].verdict, "composite 90+5=95")
@@ -405,12 +445,12 @@ func TestComputeVerdictsOverridesAndFallback(t *testing.T) {
 func TestComputeVerdictsNeverTrips(t *testing.T) {
 	assert.NotEmpty(t, verdictTrip, "the reserved constant is defined")
 	pools := [][]providerRow{
-		{engineRow("solo", 0, 0, 0, 0, false, 0, "", false)},
-		{engineRow("a", 4, 4, 0, 0, false, 99, "", false),
-			engineRow("b", 0, 0, 0, 0, false, 1, "", false)},
-		{engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, true),
-			engineRow("b", 5, 10, 1, 0, true, 8, stats.TrendDownStrong, true),
-			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, true)},
+		{engineRow("solo", 0, 0, 0, 0, false, 0, "", 0)},
+		{engineRow("a", 4, 4, 0, 0, false, 99, "", verdictMinHistoryWaves),
+			engineRow("b", 0, 0, 0, 0, false, 1, "", verdictMinHistoryWaves)},
+		{engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, verdictMinHistoryWaves),
+			engineRow("b", 5, 10, 1, 0, true, 8, stats.TrendDownStrong, verdictMinHistoryWaves),
+			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, verdictMinHistoryWaves)},
 		{{stats: plugins.PluginStats{PluginID: "cold"}}},
 	}
 	for _, rows := range pools {
@@ -613,12 +653,14 @@ func TestStatusDashboardWarm(t *testing.T) {
 	assert.Contains(t, s, "100.0% ·1.0%·", "plugin_a: clean share with classified coverage")
 	assert.Contains(t, s, "0.0% ·2.0%·", "plugin_b: 0% clean IS measured — coverage shown")
 	// Pool-relative verdicts (worked example in the test fixture comment):
-	// plugin_a GOOD, plugin_b POOR, plugin_c DEAD (override), plugin_d WEAK
-	// (cleanliness factor dropped — no Phase-1 evidence).
+	// plugin_a GOOD, plugin_b POOR, plugin_c DEAD (override — 3 recorded
+	// dead waves), plugin_d WEAK (cleanliness dropped), plugin_e_fresh NEW
+	// (0 waves — the fix-round-1 defect shape, never DEAD on zero evidence).
 	assert.Contains(t, s, "GOOD", "the composite verdict renders")
 	assert.Contains(t, s, "POOR", "the weakest composite renders")
 	assert.Contains(t, s, "WEAK", "the mid composite renders")
-	assert.Contains(t, s, "DEAD", "the dead override renders")
+	assert.Contains(t, s, "DEAD", "the earned dead override renders")
+	assert.Contains(t, s, "[NEW]", "the brand-new source renders the plain NEW badge")
 
 	// Select chip: cap == selected → the unbounded label (owner cosmetic).
 	assert.Contains(t, s, "unbounded · 3 active")
@@ -649,34 +691,91 @@ func TestStatusFunnelGeoDropNoteDynamic(t *testing.T) {
 		"no fabricated dirty-IP attribution")
 }
 
+// TestComputeVerdictsNewState pins the fix-round-1 ruling: a brand-new
+// source (enriched manifest row, fewer than 3 recorded history waves) is
+// NEW — never DEAD. Death must be EARNED by enough scoring waves; the
+// fetch-stage live=0 of an un-enriched wave proves nothing. The 3-wave
+// floor is the same one stats.ColdStartMin applies to the Z-score.
+func TestComputeVerdictsNewState(t *testing.T) {
+	t.Run("0/1/2 waves → NEW (live=0 fetch-stage rows included)", func(t *testing.T) {
+		for _, waves := range []int{0, 1, 2} {
+			row := engineRow("fresh", 0, 0, 0, 0, false, 20, "", waves)
+			rows := []providerRow{row}
+			computeVerdicts(rows)
+			assert.Equal(t, verdictNew, rows[0].verdict,
+				"%d waves: a brand-new source is never DEAD", waves)
+			assert.Equal(t, ui.ColorPlainName, rows[0].verdictCol, "%d waves", waves)
+		}
+	})
+	t.Run("exactly 3 waves with live=0 → DEAD (death earned)", func(t *testing.T) {
+		rows := []providerRow{engineRow("proven_dead", 0, 0, 0, 0, false, 20, "", verdictMinHistoryWaves)}
+		rows[0].alive24 = 0
+		computeVerdicts(rows)
+		assert.Equal(t, verdictDead, rows[0].verdict)
+		assert.Equal(t, ui.Red, rows[0].verdictCol)
+	})
+	t.Run("NEW outranks a would-be DEAD (0 waves, live=0, dead 24h)", func(t *testing.T) {
+		// The reported live defect: live=0 ∧ alive24=0 ∧ zero waves fired
+		// isDead on zero evidence. NEW must win that race.
+		row := engineRow("defect", 0, 0, 0, 0, false, 20, "", 0)
+		rows := []providerRow{row}
+		computeVerdicts(rows)
+		assert.Equal(t, verdictNew, rows[0].verdict)
+		assert.NotEqual(t, verdictDead, rows[0].verdict)
+	})
+	t.Run("NONE precedence unchanged (unenriched row with 0 waves)", func(t *testing.T) {
+		rows := []providerRow{{stats: plugins.PluginStats{PluginID: "cold", TotalNodes: 100}, verdict: verdictNone}}
+		computeVerdicts(rows)
+		assert.Equal(t, verdictNone, rows[0].verdict, "no enrichment evidence → still NONE, not NEW")
+	})
+	t.Run("NEW rows never enter the composite pool", func(t *testing.T) {
+		// A 2-wave fresh row next to two scored providers: the fresh row
+		// stays NEW; the others composite-score as before.
+		rows := []providerRow{
+			engineRow("fresh", 3, 3, 0, 0, false, 30, "", 2),
+			engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, verdictMinHistoryWaves),
+			engineRow("b", 20, 20, 1, 100, true, 50, "", verdictMinHistoryWaves),
+		}
+		computeVerdicts(rows)
+		assert.Equal(t, verdictNew, rows[0].verdict)
+		assert.NotEqual(t, verdictNew, rows[1].verdict)
+		assert.NotEqual(t, verdictNew, rows[2].verdict)
+	})
+	t.Run("TRIP stays reserved under the NEW precedence", func(t *testing.T) {
+		rows := []providerRow{engineRow("x", 0, 0, 0, 0, false, 0, "", 1)}
+		computeVerdicts(rows)
+		assert.NotEqual(t, verdictTrip, rows[0].verdict)
+	})
+}
+
 // TestStatusRecommendationsLiveness pins the recommendation rulings:
 // keep requires live>0; dead + ≥25% unique = the unique-but-dead class;
 // prune ranking is (overlap% desc, live asc).
 func TestStatusRecommendationsLiveness(t *testing.T) {
 	rows := []providerRow{
 		func() providerRow {
-			r := engineRow("keep_alive", 40, 40, 1, 100, true, 70, "", true)
+			r := engineRow("keep_alive", 40, 40, 1, 100, true, 70, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "other", Percent: 5}}
 			return r
 		}(),
 		func() providerRow {
-			r := engineRow("unique_but_dead", 0, 0, 0, 0, false, 30, "", false)
+			r := engineRow("unique_but_dead", 0, 0, 0, 0, false, 30, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "other", Percent: 40}}
 			return r
 		}(),
 		func() providerRow {
-			r := engineRow("redundant_alive", 3, 3, 0, 0, false, 5, "", false)
+			r := engineRow("redundant_alive", 3, 3, 0, 0, false, 5, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "big", Percent: 82}}
 			return r
 		}(),
 		func() providerRow {
-			r := engineRow("dead_low_unique", 0, 0, 0, 0, false, 5, "", false)
+			r := engineRow("dead_low_unique", 0, 0, 0, 0, false, 5, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "big", Percent: 90}}
 			return r
 		}(),
 		func() providerRow {
 			// Dead with ≥60% unique: NOT a keep — keep requires liveness.
-			r := engineRow("dead_high_unique", 0, 0, 0, 0, false, 65, "", false)
+			r := engineRow("dead_high_unique", 0, 0, 0, 0, false, 65, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "other", Percent: 10}}
 			return r
 		}(),
@@ -694,12 +793,12 @@ func TestStatusRecommendationsLiveness(t *testing.T) {
 	// first when ids would sort the other way.
 	tie := []providerRow{
 		func() providerRow {
-			r := engineRow("zz_more_live", 9, 9, 0, 0, false, 5, "", false)
+			r := engineRow("zz_more_live", 9, 9, 0, 0, false, 5, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "big", Percent: 90}}
 			return r
 		}(),
 		func() providerRow {
-			r := engineRow("aa_less_live", 1, 1, 0, 0, false, 5, "", false)
+			r := engineRow("aa_less_live", 1, 1, 0, 0, false, 5, "", verdictMinHistoryWaves)
 			r.stats.TopOverlaps = []plugins.OverlapPair{{PluginID: "big", Percent: 90}}
 			return r
 		}(),
@@ -803,11 +902,12 @@ func TestStatusDashboardASCIIFallbacks(t *testing.T) {
 		assert.Contains(t, s, " 33.3%", "funnel bars use the =/- ASCII ladder")
 		// Verdict words are self-describing and render verbatim in plain
 		// mode (the old [OK]/[!!]/[XX] pins belonged to the replaced
-		// absolute-band vocabulary).
+		// absolute-band vocabulary); NEW keeps its bracketed badge.
 		assert.Contains(t, s, "GOOD", "plain-mode composite verdict")
 		assert.Contains(t, s, "WEAK", "plain-mode mid verdict")
 		assert.Contains(t, s, "POOR", "plain-mode weak verdict")
-		assert.Contains(t, s, "DEAD", "plain-mode dead override")
+		assert.Contains(t, s, "DEAD", "plain-mode earned dead override")
+		assert.Contains(t, s, "[NEW]", "plain-mode NEW badge")
 		assert.Contains(t, s, "n/a", "NONE keeps its n/a fallback")
 	})
 
@@ -820,6 +920,7 @@ func TestStatusDashboardASCIIFallbacks(t *testing.T) {
 		assert.Contains(t, s, "38;5;46", "GOOD verdict is traffic-light green")
 		assert.Contains(t, s, "38;5;214", "WEAK/FAIR verdicts are amber (plugin_d's composite)")
 		assert.Contains(t, s, "38;5;196", "POOR/DEAD verdicts are red")
+		assert.Contains(t, s, "38;5;240", "the NEW badge is the neutral dim palette")
 	})
 
 	t.Run("deterministic across runs", func(t *testing.T) {
@@ -856,15 +957,18 @@ func TestStatusProbesOffCleanNAEverywhere(t *testing.T) {
 
 	var doc statusJSONDoc
 	require.NoError(t, json.Unmarshal(out.Bytes(), &doc))
-	require.Len(t, doc.Providers, 4)
+	require.Len(t, doc.Providers, 5)
 	for _, p := range doc.Providers {
 		assert.Nil(t, p.CleanPct, "%s: no Phase-1 evidence → clean_pct null", p.ID)
 		assert.Nil(t, p.ClassifiedCoveragePct, "%s: coverage null too", p.ID)
-		assert.NotEqual(t, verdictNone, p.Verdict,
-			"%s: the verdict is still earned from the remaining factors", p.ID)
 	}
+	// The four scored sources still earn measured verdicts from the
+	// remaining factors (cleanliness dropped — that is the point of factor
+	// dropout); the zero-history fresh source stays NEW.
 	assert.Equal(t, verdictGood, doc.Providers[0].Verdict, "plugin_a still tops the pool")
 	assert.Equal(t, verdictWeak, doc.Providers[3].Verdict, "plugin_d lands mid-scale without cleanliness")
+	assert.Equal(t, verdictNew, doc.Providers[4].Verdict, "plugin_e_fresh: 0 waves → NEW, never DEAD")
+	assert.Equal(t, verdictDead, doc.Providers[2].Verdict, "plugin_c_dead keeps its earned DEAD")
 }
 
 // ---------------------------------------------------------------------------
@@ -930,9 +1034,10 @@ func TestStatusJSONGolden(t *testing.T) {
 
 	// Providers: sorted by id, full metric set. Verdicts are the
 	// pool-relative engine's (fixture worked example):
-	// a GOOD 95 · b POOR 18.75 · c DEAD · d WEAK 32.8 (clean factor dropped).
-	require.Len(t, doc.Providers, 4)
-	a, b, c, d := doc.Providers[0], doc.Providers[1], doc.Providers[2], doc.Providers[3]
+	// a GOOD 95 · b POOR 18.75 · c DEAD (3 recorded dead waves) · d WEAK
+	// 32.8 (clean factor dropped) · e NEW (0 waves — never DEAD).
+	require.Len(t, doc.Providers, 5)
+	a, b, c, d, e := doc.Providers[0], doc.Providers[1], doc.Providers[2], doc.Providers[3], doc.Providers[4]
 	assert.Equal(t, "plugin_a", a.ID)
 	assert.Equal(t, 100, a.TotalParsed)
 	assert.Equal(t, 80, a.AliveCurrent)
@@ -954,18 +1059,28 @@ func TestStatusJSONGolden(t *testing.T) {
 	assert.InDelta(t, 0.0, *b.CleanPct, 1e-9, "0% clean IS a measurement (1 hosting record)")
 	assert.InDelta(t, 2.0, *b.ClassifiedCoveragePct, 1e-9, "1 classified of 50 parsed")
 	assert.Equal(t, verdictPoor, b.Verdict, "composite 18.75")
-	assert.Empty(t, b.Sparkline, "no history for plugin_b_redundant")
+	assert.Equal(t, []float64{10, 10, 10}, b.Sparkline,
+		"3 recorded waves — a scored provider (past the NEW gate)")
 
 	assert.Equal(t, "plugin_c_dead", c.ID)
 	assert.Nil(t, c.CleanPct, "no Phase-1 evidence → explicit null, never a fabricated 0")
 	assert.Nil(t, c.ClassifiedCoveragePct)
-	assert.Equal(t, verdictDead, c.Verdict, "override: 0 live and dead 24h average")
+	assert.Equal(t, verdictDead, c.Verdict,
+		"override: 0 live, dead 24h average, and ENOUGH history (3 waves) to prove death")
+	assert.Equal(t, []float64{0, 0, 0}, c.Sparkline, "3 recorded dead waves")
 
 	assert.Equal(t, "plugin_d_mid", d.ID)
 	assert.Nil(t, d.CleanPct, "the manifest claims 80 classified — the unified predicate says no evidence")
 	assert.Nil(t, d.ClassifiedCoveragePct)
 	assert.Equal(t, verdictWeak, d.Verdict, "composite 32.8 with the cleanliness factor dropped")
 	assert.Equal(t, []float64{60, 60, 60, 60, 60, 60}, d.Sparkline, "flat 60% history")
+
+	assert.Equal(t, "plugin_e_fresh", e.ID)
+	assert.Nil(t, e.CleanPct)
+	assert.Nil(t, e.ClassifiedCoveragePct)
+	assert.Equal(t, verdictNew, e.Verdict,
+		"brand-new source: fetch-stage live=0 with ZERO history waves is NEW, never DEAD")
+	assert.Empty(t, e.Sparkline, "no provider history yet")
 
 	// Recommendations mirror the pruning bands with liveness weight:
 	// overlap% descending (82 → 40 → 12); the dead provider lands in the
