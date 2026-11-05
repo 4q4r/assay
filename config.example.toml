@@ -31,8 +31,8 @@ data_dir = "~/.local/share/publicvpn"
 # ── Plugins (W10): the source-ingest layer is LUA PLUGINS, not config
 #    tables. Each .lua file in [plugins].dir is one source: it fetches and
 #    iterates, hands raw links to Go as publicvpn.node records, and Go keeps
-#    owning URI parsing/dedupe. The built-in plugins (matin, epodonios,
-#    radikal, haker, stintikvpn) materialize into the dir on FIRST RUN —
+#    owning URI parsing/dedupe. The built-in plugins (matin, radikal,
+#    stintikvpn, etc.) materialize into the dir on FIRST RUN —
 #    owner edits and removals persist; a new provider is a new .lua file, no
 #    rebuild. The `publicvpn watch` daemon hot-reloads the dir on the fly. ──
 [plugins]
