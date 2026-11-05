@@ -255,8 +255,10 @@ min_live_percent = 50.0
 
 	s := out.String()
 
-	// Verify plugin liveness section header
-	require.Contains(t, s, "plugins:", "plugin liveness section should appear")
+	// The intelligence table renders, and the empty `plugins:` header line
+	// is gone — the legacy chip lines follow the table directly (owner
+	// cosmetic ruling 2026-11-05).
+	require.NotContains(t, s, "plugins:  \n", "the empty plugins header line is removed")
 
 	// Verify plugin_a (OK - live% 80% > 50%, dup% 10% < 20%)
 	require.Contains(t, s, "plugin_a", "plugin_a should appear")
@@ -273,7 +275,7 @@ min_live_percent = 50.0
 	// Verify key metrics appear
 	require.Contains(t, s, "total=100", "total nodes should appear")
 	require.Contains(t, s, "live=80", "live nodes should appear")
-	require.Contains(t, s, "dup=10", "duplicate count should appear")
+	require.Contains(t, s, "dup-links=10", "duplicate count should appear (dup-links= per the owner-ordered rename, 2026-11-05)")
 	require.Contains(t, s, "hosting=30", "hosting count should appear")
 	require.Contains(t, s, "proxy=20", "proxy count should appear")
 	require.Contains(t, s, "clean=50", "clean count should appear")
