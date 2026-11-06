@@ -160,6 +160,8 @@ func TestConfiglessDefaults(t *testing.T) {
 	assert.Equal(t, filepath.Join(cfg.DataDir, "plugins"), cfg.Plugins.Dir,
 		"plugins dir defaults under the configless data_dir")
 	assert.Equal(t, config.DefaultDoHURL, cfg.Geo.DoHURL)
+	assert.True(t, cfg.Geo.UnlockProbesEnabled(),
+		"unlock_probes defaults ON in the configless path too (owner ruling 2026-11-06)")
 	assert.Equal(t, "firefox", cfg.Render.TLSFingerprint)
 	assert.Equal(t, config.DefaultTLSFingerprint, cfg.Render.TLSFingerprint)
 	assert.Equal(t, 1440, cfg.Render.TCPMaxSeg)
