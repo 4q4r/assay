@@ -990,9 +990,14 @@ func TestW14ProbeKnobValidation(t *testing.T) {
 
 // TestProbeBatchKnobsDefaults pins the 0 → default semantics for the new
 // batch knobs (no artificial floor/ceiling — 0 means "unset → default").
+// batch_size pins the literal 1000 on purpose (big-batch model): one temp
+// xray holds 1000 inbound+outbound pairs (spike on the box's xray 26.3.27:
+// ~0.225s boot, ~49MB RSS, +13.3kB/pair), so a wave boots a handful of
+// processes instead of hundreds; a failing batch retries at half size
+// (adaptive halving, floor 20 — code-level, automatic).
 func TestProbeBatchKnobsDefaults(t *testing.T) {
 	cfg := load(t, w6Base)
-	assert.Equal(t, config.DefaultProbeBatchSize, cfg.Probe.BatchSize)
+	assert.Equal(t, 1000, cfg.Probe.BatchSize, "absent batch_size = big-batch default 1000")
 	assert.Equal(t, config.DefaultProbeBatchConcurrency, cfg.Probe.BatchConcurrency)
 }
 
