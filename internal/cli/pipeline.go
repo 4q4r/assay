@@ -679,6 +679,11 @@ func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 		SpeedtestURL:     cfg.Probe.SpeedtestURL,
 		SpeedtestTimeout: cfg.Probe.SpeedtestTimeout.Duration,
 		SkipFreshWithin:  cfg.Probe.SkipFreshWithin.Duration,
+		// Wave-1 TCP pre-filter (owner-approved probe-optimization program):
+		// the config knob carries the materialized tri-state (absent = ON).
+		TCPPrefilter:        cfg.Probe.TCPPrefilter,
+		TCPPrefilterWorkers: cfg.Probe.TCPPrefilterWorkers,
+		TCPPrefilterTimeout: cfg.Probe.TCPPrefilterTimeout.Duration,
 	}
 }
 

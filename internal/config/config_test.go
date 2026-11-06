@@ -415,6 +415,81 @@ func TestUnlockProbesKnobDefaultsTrue(t *testing.T) {
 	})
 }
 
+// TestTCPPrefilterKnobDefaultsOn pins [probe].tcp_prefilter (owner-approved
+// probe-optimization program, 2026-11-06): absent = TRUE (materialized by
+// applyProbeDefaults, wave-1 TCP pre-filter runs on every wave), an explicit
+// false keeps the stage off, an explicit true parses, and the worker/timeout
+// knobs materialize their defaults. The knob is tri-state (*bool) exactly
+// like [geo].unlock_probes.
+func TestTCPPrefilterKnobDefaultsOn(t *testing.T) {
+	write := func(content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	base := `data_dir = "/tmp/publicvpn-tcpprefilter"
+`
+
+	t.Run("absent defaults to true (owner default)", func(t *testing.T) {
+		cfg, err := config.Load(write(base))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Probe.TCPPrefilter, "applyProbeDefaults materializes the absent knob")
+		assert.True(t, *cfg.Probe.TCPPrefilter)
+		assert.True(t, cfg.Probe.TCPPrefilterEnabled(),
+			"tcp_prefilter must default to true — the wave-1 pre-filter runs without an explicit knob")
+		assert.Equal(t, config.DefaultProbePrefilterWorkers, cfg.Probe.TCPPrefilterWorkers,
+			"workers default materializes")
+		assert.Equal(t, config.DefaultProbePrefilterTimeout, cfg.Probe.TCPPrefilterTimeout.Duration,
+			"timeout default materializes")
+	})
+
+	t.Run("explicit false keeps the stage off", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[probe]\ntcp_prefilter = false\n"))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Probe.TCPPrefilter)
+		assert.False(t, *cfg.Probe.TCPPrefilter)
+		assert.False(t, cfg.Probe.TCPPrefilterEnabled())
+	})
+
+	t.Run("explicit true and explicit values parse", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[probe]\ntcp_prefilter = true\ntcp_prefilter_workers = 64\ntcp_prefilter_timeout = \"2s\"\n"))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Probe.TCPPrefilter)
+		assert.True(t, *cfg.Probe.TCPPrefilter)
+		assert.True(t, cfg.Probe.TCPPrefilterEnabled())
+		assert.Equal(t, 64, cfg.Probe.TCPPrefilterWorkers)
+		assert.Equal(t, 2*time.Second, cfg.Probe.TCPPrefilterTimeout.Duration)
+	})
+
+	t.Run("unknown key still fails strict decode", func(t *testing.T) {
+		_, err := config.Load(write(base + "\n[probe]\ntcp_prefilteeer = true\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "strict mode")
+	})
+}
+
+// TestTCPPrefilterKnobNegativeValuesFailLoud pins the structural sign checks
+// on the pre-filter knobs (review round 2): the sample-config promise
+// "Negative = invalid" is enforced by validateProbe — a negative worker
+// count or dial timeout fails config.Load with the canonical W6 error, not
+// a silent probe-layer default.
+func TestTCPPrefilterKnobNegativeValuesFailLoud(t *testing.T) {
+	t.Run("negative workers", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+"[probe]\ntcp_prefilter_workers = -5\n"))
+		require.Error(t, err, "a negative worker count is structurally invalid, not a probe-layer default")
+		assert.Contains(t, err.Error(), "probe.tcp_prefilter_workers")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+
+	t.Run("negative timeout", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+"[probe]\ntcp_prefilter_timeout = \"-1s\"\n"))
+		require.Error(t, err, "a negative dial timeout is structurally invalid, not a probe-layer default")
+		assert.Contains(t, err.Error(), "probe.tcp_prefilter_timeout")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+}
+
 // TestFilterSourceCapConfigParsesAndValidates pins the [filter] section:
 // source_cap defaults to unlimited (0) and negative values fail validation
 // (review finding 6).
