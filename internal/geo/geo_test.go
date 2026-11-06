@@ -168,16 +168,23 @@ func liveProbe(n *model.Node, exitIP string) store.ProbeResult {
 // The https hop keeps a dead-loopback [geo].https_url by default so every
 // pre-W16 test stays hermetic and the ladder's rung 2 fails fast; tests
 // exercising that rung override Cfg.HTTPSURL with an infoDouble.
+// unlock_probes is an EXPLICIT false: the production default flipped ON
+// (owner ruling 2026-11-06), so the knob-off tests must opt out loudly —
+// an absent knob here would silently turn every geo test into a real
+// network unlock sweep. The unlock tests override this via unlockInput /
+// the enabled-by-default pin.
 func baseInput(dir string, nodes []*model.Node, probes map[string]store.ProbeResult, f geo.Factory, selfURL string) geo.Input {
+	off := false
 	return geo.Input{
 		DataDir:    dir,
 		Nodes:      nodes,
 		ProbeByKey: probes,
 		Cfg: config.GeoConfig{
-			TTL:      config.Duration{Duration: 24 * time.Hour},
-			Timeout:  config.Duration{Duration: 5 * time.Second},
-			DoHURL:   "https://dns.google/resolve",
-			HTTPSURL: "http://127.0.0.1:1/json", // dead loopback — overridden by https-hop tests
+			TTL:          config.Duration{Duration: 24 * time.Hour},
+			Timeout:      config.Duration{Duration: 5 * time.Second},
+			DoHURL:       "https://dns.google/resolve",
+			HTTPSURL:     "http://127.0.0.1:1/json", // dead loopback — overridden by https-hop tests
+			UnlockProbes: &off,
 		},
 		UserAgent: "geo-agent/11",
 		Factory:   f,

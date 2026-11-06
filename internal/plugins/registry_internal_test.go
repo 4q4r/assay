@@ -23,9 +23,9 @@ func TestEmbeddedDefaultsCompile(t *testing.T) {
 			}
 		})
 	}
-	if len(defaultSources()) != 14 {
-		t.Fatalf("expected 14 embedded defaults (matin, radikal, stintikvpn, "+
-			"hidashimora, kort0881, au1rxx, barryfar, nirevil, mehdirzfx, mhditaheri, "+
+	if len(defaultSources()) != 12 {
+		t.Fatalf("expected 12 embedded defaults (matin, radikal, stintikvpn, "+
+			"hidashimora, kort0881, au1rxx, barryfar, mehdirzfx, "+
 			"flat447, luxxuria, igareck, nodesradar), got %d",
 			len(defaultSources()))
 	}
@@ -41,8 +41,8 @@ func TestEnsureDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(entries) != 14 {
-			t.Fatalf("expected 14 materialized defaults, got %d", len(entries))
+		if len(entries) != 12 {
+			t.Fatalf("expected 12 materialized defaults, got %d", len(entries))
 		}
 		for _, entry := range entries {
 			info, err := entry.Info()

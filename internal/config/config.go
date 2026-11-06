@@ -217,9 +217,20 @@ type GeoConfig struct {
 	// per distinct exit IP whose cached state is older than 7 days, probe
 	// ChatGPT/Netflix/YouTube/Disney+/TikTok unlocks and IP quality THROUGH
 	// that exit's own tunnel (3s per request; results keyed by exit IP and
-	// persisted in geo-base.jsonl). Default false = stage off (zero
-	// production behavior change until explicitly enabled).
-	UnlockProbes bool `toml:"unlock_probes"`
+	// persisted in geo-base.jsonl). Default TRUE (owner ruling 2026-11-06:
+	// unlock probes ship on by default, like the ip quality fields they
+	// carry); an explicit false keeps the stage off (zero unlock requests;
+	// quality/media fields stay unchecked). Tri-state like auto_restart:
+	// nil (absent) materializes as true in applyGeoDefaults.
+	UnlockProbes *bool `toml:"unlock_probes"`
+}
+
+// UnlockProbesEnabled resolves the tri-state knob: nil (absent) = true —
+// the owner default-flip ruling (unlock probes run by default); an
+// explicit false keeps the stage off. applyGeoDefaults materializes the
+// absent case, so loaded configs and hand-built configs agree.
+func (g GeoConfig) UnlockProbesEnabled() bool {
+	return g.UnlockProbes == nil || *g.UnlockProbes
 }
 
 // SelectConfig controls the ranking caps (D5/D7; W19 unbounded flip):
@@ -771,6 +782,14 @@ func applyGeoDefaults(g *GeoConfig) {
 	}
 	if g.MaxTTL.Duration == 0 {
 		g.MaxTTL.Duration = DefaultGeoMaxTTL
+	}
+	// UnlockProbes: nil (absent) materializes TRUE — the owner default-flip
+	// ruling (unlock probes run by default); UnlockProbesEnabled() treats a
+	// nil pointer the same way, so hand-built configs agree with loaded ones.
+	// An explicit false survives defaults and keeps the stage off.
+	if g.UnlockProbes == nil {
+		v := true
+		g.UnlockProbes = &v
 	}
 }
 
