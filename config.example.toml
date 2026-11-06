@@ -96,10 +96,16 @@ threads = 32                         # parallel temp-instance workers (each is a
                                      # process; W19 default — saturates the boot-serialization
                                      # ceiling so wave wall time stays bounded-minutes per 1000
                                      # nodes; the semaphore still bounds instantaneous load)
-batch_size = 10                      # nodes per xray process in batch mode (W20+):
-                                     # one xray with N outbounds + N inbounds + routing rules,
-                                     # reducing process count by ~batch_size. The boot mutex
-                                     # serializes per-BATCH instead of per-node.
+batch_size = 1000                    # nodes per xray process in batch mode (big-batch model):
+                                     # one xray with N outbounds + N inbounds + routing rules.
+                                     # Spike on xray 26.3.27: 1000 pairs boot in ~0.225s at
+                                     # ~49MB RSS (+13.3kB per pair, fds ≈ N+6) — a wave boots
+                                     # a handful of processes instead of hundreds. A batch
+                                     # that fails AS A BATCH (boot failure / address
+                                     # mismatch / batch-context death) retries its unprobed
+                                     # nodes at half the size, recursively, down to the
+                                     # floor of 20 (adaptive halving — automatic, no knob;
+                                     # per-node handshake failures never trigger it).
 batch_concurrency = 10               # nodes probed concurrently inside one batch (each is a
                                      # real probe attempt through the shared xray process).
                                      # 0 = default 10. Negative = invalid.
