@@ -43,7 +43,7 @@ const exitIPURL = "http://ip-api.com/json/"
 type Options struct {
 	Timeout          time.Duration                     // per-attempt HTTP timeout
 	Threads          int                               // parallel temp-instance workers (0 = default 32)
-	BatchSize        int                               // nodes per xray process in batch mode (0 = default 10)
+	BatchSize        int                               // nodes per xray process (0 = unset → 1000)
 	BatchConcurrency int                               // nodes probed concurrently inside one batch (0 = default 10)
 	URL              string                            // probe target URL
 	Attempts         int                               // HTTP GET attempts per node (>= 1)
@@ -125,9 +125,14 @@ func Run(
 
 // RunWithBatchFactory is like Run but accepts an optional BatchFactory for
 // multi-node batching. When batchFactory is non-nil, nodes are grouped into
-// batches of size opts.BatchSize (default 10) and processed with fewer
-// xray process spawns. The single-node factory `f` is used as a fallback for
-// any nodes not handled by the batch factory (e.g., remainder nodes).
+// batches of size opts.BatchSize (0 = unset → the big-batch default 1000,
+// config.DefaultProbeBatchSize) and processed with fewer xray process
+// spawns. A batch that fails AS A BATCH (instance boot failure, address
+// mismatch, whole-batch context death — never per-node handshake failures)
+// retries its unprobed nodes at half the batch size, recursively, down to
+// the halvingFloorBatchSize floor of 20 (adaptive halving). The single-node
+// factory `f` is used as a fallback for any nodes not handled by the batch
+// factory (e.g., remainder nodes).
 // Before any batching, the wave-1 TCP pre-filter (prefilter.go) excludes
 // TCP-dead endpoints from the wave when enabled (default ON).
 func RunWithBatchFactory(
@@ -175,7 +180,7 @@ func RunWithBatchFactory(
 	if batchFactory != nil && len(ordered) > 0 {
 		batchSize := opts.BatchSize
 		if batchSize <= 0 {
-			batchSize = 20 // default batch size (config.DefaultProbeBatchSize)
+			batchSize = 1000 // default batch size (config.DefaultProbeBatchSize, big-batch model)
 		}
 		outcomes = runBatchJobs(ctx, batchFactory, ordered, opts, batchSize)
 	} else {
@@ -277,6 +282,14 @@ func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*
 	return out
 }
 
+// halvingFloorBatchSize is the adaptive batch-halving floor (the
+// pre-big-batch default): a batch that failed AS A BATCH retries its
+// unprobed nodes at half the batch size only while the retry size stays at
+// or above this floor; below it the batch is reported failed loudly. The
+// floor is deliberately a code-level constant, not a knob (owner-approved
+// big-batch wave design — halving is automatic, no new config surface).
+const halvingFloorBatchSize = 20
+
 // runBatchJobs executes jobs in batches using a BatchFactory. Each batch
 // shares one xray process. The concurrency limit applies to BATCHES, not
 // individual nodes.
@@ -317,7 +330,7 @@ func runBatchJobs(ctx context.Context, bf BatchFactory, jobs []*probeJob, opts O
 				sem <- struct{}{}
 				defer func() { <-sem }()
 			}
-			batchOutcomes := runBatchJob(ctx, bf, batches[i], opts)
+			batchOutcomes := runBatchJobAdaptive(ctx, bf, batches[i].jobs, opts, batchSize)
 			// Write outcomes back to the correct positions
 			for j, o := range batchOutcomes {
 				out[batches[i].order+j] = o
@@ -336,29 +349,89 @@ func runBatchJobs(ctx context.Context, bf BatchFactory, jobs []*probeJob, opts O
 	return out
 }
 
-// runBatchJob drives one batch: single temp instance → per-node attempts →
-// exit IP → speedtest → aggregation. Nodes within a batch are probed
-// CONCURRENTLY (up to BatchConcurrency limit) to avoid the sequential
-// bottleneck: batchSize=10 * 3 attempts * 10s = 300s/batch serial.
-// The shared xray process handles concurrent SOCKS5 connections natively.
-func runBatchJob(ctx context.Context, bf BatchFactory, bj *batchJob, opts Options) []*outcome {
+// runBatchJobAdaptive drives one batch with adaptive halving (the v2rayN
+// pattern): a batch that fails AS A BATCH — instance boot failure, address
+// mismatch, whole-batch context death, but NEVER per-node handshake
+// failures, which are normal outcomes — retries its UNPROBED nodes at half
+// the batch size, recursively, down to the halvingFloorBatchSize floor of
+// 20; at the floor the remaining nodes are reported failed loudly (per-node
+// instance-boot outcomes, exactly the pre-halving semantics). A successful
+// batch never halves anything, and per-node verdict logic is untouched:
+// halving is a process-model recovery, not a verdict change. The returned
+// slice stays aligned 1:1 with jobs.
+func runBatchJobAdaptive(
+	ctx context.Context, bf BatchFactory, jobs []*probeJob, opts Options, batchSize int,
+) []*outcome {
+	outcomes, failure := runBatchJobOnce(ctx, bf, jobs, opts)
+	if failure == nil {
+		return outcomes
+	}
+	out := make([]*outcome, len(jobs))
+	copy(out, outcomes) // outcomes is nil after a boot failure — out stays all-unprobed
+	unprobed := unprobedIdxs(ctx, out)
+	if len(unprobed) == 0 {
+		return out // every node holds a standing outcome despite the batch-level event
+	}
+	half := batchSize / 2
+	if ctx.Err() != nil {
+		// The whole-batch context ended: retries would boot-fail against the
+		// same dead context. Report loudly instead of spinning the ladder.
+		progressf(opts.Progress,
+			"probing batch of %d nodes failed as a batch (%v) — wave context ended, reporting %d unprobed nodes failed",
+			batchSize, failure, len(unprobed))
+		fillUnprobedFailures(out, unprobed, jobs, opts, failure)
+		return out
+	}
+	if half < halvingFloorBatchSize {
+		progressf(opts.Progress,
+			"probing batch halving floor %d reached — reporting %d unprobed nodes failed (%v)",
+			halvingFloorBatchSize, len(unprobed), failure)
+		fillUnprobedFailures(out, unprobed, jobs, opts, failure)
+		return out
+	}
+	progressf(opts.Progress,
+		"probing batch of %d nodes failed as a batch (%v) — adaptive halving: %d unprobed nodes retry at batch size %d",
+		batchSize, failure, len(unprobed), half)
+	for start := 0; start < len(unprobed); start += half {
+		end := min(start+half, len(unprobed))
+		chunk := unprobed[start:end]
+		chunkJobs := make([]*probeJob, len(chunk))
+		for i, idx := range chunk {
+			chunkJobs[i] = jobs[idx]
+		}
+		chunkOut := runBatchJobAdaptive(ctx, bf, chunkJobs, opts, half)
+		for i, idx := range chunk {
+			out[idx] = chunkOut[i]
+		}
+	}
+	return out
+}
+
+// runBatchJobOnce makes ONE batch attempt: single temp instance → per-node
+// attempts → exit IP → speedtest → aggregation. It returns the per-node
+// outcomes aligned with jobs (nil for never-probed nodes) plus the batch-
+// level failure, if any: a boot error, an address-count mismatch, or the
+// whole-batch context dying mid-probe (failed outcomes from a dead context
+// are artifacts, and the adaptive layer re-decides their fate). Per-node
+// handshake failures are normal outcomes and never set the batch failure.
+func runBatchJobOnce(ctx context.Context, bf BatchFactory, jobs []*probeJob, opts Options) ([]*outcome, error) {
 	// Collect nodes for the batch factory
-	nodes := make([]*model.Node, len(bj.jobs))
-	for i, job := range bj.jobs {
+	nodes := make([]*model.Node, len(jobs))
+	for i, job := range jobs {
 		nodes[i] = job.node
 	}
 
-	progressf(opts.Progress, "probing batch of %d nodes (%s)…", len(nodes), bj.jobs[0].host)
+	progressf(opts.Progress, "probing batch of %d nodes (%s)…", len(nodes), jobs[0].host)
 
 	inst, err := bf(ctx, nodes)
 	if err != nil {
-		return batchBootFailure(bj.jobs, opts, err)
+		return nil, err
 	}
 	defer func() { _ = inst.Close() }()
 
 	addrs := inst.Addrs()
-	if len(addrs) != len(bj.jobs) {
-		return batchBootFailure(bj.jobs, opts, errors.New("batch instance address count mismatch"))
+	if len(addrs) != len(jobs) {
+		return nil, errors.New("batch instance address count mismatch")
 	}
 
 	// Probe nodes within the batch CONCURRENTLY.
@@ -368,18 +441,18 @@ func runBatchJob(ctx context.Context, bf BatchFactory, bj *batchJob, opts Option
 	if batchConcurrency <= 0 {
 		batchConcurrency = 10 // default batch concurrency
 	}
-	if batchConcurrency > len(bj.jobs) {
-		batchConcurrency = len(bj.jobs)
+	if batchConcurrency > len(jobs) {
+		batchConcurrency = len(jobs)
 	}
 
-	results := make([]*outcome, len(bj.jobs))
+	results := make([]*outcome, len(jobs))
 	sem := make(chan struct{}, batchConcurrency)
-	done := make([]chan struct{}, len(bj.jobs))
+	done := make([]chan struct{}, len(jobs))
 	for i := range done {
 		done[i] = make(chan struct{})
 	}
 
-	for i, job := range bj.jobs {
+	for i, job := range jobs {
 		go func(i int, job *probeJob, addr string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -391,20 +464,39 @@ func runBatchJob(ctx context.Context, bf BatchFactory, bj *batchJob, opts Option
 	for i := range done {
 		<-done[i]
 	}
-	return results
+
+	if cerr := ctx.Err(); cerr != nil {
+		return results, fmt.Errorf("batch context ended mid-probe: %w", cerr)
+	}
+	return results, nil
 }
 
-// batchBootFailure returns failure outcomes for all nodes in a batch.
-func batchBootFailure(jobs []*probeJob, opts Options, err error) []*outcome {
-	results := make([]*outcome, len(jobs))
-	for i, job := range jobs {
-		results[i] = &outcome{
-			host: job.host, alive: false, status: "failed",
+// unprobedIdxs returns the positions lacking a trustworthy outcome: never-
+// probed (nil) always; additionally, once the batch context has ended, a
+// failed outcome is a context artifact and counts as unprobed (alive
+// outcomes completed before the cancellation and stand).
+func unprobedIdxs(ctx context.Context, out []*outcome) []int {
+	ctxDead := ctx.Err() != nil
+	var idxs []int
+	for i, o := range out {
+		if o == nil || (ctxDead && !o.alive) {
+			idxs = append(idxs, i)
+		}
+	}
+	return idxs
+}
+
+// fillUnprobedFailures records the loud batch-level failure for every
+// unprobed node — the exact per-node shape the pre-halving batchBootFailure
+// produced (failed / instance-boot / one-lined reason).
+func fillUnprobedFailures(out []*outcome, idxs []int, jobs []*probeJob, opts Options, err error) {
+	for _, idx := range idxs {
+		out[idx] = &outcome{
+			host: jobs[idx].host, alive: false, status: "failed",
 			reason: oneLine(err.Error()), failureKind: "instance-boot",
 			total: opts.Attempts,
 		}
 	}
-	return results
 }
 
 // probeNode probes a single node through the given address.

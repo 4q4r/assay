@@ -197,8 +197,6 @@ func healthySite(t *testing.T) *httptest.Server {
 // exitIPEcho is the exit-IP double: it answers exactly what the production
 // ip-api self-report answers, so the engine's D8 anchor parse is exercised
 // against the real response shape.
-//
-//nolint:unparam // the ip param keeps the echo double honest for future callers
 func exitIPEcho(t *testing.T, ip string) string {
 	t.Helper()
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
