@@ -56,11 +56,13 @@ func TestLiveProbeDeadLink(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	off := false // pre-filter off: the TEST-NET target is dead BY DESIGN — this test pins classify, not reachability
 	results, err := probe.Run(ctx, []*model.Node{dead}, probeFactory, probe.Options{
-		Timeout:  3 * time.Second,
-		Threads:  1,
-		Attempts: 2,
-		URL:      "https://cloudflare.com/cdn-cgi/trace",
+		Timeout:      3 * time.Second,
+		Threads:      1,
+		Attempts:     2,
+		URL:          "https://cloudflare.com/cdn-cgi/trace",
+		TCPPrefilter: &off,
 	}, "")
 	require.NoError(t, err)
 	require.Len(t, results, 1)

@@ -209,13 +209,19 @@ func exitIPEcho(t *testing.T, ip string) string {
 }
 
 func baseOpts(siteURL, echoURL string) Options {
-	return Options{
+	// The engine fixtures drive FAKE endpoints (name.example.com) through
+	// in-process doubles — they pin probe verdict logic, not reachability,
+	// so the wave-1 TCP pre-filter is explicitly OFF here (prefilter tests
+	// cover the ON path; engine tests must stay deterministic offline).
+	opts := Options{
 		Timeout:          5 * time.Second,
 		Attempts:         3,
 		URL:              siteURL,
 		ExitIPURL:        echoURL,
 		SpeedtestTimeout: time.Second,
+		TCPPrefilter:     prefilterOff(),
 	}
+	return opts
 }
 
 func TestEngineAliveMapping(t *testing.T) {
@@ -260,13 +266,16 @@ func TestProductionWaveCarriesExitIPByDefault(t *testing.T) {
 	n := node(t, "prod-echo")
 
 	// The production literal: only the fields probeOptions sets — nothing
-	// echo-specific. Whatever the zero value of the echo control is, the
-	// alive record below must carry a non-empty exit IP.
+	// echo-specific — with ONE documented exception: the pre-filter knob is
+	// pinned OFF because this fixture's endpoint is fake (name.example.com
+	// must never be TCP-dialed); production receives the knob from config
+	// (default ON) via probeOptions.
 	opts := Options{
-		Timeout:   5 * time.Second,
-		Attempts:  3,
-		URL:       site.URL,
-		ExitIPURL: echoURL,
+		Timeout:      5 * time.Second,
+		Attempts:     3,
+		URL:          site.URL,
+		ExitIPURL:    echoURL,
+		TCPPrefilter: prefilterOff(),
 	}
 	out, err := Run(context.Background(), []*model.Node{n}, tunnelFactory(socks.Addr()), opts, "")
 	require.NoError(t, err)
@@ -321,7 +330,7 @@ func TestEngineDeadMapping(t *testing.T) {
 func TestEngineBootFailureIsLoud(t *testing.T) {
 	n := node(t, "bootfail")
 	boom := errors.New("xray exited during startup: boom")
-	out, err := Run(context.Background(), []*model.Node{n}, bootFailFactory(boom), Options{Attempts: 3}, "")
+	out, err := Run(context.Background(), []*model.Node{n}, bootFailFactory(boom), Options{Attempts: 3, TCPPrefilter: prefilterOff()}, "")
 	require.NoError(t, err, "a boot failure is a per-node outcome, never a wave error")
 	require.Len(t, out, 1)
 	r := out[0]
@@ -532,7 +541,7 @@ func TestSkipFreshDefaultProbesEverything(t *testing.T) {
 		probed.Add(1)
 		return &staticInstance{addr: socks.Addr()}, nil
 	})
-	out, err := Run(context.Background(), nodes, factory, Options{Latest: latest}, "")
+	out, err := Run(context.Background(), nodes, factory, Options{Latest: latest, TCPPrefilter: prefilterOff()}, "")
 	require.NoError(t, err)
 	assert.Len(t, out, 2, "window 0 = probe everything (default behavior)")
 	assert.Equal(t, int32(2), probed.Load(), "both nodes must be probed")
@@ -549,7 +558,7 @@ func TestSkipFreshWindowSkipsFreshPassed(t *testing.T) {
 		return &staticInstance{addr: socks.Addr()}, nil
 	})
 	var logText strings.Builder
-	opts := Options{SkipFreshWithin: 30 * time.Minute, Latest: latest, Progress: &logText}
+	opts := Options{SkipFreshWithin: 30 * time.Minute, Latest: latest, Progress: &logText, TCPPrefilter: prefilterOff()}
 	out, err := Run(context.Background(), nodes, factory, opts, "")
 	require.NoError(t, err)
 	require.Len(t, out, 1, "the skipped node gets NO probe-log entry (its history stays intact)")
@@ -574,7 +583,7 @@ func TestSkipFreshIncludesFailedAndSemiPassed(t *testing.T) {
 		return &staticInstance{addr: socks.Addr()}, nil
 	})
 	_, err := Run(context.Background(), []*model.Node{failedNode, semiNode}, factory,
-		Options{SkipFreshWithin: time.Hour, Latest: latest}, "")
+		Options{SkipFreshWithin: time.Hour, Latest: latest, TCPPrefilter: prefilterOff()}, "")
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), probed.Load(), "failed/semi-passed are not `passed` — both must be probed")
 }
@@ -588,7 +597,7 @@ func TestSkipFreshSkippedNodeKeepsHistory(t *testing.T) {
 		return &staticInstance{addr: socks.Addr()}, nil
 	})
 	_, err := Run(context.Background(), nodes, factory,
-		Options{SkipFreshWithin: 30 * time.Minute, Latest: latest}, path)
+		Options{SkipFreshWithin: 30 * time.Minute, Latest: latest, TCPPrefilter: prefilterOff()}, path)
 	require.NoError(t, err)
 	got, err := store.LatestProbeByKey(path)
 	require.NoError(t, err)

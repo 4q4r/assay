@@ -73,6 +73,7 @@ func TestBootSmokeEveryProtocolFamily(t *testing.T) {
 		t.Skipf("xray binary not present at %s", bootSmokeXrayBin)
 	}
 	for _, fam := range bootSmokeFamilies() {
+		off := false // pre-filter off: TEST-NET targets are dead by design (see Options comment below)
 		t.Run(fam.name, func(t *testing.T) {
 			n := model.NewNode("smoke", fam.scheme, "smoke-cred-1", "192.0.2.1", 443, fam.params)
 			workDir := t.TempDir()
@@ -102,6 +103,11 @@ func TestBootSmokeEveryProtocolFamily(t *testing.T) {
 				URL:      "https://192.0.2.1/cdn-cgi/trace",
 				Threads:  1,
 				Progress: nil,
+				// The smoke pins BOOT + CLASSIFY on TEST-NET targets that are
+				// unreachable BY DESIGN — the wave-1 TCP pre-filter would
+				// drop them before any boot (its verdict path is covered by
+				// the prefilter tests), so it is explicitly off here.
+				TCPPrefilter: &off,
 			}, "")
 			require.NoError(t, err, "family %s: the probe attempt must classify, never crash", fam.name)
 			require.Len(t, results, 1)
