@@ -219,6 +219,8 @@ type mediaIntel struct {
 	YouTubeRegions []string
 	RiskSum        float64
 	RiskN          int
+	HijackCount    int // exits whose v2 battery verdict carries hijack=true
+	RotatingCount  int // exits whose echo IPs spanned >1 /24 (rotating=true)
 }
 
 // geoIntel aggregates the cold base for the quality/media sections and the
@@ -520,6 +522,12 @@ func collectMedia(m *mediaIntel, r *model.GeoRecord) {
 	if r.RiskScore >= 0 {
 		m.RiskSum += float64(r.RiskScore)
 		m.RiskN++
+	}
+	if mu.Hijack {
+		m.HijackCount++
+	}
+	if mu.Rotating {
+		m.RotatingCount++
 	}
 }
 
@@ -991,6 +999,9 @@ func printMediaSummary(out io.Writer, m *mediaIntel, color bool) {
 			m.RiskSum/float64(m.RiskN), formatCount(m.RiskN))
 	}
 	outf(out, "%s\n", ui.ChipKV("  risk:    ", risk, color))
+	outf(out, "%s\n", ui.ChipKV("  exit:    ", fmt.Sprintf(
+		"%d hijack-flagged, %d rotating (echo IPs span multiple /24 — no single exit identity)",
+		m.HijackCount, m.RotatingCount), color))
 }
 
 // formatVocab renders one unlock-status counter map as "yes 40 / blocked 12"

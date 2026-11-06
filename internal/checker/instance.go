@@ -218,11 +218,15 @@ func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[st
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	// The unlock battery's STUN channel (RFC 5389 Binding through the socks
+	// UDP path) rides hysteria2 instances: enable the socks UDP relay only
+	// for the protocols that carry UDP (hysteria protocol name = v2 in core
+	// 26.3.27); every other transport keeps the lean udp:false inbound.
 	cfg := map[string]any{
 		"log": map[string]any{"loglevel": "warning"},
 		"inbounds": []any{map[string]any{
 			"tag": "socks-in", "listen": "127.0.0.1", "port": port,
-			"protocol": "socks", "settings": map[string]any{"udp": false},
+			"protocol": "socks", "settings": map[string]any{"udp": socksUDPEnabled(outbound)},
 		}},
 		"outbounds": []any{outbound},
 	}
@@ -478,6 +482,17 @@ func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedW
 // booting, so the loser-rides-the-winner's-socket collision cannot happen
 // (cross-process contention on this band remains theoretically possible and
 // surfaces as a loud boot failure, never as a silent wrong measurement).
+// socksUDPEnabled reports whether the temp instance's socks inbound needs
+// the UDP relay: only hysteria outbounds carry UDP traffic (the unlock
+// battery's RFC 5389 STUN channel rides the socks UDP path); every other
+// transport keeps the lean udp:false inbound. The core's protocol name for
+// hysteria2 IS "hysteria" (v2 = protocol "hysteria", verified against
+// 26.3.27).
+func socksUDPEnabled(outbound map[string]any) bool {
+	proto, _ := outbound["protocol"].(string)
+	return proto == "hysteria"
+}
+
 func freeInstancePort(ctx context.Context) (int, error) {
 	var lc net.ListenConfig
 	for p := instancePortMin; p <= instancePortMax; p++ {
