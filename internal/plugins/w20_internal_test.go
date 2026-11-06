@@ -19,22 +19,22 @@ import (
 	"public_vpn/internal/parse"
 )
 
-// W20 fixture tests: each of the seven new embedded plugins runs against an
-// httptest fixture of its REAL upstream file shapes (verified 2026-10-30 via
+// W20 fixture tests: the W20-batch embedded plugins run against an
+// httptest fixture of their REAL upstream file shapes (verified 2026-10-30 via
 // the GitHub API; see the wave report for per-repo evidence). The
 // github_files plugins keep their real repo strings — the fixture mux routes
 // those exact paths. The format contract under test: URI lists
 // (vless/vmess/trojan/ss/hysteria2/hy2/tuic) and whole-body base64 are
 // ingestible; everything else (YAML/JSON profiles, credits, bookkeeping)
 // loud-skips per file — logged through publicvpn.log, never fatal.
+// (nirevil + mhditaheri left the defaults — owner order 2026-11-06 — and
+// their fixture twins went with them.)
 
 const (
 	hidashimoraRepo = "Hidashimora/free-vpn-anti-rkn"
 	kort0881Repo    = "kort0881/vpn-vless-configs-russia"
 	au1rxxRepo      = "Au1rxx/free-vpn-subscriptions"
 	barryfarRepo    = "barry-far/V2ray-Config"
-	nirevilRepo     = "NiREvil/vless"
-	mhditaheriRepo  = "MhdiTaheri/V2rayCollector"
 )
 
 func b64Of(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -225,47 +225,6 @@ func TestW20BarryfarFixture(t *testing.T) {
 	assert.NotContains(t, log.String(), "ssr://")
 }
 
-func TestW20NirevilFixture(t *testing.T) {
-	srv := newRepoFixture(t, nirevilRepo, map[string]string{
-		"/" + nirevilRepo + "/HEAD/sub/SSTime": "# profile-title: base64:U0hBRE9XU09DS1MgVElNRQ==\n" +
-			"# profile-update-interval: 23\n" +
-			"ss://YWJjZEBmNDoyNDQ0#s1\nss://ZGVmQG1uOjQ0NDIjczI=\n" +
-			"hysteria2://e@h9:443/?insecure=1#h1\n",
-	})
-	var log strings.Builder
-	nodes, err := runW20(t, srv, "nirevil", &log)
-	require.NoError(t, err)
-
-	// The one ingestible file in the toolkit repo: both ss:// links and the
-	// hysteria2:// link land; the metadata header comments drop.
-	assert.Equal(t, []string{
-		"hysteria2://e@h9:443/?insecure=1#h1",
-		"ss://YWJjZEBmNDoyNDQ0#s1",
-		"ss://ZGVmQG1uOjQ0NDIjczI=",
-	}, sortedRaws(nodes))
-}
-
-func TestW20MhditaheriFixture(t *testing.T) {
-	srv := newRepoFixture(t, mhditaheriRepo, map[string]string{
-		"/" + mhditaheriRepo + "/HEAD/sub/mix": "trojan://bcacaab-baca-baca-dbac-accaabbcbacb@127.0.0.1:1080?security=tls#LATEST\n" +
-			"vless://f@h11:443?s=1#n5\nss://YWJjZEBmNDoyNDQ0#n2\n",
-		"/" + mhditaheriRepo + "/HEAD/sub/mixbase64": b64Of("vmess://" + b64Of(`{"add":"example"}`) + "\n"),
-	})
-	var log strings.Builder
-	nodes, err := runW20(t, srv, "mhditaheri", &log)
-	require.NoError(t, err)
-
-	// The union + its base64 twin; the upstream trojan://127.0.0.1 update
-	// marker is KEPT as a candidate on purpose — the parse stage (loopback
-	// rejection) owns it, the plugin does not second-guess.
-	assert.Equal(t, []string{
-		"ss://YWJjZEBmNDoyNDQ0#n2",
-		"trojan://bcacaab-baca-baca-dbac-accaabbcbacb@127.0.0.1:1080?security=tls#LATEST",
-		"vless://f@h11:443?s=1#n5",
-		"vmess://" + b64Of(`{"add":"example"}`),
-	}, sortedRaws(nodes))
-}
-
 // newMehdirzfxFixture hosts a catalog README plus its nested subscription
 // routes. The README body is filled in after the server exists (it embeds
 // the server URL). fetches records per-path request counts.
@@ -430,12 +389,12 @@ func TestW20MehdirzfxFetchCap(t *testing.T) {
 	assert.Contains(t, log.String(), "catalog crawl capped")
 }
 
-// TestW20DefaultsCompileLoad pins the load-check contract for all seven new
-// embedded defaults: the chunk is side-effect-free (no network at load) and
-// compiles into the canonical discover-function shape.
+// TestW20DefaultsCompileLoad pins the load-check contract for the remaining
+// new embedded defaults: the chunk is side-effect-free (no network at load)
+// and compiles into the canonical discover-function shape.
 func TestW20DefaultsCompileLoad(t *testing.T) {
 	for _, id := range []string{
-		"hidashimora", "kort0881", "au1rxx", "barryfar", "nirevil", "mehdirzfx", "mhditaheri",
+		"hidashimora", "kort0881", "au1rxx", "barryfar", "mehdirzfx",
 	} {
 		code, ok := defaultSources()[id+".lua"]
 		require.True(t, ok, "embedded default %s.lua missing", id)

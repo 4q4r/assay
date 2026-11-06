@@ -547,8 +547,8 @@ func TestCleanFamilyRiskBandUnified(t *testing.T) {
 	}
 }
 
-// TestCleanFamilyUncheckedIsByteIdentical proves the production-default
-// behavioral note: with [geo].unlock_probes OFF every RiskScore is
+// TestCleanFamilyUncheckedIsByteIdentical proves the [geo].unlock_probes
+// = false behavioral note: with the unlock stage off every RiskScore is
 // unchecked, and the clean family must behave byte-identically to the
 // pre-Phase-3 flags-only state. Rendering the same clean selection with NO
 // evidence map (the knob-off pipeline shape) and with an ALL-UNCHECKED

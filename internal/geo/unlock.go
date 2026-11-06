@@ -854,10 +854,11 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 
 // runUnlockWave probes quality + media once per distinct exit IP whose
 // cached verdict is older than UnlockTTL, attaching copies to every report
-// sharing the exit. Gated by [geo].unlock_probes (default off = zero
-// production behavior change); it never fails a wave.
+// sharing the exit. Gated by [geo].unlock_probes (default ON — owner
+// ruling 2026-11-06; an explicit false = stage off, zero unlock requests);
+// it never fails a wave.
 func runUnlockWave(ctx context.Context, in Input, r *Reporter, reports []NodeReport, idx exitIPIndex) {
-	if !in.Cfg.UnlockProbes || len(reports) == 0 {
+	if !in.Cfg.UnlockProbesEnabled() || len(reports) == 0 {
 		return
 	}
 	groups := groupByExit(reports, idx)

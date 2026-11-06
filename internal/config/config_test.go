@@ -115,6 +115,9 @@ data_dir = "/tmp/publicvpn-defaults"
 	assert.Equal(t, "https://dns.google/resolve", cfg.Geo.DoHURL, "doh_url defaults to the dns.google/resolve DoH endpoint")
 	assert.Equal(t, "https://ipinfo.io/json", cfg.Geo.HTTPSURL, "https_url defaults to the keyless ipinfo.io/json self-geo endpoint")
 	assert.Equal(t, 24*time.Hour, cfg.Geo.TTL.Duration)
+	require.NotNil(t, cfg.Geo.UnlockProbes)
+	assert.True(t, *cfg.Geo.UnlockProbes, "unlock_probes defaults ON (owner ruling 2026-11-06)")
+	assert.True(t, cfg.Geo.UnlockProbesEnabled(), "absent knob = unlock stage on")
 	// W19 owner order («259 живых, значит 259 раскидываются по балансирам»):
 	// absent/0 = ALL alive nodes go active — every cap knob defaults
 	// UNBOUNDED; an explicit positive number stays a cap (no-floor/no-ceiling
@@ -360,6 +363,53 @@ func TestAutoRestartKnobDefaultsToTrue(t *testing.T) {
 
 	t.Run("unknown key still fails strict decode", func(t *testing.T) {
 		_, err := config.Load(write(base + "\n[maintain]\nauto_restartt = true\n"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "strict mode")
+	})
+}
+
+// TestUnlockProbesKnobDefaultsTrue pins [geo].unlock_probes (owner ruling
+// 2026-11-06: unlock probes ship ON by default, like the ip quality fields
+// they carry): absent = TRUE (materialized by applyGeoDefaults), an
+// explicit false keeps the stage off, an explicit true parses. The knob is
+// tri-state (*bool) exactly like [maintain].auto_restart.
+func TestUnlockProbesKnobDefaultsTrue(t *testing.T) {
+	write := func(content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	base := `data_dir = "/tmp/publicvpn-unlockprobes"
+`
+
+	t.Run("absent defaults to true (owner flip)", func(t *testing.T) {
+		cfg, err := config.Load(write(base))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Geo.UnlockProbes, "applyGeoDefaults materializes the absent knob")
+		assert.True(t, *cfg.Geo.UnlockProbes)
+		assert.True(t, cfg.Geo.UnlockProbesEnabled(),
+			"unlock_probes must default to true — the unlock stage runs without an explicit knob")
+	})
+
+	t.Run("explicit false keeps the stage off", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[geo]\nunlock_probes = false\n"))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Geo.UnlockProbes)
+		assert.False(t, *cfg.Geo.UnlockProbes)
+		assert.False(t, cfg.Geo.UnlockProbesEnabled())
+	})
+
+	t.Run("explicit true parses", func(t *testing.T) {
+		cfg, err := config.Load(write(base + "\n[geo]\nunlock_probes = true\n"))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Geo.UnlockProbes)
+		assert.True(t, *cfg.Geo.UnlockProbes)
+		assert.True(t, cfg.Geo.UnlockProbesEnabled())
+	})
+
+	t.Run("unknown key still fails strict decode", func(t *testing.T) {
+		_, err := config.Load(write(base + "\n[geo]\nunlock_probbes = true\n"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "strict mode")
 	})

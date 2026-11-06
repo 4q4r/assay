@@ -128,9 +128,11 @@ func unlockBodies() map[string]string {
 	}
 }
 
-// unlockInput builds a geo Input with the Phase-1 stage on, both nodes
-// sharing ONE exit IP (the dedup contract), and every probe riding the
-// given doubles through the in-process socks relay.
+// unlockInput builds a geo Input with the Phase-1 stage explicitly ON
+// (baseInput's explicit-false fixture overridden — also pins that an
+// explicit true is honored), both nodes sharing ONE exit IP (the dedup
+// contract), and every probe riding the given doubles through the
+// in-process socks relay.
 func unlockInput(t *testing.T, dir string, f geo.Factory, selfURL string, ep *geo.UnlockEndpoints,
 	cache *geo.ExitGeoCache,
 ) geo.Input {
@@ -141,7 +143,8 @@ func unlockInput(t *testing.T, dir string, f geo.Factory, selfURL string, ep *ge
 		n2.Key: liveProbe(n2, "203.0.113.7"),
 	}
 	in := baseInput(dir, []*model.Node{n1, n2}, probes, f, selfURL)
-	in.Cfg.UnlockProbes = true
+	on := true
+	in.Cfg.UnlockProbes = &on
 	in.UnlockEndpoints = ep
 	in.ExitCache = cache
 	return in
@@ -269,10 +272,11 @@ func TestUnlockCacheHitZeroNetworkCalls(t *testing.T) {
 	assert.Equal(t, firstWave, ud.totalHits(), "expired verdict re-probes every service")
 }
 
-// TestUnlockStageDisabledByDefault pins the zero-behavior-change gate: with
-// [geo].unlock_probes unset the stage never probes (all requests stay geo
-// only) and the Phase-1 fields stay unchecked.
-func TestUnlockStageDisabledByDefault(t *testing.T) {
+// TestUnlockStageExplicitDisabled pins the opt-out contract: an EXPLICIT
+// unlock_probes = false (baseInput's fixture — the production default
+// flipped ON by the owner ruling 2026-11-06) keeps the stage off: zero
+// probe requests, every Phase-1 field stays unchecked.
+func TestUnlockStageExplicitDisabled(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	ud := newUnlockDouble(t, unlockBodies())
 	socks := newSocksServer(t)
@@ -280,6 +284,8 @@ func TestUnlockStageDisabledByDefault(t *testing.T) {
 	n1 := node("1", "one.example.com")
 	probes := map[string]store.ProbeResult{n1.Key: liveProbe(n1, "203.0.113.7")}
 	in := baseInput(t.TempDir(), []*model.Node{n1}, probes, f, api.URL())
+	require.NotNil(t, in.Cfg.UnlockProbes)
+	require.False(t, *in.Cfg.UnlockProbes, "baseInput carries the explicit-false fixture")
 	in.UnlockEndpoints = ud.endpoints()
 	in.ExitCache = geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
@@ -290,6 +296,30 @@ func TestUnlockStageDisabledByDefault(t *testing.T) {
 	assert.Equal(t, -1, records[0].RiskScore)
 	assert.Empty(t, records[0].IPType)
 	assert.Empty(t, records[0].MediaUnlocks)
+}
+
+// TestUnlockStageNilKnobEnabled pins the accessor's nil branch end to end:
+// a hand-built config that never went through applyDefaults (knob nil — the
+// absent case) runs the stage, exactly like a loaded config with the key
+// absent (applyGeoDefaults materializes true). This is what keeps
+// hand-built and loaded configs in agreement after the default flip.
+func TestUnlockStageNilKnobEnabled(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	n1 := node("1", "one.example.com")
+	probes := map[string]store.ProbeResult{n1.Key: liveProbe(n1, "203.0.113.7")}
+	in := baseInput(t.TempDir(), []*model.Node{n1}, probes, f, api.URL())
+	in.Cfg.UnlockProbes = nil // absent: the pre-defaults shape a loaded config materializes to true
+	in.UnlockEndpoints = ud.endpoints()
+	in.ExitCache = geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Positive(t, ud.totalHits(), "absent knob = stage on")
+	assert.NotEmpty(t, records[0].MediaUnlocks)
 }
 
 // TestUnlockParsers tables the pure probe parsers/classifiers against the
