@@ -87,9 +87,16 @@ func (s *socksServer) handle(conn net.Conn) {
 	if _, err := conn.Write([]byte{5, 0}); err != nil {
 		return
 	}
-	// Request: VER, CMD, RSV, ATYP, ADDR, PORT — CONNECT only.
+	// Request: VER, CMD, RSV, ATYP, ADDR, PORT — CONNECT or UDP ASSOCIATE.
 	req := make([]byte, 4)
-	if _, err := io.ReadFull(conn, req); err != nil || req[0] != 5 || req[1] != 1 {
+	if _, err := io.ReadFull(conn, req); err != nil || req[0] != 5 {
+		return
+	}
+	if req[1] == 3 {
+		s.handleUDPAssociate(conn)
+		return
+	}
+	if req[1] != 1 {
 		return
 	}
 	var target string
@@ -144,6 +151,118 @@ func joinTarget(host string, conn net.Conn) string {
 		return ""
 	}
 	return net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port))))
+}
+
+// udpAssociateState tracks one ASSOCIATE exchange (the STUN e2e evidence:
+// the requests counter proves the battery's Binding rode the relay).
+type udpAssociateState struct {
+	client   *net.UDPAddr
+	relay    *net.UDPConn
+	requests atomic.Int32
+}
+
+// relayLoop is the UDP ASSOCIATE datagram pump (split out so the control
+// connection watcher and the shared closers can both end it).
+func (s *socksServer) relayLoop(uc *net.UDPConn, state *udpAssociateState) {
+	buf := make([]byte, 1500)
+	var clientAddr *net.UDPAddr
+	for {
+		n, from, rerr := uc.ReadFromUDP(buf)
+		if rerr != nil {
+			return
+		}
+		if clientAddr == nil {
+			if n >= 10 && buf[0] == 0 && buf[1] == 0 && (buf[3] == 1 || buf[3] == 4) {
+				clientAddr = &net.UDPAddr{IP: from.IP, Port: from.Port}
+				state.client = clientAddr
+			} else {
+				continue
+			}
+		}
+		if from.Port == clientAddr.Port {
+			atyp := buf[3]
+			var daddr string
+			var hdrLen int
+			switch atyp {
+			case 1:
+				daddr = net.IP(buf[4:8]).String()
+				hdrLen = 10
+			case 4:
+				daddr = net.IP(buf[4:20]).String()
+				hdrLen = 22
+			default:
+				continue
+			}
+			port := int(binary.BigEndian.Uint16(buf[hdrLen-2 : hdrLen]))
+			dst, derr := net.ResolveUDPAddr("udp", net.JoinHostPort(daddr, strconv.Itoa(port)))
+			if derr != nil {
+				continue
+			}
+			state.requests.Add(1)
+			if _, werr := uc.WriteToUDP(buf[hdrLen:n], dst); werr != nil {
+				return
+			}
+			continue
+		}
+		// Upstream → client: SOCKS-encapsulate with the source address.
+		hdr := []byte{0, 0, 0}
+		if v4 := from.IP.To4(); v4 != nil {
+			hdr = append(hdr, 1)
+			hdr = append(hdr, v4...)
+		} else {
+			hdr = append(hdr, 4)
+			hdr = append(hdr, from.IP.To16()...)
+		}
+		hdr = binary.BigEndian.AppendUint16(hdr, uint16(from.Port))
+		if _, werr := uc.WriteToUDP(append(hdr, buf[:n]...), clientAddr); werr != nil {
+			return
+		}
+	}
+}
+
+var udpAssocs sync.Map // listener addr string → *udpAssociateState
+
+// handleUDPAssociate serves SOCKS5 CMD=3 (the STUN channel's transport):
+// the reply carries the fixture's own UDP relay port, and datagrams are
+// routed by direction — encapsulated client datagrams are stripped and
+// forwarded to the embedded destination, raw upstream answers are
+// encapsulated back to the client.
+func (s *socksServer) handleUDPAssociate(conn net.Conn) {
+	tail := make([]byte, 6) // DST.ADDR/PORT (wildcard) — ignored
+	if _, err := io.ReadFull(conn, tail); err != nil {
+		return
+	}
+	var lc net.ListenConfig
+	relay, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	if err != nil {
+		return
+	}
+	uc := relay.(*net.UDPConn)
+	lport := uc.LocalAddr().(*net.UDPAddr).Port
+	reply := []byte{5, 0, 0, 1, 127, 0, 0, 1}
+	reply = binary.BigEndian.AppendUint16(reply, uint16(lport))
+	if _, err := conn.Write(reply); err != nil {
+		_ = uc.Close()
+		return
+	}
+	state := &udpAssociateState{relay: uc}
+	udpAssocs.Store(s.Addr(), state)
+	// Register the UDP relay in the shared closers: socksServer.Close must
+	// be able to unblock the ReadFromUDP loop below (and the s.done
+	// WaitGroup must cover it, or Close hangs forever).
+	s.mu.Lock()
+	s.closers = append(s.closers, uc)
+	s.mu.Unlock()
+	var udpDone sync.WaitGroup
+	udpDone.Go(func() {
+		s.relayLoop(uc, state)
+	})
+	// The control connection's death also ends the relay (the client hung
+	// up — the exchange is over either way).
+	_, _ = io.Copy(io.Discard, conn)
+	_ = uc.Close()
+	udpDone.Wait()
+	udpAssocs.Delete(s.Addr())
 }
 
 // relay pumps both directions until either side closes, then tears BOTH down

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,15 +201,18 @@ func TestClassifyNetflixEmptyBodiesFailUnknown(t *testing.T) {
 
 // definiteStatus is a fully definite verdict (every media field carries a
 // definite vocabulary answer — blocked counts as definite): the 7-day window
-// shape.
+// shape. BatteryVersion is the CURRENT battery: the migration rule (older
+// batteries are stale on sight) is pinned separately in
+// TestFreshUnlockBatteryMigration.
 func definiteStatus(checkedAt string) *model.MediaUnlockStatus {
 	return &model.MediaUnlockStatus{
-		ChatGPT:       model.UnlockYes,
-		Netflix:       model.UnlockNetflixFull,
-		YouTubeRegion: "DE",
-		Disney:        model.UnlockYes,
-		TikTok:        model.UnlockYes,
-		CheckedAt:     checkedAt,
+		ChatGPT:        model.UnlockYes,
+		Netflix:        model.UnlockNetflixFull,
+		YouTubeRegion:  "DE",
+		Disney:         model.UnlockYes,
+		TikTok:         model.UnlockYes,
+		CheckedAt:      checkedAt,
+		BatteryVersion: UnlockBatteryVersion,
 	}
 }
 
@@ -253,6 +259,35 @@ func TestFreshUnlock(t *testing.T) {
 	assert.False(t, freshUnlock(nil, now), "nil verdict = unchecked")
 	assert.False(t, freshUnlock(mkStatus(""), now), "empty CheckedAt = never probed")
 	assert.False(t, freshUnlock(mkStatus("not-a-time"), now), "unparsable = stale")
+}
+
+// TestFreshUnlockBatteryMigration pins the battery_version migration rule:
+// a verdict written by ANY battery older than the current one is stale on
+// sight — fresh definite, 7-day-window shape, whatever — because the v1
+// battery had no hijack detector and its definite "yes" verdicts may be
+// poisoned. The current battery's verdicts serve their normal windows.
+func TestFreshUnlockBatteryMigration(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	stamp := now.Add(-time.Hour).Format(time.RFC3339)
+
+	v1Definite := definiteStatus(stamp)
+	v1Definite.BatteryVersion = 1
+	assert.False(t, freshUnlock(v1Definite, now),
+		"a battery-v1 cached definite verdict is stale under battery v2 — re-probed (the poisoned-verdict kill)")
+
+	legacyDefinite := definiteStatus(stamp)
+	legacyDefinite.BatteryVersion = 0
+	assert.False(t, freshUnlock(legacyDefinite, now),
+		"a legacy (versionless) verdict is stale — pre-battery-stamp entries re-probe too")
+
+	v1Unknown := unknownStatus(stamp)
+	v1Unknown.BatteryVersion = 1
+	assert.False(t, freshUnlock(v1Unknown, now), "v1 unknown verdicts are stale equally")
+
+	futureDefinite := definiteStatus(stamp)
+	futureDefinite.BatteryVersion = UnlockBatteryVersion + 1
+	assert.True(t, freshUnlock(futureDefinite, now),
+		"a NEWER battery stamp is not downgraded by the reader (forward-compatible)")
 }
 
 // TestUnlockVerdictUnknownTTL pins the verdict-shaped TTL: any unknown or
@@ -373,7 +408,11 @@ func TestUnknownCachedProbeRep(t *testing.T) {
 }
 
 // TestDefaultUnlockEndpoints pins the production probe URL set (the Phase-1
-// wire contract; the test seam overrides these, never the semantics).
+// wire contract; the test seam overrides these, never the semantics). The
+// v2 battery adds the exit-truth channels: the cftrace primary echo, the
+// ipify/ip.sb consensus echoes, the ip-api body contract, the OS
+// connectivity-check alive gate, the authoritative DNS-over-TCP target and
+// the STUN server.
 func TestDefaultUnlockEndpoints(t *testing.T) {
 	ep := defaultUnlockEndpoints()
 	require.Equal(t, "https://chatgpt.com/cdn-cgi/trace", ep.ChatGPCTrace)
@@ -387,4 +426,164 @@ func TestDefaultUnlockEndpoints(t *testing.T) {
 	assert.Equal(t, "https://disney.api.edge.bamgrid.com/token", ep.DisneyAuth)
 	assert.Equal(t, "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql", ep.DisneyGraphQL)
 	assert.Equal(t, "https://ipinfo.io/widget/demo/", ep.IPInfoWidget)
+	assert.Equal(t, "https://www.cloudflare.com/cdn-cgi/trace", ep.CFTrace)
+	assert.Equal(t, "https://api.ipify.org", ep.EchoIPify)
+	assert.Equal(t, "https://api.ip.sb/ip", ep.EchoIPSB)
+	assert.Equal(t, "http://ip-api.com/json/", ep.IPAPIContract)
+	assert.Equal(t, "https://connectivitycheck.gstatic.com/generate_204", ep.AlivePrimary)
+	assert.Equal(t, "https://www.msftconnecttest.com/connecttest.txt", ep.AliveFallback)
+	assert.Equal(t, "216.239.32.10:53", ep.DNSServer)
+	assert.Equal(t, "o-o.myaddr.l.google.com", ep.DNSName)
+	assert.Equal(t, "stun.l.google.com:19302", ep.STUNServer)
+}
+
+// TestParseCFTraceContract pins the cftrace parser (item 1): key=value
+// lines parse into ip/colo/loc, and the BODY CONTRACT requires a parseable
+// ip= line — a trace without one (or garbage) is the suspect class, never
+// exit evidence.
+func TestParseCFTraceContract(t *testing.T) {
+	ev, ok := ParseCFTrace("fl=1.1\nip=203.0.113.7\ncolo=FRA\nloc=DE\n tsl=bogus\n")
+	require.True(t, ok, "a real trace shape parses")
+	assert.Equal(t, "203.0.113.7", ev.IP)
+	assert.Equal(t, "FRA", ev.Colo)
+	assert.Equal(t, "DE", ev.Loc)
+
+	_, ok = ParseCFTrace("fl=1.1\ncolo=FRA\nloc=DE\n")
+	assert.False(t, ok, "missing ip= line = contract-suspect (the fake-trace class)")
+
+	_, ok = ParseCFTrace("ip=not-an-ip\nloc=DE\n")
+	assert.False(t, ok, "an unparseable ip= value = contract-suspect")
+
+	_, ok = ParseCFTrace("<html>blocked</html>")
+	assert.False(t, ok, "garbage body = contract-suspect")
+
+	_, ok = ParseCFTrace("")
+	assert.False(t, ok, "empty body = contract-suspect")
+}
+
+// TestEchoConsensus pins the three-source consensus (item 2): ≥2 agreeing
+// IPs pin the exit with the agree count, no agreement pins nothing, and
+// echo IPs spanning >1 distinct /24 raise the ROTATING flag regardless of
+// pinning.
+func TestEchoConsensus(t *testing.T) {
+	okEcho := func(source, ip string) EchoResult {
+		return EchoResult{Source: source, IP: ip, Class: echoOK}
+	}
+	t.Run("three agree", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "203.0.113.7"), okEcho(echoIPify, "203.0.113.7"), okEcho(echoIPSB, "203.0.113.7"),
+		})
+		assert.Equal(t, "203.0.113.7", res.IP)
+		assert.Equal(t, 3, res.Agree)
+		assert.False(t, res.Rotating)
+	})
+	t.Run("majority pins, minority noted", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "203.0.113.7"), okEcho(echoIPify, "203.0.113.8"), okEcho(echoIPSB, "203.0.113.7"),
+		})
+		assert.Equal(t, "203.0.113.7", res.IP)
+		assert.Equal(t, 2, res.Agree)
+		assert.False(t, res.Rotating, "a same-/24 minority is not rotation")
+	})
+	t.Run("all-different cross-/24 = rotating, no pin", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "203.0.113.7"), okEcho(echoIPify, "198.51.100.9"), okEcho(echoIPSB, "198.52.100.10"),
+		})
+		assert.Empty(t, res.IP)
+		assert.Zero(t, res.Agree)
+		assert.True(t, res.Rotating)
+	})
+	t.Run("all-different same /24 = no pin, not rotating", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "203.0.113.7"), okEcho(echoIPify, "203.0.113.8"), okEcho(echoIPSB, "203.0.113.9"),
+		})
+		assert.Empty(t, res.IP)
+		assert.Zero(t, res.Agree)
+		assert.False(t, res.Rotating, "one /24 = one egress identity, churn within it is not cross-/24 rotation")
+	})
+	t.Run("majority pins even with a cross-/24 minority, but rotating", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "203.0.113.7"), okEcho(echoIPify, "198.51.100.9"), okEcho(echoIPSB, "203.0.113.7"),
+		})
+		assert.Equal(t, "203.0.113.7", res.IP)
+		assert.Equal(t, 2, res.Agree)
+		assert.True(t, res.Rotating, "echo IPs span two /24s — the exit rotates, the record says so")
+	})
+	t.Run("failed echoes carry no vote", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			{Source: echoCFTrace, Class: echoErr},
+			okEcho(echoIPify, "203.0.113.7"), {Source: echoIPSB, Class: echoBad},
+		})
+		assert.Empty(t, res.IP)
+		assert.Zero(t, res.Agree)
+		assert.False(t, res.Rotating)
+	})
+	t.Run("zero echoes", func(t *testing.T) {
+		res := echoConsensus(nil)
+		assert.Empty(t, res.IP)
+		assert.Zero(t, res.Agree)
+		assert.False(t, res.Rotating)
+	})
+}
+
+// TestHijackTLSErrorClassification pins the TLS-layer hijack signatures:
+// certificate-validation failures and plaintext-where-TLS-was-mandated are
+// the intercept class; timeouts, resets and EOFs are NOT (they are the
+// dead-tunnel/flaky classes).
+func TestHijackTLSErrorClassification(t *testing.T) {
+	hijacked := []error{
+		x509.CertificateInvalidError{Reason: x509.Expired},
+		x509.HostnameError{Host: "chatgpt.com"},
+		x509.UnknownAuthorityError{},
+		tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
+		errors.New(`Get "https://chatgpt.com/cdn-cgi/trace": http: server gave HTTP response to HTTPS client`),
+		fmt.Errorf("wrap: %w", x509.CertificateInvalidError{Reason: x509.NotAuthorizedToSign, Detail: "wrapped"}),
+	}
+	for _, err := range hijacked {
+		assert.True(t, hijackTLSError(err), "hijack signature: %v", err)
+	}
+	notHijack := []error{
+		nil,
+		errors.New("context deadline exceeded"),
+		errors.New(`Get "https://x": read tcp 127.0.0.1:1->127.0.0.1:2: connection reset by peer`),
+		errors.New("EOF"),
+		errors.New(`net/http: TLS handshake timeout`),
+		errors.New("socks connect tcp 1.2.3.4:443: connection refused"),
+	}
+	for _, err := range notHijack {
+		assert.False(t, hijackTLSError(err), "NOT a hijack signature: %v", err)
+	}
+}
+
+// TestValidateIPAPIBody pins the HTTP-family body contract (item 3): the
+// answer MUST be JSON with a parseable query-field IP — the hijacked
+// 24-byte fake answer carried no contract fields.
+func TestValidateIPAPIBody(t *testing.T) {
+	ip, ok := validateIPAPIBody(`{"status":"success","query":"203.0.113.7","country":"DE"}`)
+	require.True(t, ok)
+	assert.Equal(t, "203.0.113.7", ip)
+
+	for name, body := range map[string]string{
+		"the fake 24-byte answer": `{"err":true,"m":"x"}`,
+		"plain garbage":           "\x1f\x8bgarbage-bytes",
+		"query not an IP":         `{"query":"not-an-ip"}`,
+		"query empty":             `{"query":""}`,
+		"valid JSON no query":     `{"status":"fail","message":"boom"}`,
+		"empty body":              "",
+	} {
+		_, ok := validateIPAPIBody(body)
+		assert.False(t, ok, "contract violation must fail: %s", name)
+	}
+}
+
+// TestExtractIPv4Token pins the TXT evidence extraction: the authoritative
+// answer embeds the IP inside a longer character-string.
+func TestExtractIPv4Token(t *testing.T) {
+	ip, ok := extractIPv4Token("198.51.100.53.# 22:19:53.793 resolver evidence")
+	require.True(t, ok)
+	assert.Equal(t, "198.51.100.53", ip)
+	_, ok = extractIPv4Token("no ip in here")
+	assert.False(t, ok)
+	_, ok = extractIPv4Token("")
+	assert.False(t, ok)
 }

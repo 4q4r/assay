@@ -2,10 +2,14 @@ package geo
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -15,6 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/proxy"
+
+	"public_vpn/internal/checker"
 	"public_vpn/internal/model"
 	"public_vpn/internal/store"
 )
@@ -51,10 +58,24 @@ const (
 	// week even once its tunnel recovered. Unknown-carrying verdicts now go
 	// stale after a day; fully definite ones keep UnlockTTL.
 	UnlockUnknownTTL = 24 * time.Hour
+	// UnlockBatteryVersion is the CURRENT unlock battery's version. Verdicts
+	// stamped with a lower version are stale REGARDLESS of their TTL
+	// (freshUnlock): the v1 battery scored hijack exits "yes" (no exit-echo
+	// consensus, no hijack detector, no contract checks), so every pre-v2
+	// cached definite verdict is re-probed exactly once by the first wave
+	// after the upgrade — the one-time migration sweep — and v2 verdicts
+	// then serve their normal windows.
+	UnlockBatteryVersion = 2
 	// unlockRequestTimeout bounds ONE probe request (the spec's 3s): every
 	// request carries its own context budget, so no slow service hangs a
 	// wave.
 	unlockRequestTimeout = 3 * time.Second
+	// unlockRetryStagger is the inter-attempt delay of the retry-once
+	// wrapper: an endpoint that failed transport-level gets ONE re-shot
+	// after this stagger; a pass after exactly one failure is the OK_FLAKY
+	// class (the research: ~25% of the unknown mass was unstable links, not
+	// policy), both passes failing is the deterministic class.
+	unlockRetryStagger = 500 * time.Millisecond
 	// unlockBodyLimit bounds HTML-ish probe bodies (title/premium/home
 	// pages); unlockJSONLimit bounds the JSON endpoints.
 	unlockBodyLimit = 4 << 20
@@ -111,7 +132,13 @@ const (
 )
 
 // UnlockEndpoints are the Phase-1 probe URLs — a test seam (nil = the
-// production defaults), exactly like Input.SelfURL.
+// production defaults), exactly like Input.SelfURL. The v2 battery extends
+// the set with the exit-truth channels (cftrace primary echo, the ipify /
+// ip.sb consensus echoes, the ip-api body-contract hijack probe, the OS
+// connectivity-check tunnel-alive gate, the DNS-authoritative TCP channel
+// and the STUN server for hysteria2): the *Server/*Name fields are
+// host:port strings where "" disables the channel (tests stay hermetic;
+// production defaults fill them).
 type UnlockEndpoints struct {
 	ChatGPCTrace      string
 	ChatGPTCompliance string
@@ -124,6 +151,30 @@ type UnlockEndpoints struct {
 	DisneyAuth        string
 	DisneyGraphQL     string
 	IPInfoWidget      string
+	// CFTrace is the PRIMARY exit-IP echo: www.cloudflare.com/cdn-cgi/trace
+	// through the tunnel (ip= is the connecting IP; colo=/loc= evidence).
+	CFTrace string
+	// EchoIPify / EchoIPSB are consensus echoes 2 and 3 (api.ipify.org and
+	// api.ip.sb/ip, plain-text IPs over HTTPS).
+	EchoIPify string
+	EchoIPSB  string
+	// IPAPIContract is the plain-HTTP ip-api answer the hijack detector
+	// body-contracts: a 200 whose JSON lacks a parseable query-field IP is
+	// the fake-answer hijack signature (the 24-byte magiclampcloud shape).
+	IPAPIContract string
+	// AlivePrimary / AliveFallback are the OS connectivity-check endpoints
+	// the tunnel-alive gate rides (gstatic generate_204, msft
+	// connecttest.txt) — the highest blocking cost an operator can pay.
+	AlivePrimary  string
+	AliveFallback string
+	// DNSServer is the DNS-over-TCP authoritative echo target
+	// (216.239.32.10:53) and DNSName the TXT owner
+	// (o-o.myaddr.l.google.com); "" disables the channel.
+	DNSServer string
+	DNSName   string
+	// STUNServer is the RFC 5389 Binding target for hysteria2 nodes
+	// (stun.l.google.com:19302); "" disables the channel.
+	STUNServer string
 }
 
 func defaultUnlockEndpoints() UnlockEndpoints {
@@ -139,7 +190,63 @@ func defaultUnlockEndpoints() UnlockEndpoints {
 		DisneyAuth:        "https://disney.api.edge.bamgrid.com/token",
 		DisneyGraphQL:     "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql",
 		IPInfoWidget:      "https://ipinfo.io/widget/demo/",
+		CFTrace:           "https://www.cloudflare.com/cdn-cgi/trace",
+		EchoIPify:         "https://api.ipify.org",
+		EchoIPSB:          "https://api.ip.sb/ip",
+		IPAPIContract:     "http://ip-api.com/json/",
+		AlivePrimary:      "https://connectivitycheck.gstatic.com/generate_204",
+		AliveFallback:     "https://www.msftconnecttest.com/connecttest.txt",
+		DNSServer:         "216.239.32.10:53",
+		DNSName:           "o-o.myaddr.l.google.com",
+		STUNServer:        "stun.l.google.com:19302",
 	}
+}
+
+// Echo channel names (the evidence classes recorded per source).
+const (
+	echoCFTrace = "cftrace"
+	echoIPify   = "ipify"
+	echoIPSB    = "ipsb"
+	echoIPAPI   = "ipapi"
+	// Echo outcome classes.
+	echoOK     = "ok"
+	echoHijack = "hijack"
+	echoBad    = "suspect" // contract violation: the answer is not a parseable exit IP
+	echoErr    = "err"     // transport/rate-limit failure — recorded, non-fatal, NOT hijack
+)
+
+// EchoResult is ONE echo channel's outcome for one exit: the parsed exit IP
+// ("" when the channel failed or the body broke its contract) and the
+// outcome class.
+type EchoResult struct {
+	Source string
+	IP     string
+	Class  string
+	Detail string
+}
+
+// ExitEvidence is one battery run's evidence bundle for ONE exit. It is the
+// in-memory shape; the verdict-shaped subset folds into the persisted
+// MediaUnlockStatus (stampEvidence).
+type ExitEvidence struct {
+	TunnelAlive   bool
+	Echo          []EchoResult
+	ConsensusIP   string // pinned when ≥2 echo sources agree
+	Consensus     int    // agreeing echo sources
+	Rotating      bool   // echo IPs span >1 distinct /24
+	Hijack        bool
+	HijackReasons []string
+	CFColo        string
+	CFLoc         string
+	DNSIP         string
+	StunIP        string
+	FlakyCount    int // endpoints recovered on the retry pass (OK_FLAKY)
+}
+
+// flag marks a hijack reason (evidence list) and raises the exit-level flag.
+func (e *ExitEvidence) flag(reason string) {
+	e.Hijack = true
+	e.HijackReasons = append(e.HijackReasons, reason)
 }
 
 // IPQuality is the Phase-1 quality verdict for one exit IP. ScamalyticsScore
@@ -202,6 +309,143 @@ func ParseCDNTrace(body string) string {
 // unsupported_country marker (true = the exit's country is unsupported).
 func ParseChatGPTCompliance(body string) bool {
 	return strings.Contains(body, unsupportedCountryMarker)
+}
+
+// CFTraceEvidence is the parsed cdn-cgi/trace contract: ip= is the
+// connecting (exit) IP, colo=/loc= the Cloudflare evidence fields.
+type CFTraceEvidence struct {
+	IP   string
+	Colo string
+	Loc  string
+}
+
+// ParseCFTrace extracts the key=value lines of a cdn-cgi/trace body. ok is
+// the BODY CONTRACT: a trace that does not carry a parseable ip= line is
+// not evidence — through a hijacking exit it is the fake-body signature
+// (suspect class), never an exit answer.
+func ParseCFTrace(body string) (CFTraceEvidence, bool) {
+	var ev CFTraceEvidence
+	for line := range strings.SplitSeq(body, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "ip":
+			ev.IP = strings.TrimSpace(v)
+		case "colo":
+			ev.Colo = strings.TrimSpace(v)
+		case "loc":
+			ev.Loc = strings.TrimSpace(v)
+		}
+	}
+	if net.ParseIP(ev.IP) == nil {
+		return ev, false
+	}
+	return ev, true
+}
+
+// hijackTLSError reports whether a transport error is a TLS-LAYER intercept
+// signature observed through the tunnel: a certificate the system pool
+// rejects (the MITM presented its own cert), or PLAINTEXT answered where
+// TLS was mandated ("server gave HTTP response to HTTPS client",
+// tls.RecordHeaderError — the magiclampcloud plain-HTTP-on-:443 shape).
+// Timeouts, resets and EOFs are NOT hijack evidence — those are the
+// dead-tunnel / flaky-link classes.
+func hijackTLSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The x509/tls error types carry VALUE receivers in the current
+	// toolchain (and historically shipped pointer-typed wraps), so both
+	// shapes are matched — a MITM signature must classify regardless of how
+	// the transport wrapped it.
+	var certErr x509.CertificateInvalidError
+	var certErrPtr *x509.CertificateInvalidError
+	var hostErr x509.HostnameError
+	var hostErrPtr *x509.HostnameError
+	var authErr x509.UnknownAuthorityError
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &certErr) || errors.As(err, &certErrPtr) ||
+		errors.As(err, &hostErr) || errors.As(err, &hostErrPtr) ||
+		errors.As(err, &authErr) || errors.As(err, &recordErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
+}
+
+// parsePlainIPEcho contracts a plain-text IP echo body (ipify / ip.sb):
+// the trimmed body must be exactly a parseable IP — anything else is the
+// suspect/garbage class.
+func parsePlainIPEcho(body string) (string, bool) {
+	ip := net.ParseIP(strings.TrimSpace(body))
+	if ip == nil {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+// validateIPAPIBody contracts the plain-HTTP ip-api answer (hijack
+// detector, HTTP family): the body MUST decode as JSON carrying a query
+// field with a parseable IP — the hijacked 24-byte fake answer had no
+// contract fields. Returns the query IP when the contract held.
+func validateIPAPIBody(body string) (string, bool) {
+	var resp struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return "", false
+	}
+	ip := net.ParseIP(strings.TrimSpace(resp.Query))
+	if ip == nil {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+// echoConsensusOut is the consensus verdict over the echo outcomes.
+type echoConsensusOut struct {
+	IP       string // pinned when ≥2 echo sources agree ("" otherwise)
+	Agree    int    // agreeing echo sources
+	Rotating bool   // echo IPs span >1 distinct /24
+}
+
+// echoConsensus folds the echo outcomes into the exit-IP verdict: ≥2
+// sources agreeing on the exact IP pin it (consensus = the agree count,
+// the minority is noted in the echo list), no agreement pins nothing, and
+// echo IPs spanning MORE THAN ONE distinct /24 raise the ROTATING flag —
+// those exits serve different egresses per request, so a single IP must
+// never become the classification identity.
+func echoConsensus(echoes []EchoResult) echoConsensusOut {
+	counts := map[string]int{}
+	order := []string{}
+	var nets []string
+	seen24 := map[string]bool{}
+	for _, e := range echoes {
+		if e.Class != echoOK || e.IP == "" {
+			continue
+		}
+		if _, ok := counts[e.IP]; !ok {
+			order = append(order, e.IP)
+		}
+		counts[e.IP]++
+		slash24 := "v6:" + e.IP
+		if p := net.ParseIP(e.IP); p != nil {
+			if v4 := p.To4(); v4 != nil {
+				slash24 = v4.Mask(net.CIDRMask(24, 32)).String()
+			}
+		}
+		if !seen24[slash24] {
+			seen24[slash24] = true
+			nets = append(nets, slash24)
+		}
+	}
+	for _, candidate := range order {
+		if counts[candidate] >= 2 {
+			return echoConsensusOut{IP: candidate, Agree: counts[candidate], Rotating: len(nets) > 1}
+		}
+	}
+	return echoConsensusOut{Rotating: len(nets) > 1}
 }
 
 // ClassifyChatGPT maps the two probe outcomes onto the stored vocabulary.
@@ -458,20 +702,80 @@ func ComputeIPQuality(g *Response, w *IPInfoWidget) *IPQuality {
 	}
 }
 
-// unlockProbe is ONE exit's probe session: the through-tunnel client, the
-// ONE pipeline user agent, the endpoint set, the shared pacing and the
-// clock — every rung of every service rides the same temp socks instance.
+// unlockProbe is ONE exit's probe session: the through-tunnel clients (the
+// TLS-validated HTTP battery client and the checker tunnel client for the
+// DNS/STUN channels), the ONE pipeline user agent, the endpoint set, the
+// shared pacing, the clock and the exit identity — every rung of every
+// service rides the same temp socks instance. tlsRoots is the test seam for
+// the certificate pool (nil = the SYSTEM pool — production validates every
+// HTTPS answer against the real WebPKI; a fixture self-signed cert fails
+// validation exactly like a MITM).
 type unlockProbe struct {
 	cl     *http.Client
+	tc     *checker.TunnelClient // DNS-over-TCP + STUN channels; nil = disabled
 	ua     string
 	ep     UnlockEndpoints
 	pac    *pacer
+	sleep  func(ctx context.Context, d time.Duration) error
 	now    func() time.Time
 	exitIP string
+	scheme string // the representative node's scheme (STUN rides hysteria2/hy2 only)
+	flaky  int    // endpoints recovered on the retry pass (OK_FLAKY count)
 }
 
-func (p *unlockProbe) get(ctx context.Context, endpoint string, headers map[string]string) (int, string, error) {
-	return p.do(ctx, http.MethodGet, endpoint, "", "", headers, unlockBodyLimit)
+// buildUnlockClient builds the battery's HTTP client: the ONLY transport
+// path is the temp instance's socks endpoint (socks5h — hostnames resolve
+// at the exit), certificate validation is ALWAYS on against roots (nil =
+// the system pool), and Proxy is nil — the L5 landmine guard: the ambient
+// http_proxy of the owner's shell must never carry unlock traffic.
+func buildUnlockClient(socksAddr string, timeout time.Duration, roots *x509.CertPool) (*http.Client, error) {
+	d, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("socks dialer: %w", err)
+	}
+	dialer, ok := d.(proxy.ContextDialer)
+	if !ok {
+		return nil, errors.New("socks dialer: no context support")
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: dialer.DialContext,
+			Proxy:       nil, // L5: NEVER http.ProxyFromEnvironment here
+			TLSClientConfig: &tls.Config{
+				RootCAs:    roots, // nil = system pool (production)
+				MinVersion: tls.VersionTLS12,
+			},
+			ForceAttemptHTTP2:   true,
+			TLSHandshakeTimeout: timeout,
+			DisableKeepAlives:   true, // 1–2 requests per instance: reuse buys nothing
+		},
+		Timeout: timeout,
+	}, nil
+}
+
+// getRetry is the retry-once wrapper (item 7): a TRANSPORT-level failure
+// gets exactly one re-shot after the ~500ms stagger (the pacer re-slots the
+// attempt); a recovered pass counts the endpoint OK_FLAKY. HTTP statuses
+// are DATA (the classifiers interpret them) and are never retried.
+func (p *unlockProbe) getRetry(ctx context.Context, endpoint string, headers map[string]string) (int, string, error) {
+	st, body, err := p.do(ctx, http.MethodGet, endpoint, "", "", headers, unlockBodyLimit)
+	if err == nil {
+		return st, body, nil
+	}
+	if ctx.Err() != nil {
+		return st, body, err
+	}
+	if p.sleep != nil {
+		if serr := p.sleep(ctx, unlockRetryStagger); serr != nil {
+			return st, body, err
+		}
+	}
+	st, body, err = p.do(ctx, http.MethodGet, endpoint, "", "", headers, unlockBodyLimit)
+	if err == nil {
+		p.flaky++ // the OK_FLAKY count: this endpoint recovered on the retry pass
+		return st, body, nil
+	}
+	return st, body, err
 }
 
 func (p *unlockProbe) postJSON(
@@ -525,32 +829,46 @@ func (p *unlockProbe) do(ctx context.Context, method, endpoint, contentType, bod
 	return resp.StatusCode, string(b), nil
 }
 
-func (p *unlockProbe) chatgpt(ctx context.Context) string {
-	st, body, err := p.get(ctx, p.ep.ChatGPCTrace, nil)
+// chatgpt runs the trace + compliance pair with the retry-once wrapper. A
+// TLS-layer intercept signature on either rung is the HIJACK class: the
+// exit intercepts TLS, so "yes" is unreachable by construction — the
+// verdict is blocked (the second return flags the exit-level hijack).
+func (p *unlockProbe) chatgpt(ctx context.Context) (string, bool) {
+	st, body, err := p.getRetry(ctx, p.ep.ChatGPCTrace, nil)
+	traceHijack := err != nil && hijackTLSError(err)
 	traceOK := err == nil && st == http.StatusOK
 	if traceOK {
 		// The trace's loc= line is the reachability proof (the reference
 		// greps it): an unparseable trace is no evidence.
 		traceOK = ParseCDNTrace(body) != ""
 	}
-	st, body, err = p.get(ctx, p.ep.ChatGPTCompliance, map[string]string{
+	st, body, err = p.getRetry(ctx, p.ep.ChatGPTCompliance, map[string]string{
 		headerAuthorization: "Bearer null",
 		headerOrigin:        platformOpenAIOrigin,
 		headerReferer:       platformOpenAIReferer,
 	})
+	complianceHijack := err != nil && hijackTLSError(err)
 	complianceOK := err == nil && st == http.StatusOK
 	unsupported := complianceOK && ParseChatGPTCompliance(body)
-	return ClassifyChatGPT(unsupported, traceOK, complianceOK)
+	if traceHijack || complianceHijack {
+		return model.UnlockBlocked, true
+	}
+	return ClassifyChatGPT(unsupported, traceOK, complianceOK), false
 }
 
-func (p *unlockProbe) netflix(ctx context.Context) string {
-	stA, bodyA, errA := p.get(ctx, p.ep.NetflixTitleA, nil)
-	stB, bodyB, errB := p.get(ctx, p.ep.NetflixTitleB, nil)
-	return ClassifyNetflix(errA, errB, stA, stB, bodyA, bodyB)
+// netflix runs the two title probes with retry-once. A TLS intercept
+// signature is the hijack class — blocked, never yes/full.
+func (p *unlockProbe) netflix(ctx context.Context) (string, bool) {
+	stA, bodyA, errA := p.getRetry(ctx, p.ep.NetflixTitleA, nil)
+	stB, bodyB, errB := p.getRetry(ctx, p.ep.NetflixTitleB, nil)
+	if (errA != nil && hijackTLSError(errA)) || (errB != nil && hijackTLSError(errB)) {
+		return model.UnlockBlocked, true
+	}
+	return ClassifyNetflix(errA, errB, stA, stB, bodyA, bodyB), false
 }
 
 func (p *unlockProbe) youtube(ctx context.Context) string {
-	st, body, err := p.get(ctx, p.ep.YouTubePremium, map[string]string{
+	st, body, err := p.getRetry(ctx, p.ep.YouTubePremium, map[string]string{
 		headerAcceptLanguage: "en",
 		headerCookie:         youtubeCookies,
 	})
@@ -558,13 +876,13 @@ func (p *unlockProbe) youtube(ctx context.Context) string {
 }
 
 func (p *unlockProbe) tiktok(ctx context.Context) string {
-	st, body, err := p.get(ctx, p.ep.TikTokHome, nil)
+	st, body, err := p.getRetry(ctx, p.ep.TikTokHome, nil)
 	if err != nil {
 		return model.UnlockUnknown
 	}
 	if strings.Contains(body, tikTokChallengeMarker) {
 		// The reference retries the challenge page against /explore.
-		if st2, body2, err2 := p.get(ctx, p.ep.TikTokExplore, nil); err2 == nil && body2 != "" {
+		if st2, body2, err2 := p.getRetry(ctx, p.ep.TikTokExplore, nil); err2 == nil && body2 != "" {
 			st, body = st2, body2
 		}
 	}
@@ -578,7 +896,7 @@ func (p *unlockProbe) tiktok(ctx context.Context) string {
 	// server's gzipped body arrive compressed, the region literal stays
 	// byte-absent, and the verdict fabricates (adversarial review F2).
 	if st == http.StatusOK {
-		_, body3, err3 := p.get(ctx, p.ep.TikTokHome, map[string]string{
+		_, body3, err3 := p.getRetry(ctx, p.ep.TikTokHome, map[string]string{
 			"Accept":             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			headerAcceptLanguage: "en",
 		})
@@ -669,7 +987,7 @@ func (p *unlockProbe) disney(ctx context.Context) string {
 }
 
 func (p *unlockProbe) ipinfo(ctx context.Context) *IPInfoWidget {
-	st, body, err := p.get(ctx, p.ep.IPInfoWidget+p.exitIP, nil)
+	st, body, err := p.getRetry(ctx, p.ep.IPInfoWidget+p.exitIP, nil)
 	if err != nil || st != http.StatusOK {
 		return nil
 	}
@@ -680,29 +998,284 @@ func (p *unlockProbe) ipinfo(ctx context.Context) *IPInfoWidget {
 	return w
 }
 
-// probeUnlockSet runs every Phase-1 probe for ONE exit through ONE tunnel
-// client. Failures are non-fatal: the service's verdict becomes unknown and
-// the wave keeps moving. CheckedAt is stamped whenever the probes actually
-// ran — an all-unknown outcome caches for UnlockUnknownTTL (24h, owner
-// order 2026-11-06: a dead-tunnel unknown must not poison the exit for the
-// 7-day window), a definite outcome for UnlockTTL, and an alive-now exit
-// with an unknown-carrying cached verdict is re-probed by the next wave it
-// is eligible for (the alive-bypass in runUnlockGroup). A canceled context
+// tunnelAlive is the tunnel-alive gate (item 5): the OS connectivity-check
+// endpoints — connectivitycheck.gstatic.com/generate_204 primary,
+// msftconnecttest.com/connecttest.txt fallback. Blocking THESE breaks the
+// operating system's own internet detection — the maximum blocking cost an
+// operator can pay, so an exit failing both (after the retry-once wrapper)
+// is dead-now: the battery records all-unknown verdicts and skips the rest
+// of the probe set. A TLS intercept signature through the gate is the
+// opposite of dead — the tunnel DELIVERED bytes to the endpoint — so it
+// keeps the exit alive AND raises the hijack evidence.
+func (p *unlockProbe) tunnelAlive(ctx context.Context, ev *ExitEvidence) bool {
+	hijackedOrOK := func(err error, ok bool) bool {
+		if err != nil && hijackTLSError(err) {
+			ev.flag("alive gate: TLS intercept signature: " + err.Error())
+			return true
+		}
+		return ok
+	}
+	if p.ep.AlivePrimary != "" {
+		st, _, err := p.getRetry(ctx, p.ep.AlivePrimary, nil)
+		if hijackedOrOK(err, err == nil && st == http.StatusNoContent) {
+			return true
+		}
+	}
+	if p.ep.AliveFallback != "" {
+		st, body, err := p.getRetry(ctx, p.ep.AliveFallback, nil)
+		if hijackedOrOK(err, err == nil && st == http.StatusOK &&
+			strings.Contains(body, "Microsoft Connect Test")) {
+			return true
+		}
+	}
+	return false
+}
+
+// cfTraceEcho is the PRIMARY echo (item 1): GET www.cloudflare.com/cdn-cgi/
+// trace through the tunnel; ip= is the connecting IP, colo=/loc= are stored
+// as evidence. A TLS intercept is the hijack class; a body without a
+// parseable ip= line is the contract-suspect (fake-trace/garbage) class.
+func (p *unlockProbe) cfTraceEcho(ctx context.Context, ev *ExitEvidence) EchoResult {
+	res := EchoResult{Source: echoCFTrace, Class: echoErr}
+	st, body, err := p.getRetry(ctx, p.ep.CFTrace, nil)
+	if err != nil {
+		res.Detail = err.Error()
+		if hijackTLSError(err) {
+			res.Class = echoHijack
+			ev.flag("cftrace: TLS intercept signature: " + err.Error())
+		}
+		return res
+	}
+	if st != http.StatusOK {
+		res.Detail = fmt.Sprintf("status %d", st)
+		return res
+	}
+	parsed, ok := ParseCFTrace(body)
+	if !ok {
+		res.Class = echoBad
+		res.Detail = "trace body contract: no parseable ip= line"
+		ev.flag("cftrace: " + res.Detail)
+		return res
+	}
+	res.IP, res.Class = parsed.IP, echoOK
+	res.Detail = "colo=" + parsed.Colo + " loc=" + parsed.Loc
+	ev.CFColo, ev.CFLoc = parsed.Colo, parsed.Loc
+	return res
+}
+
+// plainEcho contracts one plain-text IP echo (ipify / ip.sb, item 2). A TLS
+// intercept is the hijack class; a non-IP body is the suspect class.
+func (p *unlockProbe) plainEcho(ctx context.Context, source, endpoint string, ev *ExitEvidence) EchoResult {
+	res := EchoResult{Source: source, Class: echoErr}
+	st, body, err := p.getRetry(ctx, endpoint, nil)
+	if err != nil {
+		res.Detail = err.Error()
+		if hijackTLSError(err) {
+			res.Class = echoHijack
+			ev.flag(source + ": TLS intercept signature: " + err.Error())
+		}
+		return res
+	}
+	if st != http.StatusOK {
+		res.Detail = fmt.Sprintf("status %d", st)
+		return res
+	}
+	ip, ok := parsePlainIPEcho(body)
+	if !ok {
+		res.Class = echoBad
+		res.Detail = "body contract: not a parseable IP"
+		ev.flag(source + ": " + res.Detail)
+		return res
+	}
+	res.IP, res.Class = ip, echoOK
+	return res
+}
+
+// ipAPIEcho is the HTTP-family hijack probe (item 3): the free-tier ip-api
+// answer is plain HTTP, so certificate validation cannot protect it — the
+// BODY CONTRACT does. A 200 whose JSON lacks a parseable query-field IP is
+// the fake-answer hijack signature. Transport errors and rate limits are
+// recorded non-fatally — never hijack.
+func (p *unlockProbe) ipAPIEcho(ctx context.Context, ev *ExitEvidence) EchoResult {
+	res := EchoResult{Source: echoIPAPI, Class: echoErr}
+	st, body, err := p.getRetry(ctx, p.ep.IPAPIContract, nil)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	if st == http.StatusTooManyRequests {
+		res.Detail = "rate-limited (429)"
+		return res
+	}
+	if st != http.StatusOK {
+		res.Detail = fmt.Sprintf("status %d", st)
+		return res
+	}
+	ip, ok := validateIPAPIBody(body)
+	if !ok {
+		res.Class = echoHijack
+		res.Detail = fmt.Sprintf("ip-api body contract: no parseable query-field IP (%d bytes)", len(body))
+		ev.flag("ip-api: " + res.Detail + " — hijack/garbage class")
+		return res
+	}
+	res.IP, res.Class = ip, echoOK
+	return res
+}
+
+// dnsChannel is the DNS-authoritative second channel (item 4): TXT
+// o-o.myaddr.l.google.com at 216.239.32.10:53 queried over FRAMED TCP
+// through the tunnel — an independent failure envelope from HTTPS (port-53
+// egress filtering on some paths is expected and recorded non-fatally).
+func (p *unlockProbe) dnsChannel(ctx context.Context, ev *ExitEvidence) {
+	if p.tc == nil || p.ep.DNSServer == "" {
+		return
+	}
+	name := p.ep.DNSName
+	if name == "" {
+		name = "o-o.myaddr.l.google.com"
+	}
+	txts, err := p.tc.DNSOverTCP(ctx, p.ep.DNSServer, name, 16)
+	if err != nil {
+		return // recorded non-fatal: the evidence simply stays empty
+	}
+	if ip, ok := extractIPv4Token(txts); ok {
+		ev.DNSIP = ip
+	}
+}
+
+// stunChannel is the hysteria2 transport-level echo (item 6): one RFC 5389
+// Binding to the STUN server through the socks UDP path; the
+// XOR-MAPPED-ADDRESS is the exit IP as the transport sees it. Runs only on
+// hysteria2/hy2 nodes (the UDP-enabled instances); every failure is
+// recorded non-fatally.
+func (p *unlockProbe) stunChannel(ctx context.Context, ev *ExitEvidence) {
+	if p.tc == nil || p.ep.STUNServer == "" {
+		return
+	}
+	if p.scheme != "hysteria2" && p.scheme != "hy2" {
+		return
+	}
+	ip, err := p.tc.STUNBinding(ctx, p.ep.STUNServer)
+	if err == nil {
+		ev.StunIP = ip
+	}
+}
+
+// ipv4TokenRe extracts the first dotted-quad literal out of a free-form
+// string (the authoritative TXT answer embeds the resolver-facing IP in
+// its character-strings).
+var ipv4TokenRe = regexp.MustCompile(`(?:\d{1,3}\.){3}\d{1,3}`)
+
+// extractIPv4Token returns the first dotted-quad literal that parses as an
+// IPv4 address.
+func extractIPv4Token(s string) (string, bool) {
+	for _, m := range ipv4TokenRe.FindAllString(s, -1) {
+		if p := net.ParseIP(m); p != nil && p.To4() != nil {
+			return p.String(), true
+		}
+	}
+	return "", false
+}
+
+// probeUnlockSet runs the v2 battery for ONE exit through ONE tunnel
+// client. Flow: the tunnel-alive gate first (dead tunnels are recorded
+// all-unknown without burning the full battery); then the exit-echo
+// channels (cftrace primary + ipify/ip.sb consensus, the ip-api body
+// contract) whose TLS/body-contract signatures raise the exit-level HIJACK
+// flag; then the media probes; then the DNS-authoritative and STUN
+// evidence channels. Failures are non-fatal: the verdict records unknown
+// and the wave keeps moving. The exit-level hijack forces EVERY media
+// verdict to blocked (a cert/body-contract intercept proves the answers
+// are not the services' own — "yes" is unreachable by construction, which
+// kills the poisoned-verdict class the v1 battery fabricated). CheckedAt
+// is stamped whenever the probes actually ran — an all-unknown outcome
+// caches for UnlockUnknownTTL (24h), a definite outcome for UnlockTTL, and
+// the verdict carries the current battery version (freshUnlock re-probes
+// anything older than it: the migration semantics). A canceled context
 // returns nil (a partial verdict must not be cached as checked).
-func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStatus, *IPInfoWidget) {
-	st := &model.MediaUnlockStatus{
-		ChatGPT:       p.chatgpt(ctx),
-		Netflix:       p.netflix(ctx),
-		YouTubeRegion: p.youtube(ctx),
-		Disney:        p.disney(ctx),
-		TikTok:        p.tiktok(ctx),
+func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStatus, *IPInfoWidget, *ExitEvidence) {
+	ev := &ExitEvidence{}
+	st := &model.MediaUnlockStatus{}
+	stamp := func() *model.MediaUnlockStatus {
+		st.CheckedAt = p.now().UTC().Format(time.RFC3339)
+		stampEvidence(st, ev)
+		return st
+	}
+	// Tunnel-alive gate: the OS connectivity-check endpoints.
+	ev.TunnelAlive = p.tunnelAlive(ctx, ev)
+	if !ev.TunnelAlive {
+		st.ChatGPT, st.Netflix, st.YouTubeRegion = model.UnlockUnknown, model.UnlockUnknown, model.UnlockUnknown
+		st.Disney, st.TikTok = model.UnlockUnknown, model.UnlockUnknown
+		if ctx.Err() != nil {
+			return nil, nil, nil
+		}
+		return stamp(), nil, ev
+	}
+	// Exit-echo channels: the consensus + the exit-level hijack evidence.
+	if p.ep.CFTrace != "" {
+		ev.Echo = append(ev.Echo, p.cfTraceEcho(ctx, ev))
+	}
+	if p.ep.EchoIPify != "" {
+		ev.Echo = append(ev.Echo, p.plainEcho(ctx, echoIPify, p.ep.EchoIPify, ev))
+	}
+	if p.ep.EchoIPSB != "" {
+		ev.Echo = append(ev.Echo, p.plainEcho(ctx, echoIPSB, p.ep.EchoIPSB, ev))
+	}
+	consensus := echoConsensus(ev.Echo)
+	ev.ConsensusIP, ev.Consensus, ev.Rotating = consensus.IP, consensus.Agree, consensus.Rotating
+	// The ip-api body-contract probe is HIJACK evidence, never a consensus
+	// vote: the 3-source consensus is the HTTPS echo family (cftrace +
+	// ipify + ip.sb), and the plain-HTTP contract answer rides a different
+	// trust envelope.
+	if p.ep.IPAPIContract != "" {
+		ev.Echo = append(ev.Echo, p.ipAPIEcho(ctx, ev))
+	}
+	// Media battery.
+	chatgpt, chatHijack := p.chatgpt(ctx)
+	netflix, netHijack := p.netflix(ctx)
+	st.ChatGPT, st.Netflix = chatgpt, netflix
+	st.YouTubeRegion = p.youtube(ctx)
+	st.Disney = p.disney(ctx)
+	st.TikTok = p.tiktok(ctx)
+	if chatHijack {
+		ev.flag("chatgpt: TLS intercept signature (trace/compliance)")
+	}
+	if netHijack {
+		ev.flag("netflix: TLS intercept signature (title pages)")
 	}
 	widget := p.ipinfo(ctx)
+	// Independent evidence channels (recorded, non-fatal).
+	p.dnsChannel(ctx, ev)
+	p.stunChannel(ctx, ev)
 	if ctx.Err() != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	st.CheckedAt = p.now().UTC().Format(time.RFC3339)
-	return st, widget
+	// Exit-level hijack: every media verdict becomes blocked — unknown ≠
+	// hijack ≠ blocked stay three distinct honest classes.
+	if ev.Hijack {
+		st.ChatGPT = model.UnlockBlocked
+		st.Netflix = model.UnlockBlocked
+		st.YouTubeRegion = model.UnlockBlocked
+		st.Disney = model.UnlockBlocked
+		st.TikTok = model.UnlockBlocked
+	}
+	return stamp(), widget, ev
+}
+
+// stampEvidence folds the verdict-shaped evidence subset into the stored
+// verdict: the battery version (the migration anchor — verdicts older than
+// the current battery are stale on sight) plus the echo/hijack/DNS/STUN
+// evidence the status line and pool consumers read.
+func stampEvidence(st *model.MediaUnlockStatus, ev *ExitEvidence) {
+	st.BatteryVersion = UnlockBatteryVersion
+	st.ExitIP = ev.ConsensusIP
+	st.ConsensusCount = ev.Consensus
+	st.Rotating = ev.Rotating
+	st.Hijack = ev.Hijack
+	st.CFColo = ev.CFColo
+	st.CFLoc = ev.CFLoc
+	st.DNSIP = ev.DNSIP
+	st.StunIP = ev.StunIP
 }
 
 // unlockVerdictUnknown reports whether ANY media field of the verdict is
@@ -736,11 +1309,18 @@ func unlockTTL(st *model.MediaUnlockStatus) time.Duration {
 }
 
 // freshUnlock reports whether a cached verdict is inside its own freshness
-// window: CheckedAt must parse, must not sit further in the future than the
+// window: the battery version must be the CURRENT one (the migration rule —
+// verdicts written by an older battery are stale regardless of their age or
+// definiteness: v1 definite verdicts may be hijack-poisoned, and the
+// one-time re-classification sweep re-probes every pre-v2 entry exactly
+// once), CheckedAt must parse, must not sit further in the future than the
 // skew tolerance, and must be at most unlockTTL(st) old (7 days for fully
 // definite verdicts, 24 hours for unknown-carrying ones).
 func freshUnlock(st *model.MediaUnlockStatus, now time.Time) bool {
 	if st == nil || st.CheckedAt == "" {
+		return false
+	}
+	if st.BatteryVersion < UnlockBatteryVersion {
 		return false
 	}
 	t, err := time.Parse(time.RFC3339, st.CheckedAt)
@@ -804,15 +1384,18 @@ func groupByExit(reports []NodeReport, idx exitIPIndex) []unlockGroup {
 	return groups
 }
 
-// unlockStage carries one unlock wave's shared inputs.
+// unlockStage carries one unlock wave's shared inputs. tlsRoots is the
+// battery client's certificate-pool seam (nil = the SYSTEM pool — the
+// production contract; tests may pin a fixture CA).
 type unlockStage struct {
-	in    Input
-	r     *Reporter
-	cold  map[string]*model.MediaUnlockStatus
-	nodes map[string]*model.Node
-	ep    UnlockEndpoints
-	pac   *pacer
-	now   func() time.Time
+	in       Input
+	r        *Reporter
+	cold     map[string]*model.MediaUnlockStatus
+	nodes    map[string]*model.Node
+	ep       UnlockEndpoints
+	pac      *pacer
+	now      func() time.Time
+	tlsRoots *x509.CertPool
 }
 
 // attachUnlock gives every report of the exit group its own copy of the
@@ -848,7 +1431,7 @@ func (st *unlockStage) storeUnlock(exitIP string, rep NodeReport, status *model.
 	_ = st.r.Cache.Set(exitIP, entry)
 }
 
-func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *IPQuality) {
+func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *IPQuality, ev *ExitEvidence) {
 	if w == nil {
 		return
 	}
@@ -860,6 +1443,35 @@ func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *I
 		"unlock: %s chatgpt=%s netflix=%s youtube=%s disney=%s tiktok=%s risk=%d type=%s\n",
 		exitIP, status.ChatGPT, status.Netflix, status.YouTubeRegion, status.Disney, status.TikTok,
 		risk, ipType)
+	if ev == nil {
+		return
+	}
+	// Evidence tail: the v2 battery's exit-truth channels. A hijack-flagged
+	// exit is excluded from the service pools by construction (its media
+	// verdicts are blocked, never yes/full).
+	flags := fmt.Sprintf("battery=v%d alive=%t consensus=%d", status.BatteryVersion, ev.TunnelAlive, ev.Consensus)
+	if status.ExitIP != "" {
+		flags += " exit=" + status.ExitIP
+	}
+	if status.Rotating {
+		flags += " rotating=true"
+	}
+	if status.Hijack {
+		flags += " hijack=true (" + strings.Join(ev.HijackReasons, "; ") + ")"
+	}
+	if ev.FlakyCount > 0 {
+		flags += fmt.Sprintf(" ok_flaky=%d", ev.FlakyCount)
+	}
+	if status.CFColo != "" || status.CFLoc != "" {
+		flags += " cf_colo=" + status.CFColo + " cf_loc=" + status.CFLoc
+	}
+	if status.DNSIP != "" {
+		flags += " dns_ip=" + status.DNSIP
+	}
+	if status.StunIP != "" {
+		flags += " stun_ip=" + status.StunIP
+	}
+	_, _ = fmt.Fprintf(w, "unlock: %s evidence %s\n", exitIP, flags)
 }
 
 // unlockAliveNow reports whether the node's tunnel demonstrably carried a
@@ -992,12 +1604,19 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 		return // infrastructure failure: nothing to attach, nothing cached
 	}
 	defer func() { _ = inst.Close() }()
-	cl, err := NewTunnelClient(inst.Addr(), st.r.Timeout)
+	// The v2 battery client: certificate validation ALWAYS on (tlsRoots nil
+	// = the system pool — the production contract the hijack detector
+	// leans on) plus the checker tunnel client for the DNS-over-TCP and
+	// STUN channels.
+	tcl, err := buildUnlockClient(inst.Addr(), st.r.Timeout, st.tlsRoots)
 	if err != nil {
 		return
 	}
-	probed, widget := probeUnlockSet(ctx, &unlockProbe{
-		cl: cl, ua: st.r.userAgent(), ep: st.ep, pac: st.pac, now: st.now, exitIP: g.exitIP,
+	tc := checker.NewTunnelClient(inst.Addr(), st.r.Timeout)
+	probed, widget, ev := probeUnlockSet(ctx, &unlockProbe{
+		cl: tcl, tc: tc, ua: st.r.userAgent(), ep: st.ep, pac: st.pac,
+		sleep: st.r.sleepFn(), now: st.now, exitIP: g.exitIP,
+		scheme: node.Scheme,
 	})
 	if probed == nil {
 		return // canceled mid-wave
@@ -1005,7 +1624,7 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 	quality := ComputeIPQuality(rep.Geo, widget)
 	attachUnlock(reports, g.inds, probed, quality)
 	st.storeUnlock(g.exitIP, rep, probed, quality)
-	logUnlock(st.r.Progress, g.exitIP, probed, quality)
+	logUnlock(st.r.Progress, g.exitIP, probed, quality, ev)
 }
 
 // runUnlockWave probes quality + media once per distinct exit IP with an
