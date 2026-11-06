@@ -216,6 +216,24 @@ type MediaUnlockStatus struct {
 	Disney        string `json:"disney"`         // UnlockYes|UnlockBlocked|UnlockUnknown
 	TikTok        string `json:"tiktok"`         // UnlockYes|UnlockTikTokIDC|UnlockBlocked|UnlockUnknown
 	CheckedAt     string `json:"checked_at"`
+
+	// Battery evidence (v2 battery, the 2026-11-07 exit-truth research
+	// battery). Every field is omitempty: a legacy (battery v1) verdict
+	// round-trips byte-identically, and a legacy decode lands on the zero
+	// values — BatteryVersion 0 is below the current battery version, which
+	// is exactly the migration semantics (verdicts from batteries below the
+	// current one are stale → re-probed once with the new battery; the
+	// poisoned definite verdicts of the pre-hijack-detector era never serve
+	// past the migration).
+	BatteryVersion int    `json:"battery_version,omitempty"` // 0 = pre-v2 (legacy); producers stamp the current battery
+	ExitIP         string `json:"exit_ip,omitempty"`         // echo-consensus exit IP ("" = no ≥2 agreement, unpinned)
+	ConsensusCount int    `json:"consensus,omitempty"`       // echo sources agreeing on ExitIP (0 = none)
+	Rotating       bool   `json:"rotating,omitempty"`        // echo IPs span >1 distinct /24 — never trust one IP
+	Hijack         bool   `json:"hijack,omitempty"`          // TLS/body-contract intercept — media verdicts forced blocked
+	CFColo         string `json:"cf_colo,omitempty"`         // cloudflare cdn-cgi/trace colo= evidence
+	CFLoc          string `json:"cf_loc,omitempty"`          // cloudflare cdn-cgi/trace loc= evidence
+	DNSIP          string `json:"dns_ip,omitempty"`          // DNS-authoritative echo (TXT o-o.myaddr.l.google.com)
+	StunIP         string `json:"stun_ip,omitempty"`         // RFC 5389 XOR-MAPPED-ADDRESS (hysteria2 nodes)
 }
 
 // Unlock/IP-type vocabulary (the stored contract for MediaUnlockStatus and

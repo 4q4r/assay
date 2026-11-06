@@ -85,6 +85,11 @@ func definiteVerdict() *model.MediaUnlockStatus {
 		ChatGPT: model.UnlockYes, Netflix: model.UnlockNetflixFull,
 		YouTubeRegion: "DE", Disney: model.UnlockYes, TikTok: model.UnlockYes,
 		CheckedAt: agedStamp(-time.Hour),
+		// The fixtures represent CURRENT-battery cached verdicts: the
+		// migration rule (older batteries are stale on sight) is pinned in
+		// TestFreshUnlockBatteryMigration + TestUnlockMigrationV1..., not
+		// here.
+		BatteryVersion: geo.UnlockBatteryVersion,
 	}
 }
 
