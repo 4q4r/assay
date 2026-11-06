@@ -226,6 +226,13 @@ type NodeReport struct {
 	RequestRTTMs []float64
 	// TimedOut counts timed-out requests for this node.
 	TimedOut int
+	// LadderRan marks a report whose geo ladder actually ran in THIS wave (a
+	// temp instance was spawned and the rungs were attempted). Cache-served
+	// clones never carry it: the cached Geo/HTTPS/RateLimited fields are the
+	// evidence of the wave that produced the entry, never in-wave evidence.
+	// The flag is in-wave only — stripped before every cache write and
+	// cleared on every cache-hit clone.
+	LadderRan bool
 }
 
 // Summary aggregates the wave's classes for the wave log.
@@ -314,8 +321,13 @@ func Run(ctx context.Context, in Input) ([]*model.GeoRecord, Summary, error) {
 		byKey[reports[i].Key] = &reports[i]
 	}
 	// Phase-1 unlock stage: quality + media probes once per distinct exit IP
-	// whose cached state is older than UnlockTTL (gated by [geo].unlock_probes,
-	// default ON; an explicit false = no-op — zero unlock requests).
+	// with an unlock-NEED — classification missing, any unknown/unchecked
+	// field, or the verdict past its own TTL (gated by [geo].unlock_probes,
+	// default ON; an explicit false = no-op — zero unlock requests). The
+	// eligibility layers are decoupled (owner order 2026-11-06): this stage
+	// needs a tunnel independently of the geo ladder's 24h freshness gate —
+	// a fresh-geo exit with unlock-need gets an unlock-only sweep (no ip-api
+	// hop, quota preserved), a geo-stale exit gets the full ladder.
 	runUnlockWave(ctx, in, reporter, reports, exitIPs)
 	records, err := mergeGeoRecords(in, byKey)
 	if err != nil {
@@ -782,6 +794,7 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 				clone.ProbeExitIP = probeExitIP
 				clone.RequestRTTMs = append([]float64(nil), cached.Report.RequestRTTMs...)
 				clone.TimedOut = cached.Report.TimedOut
+				clone.LadderRan = false // in-wave fact: a served clone is not a ladder run
 				r.logNode(n, clone)
 				return clone
 			}
@@ -793,6 +806,7 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 				clone.ProbeExitIP = probeExitIP
 				clone.RequestRTTMs = append([]float64(nil), cached.RequestRTTMs...)
 				clone.TimedOut = cached.TimedOut
+				clone.LadderRan = false // in-wave fact: a served clone is not a ladder run
 				r.cacheMu.Unlock()
 				r.logNode(n, clone)
 				return clone
@@ -801,7 +815,9 @@ func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, prob
 		}
 	}
 
-	rep := NodeReport{Key: n.Key, RequestRTTMs: []float64{}}
+	// From here on the geo ladder RUNS for this node (geo-need): the report
+	// is a fresh in-wave outcome, whatever the rungs conclude.
+	rep := NodeReport{Key: n.Key, RequestRTTMs: []float64{}, LadderRan: true}
 	inst, err := r.Factory(ctx, n)
 	if err != nil {
 		rep.Class = ClassUnknown
@@ -992,9 +1008,11 @@ func cacheResult(r *Reporter, exitIP string, rep NodeReport) {
 	if r.cache == nil {
 		r.cache = map[string]NodeReport{}
 	}
-	// store a copy without Key (Key is per-node)
+	// store a copy without Key (Key is per-node) and without the in-wave
+	// ladder marker (a cached report must never claim this wave's evidence)
 	stored := rep
 	stored.Key = ""
+	stored.LadderRan = false
 	r.cache[exitIP] = stored
 }
 
@@ -1004,9 +1022,11 @@ func nodeReportToEntry(exitIP string, rep NodeReport) *ExitGeoEntry {
 		GeoSource: rep.Class,
 		Report:    rep,
 	}
-	// store a copy without Key (Key is per-node)
+	// store a copy without Key (Key is per-node) and without the in-wave
+	// ladder marker (a cached report must never claim this wave's evidence)
 	stored := rep
 	stored.Key = ""
+	stored.LadderRan = false
 	entry.Report = stored
 	if rep.Geo != nil {
 		entry.Country = strings.ToLower(rep.Geo.CountryCode)

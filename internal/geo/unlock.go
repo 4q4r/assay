@@ -19,8 +19,9 @@ import (
 	"public_vpn/internal/store"
 )
 
-// Phase-1 IP quality & media unlock engine: once per distinct exit IP whose
-// cached verdict is outside its freshness window (7 days for fully definite
+// Phase-1 IP quality & media unlock engine: once per distinct exit IP with
+// an unlock-need (classification missing, any unknown/unchecked field, or
+// the verdict past its own freshness window — 7 days for fully definite
 // verdicts, 24 hours for unknown-carrying ones — owner order 2026-11-06),
 // the stage probes ChatGPT / Netflix / YouTube / Disney+ / TikTok unlocks
 // plus IP quality THROUGH that exit's own tunnel (the same temp-socks
@@ -28,7 +29,12 @@ import (
 // ExitGeoEntry + the geo-base.jsonl cold half), and folds it into every geo
 // record sharing the exit. An exit whose tunnel demonstrably worked in the
 // current wave bypasses a fresh unknown-carrying cache hit and re-probes
-// (the alive-bypass). Probe semantics are the ip.check.place reference
+// (the alive-bypass). The eligibility layers are decoupled (owner order
+// 2026-11-06, point 2 of the classification-acceleration plan): geo-need
+// (record stale >24h / no record) drives the full ladder with its ip-api
+// hop; unlock-need alone drives an UNLOCK-ONLY sweep through the tunnel —
+// a fresh-geo exit is never starved of re-classification by the geo stage's
+// freshness gate. Probe semantics are the ip.check.place reference
 // (xykt/IPQuality); failures are non-fatal — the verdict records "unknown"
 // and the wave never hangs (per-request budgets).
 
@@ -857,14 +863,53 @@ func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *I
 }
 
 // unlockAliveNow reports whether the node's tunnel demonstrably carried a
-// successful HTTP answer during the CURRENT wave's geo ladder: a self-report
-// or DoH-fallback geo answer (both requests ride the tunnel), the HTTPS
-// self-geo, or a rate-limited answer (a 429 is an application-level answer
-// received through a working tunnel). This is the same in-wave tunnel
-// evidence the geo stage produces for its self-report candidates — unlike
-// the probe wave's Alive flag, it says the tunnel WORKS now.
+// successful HTTP answer during the CURRENT wave's geo ladder: the report is
+// a fresh ladder outcome (LadderRan — cache-served clones carry the cached
+// rung evidence of the wave that produced the entry, never this wave's) AND
+// one of the rungs answered: a self-report or DoH-fallback geo answer (both
+// requests ride the tunnel), the HTTPS self-geo, or a rate-limited answer
+// (a 429 is an application-level answer received through a working tunnel).
+// This is the same in-wave tunnel evidence the geo stage produces for its
+// self-report candidates — unlike the probe wave's Alive flag, it says the
+// tunnel WORKS now.
 func unlockAliveNow(rep *NodeReport) bool {
-	return rep.Geo != nil || rep.HTTPS != nil || rep.RateLimited
+	return rep.LadderRan && (rep.Geo != nil || rep.HTTPS != nil || rep.RateLimited)
+}
+
+// ladderRanThisWave reports whether the geo ladder actually ran for the
+// exit group in the current wave (any member's report is a fresh ladder
+// outcome). False means every member was served from the exit cache — the
+// geo stage had no reason to touch the exit (geo satisfied), and the unlock
+// stage is the sole judge of what still needs a tunnel (the eligibility
+// layer, owner order 2026-11-06).
+func ladderRanThisWave(reports []NodeReport, g unlockGroup) bool {
+	for _, i := range g.inds {
+		if reports[i].LadderRan {
+			return true
+		}
+	}
+	return false
+}
+
+// unknownCachedProbeRep decides how a FRESH unknown-carrying cached verdict
+// is re-classified, and which report the re-probe should ride. Two paths
+// re-probe: the PR-#15 alive-bypass (a member's tunnel answered in this
+// wave's geo ladder — ride that member), and the eligibility layer's
+// unlock-only sweep (no member rode a ladder this wave — fresh geo, the
+// exit was cache-served — so probe-wave aliveness is the only gate and the
+// representative node is the rider; a dead-at-probe-time tunnel fails into
+// a fresh unknown, bounded by the 24h TTL). When the ladder DID run this
+// wave and no tunnel answered, the exit is dead-now: the cached unknown
+// stands until it ages out (the residue rule — a tunnel that just failed
+// the rungs is not re-probed through a second instance).
+func unknownCachedProbeRep(reports []NodeReport, g unlockGroup) (NodeReport, bool) {
+	if ind, alive := g.aliveInd(reports); alive {
+		return reports[ind], true // alive now + cached unknown: re-probe (PR-#15 alive-bypass)
+	}
+	if !ladderRanThisWave(reports, g) {
+		return reports[g.inds[0]], true // unlock-need, no ladder this wave: unlock-only sweep
+	}
+	return NodeReport{}, false // dead-now residue: keep the cached unknown
 }
 
 // aliveInd returns the index of the group's first member whose tunnel
@@ -880,34 +925,42 @@ func (g unlockGroup) aliveInd(reports []NodeReport) (int, bool) {
 
 // runUnlockGroup drives ONE exit: hot cache hit → cold geo-base hit → probe
 // through a fresh temp instance of the representative node. A fresh cached
-// verdict that still carries unknowns is bypassed when the exit is alive in
-// the current wave (the alive-bypass re-probe). Infrastructure failures
+// verdict that still carries unknowns is bypassed when the exit's tunnel
+// worked in the current wave (the alive-bypass re-probe) OR when no member
+// rode a ladder this wave at all (the eligibility layer's unlock-only sweep
+// — fresh geo no longer starves re-classification). Infrastructure failures
 // attach and cache NOTHING (the next wave retries); probe failures are
 // recorded as unknown.
 // resolveUnlock decides how ONE exit's cached verdict is served: a non-nil
 // status is attached to every report of the group (hot hit as-is, cold hit
 // re-hydrated into the hot entry); nil means the exit must be probed. The
-// alive-bypass (owner order 2026-11-06) fires only when the exit's tunnel
-// demonstrably worked in the current wave and the fresh cached verdict still
-// carries unknown media fields — the probe rep switches to the first member
-// whose geo ladder answered, so the re-probe never rides a dead tunnel.
-// Fully definite verdicts are never bypassed, and a dead-now exit keeps its
-// cached unknown until it ages out (the 24h unknown TTL bounds the residue).
+// unlock-NEED rules (owner order 2026-11-06, decoupled from the geo
+// freshness gate): classification missing or verdict TTL expired → probe
+// (the fall-through); unknown-carrying fresh verdict → probe whenever the
+// exit is alive (the alive-bypass with in-wave tunnel evidence, the
+// unlock-only sweep without it). Fully definite verdicts are never
+// bypassed, and a dead-now exit (the ladder ran this wave and the tunnel
+// failed) keeps its cached unknown until it ages out (the 24h unknown TTL
+// bounds the residue).
 func (st *unlockStage) resolveUnlock(
 	reports []NodeReport, g unlockGroup,
 ) (*model.MediaUnlockStatus, *IPQuality, NodeReport) {
 	rep := reports[g.inds[0]]
 	if st.r.Cache != nil {
 		if e, ok := st.r.Cache.Get(g.exitIP); ok && e != nil && freshUnlock(e.MediaUnlocks, st.now()) {
-			if ind, alive := g.aliveInd(reports); alive && unlockVerdictUnknown(e.MediaUnlocks) {
-				return nil, nil, reports[ind] // alive now + cached unknown: re-probe
+			if unlockVerdictUnknown(e.MediaUnlocks) {
+				if probeRep, doProbe := unknownCachedProbeRep(reports, g); doProbe {
+					return nil, nil, probeRep
+				}
 			}
 			return e.MediaUnlocks, e.Report.Quality, rep
 		}
 	}
 	if c, ok := st.cold[g.exitIP]; ok && freshUnlock(c, st.now()) {
-		if ind, alive := g.aliveInd(reports); alive && unlockVerdictUnknown(c) {
-			return nil, nil, reports[ind] // alive now + cached unknown: re-probe
+		if unlockVerdictUnknown(c) {
+			if probeRep, doProbe := unknownCachedProbeRep(reports, g); doProbe {
+				return nil, nil, probeRep
+			}
 		}
 		st.storeUnlock(g.exitIP, rep, c, nil)
 		return c, nil, rep
@@ -924,6 +977,15 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 	node := st.nodes[rep.Key]
 	if node == nil {
 		return
+	}
+	// The unlock-ONLY sweep marker: the exit is geo-fresh (cache-served, no
+	// geo ladder this wave), so this probe rides the tunnel without any geo
+	// hop — no ip-api request, no quota. The wave log names these lines so
+	// the sweep's cost stays visible (one-time full-set sweep, then steady
+	// state = new/failed/expired exits only).
+	if !ladderRanThisWave(reports, g) && st.r.Progress != nil {
+		_, _ = fmt.Fprintf(st.r.Progress,
+			"unlock: %s unlock-only sweep (geo fresh — no geo ladder this wave)\n", g.exitIP)
 	}
 	inst, err := st.r.Factory(ctx, node)
 	if err != nil {
@@ -946,13 +1008,17 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 	logUnlock(st.r.Progress, g.exitIP, probed, quality)
 }
 
-// runUnlockWave probes quality + media once per distinct exit IP whose
-// cached verdict is outside its own freshness window (7 days definite, 24
-// hours unknown-carrying), re-probing alive exits early when their cached
-// verdict still carries unknowns (the alive-bypass), attaching copies to
-// every report sharing the exit. Gated by [geo].unlock_probes (default ON —
-// owner ruling 2026-11-06; an explicit false = stage off, zero unlock
-// requests); it never fails a wave.
+// runUnlockWave probes quality + media once per distinct exit IP with an
+// unlock-NEED — classification missing, any unknown/unchecked field, or a
+// verdict past its own freshness window (7 days definite, 24 hours
+// unknown-carrying) — re-probing alive exits early when their cached verdict
+// still carries unknowns (the alive-bypass for exits whose tunnels answered
+// in this wave's geo ladder, the unlock-only sweep for fresh-geo exits that
+// never rode one). The eligibility layer is independent of the geo stage's
+// 24h freshness gate (owner order 2026-11-06): a fresh-geo exit with
+// unlock-need still gets its probes, riding the tunnel with NO geo hops.
+// Gated by [geo].unlock_probes (default ON — owner ruling 2026-11-06; an
+// explicit false = stage off, zero unlock requests); it never fails a wave.
 func runUnlockWave(ctx context.Context, in Input, r *Reporter, reports []NodeReport, idx exitIPIndex) {
 	if !in.Cfg.UnlockProbesEnabled() || len(reports) == 0 {
 		return
