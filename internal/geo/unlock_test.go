@@ -3,11 +3,15 @@ package geo_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +29,7 @@ import (
 type unlockDouble struct {
 	srv      *httptest.Server
 	bodies   map[string]string
+	statuses map[string]int // per-path status override (204 alive probe etc.)
 	mu       sync.Mutex
 	hits     map[string]int
 	lastHdr  map[string]http.Header
@@ -35,6 +40,7 @@ func newUnlockDouble(t *testing.T, bodies map[string]string) *unlockDouble {
 	t.Helper()
 	d := &unlockDouble{
 		bodies:   bodies,
+		statuses: map[string]int{"/generate_204": http.StatusNoContent},
 		hits:     map[string]int{},
 		lastHdr:  map[string]http.Header{},
 		lastBody: map[string][]byte{},
@@ -51,10 +57,14 @@ func (d *unlockDouble) handle(w http.ResponseWriter, r *http.Request) {
 	d.lastHdr[r.URL.Path] = r.Header.Clone()
 	d.lastBody[r.URL.Path] = body
 	out, ok := d.bodies[r.URL.Path]
+	st, hasStatus := d.statuses[r.URL.Path]
 	d.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
+	}
+	if hasStatus {
+		w.WriteHeader(st)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(out))
@@ -82,6 +92,14 @@ func (d *unlockDouble) endpoints() *geo.UnlockEndpoints {
 		DisneyAuth:        u + "/token",
 		DisneyGraphQL:     u + "/graph/v1/device/graphql",
 		IPInfoWidget:      u + "/widget/demo/",
+		CFTrace:           u + "/cftrace",
+		EchoIPify:         u + "/ipify",
+		EchoIPSB:          u + "/ipsb",
+		IPAPIContract:     u + "/ipapi",
+		AlivePrimary:      u + "/generate_204",
+		AliveFallback:     u + "/connecttest.txt",
+		// DNSServer/STUNServer stay "" — those channels are disabled unless
+		// a test provides its local fixture addresses (hermetic default).
 	}
 }
 
@@ -119,8 +137,31 @@ func (d *unlockDouble) reset() {
 	d.hits = map[string]int{}
 }
 
+// syncLog is a mutex-guarded Progress capture: reportAll writes the log
+// lines from concurrent per-node goroutines, so a bare strings.Builder
+// would be a data race under -race.
+type syncLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
 // unlockBodies is the all-unlocked fixture set: every probe path answers a
 // clean, parseable body (the through-tunnel test pins the full happy path).
+// The v2 battery channels answer contract-valid: cftrace with ip/loc/colo,
+// agreeing plain-text echoes, an ip-api JSON with the query field, and the
+// gstatic 204 the tunnel-alive gate rides.
 func unlockBodies() map[string]string {
 	return map[string]string{
 		"/cdn-cgi/trace":                  "fl=1.1\nip=203.0.113.7\nloc=DE\n",
@@ -134,6 +175,12 @@ func unlockBodies() map[string]string {
 		"/token":                          `{"refresh_token":"RT-1"}`,
 		"/graph/v1/device/graphql":        `{"extensions":{"sdk":{"session":{"location":{"countryCode":"DE"},"inSupportedLocation":true}}}}`,
 		"/widget/demo/203.0.113.7":        `{"data":{"asn":{"type":"hosting"},"privacy":{"vpn":false,"proxy":false,"tor":false,"hosting":true},"is_mobile":false,"is_anonymous":false}}`,
+		"/cftrace":                        "fl=1.1\nip=203.0.113.7\ncolo=FRA\nloc=DE\n",
+		"/ipify":                          "203.0.113.7\n",
+		"/ipsb":                           "203.0.113.7\n",
+		"/ipapi":                          `{"status":"success","query":"203.0.113.7","hosting":true}`,
+		"/generate_204":                   "",
+		"/connecttest.txt":                "Microsoft Connect Test CDN service",
 	}
 }
 
@@ -341,6 +388,11 @@ func TestUnlockProbeThroughTunnel(t *testing.T) {
 	assert.Equal(t, 1, ud.hitsOf("/token"))
 	assert.Equal(t, 1, ud.hitsOf("/graph/v1/device/graphql"))
 	assert.Equal(t, 1, ud.hitsOf("/widget/demo/203.0.113.7"))
+	assert.Equal(t, 1, ud.hitsOf("/cftrace"))
+	assert.Equal(t, 1, ud.hitsOf("/ipify"))
+	assert.Equal(t, 1, ud.hitsOf("/ipsb"))
+	assert.Equal(t, 1, ud.hitsOf("/ipapi"))
+	assert.Equal(t, 1, ud.hitsOf("/generate_204"))
 
 	// The verdict lands on every record sharing the exit.
 	st := records[0].MediaUnlocks
@@ -353,6 +405,19 @@ func TestUnlockProbeThroughTunnel(t *testing.T) {
 	require.NoError(t, perr, "CheckedAt must be an RFC3339 stamp")
 	assert.LessOrEqual(t, time.Since(checkedAt), time.Minute)
 	assert.Equal(t, st, records[1].MediaUnlocks)
+
+	// v2 battery evidence contract: the echo consensus pinned the exit
+	// (3 agree, one /24, no rotation), the cftrace evidence fields ride,
+	// the battery version stamps the migration semantics.
+	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
+	assert.Equal(t, "203.0.113.7", st.ExitIP)
+	assert.Equal(t, 3, st.ConsensusCount)
+	assert.False(t, st.Rotating)
+	assert.False(t, st.Hijack)
+	assert.Equal(t, "FRA", st.CFColo)
+	assert.Equal(t, "DE", st.CFLoc)
+	assert.Empty(t, st.DNSIP, "the DNS channel is seam-disabled in this fixture")
+	assert.Empty(t, st.StunIP, "vless nodes carry no STUN channel")
 
 	// Quality from the in-tunnel evidence: the ip-api fixture is hosting
 	// (Contabo) and the widget agrees (asn.type=hosting) → DataCenter/25.
@@ -748,4 +813,584 @@ func TestRiskBands(t *testing.T) {
 		assert.Equal(t, 100, geo.ComputeRiskScore(true, false, abuse))
 		assert.Equal(t, 40, geo.ComputeRiskScore(false, true, abuse))
 	})
+}
+
+// deadAliveEndpoints blanks the tunnel-alive endpoints: both OS
+// connectivity checks answer 404, so the gate must judge the tunnel dead
+// and the battery must skip the rest of the probe set.
+func deadAliveEndpoints(d *unlockDouble) *geo.UnlockEndpoints {
+	ep := d.endpoints()
+	ep.AlivePrimary = d.srv.URL + "/alive-dead-1"
+	ep.AliveFallback = d.srv.URL + "/alive-dead-2"
+	return ep
+}
+
+// TestUnlockHijackTLSCertBlockedNotYes pins the hijack detector end to end
+// (the poisoned-verdict kill): a self-signed TLS fixture is what a MITM
+// exit presents, and the production path validates certificates against
+// the SYSTEM pool — every HTTPS probe fails validation, the exit is
+// hijack-flagged, and the media verdicts are BLOCKED (never yes/full, the
+// v1 battery's false-positive class). blocked answers are definite → the
+// verdict caches 7 days honestly.
+func TestUnlockHijackTLSCertBlockedNotYes(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A full happy-path answer set: under a validating client NONE of
+		// it may produce a yes — the cert fails validation first.
+		for path, body := range unlockBodies() {
+			if r.URL.Path == path {
+				_, _ = w.Write([]byte(body))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	u := srv.URL
+	in := unlockInput(t, dir, f, api.URL(), &geo.UnlockEndpoints{
+		ChatGPCTrace:      u + "/cdn-cgi/trace",
+		ChatGPTCompliance: u + "/compliance/cookie_requirements",
+		NetflixTitleA:     u + "/title/81280792",
+		NetflixTitleB:     u + "/title/70143836",
+		YouTubePremium:    u + "/premium",
+		TikTokHome:        u + "/",
+		TikTokExplore:     u + "/explore",
+		DisneyDevices:     u + "/devices",
+		DisneyAuth:        u + "/token",
+		DisneyGraphQL:     u + "/graph/v1/device/graphql",
+		IPInfoWidget:      u + "/widget/demo/",
+		CFTrace:           u + "/cftrace",
+		EchoIPify:         u + "/ipify",
+		EchoIPSB:          u + "/ipsb",
+		IPAPIContract:     u + "/ipapi",
+		AlivePrimary:      u + "/generate_204",
+		AliveFallback:     u + "/connecttest.txt",
+	}, cache)
+
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	require.NotEmpty(t, st.CheckedAt, "the battery ran (the TLS answers prove a live tunnel)")
+	assert.True(t, st.Hijack, "a self-signed cert through the tunnel = the hijack class")
+	assert.Equal(t, model.UnlockBlocked, st.ChatGPT,
+		"chatgpt must be blocked, NOT yes — cert validation is the poison kill")
+	assert.Equal(t, model.UnlockBlocked, st.Netflix)
+	assert.Equal(t, model.UnlockBlocked, st.YouTubeRegion)
+	assert.Equal(t, model.UnlockBlocked, st.Disney)
+	assert.Equal(t, model.UnlockBlocked, st.TikTok)
+	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
+}
+
+// TestUnlockIPAPIBodyContractHijack pins the HTTP-family hijack detector:
+// the free-tier ip-api answer is plain HTTP (no cert to validate), so the
+// BODY CONTRACT is the defense — a 200 whose JSON lacks a parseable
+// query-field IP (the magiclampcloud 24-byte fake shape) flags the exit
+// hijack and forces the media verdicts blocked, while the echo consensus
+// still pins what it honestly saw.
+func TestUnlockIPAPIBodyContractHijack(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	bodies["/ipapi"] = `{"err":true}` // the fake 24-byte answer: no query field
+	ud := newUnlockDouble(t, bodies)
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.True(t, st.Hijack, "a contract-breaking ip-api answer = the hijack/garbage class")
+	assert.Equal(t, model.UnlockBlocked, st.ChatGPT, "media verdicts are forced blocked")
+	assert.Equal(t, model.UnlockBlocked, st.Netflix)
+	assert.Equal(t, "203.0.113.7", st.ExitIP, "the echo consensus still records what it saw")
+	assert.Equal(t, 3, st.ConsensusCount)
+	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
+}
+
+// TestUnlockPlaintextOnTLSHijack pins the plaintext-where-TLS-was-mandated
+// signature: an https:// endpoint answered by a PLAIN-HTTP server (the
+// magiclampcloud plain-HTTP-on-:443 shape) produces the exact
+// "server gave HTTP response to HTTPS client" transport signature —
+// classified hijack, media verdicts blocked.
+func TestUnlockPlaintextOnTLSHijack(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	bodies["/ipapi"] = `{"status":"success","query":"203.0.113.7"}` // contract held
+	ud := newUnlockDouble(t, bodies)
+	// The cftrace endpoint lies about its scheme: https:// against the
+	// plain-HTTP listener.
+	ep := ud.endpoints()
+	ep.CFTrace = "https://" + strings.TrimPrefix(ud.srv.URL, "http://") + "/cftrace"
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ep, cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.True(t, st.Hijack, "plaintext where TLS was mandated = the hijack class")
+	assert.Equal(t, model.UnlockBlocked, st.ChatGPT)
+}
+
+// TestUnlockEchoRotatingNoPin pins the rotating class (the 5-7-distinct-
+// exit research shape): echo answers spanning more than one /24 raise
+// rotating=true, pin NOTHING as the classification identity, and the media
+// verdicts still stand.
+func TestUnlockEchoRotatingNoPin(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	bodies["/cftrace"] = "fl=1.1\nip=203.0.113.7\ncolo=FRA\nloc=DE\n"
+	bodies["/ipify"] = "198.51.100.9\n"
+	bodies["/ipsb"] = "198.52.100.10\n"
+	ud := newUnlockDouble(t, bodies)
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.True(t, st.Rotating, "echo IPs across three /24s = rotating")
+	assert.Empty(t, st.ExitIP, "a rotating exit pins no single IP as its identity")
+	assert.Zero(t, st.ConsensusCount)
+	assert.False(t, st.Hijack)
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "the media verdicts still stand")
+}
+
+// TestUnlockEchoMajorityPinsMinorityNoted pins the 2-agree-1-disagree case:
+// the majority pins the exit IP (consensus = the agree count), the
+// minority echo is recorded, and a same-/24 minority is not rotation.
+func TestUnlockEchoMajorityPinsMinorityNoted(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	bodies["/cftrace"] = "fl=1.1\nip=203.0.113.7\ncolo=FRA\nloc=DE\n"
+	bodies["/ipify"] = "203.0.113.8\n" // minority, same /24
+	bodies["/ipsb"] = "203.0.113.7\n"
+	ud := newUnlockDouble(t, bodies)
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, "203.0.113.7", st.ExitIP, "the majority pins the exit IP")
+	assert.Equal(t, 2, st.ConsensusCount)
+	assert.False(t, st.Rotating, "a same-/24 minority is not rotation")
+}
+
+// TestUnlockRetryOKFlaky pins the retry-once wrapper (item 7): a
+// transport-level failure recovered on the second shot keeps the real
+// verdict (the OK_FLAKY class — the research's 25% unstable-link mass is
+// not policy), a deterministic double failure stays the honest
+// unknown — with exactly two attempts per endpoint — and the recovered
+// pass surfaces in the production evidence tail as ok_flaky (the
+// evidence counter logUnlock reads; probeUnlockSet must copy it).
+func TestUnlockRetryOKFlaky(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	ud := newUnlockDouble(t, bodies)
+	var premiumKilled, titleKilled atomic.Bool
+	var premiumTries, titleTries atomic.Int32
+	orig := ud.srv.Config.Handler
+	ud.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/premium":
+			premiumTries.Add(1)
+			// Fail ONCE (connection slammed shut), then answer: YouTube
+			// recovers with the real region verdict (OK_FLAKY).
+			if !premiumKilled.Swap(true) {
+				if hj, ok := w.(http.Hijacker); ok {
+					conn, _, _ := hj.Hijack()
+					_ = conn.Close()
+				}
+				return
+			}
+		case "/title/81280792":
+			titleTries.Add(1)
+			// Fail EVERY pass (deterministic): netflix stays unknown — a
+			// reset is a dead link, not a TLS hijack.
+			titleKilled.Store(true)
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, _ := hj.Hijack()
+				_ = conn.Close()
+			}
+			return
+		}
+		orig.ServeHTTP(w, r)
+	})
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	in.Sleep = func(context.Context, time.Duration) error { return nil } // no real stagger waits
+	var log syncLog
+	in.Progress = &log // the evidence tail carries the OK_FLAKY counter pin
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, "DE", st.YouTubeRegion,
+		"the retry recovered the premium answer — the verdict stands (OK_FLAKY)")
+	assert.Equal(t, int32(2), premiumTries.Load(), "fail + exactly one retry")
+	assert.Equal(t, model.UnlockUnknown, st.Netflix,
+		"both title-A passes failing is the deterministic-fail class, not hijack")
+	assert.Equal(t, int32(2), titleTries.Load(), "fail + exactly one retry, then stop")
+	assert.False(t, st.Hijack, "a connection reset is a dead link, never a TLS intercept")
+	assert.True(t, titleKilled.Load(), "fixture sanity: title A was killed on the wire")
+	assert.Contains(t, log.String(), "ok_flaky=1",
+		"the evidence counter carries the ONE recovered endpoint (premium) — the OK_FLAKY counter logUnlock reads")
+}
+
+// TestUnlockTunnelAliveGateSkipsDeadBattery pins the alive gate (item 5):
+// the OS connectivity-check endpoints are the battery's FIRST probe — a
+// tunnel failing both (after the retry-once wrapper) is dead-now, the rest
+// of the battery is skipped entirely (no media/echo requests), and the
+// verdict is the honest all-unknown with a fresh stamp.
+func TestUnlockTunnelAliveGateSkipsDeadBattery(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), deadAliveEndpoints(ud), cache)
+	in.Sleep = func(context.Context, time.Duration) error { return nil }
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	require.NotEmpty(t, st.CheckedAt, "the alive check ran and is stamped honestly")
+	assert.Equal(t, model.UnlockUnknown, st.ChatGPT)
+	assert.Equal(t, model.UnlockUnknown, st.Netflix)
+	assert.Zero(t, ud.hitsOf("/cdn-cgi/trace"), "a dead tunnel skips the whole battery")
+	assert.Zero(t, ud.hitsOf("/premium"))
+	assert.Zero(t, ud.hitsOf("/cftrace"))
+	// Statuses are DATA (the getRetry contract): a wrong-status alive
+	// answer is a gate miss, not a transport failure — exactly one attempt
+	// per gate endpoint, then the battery is skipped.
+	assert.Equal(t, 2, ud.hitsOf("/alive-dead-1")+ud.hitsOf("/alive-dead-2"),
+		"primary and fallback each got one attempt, then the battery was skipped")
+	assert.Equal(t, 1, ud.hitsOf("/alive-dead-2"))
+}
+
+// TestUnlockMigrationV1DefiniteStaleReprobed pins the battery_version
+// migration: a fresh cached DEFINITE verdict stamped by battery v1 (the
+// pre-hijack-detector era — possibly poisoned) is STALE under battery v2
+// regardless of its age, gets re-probed exactly once, and the v2 verdict
+// then serves its normal window (zero hits on the follow-up wave).
+func TestUnlockMigrationV1DefiniteStaleReprobed(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	require.Equal(t, geo.UnlockBatteryVersion, records[0].MediaUnlocks.BatteryVersion)
+	firstWave := ud.totalHits()
+	require.Positive(t, firstWave)
+
+	// Downgrade the cached verdict to battery v1 (fresh definite — exactly
+	// the poisoned-chatgpt=yes shape the migration must not serve), in both
+	// the hot cache and the cold geo-base half.
+	downgradeToV1 := func() {
+		path := filepath.Join(dir, "geo-base.jsonl")
+		recs, rerr := store.ReadGeo(path)
+		require.NoError(t, rerr)
+		for _, r := range recs {
+			r.MediaUnlocks.BatteryVersion = 1
+		}
+		require.NoError(t, store.WriteGeo(path, recs))
+		e, ok := cache.Get("203.0.113.7")
+		require.True(t, ok)
+		require.NotNil(t, e.MediaUnlocks)
+		e.MediaUnlocks.BatteryVersion = 1
+	}
+	downgradeToV1()
+	ud.reset()
+	_, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	assert.Equal(t, firstWave, ud.totalHits(),
+		"a battery-v1 definite verdict is stale under v2 — the full battery re-ran (the migration sweep)")
+
+	// The re-probe rewrote the verdict at the current battery version: the
+	// next wave is a clean cache hit.
+	ud.reset()
+	_, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Zero(t, ud.totalHits(), "battery-v2 definite verdict = normal cache hit")
+	records, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Equal(t, geo.UnlockBatteryVersion, records[0].MediaUnlocks.BatteryVersion)
+}
+
+// dnsTCPFixture is a minimal framed DNS-over-TCP test server: it verifies
+// the 2-byte big-endian length prefix on the query, then answers with the
+// frame the test scripted (rcode/TXT strings).
+type dnsTCPFixture struct {
+	ln       net.Listener
+	queries  atomic.Int32
+	lastQ    atomic.Pointer[string]
+	response []byte // the FULL 2-byte-prefixed answer frame to send
+}
+
+func newDNSTCPFixture(t *testing.T, response []byte) *dnsTCPFixture {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	fx := &dnsTCPFixture{ln: ln, response: response}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				prefix := make([]byte, 2)
+				if _, err := io.ReadFull(c, prefix); err != nil {
+					return
+				}
+				n := int(binary.BigEndian.Uint16(prefix))
+				msg := make([]byte, n)
+				if _, err := io.ReadFull(c, msg); err != nil {
+					return
+				}
+				fx.queries.Add(1)
+				name := dnsQuestionName(msg)
+				fx.lastQ.Store(&name)
+				_, _ = c.Write(fx.response)
+			}(conn)
+		}
+	}()
+	return fx
+}
+
+// dnsQuestionName extracts the question name of a query message (evidence
+// the fixture asserts the framed query was well-formed).
+func dnsQuestionName(msg []byte) string {
+	if len(msg) < 13 {
+		return ""
+	}
+	var b strings.Builder
+	pos := 12
+	for {
+		l := int(msg[pos])
+		if l == 0 {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteByte('.')
+		}
+		b.Write(msg[pos+1 : pos+1+l])
+		pos += 1 + l
+	}
+	return b.String()
+}
+
+// buildDNSTXTAnswer frames a DNS response carrying one TXT answer whose
+// character-string embeds the given IP (the o-o.myaddr.l.google.com shape:
+// "IP.# comment").
+func buildDNSTXTAnswer(ip string, rcode int, withAnswer bool) []byte {
+	owner := "o-o.myaddr.l.google" // 19 bytes — the label length must match
+	qname := append([]byte{byte(len(owner))}, owner...)
+	qname = append(qname, []byte{3}...)
+	qname = append(qname, []byte("com")...)
+	qname = append(qname, 0)
+
+	msg := []byte{
+		0x00, 0x00, // id
+		0x80, byte(rcode & 0x0F), // QR=1, rcode
+		0x00, 0x01, // qdcount
+		0x00, 0x00, // ancount — patched below
+		0x00, 0x00, 0x00, 0x00,
+	}
+	msg = append(msg, qname...)
+	msg = binary.BigEndian.AppendUint16(msg, 16) // qtype TXT
+	msg = binary.BigEndian.AppendUint16(msg, 1)  // IN
+	if withAnswer {
+		// Answer: pointer to the question name (0xC00C), TXT, IN, ttl,
+		// rdlen, one character-string "IP.# evidence".
+		rdata := append([]byte{byte(len(ip) + 2)}, []byte(ip+".#")...)
+		msg[6], msg[7] = 0x00, 0x01
+		msg = append(msg, 0xC0, 0x0C)
+		msg = binary.BigEndian.AppendUint16(msg, 16)
+		msg = binary.BigEndian.AppendUint16(msg, 1)
+		msg = binary.BigEndian.AppendUint32(msg, 60)
+		msg = binary.BigEndian.AppendUint16(msg, uint16(len(rdata)))
+		msg = append(msg, rdata...)
+	}
+	frame := binary.BigEndian.AppendUint16(nil, uint16(len(msg)))
+	return append(frame, msg...)
+}
+
+// TestUnlockDNSChannelRecorded pins the DNS-authoritative second channel
+// (item 4): TXT o-o.myaddr.l.google.com queried over FRAMED TCP through the
+// tunnel; the parsed TXT IP lands as dns_ip evidence. A failing DNS
+// channel (port-53 egress filtering) is recorded non-fatally — the verdict
+// stands without it.
+func TestUnlockDNSChannelRecorded(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	fx := newDNSTCPFixture(t, buildDNSTXTAnswer("198.51.100.53", 0, true))
+	ep := ud.endpoints()
+	ep.DNSServer = fx.ln.Addr().String()
+	ep.DNSName = "o-o.myaddr.l.google.com"
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ep, cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, "198.51.100.53", st.DNSIP, "the authoritative TXT echo is dns_ip evidence")
+	require.NotNil(t, fx.lastQ.Load())
+	assert.Equal(t, "o-o.myaddr.l.google.com", *fx.lastQ.Load(),
+		"the framed query carried the TXT owner name through the tunnel")
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "the DNS channel is additive evidence, never a verdict gate")
+
+	// Non-fatal failure: a DNS server that never answers leaves the
+	// verdict untouched and the evidence empty.
+	fx2 := newDNSTCPFixture(t, []byte{0xFF, 0xFF, 0x00}) // garbage frame
+	ep2 := ud.endpoints()
+	ep2.DNSServer = fx2.ln.Addr().String()
+	cache2 := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+	in = unlockInput(t, dir, f, api.URL(), ep2, cache2)
+	records, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	assert.Empty(t, records[0].MediaUnlocks.DNSIP)
+	assert.Equal(t, model.UnlockYes, records[0].MediaUnlocks.ChatGPT,
+		"a failed DNS channel never degrades the verdict")
+}
+
+// geoStunFixture is a minimal UDP "STUN" server: it captures the Binding
+// request and replies with a Binding success whose XOR-MAPPED-ADDRESS
+// echoes the request's own transaction id (STUNBinding generates a fresh
+// one internally, so the reply must be built per-request).
+type geoStunFixture struct {
+	pc      *net.UDPConn
+	mu      sync.Mutex
+	request []byte
+}
+
+func newGeoStunFixture(t *testing.T, ip [4]byte, port uint16) *geoStunFixture {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	require.NoError(t, err)
+	fx := &geoStunFixture{pc: pc}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, raddr, rerr := pc.ReadFromUDP(buf)
+			if rerr != nil {
+				return
+			}
+			fx.mu.Lock()
+			fx.request = append([]byte(nil), buf[:n]...)
+			var reply []byte
+			if n >= 20 {
+				msg := make([]byte, 0, 32)
+				msg = append(msg, 0x01, 0x01) // Binding success
+				msg = binary.BigEndian.AppendUint16(msg, 12)
+				msg = append(msg, 0x21, 0x12, 0xA4, 0x42) // magic cookie
+				msg = append(msg, buf[8:20]...)           // the request's txid
+				msg = binary.BigEndian.AppendUint16(msg, 0x0020)
+				msg = binary.BigEndian.AppendUint16(msg, 8)
+				msg = append(msg, 0x00, 0x01) // reserved + IPv4 family
+				xport := port ^ 0x2112
+				msg = binary.BigEndian.AppendUint16(msg, xport)
+				for i, b := range ip {
+					msg = append(msg, b^[]byte{0x21, 0x12, 0xA4, 0x42}[i])
+				}
+				reply = msg
+			}
+			fx.mu.Unlock()
+			if reply != nil {
+				_, _ = pc.WriteToUDP(reply, raddr)
+			}
+		}
+	}()
+	return fx
+}
+
+func (fx *geoStunFixture) addr() string { return fx.pc.LocalAddr().String() }
+
+func (fx *geoStunFixture) gotRequest() []byte {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	return fx.request
+}
+
+// TestUnlockStunHysteriaRecorded pins the STUN channel (item 6) end to end:
+// a hysteria2 node's battery carries an RFC 5389 Binding through the socks
+// UDP path (the hysteria instances are the only ones whose socks inbound
+// enables UDP), and the decoded XOR-MAPPED-ADDRESS lands as stun_ip
+// evidence. Failure is recorded non-fatally: a vless node's battery never
+// sends a Binding at all.
+func TestUnlockStunHysteriaRecorded(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	fx := newGeoStunFixture(t, [4]byte{198, 51, 100, 99}, 3478)
+	ep := ud.endpoints()
+	ep.STUNServer = fx.addr()
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	// One hysteria2 node (the STUN rider) — the single-node shape keeps the
+	// UDP relay state machine serial.
+	h := model.NewNode("stunsrc", "hysteria2", "stun-cred", "stun.example.com", 443, nil)
+	probes := map[string]store.ProbeResult{h.Key: liveProbe(h, "203.0.113.7")}
+	in := baseInput(dir, []*model.Node{h}, probes, f, api.URL())
+	on := true
+	in.Cfg.UnlockProbes = &on
+	in.UnlockEndpoints = ep
+	in.ExitCache = cache
+
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, "198.51.100.99", st.StunIP,
+		"the hysteria2 node's battery carries the STUN echo as stun_ip evidence")
+	require.NotNil(t, fx.gotRequest(), "the Binding request rode the socks UDP path")
+	require.Len(t, fx.gotRequest(), 20, "the Binding request is the 20-byte header shape")
+	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "STUN is additive evidence, never a verdict gate")
 }
