@@ -322,7 +322,10 @@ type CFTraceEvidence struct {
 // ParseCFTrace extracts the key=value lines of a cdn-cgi/trace body. ok is
 // the BODY CONTRACT: a trace that does not carry a parseable ip= line is
 // not evidence — through a hijacking exit it is the fake-body signature
-// (suspect class), never an exit answer.
+// (suspect class), never an exit answer. A parseable ip= is stored in the
+// CANONICAL net.ParseIP text form (raw otherwise): textual variants of one
+// address must not split the echoConsensus buckets — parsePlainIPEcho
+// normalizes the same way.
 func ParseCFTrace(body string) (CFTraceEvidence, bool) {
 	var ev CFTraceEvidence
 	for line := range strings.SplitSeq(body, "\n") {
@@ -339,9 +342,11 @@ func ParseCFTrace(body string) (CFTraceEvidence, bool) {
 			ev.Loc = strings.TrimSpace(v)
 		}
 	}
-	if net.ParseIP(ev.IP) == nil {
+	ip := net.ParseIP(ev.IP)
+	if ip == nil {
 		return ev, false
 	}
+	ev.IP = ip.String()
 	return ev, true
 }
 
@@ -1197,6 +1202,7 @@ func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStat
 	ev := &ExitEvidence{}
 	st := &model.MediaUnlockStatus{}
 	stamp := func() *model.MediaUnlockStatus {
+		ev.FlakyCount = p.flaky // the OK_FLAKY counter: endpoints recovered on the retry pass
 		st.CheckedAt = p.now().UTC().Format(time.RFC3339)
 		stampEvidence(st, ev)
 		return st

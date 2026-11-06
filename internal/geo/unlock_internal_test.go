@@ -448,6 +448,13 @@ func TestParseCFTraceContract(t *testing.T) {
 	assert.Equal(t, "FRA", ev.Colo)
 	assert.Equal(t, "DE", ev.Loc)
 
+	// Normalization contract: ip= is stored in the CANONICAL net.ParseIP
+	// text form — textual variants of one address must not split the
+	// echoConsensus buckets (parsePlainIPEcho already normalizes).
+	ev, ok = ParseCFTrace("fl=1.1\nip=2001:DB8::1\ncolo=FRA\nloc=DE\n")
+	require.True(t, ok, "a v6 trace shape parses")
+	assert.Equal(t, "2001:db8::1", ev.IP, "the uppercase trace form is stored canonical")
+
 	_, ok = ParseCFTrace("fl=1.1\ncolo=FRA\nloc=DE\n")
 	assert.False(t, ok, "missing ip= line = contract-suspect (the fake-trace class)")
 
@@ -517,6 +524,30 @@ func TestEchoConsensus(t *testing.T) {
 		assert.Empty(t, res.IP)
 		assert.Zero(t, res.Agree)
 		assert.False(t, res.Rotating)
+	})
+	t.Run("v6 textual variants collapse into one bucket (parser-normalized inputs)", func(t *testing.T) {
+		// Production feeds the consensus through the normalizing parsers:
+		// ParseCFTrace stores the canonical text, parsePlainIPEcho always
+		// did — the uppercase-trace form and the zero-compressed echo form
+		// are ONE address and MUST agree, never split the buckets.
+		traceEv, ok := ParseCFTrace("fl=1.1\nip=2001:DB8::1\ncolo=FRA\nloc=DE\n")
+		require.True(t, ok)
+		plainIP, ok := parsePlainIPEcho("2001:0DB8:0000:0000:0000:0000:0000:0001\n")
+		require.True(t, ok)
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, traceEv.IP), okEcho(echoIPify, plainIP), okEcho(echoIPSB, "2001:db8::1"),
+		})
+		assert.Equal(t, "2001:db8::1", res.IP)
+		assert.Equal(t, 3, res.Agree)
+		assert.False(t, res.Rotating, "one address in three textual forms = one egress identity")
+	})
+	t.Run("two distinct v6 disagree", func(t *testing.T) {
+		res := echoConsensus([]EchoResult{
+			okEcho(echoCFTrace, "2001:db8::1"), okEcho(echoIPify, "2001:db8::2"), okEcho(echoIPSB, "2001:db8::3"),
+		})
+		assert.Empty(t, res.IP)
+		assert.Zero(t, res.Agree)
+		assert.True(t, res.Rotating, "each distinct v6 address is its own net bucket — distinct v6 = rotation evidence")
 	})
 	t.Run("zero echoes", func(t *testing.T) {
 		res := echoConsensus(nil)

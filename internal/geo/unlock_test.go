@@ -137,6 +137,26 @@ func (d *unlockDouble) reset() {
 	d.hits = map[string]int{}
 }
 
+// syncLog is a mutex-guarded Progress capture: reportAll writes the log
+// lines from concurrent per-node goroutines, so a bare strings.Builder
+// would be a data race under -race.
+type syncLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
 // unlockBodies is the all-unlocked fixture set: every probe path answers a
 // clean, parseable body (the through-tunnel test pins the full happy path).
 // The v2 battery channels answer contract-valid: cftrace with ip/loc/colo,
@@ -981,8 +1001,10 @@ func TestUnlockEchoMajorityPinsMinorityNoted(t *testing.T) {
 // TestUnlockRetryOKFlaky pins the retry-once wrapper (item 7): a
 // transport-level failure recovered on the second shot keeps the real
 // verdict (the OK_FLAKY class — the research's 25% unstable-link mass is
-// not policy), and a deterministic double failure stays the honest
-// unknown — with exactly two attempts per endpoint.
+// not policy), a deterministic double failure stays the honest
+// unknown — with exactly two attempts per endpoint — and the recovered
+// pass surfaces in the production evidence tail as ok_flaky (the
+// evidence counter logUnlock reads; probeUnlockSet must copy it).
 func TestUnlockRetryOKFlaky(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	bodies := unlockBodies()
@@ -1023,6 +1045,8 @@ func TestUnlockRetryOKFlaky(t *testing.T) {
 
 	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
 	in.Sleep = func(context.Context, time.Duration) error { return nil } // no real stagger waits
+	var log syncLog
+	in.Progress = &log // the evidence tail carries the OK_FLAKY counter pin
 	records, _, err := geo.Run(context.Background(), in)
 	require.NoError(t, err)
 	require.Len(t, records, 2)
@@ -1035,6 +1059,8 @@ func TestUnlockRetryOKFlaky(t *testing.T) {
 	assert.Equal(t, int32(2), titleTries.Load(), "fail + exactly one retry, then stop")
 	assert.False(t, st.Hijack, "a connection reset is a dead link, never a TLS intercept")
 	assert.True(t, titleKilled.Load(), "fixture sanity: title A was killed on the wire")
+	assert.Contains(t, log.String(), "ok_flaky=1",
+		"the evidence counter carries the ONE recovered endpoint (premium) — the OK_FLAKY counter logUnlock reads")
 }
 
 // TestUnlockTunnelAliveGateSkipsDeadBattery pins the alive gate (item 5):
