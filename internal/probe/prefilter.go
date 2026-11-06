@@ -98,18 +98,22 @@ type prefilterStats struct {
 	uniqueEndpoints int            // distinct host:port pairs actually dialed
 	linksDead       int            // links excluded (TCP verdict: dead)
 	linksBypassed   int            // links kept without dialing (UDP transport / no endpoint)
-	linksPassed     int            // links reaching batching
+	linksPassed     int            // links reaching batching with an alive verdict
+	linksUnchecked  int            // links passing through unchecked (wave torn down mid-dial — no verdict)
 	drops           map[string]int // drop-reason class → link count (the filter-style drop report)
 }
 
 // logLine renders the one-line stage report in the pipeline's stage style
 // ("filter complete: … kept, … dropped %v"): the dedup saving is visible as
 // links vs unique-endpoints, the verdict split as filtered-dead /
-// bypassed-udp / passed-through, and the drop-reason breakdown last.
+// bypassed-udp / passed-through, dials interrupted by wave teardown rendered
+// separately (a canceled dial is not a passed-through verdict), and the
+// drop-reason breakdown last.
 func (s *prefilterStats) logLine() string {
 	return fmt.Sprintf(
-		"probe pre-filter: links %d → unique-endpoints %d — filtered-dead %d, bypassed-udp %d, passed-through %d; drops %v",
-		s.linksTotal, s.uniqueEndpoints, s.linksDead, s.linksBypassed, s.linksPassed, s.drops,
+		"probe pre-filter: links %d → unique-endpoints %d — "+
+			"filtered-dead %d, bypassed-udp %d, passed-through %d, unchecked %d; drops %v",
+		s.linksTotal, s.uniqueEndpoints, s.linksDead, s.linksBypassed, s.linksPassed, s.linksUnchecked, s.drops,
 	)
 }
 
@@ -125,20 +129,28 @@ func prefilterOrdered(ctx context.Context, ordered []*probeJob, opts Options) []
 	return survivors
 }
 
+// dialOutcome is one endpoint's pre-filter result: reason is the drop-reason
+// class ("" = alive); checked=false means the wave was torn down mid-dial and
+// the result carries no verdict at all.
+type dialOutcome struct {
+	reason  string
+	checked bool
+}
+
 // dialVerdicts dials each unique endpoint once across a worker pool (capped
-// at the endpoint count, floor 1) and returns endpoint → drop reason
-// ("" = alive). The map is filled under a mutex; the pool is bounded by a
-// semaphore — the same shape the engine's job loops use.
+// at the endpoint count, floor 1) and returns endpoint → outcome. The map is
+// filled under a mutex; the pool is bounded by a semaphore — the same shape
+// the engine's job loops use.
 func dialVerdicts(
 	ctx context.Context, dial dialFunc, eps []string, timeout time.Duration, workers int,
-) map[string]string {
+) map[string]dialOutcome {
 	if workers > len(eps) {
 		workers = len(eps)
 	}
 	if workers < 1 {
 		workers = 1
 	}
-	verdicts := make(map[string]string, len(eps))
+	verdicts := make(map[string]dialOutcome, len(eps))
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -148,9 +160,9 @@ func dialVerdicts(
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			kind, _ := dialEndpoint(ctx, dial, endpoint, timeout)
+			reason, checked := dialEndpoint(ctx, dial, endpoint, timeout)
 			mu.Lock()
-			verdicts[endpoint] = kind
+			verdicts[endpoint] = dialOutcome{reason: reason, checked: checked}
 			mu.Unlock()
 		}(ep)
 	}
@@ -207,16 +219,24 @@ func runTCPPrefilter(ctx context.Context, jobs []*probeJob, opts Options) ([]*pr
 	// in exactly the engine's input order.
 	passing := make([]*probeJob, 0, len(jobs))
 	for i, job := range jobs {
-		switch ep := jobEndpoint[i]; {
+		ep := jobEndpoint[i]
+		switch {
 		case ep == "":
 			stats.linksBypassed++
 			passing = append(passing, job)
-		case verdicts[ep] == "":
+		case !verdicts[ep].checked:
+			// Teardown mid-dial: no verdict — the job passes through
+			// unchecked and is counted separately so the stage report
+			// never overstates passed-through after a canceled wave
+			// (xray-knife FailCanceled parity).
+			stats.linksUnchecked++
+			passing = append(passing, job)
+		case verdicts[ep].reason == "":
 			stats.linksPassed++
 			passing = append(passing, job)
 		default:
 			stats.linksDead++
-			stats.drops[verdicts[ep]]++
+			stats.drops[verdicts[ep].reason]++
 		}
 	}
 	// Re-normalize the order indices: the surviving slice feeds batching

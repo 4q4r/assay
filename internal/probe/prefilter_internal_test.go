@@ -168,6 +168,8 @@ func TestClassifyDialFailure(t *testing.T) {
 		{"per-dial timeout", fmt.Errorf("dial tcp h:443: %w", context.DeadlineExceeded), "timeout"},
 		{"deadline exceeded alias", fmt.Errorf("dial tcp h:443: %w", os.ErrDeadlineExceeded), "timeout"},
 		{"dns no such host", &net.DNSError{Err: "no such host", Name: "h.example", IsNotFound: true}, "dns"},
+		{"network unreachable", fmt.Errorf("dial tcp 10.255.255.1:443: %w", errors.New("connect: network is unreachable")), "unreachable"},
+		{"connection reset", fmt.Errorf("read tcp 1.2.3.4:5678->5.6.7.8:443: %w", errors.New("read: connection reset by peer")), "reset"},
 		{"unclassified", errors.New("dial tcp h:443: weird kernel state"), "other"},
 	}
 	for _, tt := range tests {
@@ -343,6 +345,8 @@ func TestTCPPrefilterCanceledWaveIsNotAVerdict(t *testing.T) {
 	passing, stats := runTCPPrefilter(ctx, jobsOf(nodes), opts)
 	assert.Len(t, passing, 1, "a canceled wave produces NO dead verdict — the node passes unchecked")
 	assert.Zero(t, stats.linksDead, "canceled dials are not verdicts (xray-knife FailCanceled parity)")
+	assert.Equal(t, 1, stats.linksUnchecked, "the canceled dial is counted as unchecked")
+	assert.Zero(t, stats.linksPassed, "unchecked dials never inflate passed-through")
 	assert.Empty(t, stats.drops)
 }
 
@@ -497,15 +501,17 @@ func TestRunWithBatchFactoryTCPPrefilterWave(t *testing.T) {
 
 func TestPrefilterStatsLogLine(t *testing.T) {
 	s := prefilterStats{
-		linksTotal: 100, uniqueEndpoints: 80, linksDead: 15, linksBypassed: 5, linksPassed: 80,
-		drops: map[string]int{"refused": 12, "timeout": 3},
+		linksTotal: 100, uniqueEndpoints: 80, linksDead: 15, linksBypassed: 5, linksPassed: 77,
+		linksUnchecked: 3,
+		drops:          map[string]int{"refused": 12, "timeout": 3},
 	}
 	line := s.logLine()
 	assert.Contains(t, line, "unique-endpoints 80")
 	assert.Contains(t, line, "links 100")
 	assert.Contains(t, line, "filtered-dead 15")
 	assert.Contains(t, line, "bypassed-udp 5")
-	assert.Contains(t, line, "passed-through 80")
+	assert.Contains(t, line, "passed-through 77")
+	assert.Contains(t, line, "unchecked 3")
 	assert.Contains(t, line, "refused:12")
 	assert.Contains(t, line, "timeout:3")
 }
