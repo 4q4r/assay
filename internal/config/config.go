@@ -1070,9 +1070,9 @@ func validate(c *Config) error {
 	return validateNonNegative("probe.skip_fresh_within", c.Probe.SkipFreshWithin.Duration)
 }
 
-// validateProbe carries the W14 structural checks: a negative attempt count
-// or worker count is sign-invalid (0 = unset → default, the W6 convention).
-// No range bounds (owner ruling).
+// validateProbe carries the W14 structural checks: a negative attempt/worker
+// count (including the TCP pre-filter knobs) or timeout is sign-invalid
+// (0 = unset → default, the W6 convention). No range bounds (owner ruling).
 func validateProbe(p ProbeConfig) error {
 	if err := validateNonNegative("probe.attempts", p.Attempts); err != nil {
 		return err
@@ -1083,7 +1083,13 @@ func validateProbe(p ProbeConfig) error {
 	if err := validateNonNegative("probe.batch_size", p.BatchSize); err != nil {
 		return err
 	}
-	return validateNonNegative("probe.batch_concurrency", p.BatchConcurrency)
+	if err := validateNonNegative("probe.batch_concurrency", p.BatchConcurrency); err != nil {
+		return err
+	}
+	if err := validateNonNegative("probe.tcp_prefilter_workers", p.TCPPrefilterWorkers); err != nil {
+		return err
+	}
+	return validateNonNegative("probe.tcp_prefilter_timeout", p.TCPPrefilterTimeout.Duration)
 }
 
 // validatePlugins carries the structural checks for the [plugins] section:

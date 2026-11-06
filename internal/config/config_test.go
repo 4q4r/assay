@@ -469,6 +469,27 @@ func TestTCPPrefilterKnobDefaultsOn(t *testing.T) {
 	})
 }
 
+// TestTCPPrefilterKnobNegativeValuesFailLoud pins the structural sign checks
+// on the pre-filter knobs (review round 2): the sample-config promise
+// "Negative = invalid" is enforced by validateProbe — a negative worker
+// count or dial timeout fails config.Load with the canonical W6 error, not
+// a silent probe-layer default.
+func TestTCPPrefilterKnobNegativeValuesFailLoud(t *testing.T) {
+	t.Run("negative workers", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+"[probe]\ntcp_prefilter_workers = -5\n"))
+		require.Error(t, err, "a negative worker count is structurally invalid, not a probe-layer default")
+		assert.Contains(t, err.Error(), "probe.tcp_prefilter_workers")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+
+	t.Run("negative timeout", func(t *testing.T) {
+		_, err := config.Load(writeCfg(t, w6Base+"[probe]\ntcp_prefilter_timeout = \"-1s\"\n"))
+		require.Error(t, err, "a negative dial timeout is structurally invalid, not a probe-layer default")
+		assert.Contains(t, err.Error(), "probe.tcp_prefilter_timeout")
+		assert.Contains(t, err.Error(), "negative is structurally invalid")
+	})
+}
+
 // TestFilterSourceCapConfigParsesAndValidates pins the [filter] section:
 // source_cap defaults to unlimited (0) and negative values fail validation
 // (review finding 6).
