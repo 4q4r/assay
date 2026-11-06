@@ -20,19 +20,31 @@ import (
 )
 
 // Phase-1 IP quality & media unlock engine: once per distinct exit IP whose
-// cached verdict is older than UnlockTTL, the stage probes ChatGPT / Netflix
-// / YouTube / Disney+ / TikTok unlocks plus IP quality THROUGH that exit's
-// own tunnel (the same temp-socks contract as the geo ladder), caches the
-// verdict by exit IP (hot ExitGeoEntry + the geo-base.jsonl cold half), and
-// folds it into every geo record sharing the exit. Probe semantics are the
-// ip.check.place reference (xykt/IPQuality); failures are non-fatal — the
-// verdict records "unknown" and the wave never hangs (per-request budgets).
+// cached verdict is outside its freshness window (7 days for fully definite
+// verdicts, 24 hours for unknown-carrying ones — owner order 2026-11-06),
+// the stage probes ChatGPT / Netflix / YouTube / Disney+ / TikTok unlocks
+// plus IP quality THROUGH that exit's own tunnel (the same temp-socks
+// contract as the geo ladder), caches the verdict by exit IP (hot
+// ExitGeoEntry + the geo-base.jsonl cold half), and folds it into every geo
+// record sharing the exit. An exit whose tunnel demonstrably worked in the
+// current wave bypasses a fresh unknown-carrying cache hit and re-probes
+// (the alive-bypass). Probe semantics are the ip.check.place reference
+// (xykt/IPQuality); failures are non-fatal — the verdict records "unknown"
+// and the wave never hangs (per-request budgets).
 
 const (
 	// UnlockTTL is the freshness window of one exit IP's quality + media
 	// verdicts (the spec's 7-day cache: a re-check of the same exit inside
-	// the window costs zero network calls).
+	// the window costs zero network calls). Only fully definite verdicts
+	// get the full window; unknown-carrying ones take UnlockUnknownTTL.
 	UnlockTTL = 7 * 24 * time.Hour
+	// UnlockUnknownTTL bounds how long a verdict carrying any unknown or
+	// unchecked media field stays cached (owner order 2026-11-06): a
+	// dead-tunnel-at-probe-time exit used to poison its verdicts with
+	// "unknown" for the full 7-day window and stayed unclassified for a
+	// week even once its tunnel recovered. Unknown-carrying verdicts now go
+	// stale after a day; fully definite ones keep UnlockTTL.
+	UnlockUnknownTTL = 24 * time.Hour
 	// unlockRequestTimeout bounds ONE probe request (the spec's 3s): every
 	// request carries its own context budget, so no slow service hangs a
 	// wave.
@@ -665,9 +677,12 @@ func (p *unlockProbe) ipinfo(ctx context.Context) *IPInfoWidget {
 // probeUnlockSet runs every Phase-1 probe for ONE exit through ONE tunnel
 // client. Failures are non-fatal: the service's verdict becomes unknown and
 // the wave keeps moving. CheckedAt is stamped whenever the probes actually
-// ran — caching an all-unknown outcome for 7 days is the spec'd behavior (a
-// broken exit must not be hammered every wave). A canceled context returns
-// nil (a partial verdict must not be cached as checked).
+// ran — an all-unknown outcome caches for UnlockUnknownTTL (24h, owner
+// order 2026-11-06: a dead-tunnel unknown must not poison the exit for the
+// 7-day window), a definite outcome for UnlockTTL, and an alive-now exit
+// with an unknown-carrying cached verdict is re-probed by the next wave it
+// is eligible for (the alive-bypass in runUnlockGroup). A canceled context
+// returns nil (a partial verdict must not be cached as checked).
 func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStatus, *IPInfoWidget) {
 	st := &model.MediaUnlockStatus{
 		ChatGPT:       p.chatgpt(ctx),
@@ -684,9 +699,40 @@ func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStat
 	return st, widget
 }
 
-// freshUnlock reports whether a cached verdict is inside the 7-day window:
-// CheckedAt must parse, must not sit further in the future than the skew
-// tolerance, and must be at most UnlockTTL old.
+// unlockVerdictUnknown reports whether ANY media field of the verdict is
+// unknown or unchecked (""): such a verdict carries no definite answer for
+// that service. The five fields come from ONE probe pass — they age
+// together, so the whole verdict shares one TTL.
+func unlockVerdictUnknown(st *model.MediaUnlockStatus) bool {
+	if st == nil {
+		return true
+	}
+	for _, v := range []string{st.ChatGPT, st.Netflix, st.YouTubeRegion, st.Disney, st.TikTok} {
+		if v == "" || v == model.UnlockUnknown {
+			return true
+		}
+	}
+	return false
+}
+
+// unlockTTL is the freshness window of ONE verdict: unknown-carrying
+// verdicts expire after UnlockUnknownTTL, fully definite ones (blocked
+// answers included — those are definite answers) after UnlockTTL. The TTL is
+// derived from the verdict's own stored content, which is written once at
+// probe time — the write path therefore stamps it correctly without an
+// extra timestamp field, and the cold geo-base half (which persists only
+// CheckedAt + the fields) carries the same semantics on reload.
+func unlockTTL(st *model.MediaUnlockStatus) time.Duration {
+	if unlockVerdictUnknown(st) {
+		return UnlockUnknownTTL
+	}
+	return UnlockTTL
+}
+
+// freshUnlock reports whether a cached verdict is inside its own freshness
+// window: CheckedAt must parse, must not sit further in the future than the
+// skew tolerance, and must be at most unlockTTL(st) old (7 days for fully
+// definite verdicts, 24 hours for unknown-carrying ones).
 func freshUnlock(st *model.MediaUnlockStatus, now time.Time) bool {
 	if st == nil || st.CheckedAt == "" {
 		return false
@@ -698,7 +744,7 @@ func freshUnlock(st *model.MediaUnlockStatus, now time.Time) bool {
 	if t.Sub(now) > unlockClockSkew {
 		return false
 	}
-	return now.Sub(t) <= UnlockTTL
+	return now.Sub(t) <= unlockTTL(st)
 }
 
 // loadColdUnlocks indexes the freshest unlock state per exit IP from
@@ -810,21 +856,69 @@ func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *I
 		risk, ipType)
 }
 
+// unlockAliveNow reports whether the node's tunnel demonstrably carried a
+// successful HTTP answer during the CURRENT wave's geo ladder: a self-report
+// or DoH-fallback geo answer (both requests ride the tunnel), the HTTPS
+// self-geo, or a rate-limited answer (a 429 is an application-level answer
+// received through a working tunnel). This is the same in-wave tunnel
+// evidence the geo stage produces for its self-report candidates — unlike
+// the probe wave's Alive flag, it says the tunnel WORKS now.
+func unlockAliveNow(rep *NodeReport) bool {
+	return rep.Geo != nil || rep.HTTPS != nil || rep.RateLimited
+}
+
+// aliveInd returns the index of the group's first member whose tunnel
+// worked in the current wave — the tunnel a bypass re-probe should ride.
+func (g unlockGroup) aliveInd(reports []NodeReport) (int, bool) {
+	for _, i := range g.inds {
+		if unlockAliveNow(&reports[i]) {
+			return i, true
+		}
+	}
+	return g.inds[0], false
+}
+
 // runUnlockGroup drives ONE exit: hot cache hit → cold geo-base hit → probe
-// through a fresh temp instance of the representative node. Infrastructure
-// failures attach and cache NOTHING (the next wave retries); probe failures
-// are recorded as unknown.
-func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, g unlockGroup) {
+// through a fresh temp instance of the representative node. A fresh cached
+// verdict that still carries unknowns is bypassed when the exit is alive in
+// the current wave (the alive-bypass re-probe). Infrastructure failures
+// attach and cache NOTHING (the next wave retries); probe failures are
+// recorded as unknown.
+// resolveUnlock decides how ONE exit's cached verdict is served: a non-nil
+// status is attached to every report of the group (hot hit as-is, cold hit
+// re-hydrated into the hot entry); nil means the exit must be probed. The
+// alive-bypass (owner order 2026-11-06) fires only when the exit's tunnel
+// demonstrably worked in the current wave and the fresh cached verdict still
+// carries unknown media fields — the probe rep switches to the first member
+// whose geo ladder answered, so the re-probe never rides a dead tunnel.
+// Fully definite verdicts are never bypassed, and a dead-now exit keeps its
+// cached unknown until it ages out (the 24h unknown TTL bounds the residue).
+func (st *unlockStage) resolveUnlock(
+	reports []NodeReport, g unlockGroup,
+) (*model.MediaUnlockStatus, *IPQuality, NodeReport) {
 	rep := reports[g.inds[0]]
 	if st.r.Cache != nil {
 		if e, ok := st.r.Cache.Get(g.exitIP); ok && e != nil && freshUnlock(e.MediaUnlocks, st.now()) {
-			attachUnlock(reports, g.inds, e.MediaUnlocks, e.Report.Quality)
-			return
+			if ind, alive := g.aliveInd(reports); alive && unlockVerdictUnknown(e.MediaUnlocks) {
+				return nil, nil, reports[ind] // alive now + cached unknown: re-probe
+			}
+			return e.MediaUnlocks, e.Report.Quality, rep
 		}
 	}
 	if c, ok := st.cold[g.exitIP]; ok && freshUnlock(c, st.now()) {
-		attachUnlock(reports, g.inds, c, nil)
+		if ind, alive := g.aliveInd(reports); alive && unlockVerdictUnknown(c) {
+			return nil, nil, reports[ind] // alive now + cached unknown: re-probe
+		}
 		st.storeUnlock(g.exitIP, rep, c, nil)
+		return c, nil, rep
+	}
+	return nil, nil, rep // nothing fresh cached: probe
+}
+
+func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, g unlockGroup) {
+	status, q, rep := st.resolveUnlock(reports, g)
+	if status != nil {
+		attachUnlock(reports, g.inds, status, q)
 		return
 	}
 	node := st.nodes[rep.Key]
@@ -840,23 +934,25 @@ func runUnlockGroup(ctx context.Context, st *unlockStage, reports []NodeReport, 
 	if err != nil {
 		return
 	}
-	status, widget := probeUnlockSet(ctx, &unlockProbe{
+	probed, widget := probeUnlockSet(ctx, &unlockProbe{
 		cl: cl, ua: st.r.userAgent(), ep: st.ep, pac: st.pac, now: st.now, exitIP: g.exitIP,
 	})
-	if status == nil {
+	if probed == nil {
 		return // canceled mid-wave
 	}
-	q := ComputeIPQuality(rep.Geo, widget)
-	attachUnlock(reports, g.inds, status, q)
-	st.storeUnlock(g.exitIP, rep, status, q)
-	logUnlock(st.r.Progress, g.exitIP, status, q)
+	quality := ComputeIPQuality(rep.Geo, widget)
+	attachUnlock(reports, g.inds, probed, quality)
+	st.storeUnlock(g.exitIP, rep, probed, quality)
+	logUnlock(st.r.Progress, g.exitIP, probed, quality)
 }
 
 // runUnlockWave probes quality + media once per distinct exit IP whose
-// cached verdict is older than UnlockTTL, attaching copies to every report
-// sharing the exit. Gated by [geo].unlock_probes (default ON — owner
-// ruling 2026-11-06; an explicit false = stage off, zero unlock requests);
-// it never fails a wave.
+// cached verdict is outside its own freshness window (7 days definite, 24
+// hours unknown-carrying), re-probing alive exits early when their cached
+// verdict still carries unknowns (the alive-bypass), attaching copies to
+// every report sharing the exit. Gated by [geo].unlock_probes (default ON —
+// owner ruling 2026-11-06; an explicit false = stage off, zero unlock
+// requests); it never fails a wave.
 func runUnlockWave(ctx context.Context, in Input, r *Reporter, reports []NodeReport, idx exitIPIndex) {
 	if !in.Cfg.UnlockProbesEnabled() || len(reports) == 0 {
 		return

@@ -35,8 +35,10 @@ type ExitGeoEntry struct {
 	// Report carries the full cached node report (in-wave reuse).
 	Report NodeReport
 	// MediaUnlocks is the Phase-1 unlock state for this exit IP (nil =
-	// unchecked). Freshness is judged against CheckedAt + UnlockTTL, not the
-	// LRU lease — the 7-day window outlives the hot entry's TTL.
+	// unchecked). Freshness is judged against CheckedAt + the verdict's own
+	// TTL (unlockTTL: 7 days definite / 24 hours unknown-carrying), not the
+	// LRU lease — the window outlives the hot entry's TTL, and the ExpiresAt
+	// above is the hot cache's own lease, never the verdict's.
 	MediaUnlocks *model.MediaUnlockStatus
 }
 
