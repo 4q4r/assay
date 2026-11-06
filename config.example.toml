@@ -116,6 +116,21 @@ speedtest_timeout = "30s"            # the download sample window
 skip_fresh_within = "0s"            # skip re-probing nodes whose latest result is `passed`
                                     # and newer than this window (0s = probe everything; failed/
                                     # semi-passed/stale nodes are always re-probed)
+tcp_prefilter = true                 # wave-1 TCP pre-filter (default ON — absent = the stage
+                                     # runs, like every probe stage): before any temp-xray boot
+                                     # every unique node endpoint gets ONE plain TCP dial (DNS
+                                     # included); a failed dial means no TCP listener — an xray
+                                     # TCP transport cannot connect either — so the node is
+                                     # excluded from THIS wave with a per-reason drop report
+                                     # (its previous probe results stay untouched). UDP
+                                     # transports (hysteria2, kcp/mkcp/quic) bypass. `false`
+                                     # disables the stage entirely (zero dials, pre-stage
+                                     # behavior)
+tcp_prefilter_workers = 256          # concurrent pre-filter dials (a plain SYN handshake is
+                                     # cheap — no core instance). 0 = default 256. Negative =
+                                     # invalid.
+tcp_prefilter_timeout = "1s"         # bounds ONE pre-filter dial, DNS resolution included.
+                                     # 0 = default 1s. Negative = invalid.
 
 [geo]
 # W11 self-report design: every alive node asks geo endpoints THROUGH ITS
