@@ -508,8 +508,13 @@ const (
 	// 25 MB down endpoint, downloaded through each node's tunnel.
 	DefaultProbeSpeedtestURL = "https://speed.cloudflare.com/__down?bytes=25000000"
 	// DefaultProbeBatchSize is the default number of nodes sharing one xray
-	// process in batch probe mode (0 in config → this default).
-	DefaultProbeBatchSize = 20
+	// process in batch probe mode (0 in config → this default). Big-batch
+	// model: one temp xray holds 1000 inbound+outbound pairs — boot ≈0.225s,
+	// RSS ≈49MB (+13.3kB/pair), fds ≈ N+6 (spike-verified on the box's xray
+	// 26.3.27) — so a wave boots a handful of processes instead of hundreds.
+	// A batch that fails AS A BATCH retries at half its size (adaptive
+	// halving, floor 20 = the pre-big-batch default, code-level constant).
+	DefaultProbeBatchSize = 1000
 	// DefaultProbeBatchConcurrency is the default number of nodes probed
 	// concurrently inside one batch (0 in config → this default).
 	DefaultProbeBatchConcurrency = 10
