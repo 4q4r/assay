@@ -298,29 +298,78 @@ func TestUnlockVerdictUnknownTTL(t *testing.T) {
 
 // TestUnlockAliveNow pins the in-wave aliveness evidence: the node's tunnel
 // demonstrably carried a successful HTTP answer during THIS wave's geo
-// ladder — a self-report / DoH-fallback geo answer, the HTTPS self-geo, or a
-// rate-limited answer (a 429 is an application-level answer received through
-// a working tunnel). Everything else (temp-instance boot failure, dead
-// tunnel, all rungs failed) is NOT alive.
+// ladder — the report is a fresh ladder outcome (LadderRan) AND a self-report
+// / DoH-fallback geo answer, the HTTPS self-geo, or a rate-limited answer (a
+// 429 is an application-level answer received through a working tunnel).
+// Everything else (temp-instance boot failure, dead tunnel, all rungs failed)
+// is NOT alive — and neither is CACHED rung evidence on a cache-served clone:
+// the Geo/HTTPS/RateLimited fields of a served entry describe the wave that
+// produced it, never this wave (the eligibility layer, owner order
+// 2026-11-06).
 func TestUnlockAliveNow(t *testing.T) {
 	tests := []struct {
 		name string
 		rep  NodeReport
 		want bool
 	}{
-		{"self-report geo", NodeReport{Geo: &Response{Status: "success"}}, true},
-		{"https self-geo", NodeReport{HTTPS: &InfoResponse{IP: "203.0.113.7"}}, true},
-		{"rate-limited (429 through the tunnel)", NodeReport{RateLimited: true}, true},
-		{"doh fallback geo", NodeReport{Geo: &Response{Status: "success"}, Class: ClassDoHFallback}, true},
-		{"dead tunnel (all rungs failed)", NodeReport{Class: ClassUnknown}, false},
-		{"detail only", NodeReport{Detail: "self-report: timeout"}, false},
+		{"self-report geo", NodeReport{LadderRan: true, Geo: &Response{Status: "success"}}, true},
+		{"https self-geo", NodeReport{LadderRan: true, HTTPS: &InfoResponse{IP: "203.0.113.7"}}, true},
+		{"rate-limited (429 through the tunnel)", NodeReport{LadderRan: true, RateLimited: true}, true},
+		{"doh fallback geo", NodeReport{LadderRan: true, Geo: &Response{Status: "success"}, Class: ClassDoHFallback}, true},
+		{"dead tunnel (all rungs failed)", NodeReport{LadderRan: true, Class: ClassUnknown}, false},
+		{"detail only", NodeReport{LadderRan: true, Detail: "self-report: timeout"}, false},
 		{"bare report", NodeReport{}, false},
+		{"cached evidence without a ladder run", NodeReport{Geo: &Response{Status: "success"}}, false},
+		{"cached 429 without a ladder run", NodeReport{RateLimited: true}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, unlockAliveNow(&tc.rep))
 		})
 	}
+}
+
+// TestUnknownCachedProbeRep pins the three-way re-classification decision
+// for a fresh unknown-carrying cached verdict (the eligibility layer, owner
+// order 2026-11-06): a member with in-wave tunnel evidence → the PR-#15
+// alive-bypass rides THAT member; no member rode a ladder this wave (fresh
+// geo, cache-served) → the unlock-only sweep rides the representative node;
+// the ladder ran but no tunnel answered (dead-now) → no probe, the cached
+// unknown stands until the 24h TTL ages it out.
+func TestUnknownCachedProbeRep(t *testing.T) {
+	geoOK := NodeReport{Key: "n1", LadderRan: true, Geo: &Response{Status: "success"}}
+	clone := NodeReport{Key: "n1"} // cache-served: no ladder marker, no rung evidence
+	deadNow := NodeReport{Key: "n1", LadderRan: true, Class: ClassUnknown}
+
+	t.Run("alive bypass rides the in-wave member", func(t *testing.T) {
+		g := unlockGroup{exitIP: "203.0.113.7", inds: []int{0, 1}}
+		reports := []NodeReport{clone, geoOK}
+		rep, doProbe := unknownCachedProbeRep(reports, g)
+		assert.True(t, doProbe)
+		assert.Equal(t, "n1", rep.Key)
+		assert.True(t, rep.LadderRan && rep.Geo != nil, "the probe rides the member whose tunnel answered")
+	})
+
+	t.Run("no ladder this wave = unlock-only sweep via the representative", func(t *testing.T) {
+		g := unlockGroup{exitIP: "203.0.113.7", inds: []int{0}}
+		rep, doProbe := unknownCachedProbeRep([]NodeReport{clone}, g)
+		assert.True(t, doProbe, "fresh geo must not starve the re-classification")
+		assert.Equal(t, "n1", rep.Key)
+		assert.False(t, rep.LadderRan, "the sweep rides the cache-served representative")
+	})
+
+	t.Run("dead-now residue keeps the cached unknown", func(t *testing.T) {
+		g := unlockGroup{exitIP: "203.0.113.7", inds: []int{0}}
+		_, doProbe := unknownCachedProbeRep([]NodeReport{deadNow}, g)
+		assert.False(t, doProbe, "a tunnel that just failed the rungs is not re-probed")
+	})
+
+	t.Run("ladderRanThisWave needs any member flag", func(t *testing.T) {
+		g := unlockGroup{exitIP: "203.0.113.7", inds: []int{0, 1}}
+		assert.False(t, ladderRanThisWave([]NodeReport{clone, clone}, g))
+		assert.True(t, ladderRanThisWave([]NodeReport{clone, deadNow}, g),
+			"any member's fresh ladder outcome marks the exit ladder-run")
+	})
 }
 
 // TestDefaultUnlockEndpoints pins the production probe URL set (the Phase-1
