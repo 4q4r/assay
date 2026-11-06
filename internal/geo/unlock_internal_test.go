@@ -196,33 +196,131 @@ func TestClassifyNetflixEmptyBodiesFailUnknown(t *testing.T) {
 	}
 }
 
-// TestFreshUnlock boundaries: the 7-day window is judged against CheckedAt
-// alone (the hot LRU lease is a separate, much shorter freshness).
+// definiteStatus is a fully definite verdict (every media field carries a
+// definite vocabulary answer — blocked counts as definite): the 7-day window
+// shape.
+func definiteStatus(checkedAt string) *model.MediaUnlockStatus {
+	return &model.MediaUnlockStatus{
+		ChatGPT:       model.UnlockYes,
+		Netflix:       model.UnlockNetflixFull,
+		YouTubeRegion: "DE",
+		Disney:        model.UnlockYes,
+		TikTok:        model.UnlockYes,
+		CheckedAt:     checkedAt,
+	}
+}
+
+// unknownStatus is an unknown-carrying verdict (one media field unknown, the
+// rest definite): the dead-tunnel-at-probe-time shape the 24h window bounds.
+func unknownStatus(checkedAt string) *model.MediaUnlockStatus {
+	st := definiteStatus(checkedAt)
+	st.ChatGPT = model.UnlockUnknown
+	return st
+}
+
+// TestFreshUnlock boundaries: freshness is judged against CheckedAt alone
+// (the hot LRU lease is a separate, much shorter freshness) with the
+// verdict's own TTL semantics — definite verdicts live UnlockTTL (7 days),
+// verdicts carrying any unknown/unchecked media field live UnlockUnknownTTL
+// (24 hours, owner order 2026-11-06: a dead-tunnel-at-probe-time exit must
+// not poison its verdicts for the full week).
 func TestFreshUnlock(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second) // RFC3339 has second precision
 	stamp := func(offset time.Duration) string {
 		return now.Add(offset).Format(time.RFC3339)
 	}
 	tests := []struct {
-		name      string
-		checkedAt string
-		want      bool
+		name string
+		st   *model.MediaUnlockStatus
+		want bool
 	}{
-		{"fresh", stamp(-24 * time.Hour), true},
-		{"exactly at TTL", stamp(-UnlockTTL), true},
-		{"past TTL", stamp(-UnlockTTL - time.Second), false},
-		{"within future skew", stamp(time.Second), true},
-		{"too far in the future", stamp(5 * time.Minute), false},
+		{"definite fresh 23h", definiteStatus(stamp(-23 * time.Hour)), true},
+		{"definite fresh 6d23h", definiteStatus(stamp(-6*24*time.Hour - 23*time.Hour)), true},
+		{"definite exactly at 7d TTL", definiteStatus(stamp(-UnlockTTL)), true},
+		{"definite 7d1h = stale", definiteStatus(stamp(-7*24*time.Hour - time.Hour)), false},
+		{"unknown fresh 23h = hit", unknownStatus(stamp(-23 * time.Hour)), true},
+		{"unknown 25h = stale (re-probe)", unknownStatus(stamp(-25 * time.Hour)), false},
+		{"unchecked fields 25h = stale", mkStatus(stamp(-25 * time.Hour)), false},
+		{"within future skew", definiteStatus(stamp(time.Second)), true},
+		{"too far in the future", definiteStatus(stamp(5 * time.Minute)), false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := freshUnlock(mkStatus(tc.checkedAt), now)
+			got := freshUnlock(tc.st, now)
 			assert.Equal(t, tc.want, got)
 		})
 	}
 	assert.False(t, freshUnlock(nil, now), "nil verdict = unchecked")
 	assert.False(t, freshUnlock(mkStatus(""), now), "empty CheckedAt = never probed")
 	assert.False(t, freshUnlock(mkStatus("not-a-time"), now), "unparsable = stale")
+}
+
+// TestUnlockVerdictUnknownTTL pins the verdict-shaped TTL: any unknown or
+// unchecked ("") media field puts the verdict on the 24h window, a fully
+// definite verdict (blocked answers included — they are definite answers)
+// keeps the 7-day window.
+func TestUnlockVerdictUnknownTTL(t *testing.T) {
+	assert.Equal(t, UnlockUnknownTTL, unlockTTL(nil), "nil verdict = unchecked = 24h")
+	assert.Equal(t, UnlockUnknownTTL, unlockTTL(&model.MediaUnlockStatus{}),
+		"zero verdict = all fields unchecked = 24h")
+
+	// Each single unknown field poisons the whole verdict (the probe
+	// refreshes ALL fields together — they come from one probe pass).
+	definite := model.MediaUnlockStatus{
+		ChatGPT: model.UnlockYes, Netflix: model.UnlockNetflixFull,
+		YouTubeRegion: "DE", Disney: model.UnlockYes, TikTok: model.UnlockYes,
+	}
+	for name, mutate := range map[string]func(*model.MediaUnlockStatus){
+		"chatgpt":     func(s *model.MediaUnlockStatus) { s.ChatGPT = model.UnlockUnknown },
+		"netflix":     func(s *model.MediaUnlockStatus) { s.Netflix = model.UnlockUnknown },
+		"youtube":     func(s *model.MediaUnlockStatus) { s.YouTubeRegion = model.UnlockUnknown },
+		"disney":      func(s *model.MediaUnlockStatus) { s.Disney = model.UnlockUnknown },
+		"tiktok":      func(s *model.MediaUnlockStatus) { s.TikTok = model.UnlockUnknown },
+		"empty field": func(s *model.MediaUnlockStatus) { s.TikTok = "" },
+	} {
+		t.Run("unknown "+name+" → 24h", func(t *testing.T) {
+			st := definite
+			mutate(&st)
+			assert.Equal(t, UnlockUnknownTTL, unlockTTL(&st))
+			assert.True(t, unlockVerdictUnknown(&st))
+		})
+	}
+
+	assert.Equal(t, UnlockTTL, unlockTTL(&definite), "fully definite = 7d")
+	assert.False(t, unlockVerdictUnknown(&definite))
+
+	blocked := definite
+	blocked.ChatGPT, blocked.Netflix = model.UnlockBlocked, model.UnlockBlocked
+	blocked.YouTubeRegion, blocked.TikTok = model.UnlockBlocked, model.UnlockBlocked
+	assert.Equal(t, UnlockTTL, unlockTTL(&blocked), "blocked is a definite answer = 7d")
+	assert.False(t, unlockVerdictUnknown(&blocked))
+}
+
+// TestUnlockAliveNow pins the in-wave aliveness evidence: the node's tunnel
+// demonstrably carried a successful HTTP answer during THIS wave's geo
+// ladder — a self-report / DoH-fallback geo answer, the HTTPS self-geo, or a
+// rate-limited answer (a 429 is an application-level answer received through
+// a working tunnel). Everything else (temp-instance boot failure, dead
+// tunnel, all rungs failed) is NOT alive.
+func TestUnlockAliveNow(t *testing.T) {
+	tests := []struct {
+		name string
+		rep  NodeReport
+		want bool
+	}{
+		{"self-report geo", NodeReport{Geo: &Response{Status: "success"}}, true},
+		{"https self-geo", NodeReport{HTTPS: &InfoResponse{IP: "203.0.113.7"}}, true},
+		{"rate-limited (429 through the tunnel)", NodeReport{RateLimited: true}, true},
+		{"doh fallback geo", NodeReport{Geo: &Response{Status: "success"}, Class: ClassDoHFallback}, true},
+		{"dead tunnel (all rungs failed)", NodeReport{Class: ClassUnknown}, false},
+		{"detail only", NodeReport{Detail: "self-report: timeout"}, false},
+		{"bare report", NodeReport{}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, unlockAliveNow(&tc.rep))
+		})
+	}
 }
 
 // TestDefaultUnlockEndpoints pins the production probe URL set (the Phase-1

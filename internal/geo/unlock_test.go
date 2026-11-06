@@ -1,6 +1,7 @@
 package geo_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -49,14 +50,22 @@ func (d *unlockDouble) handle(w http.ResponseWriter, r *http.Request) {
 	d.hits[r.URL.Path]++
 	d.lastHdr[r.URL.Path] = r.Header.Clone()
 	d.lastBody[r.URL.Path] = body
-	d.mu.Unlock()
 	out, ok := d.bodies[r.URL.Path]
+	d.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(out))
+}
+
+// setBody swaps one fixture answer between waves (the alive-bypass tests
+// flip the ChatGPT trace from an evidence-less body to a definite one).
+func (d *unlockDouble) setBody(path, body string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.bodies[path] = body
 }
 
 func (d *unlockDouble) endpoints() *geo.UnlockEndpoints {
@@ -148,6 +157,160 @@ func unlockInput(t *testing.T, dir string, f geo.Factory, selfURL string, ep *ge
 	in.UnlockEndpoints = ep
 	in.ExitCache = cache
 	return in
+}
+
+// noTraceEvidenceBodies is the dead-tunnel-at-probe-time fixture set: every
+// service answers, but the ChatGPT trace carries no loc evidence — the
+// verdict caches chatgpt=unknown (the production 72/99 shape) with the rest
+// definite.
+func noTraceEvidenceBodies() map[string]string {
+	b := unlockBodies()
+	b["/cdn-cgi/trace"] = "fl=1.1\nip=203.0.113.7\n" // no loc= line → unknown
+	return b
+}
+
+// agedStamp renders an RFC3339 stamp offset from now (test-time aging).
+func agedStamp(offset time.Duration) string {
+	return time.Now().Add(offset).UTC().Format(time.RFC3339)
+}
+
+// ageUnlockCache ages the cached verdict for one exit IP in BOTH halves —
+// the hot entry and every geo-base record carrying the exit — the same
+// dual-half aging the 7-day-expiry contract test uses.
+func ageUnlockCache(t *testing.T, dir string, cache *geo.ExitGeoCache, exitIP string, offset time.Duration) {
+	t.Helper()
+	aged := agedStamp(offset)
+	path := filepath.Join(dir, "geo-base.jsonl")
+	recs, err := store.ReadGeo(path)
+	require.NoError(t, err)
+	require.NotEmpty(t, recs)
+	for _, r := range recs {
+		if r.IP == exitIP {
+			r.MediaUnlocks.CheckedAt = aged
+		}
+	}
+	require.NoError(t, store.WriteGeo(path, recs))
+	if e, ok := cache.Get(exitIP); ok && e != nil && e.MediaUnlocks != nil {
+		e.MediaUnlocks.CheckedAt = aged
+	}
+}
+
+// TestUnlockAliveBypassReprobesCachedUnknown pins the owner's alive-bypass
+// rule (2026-11-06): when the exit's tunnel demonstrably works in the
+// current wave (the geo ladder's self-report answered through it), a FRESH
+// cached verdict that still carries an unknown media field is bypassed and
+// re-probed — the working tunnel yields a definite answer. A fully definite
+// cached verdict is NEVER bypassed (wave 3: zero re-probes).
+func TestUnlockAliveBypassReprobesCachedUnknown(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, noTraceEvidenceBodies())
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2) // two nodes share the exit IP
+	require.Equal(t, model.UnlockUnknown, records[0].MediaUnlocks.ChatGPT,
+		"fixture: wave 1 must cache the dead-tunnel unknown")
+
+	// Age the verdict by an hour (inside the 24h unknown window): the wave-2
+	// re-stamp must then differ from the cached one — RFC3339 has second
+	// precision, so a same-second back-to-back stamp would hide the
+	// re-probe. This also pins the bypass firing through the cold geo-base
+	// half (the geo ladder re-caches the hot entry without verdicts every
+	// wave — the cold half is the serving layer for fresh verdicts).
+	ageUnlockCache(t, dir, cache, "203.0.113.7", -time.Hour)
+
+	// The tunnel works NOW (the self-report just answered through it) and
+	// the cached verdict carries an unknown → the next wave must bypass the
+	// cache and re-probe, flipping unknown→yes.
+	ud.setBody("/cdn-cgi/trace", "fl=1.1\nip=203.0.113.7\nloc=DE\n")
+	ud.reset()
+	records, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	assert.Equal(t, 1, ud.hitsOf("/cdn-cgi/trace"),
+		"alive exit + cached unknown = bypass, the wave must re-probe")
+	assert.Equal(t, 1, ud.hitsOf("/premium"),
+		"the bypass re-probe refreshes ALL media fields (one probe pass)")
+	assert.Equal(t, model.UnlockYes, records[0].MediaUnlocks.ChatGPT,
+		"the re-probe through the working tunnel must flip unknown→yes")
+	assert.Equal(t, records[0].MediaUnlocks, records[1].MediaUnlocks,
+		"the flipped verdict lands on every node sharing the exit")
+	assert.NotEqual(t, agedStamp(-time.Hour), records[0].MediaUnlocks.CheckedAt,
+		"the bypassed verdict must be re-stamped, not served from cache")
+
+	// Wave 3 — the verdict is now fully definite: the cache hit stands even
+	// though the exit is alive again (definite verdicts are never bypassed).
+	ud.reset()
+	_, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Zero(t, ud.totalHits(),
+		"definite cached verdict + alive exit = cache hit, no re-probe")
+}
+
+// TestUnlockDeadExitUnknownStalesAfter24h pins the 24h unknown TTL end to
+// end (owner order 2026-11-06, FIX 2): for an exit that is NOT alive in the
+// current wave (every geo-ladder rung failed hermetically), a cached
+// unknown verdict still serves as a cache hit inside 24h but goes stale at
+// 25h — the wave re-probes instead of serving the week-old dead-tunnel
+// unknown. A definite verdict keeps the 7-day window (pinned by
+// TestFreshUnlock and the existing cache-hit contract).
+func TestUnlockDeadExitUnknownStalesAfter24h(t *testing.T) {
+	// The self-report truth must MATCH the unlock exit key so the cold
+	// geo-base record is keyed by the same IP the unlock cache uses (the
+	// stock fixture answers query=203.0.113.77 — a churned mismatch).
+	body := bytes.ReplaceAll(
+		documentedSingleSuccess(t), []byte("203.0.113.77"), []byte("203.0.113.7"))
+	api := newIPAPIDouble(t, body)
+	ud := newUnlockDouble(t, noTraceEvidenceBodies())
+	socks := newSocksServer(t)
+	f, _, _ := newTestFactory(socks)
+	dir := t.TempDir()
+	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+
+	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
+	// /json/ = the no-param hop the double's failMode shapes; alive waves
+	// serve the healthy body there, dead waves a 503.
+	in.SelfURL = api.URL() + "/json/"
+
+	// Wave 1 — alive (the self-report answers through the tunnel): the
+	// probes cache an unknown-carrying verdict AND anchor the exit IP in the
+	// cold geo-base (production exits earn their cached unknowns while
+	// alive; the tunnel dies afterwards).
+	records, _, err := geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	require.Len(t, records, 2) // two nodes share the exit IP
+	require.Equal(t, model.UnlockUnknown, records[0].MediaUnlocks.ChatGPT)
+	require.Positive(t, ud.totalHits(), "wave 1 must probe (no cache yet)")
+
+	// 23h old — inside the unknown window: cache hit, zero network calls.
+	ageUnlockCache(t, dir, cache, "203.0.113.7", -23*time.Hour)
+
+	// Waves 2+ — the tunnel is DEAD: drop the hot entry (the geo ladder
+	// reuses it unconditionally — without this it would never dial), the
+	// self-report hop answers 503, and the HTTPS/DoH rungs ride dead
+	// loopbacks (hermetic fail-fast, no real resolver).
+	cache.Delete("203.0.113.7")
+	api.failMode.Store(1)
+	in.Cfg.DoHURL = "http://127.0.0.1:1/resolve"
+
+	ud.reset()
+	_, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Zero(t, ud.totalHits(), "unknown verdict inside 24h = cache hit")
+
+	// 25h old — past the unknown window: re-probe (the dead exit is not
+	// hammered every wave, but a day-old dead-tunnel unknown must not shield
+	// it for a week either).
+	ageUnlockCache(t, dir, cache, "203.0.113.7", -25*time.Hour)
+	ud.reset()
+	_, _, err = geo.Run(context.Background(), in)
+	require.NoError(t, err)
+	assert.Positive(t, ud.totalHits(), "unknown verdict past 24h = re-probe")
 }
 
 // TestUnlockProbeThroughTunnel pins the end-to-end happy path: one temp
