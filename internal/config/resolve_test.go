@@ -162,6 +162,10 @@ func TestConfiglessDefaults(t *testing.T) {
 	assert.Equal(t, config.DefaultDoHURL, cfg.Geo.DoHURL)
 	assert.True(t, cfg.Geo.UnlockProbesEnabled(),
 		"unlock_probes defaults ON in the configless path too (owner ruling 2026-11-06)")
+	assert.True(t, cfg.Probe.TCPPrefilterEnabled(),
+		"tcp_prefilter defaults ON in the configless path too (wave-1 probe-optimization default)")
+	assert.Equal(t, config.DefaultProbePrefilterWorkers, cfg.Probe.TCPPrefilterWorkers)
+	assert.Equal(t, config.DefaultProbePrefilterTimeout, cfg.Probe.TCPPrefilterTimeout.Duration)
 	assert.Equal(t, "firefox", cfg.Render.TLSFingerprint)
 	assert.Equal(t, config.DefaultTLSFingerprint, cfg.Render.TLSFingerprint)
 	assert.Equal(t, 1440, cfg.Render.TCPMaxSeg)

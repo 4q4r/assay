@@ -167,6 +167,37 @@ type ProbeConfig struct {
 	// (default), or "city". The fallback chain city -> country -> global ->
 	// base protects against sparse data.
 	Granularity string `toml:"granularity"`
+	// TCPPrefilter gates the wave-1 TCP pre-filter stage: before any temp
+	// xray boot, every unique node endpoint gets ONE plain TCP dial
+	// (bounded by tcp_prefilter_timeout, DNS included); a failed dial means
+	// no TCP listener — an xray TCP transport cannot connect either — so the
+	// node is excluded from THIS wave with a per-reason drop report and its
+	// previous probe results stay untouched. UDP-transport nodes (hysteria2,
+	// kcp/mkcp/quic transports) bypass — a TCP dial says nothing about a UDP
+	// transport. Default TRUE (owner-approved probe-optimization program,
+	// 2026-11-06: the pool is ~95% dead and every skipped endpoint saves a
+	// full xray boot); an explicit false keeps the stage off (zero dials,
+	// byte-identical to the pre-stage behavior). Tri-state like
+	// [geo].unlock_probes: nil (absent) materializes as true in
+	// applyProbeDefaults.
+	TCPPrefilter *bool `toml:"tcp_prefilter"`
+	// TCPPrefilterWorkers is the pre-filter's concurrent-dial count (a plain
+	// SYN handshake is cheap — no core instance). 0 = unset →
+	// DefaultProbePrefilterWorkers. Negative values are structurally
+	// invalid; no upper bound (owner ruling).
+	TCPPrefilterWorkers int `toml:"tcp_prefilter_workers"`
+	// TCPPrefilterTimeout bounds ONE pre-filter TCP dial, DNS resolution
+	// included. 0 = unset → DefaultProbePrefilterTimeout. Negative values
+	// are structurally invalid; no upper bound (owner ruling).
+	TCPPrefilterTimeout Duration `toml:"tcp_prefilter_timeout"`
+}
+
+// TCPPrefilterEnabled resolves the tri-state knob: nil (absent) = true — the
+// owner default (the TCP pre-filter runs on every wave); an explicit false
+// keeps the stage off. applyProbeDefaults materializes the absent case, so
+// loaded configs and hand-built configs agree.
+func (p ProbeConfig) TCPPrefilterEnabled() bool {
+	return p.TCPPrefilter == nil || *p.TCPPrefilter
 }
 
 // IsSpeedtest resolves the speedtest default: OFF unless explicitly enabled
@@ -482,6 +513,13 @@ const (
 	// DefaultProbeBatchConcurrency is the default number of nodes probed
 	// concurrently inside one batch (0 in config → this default).
 	DefaultProbeBatchConcurrency = 10
+	// DefaultProbePrefilterWorkers is the wave-1 TCP pre-filter's concurrent
+	// dial count (0 in config → this default). A plain SYN handshake is
+	// cheap — no core instance (the xray-knife prescan reference runs 512).
+	DefaultProbePrefilterWorkers = 256
+	// DefaultProbePrefilterTimeout bounds ONE pre-filter TCP dial, DNS
+	// resolution included (0 in config → this default).
+	DefaultProbePrefilterTimeout = time.Second
 	// DefaultGeoSelfReportConcurrency is the default number of concurrent
 	// temp instances during geo self-report (0 in config → this default).
 	DefaultGeoSelfReportConcurrency = 8
@@ -758,6 +796,21 @@ func applyProbeDefaults(p *ProbeConfig) {
 	}
 	if p.Granularity == "" {
 		p.Granularity = "country"
+	}
+	if p.TCPPrefilterWorkers == 0 {
+		p.TCPPrefilterWorkers = DefaultProbePrefilterWorkers
+	}
+	if p.TCPPrefilterTimeout.Duration == 0 {
+		p.TCPPrefilterTimeout.Duration = DefaultProbePrefilterTimeout
+	}
+	// TCPPrefilter: nil (absent) materializes TRUE — the owner-approved
+	// probe-optimization default (the stage runs on every wave);
+	// TCPPrefilterEnabled() treats a nil pointer the same way, so hand-built
+	// configs agree with loaded ones. An explicit false survives defaults
+	// and keeps the stage off with zero dials.
+	if p.TCPPrefilter == nil {
+		v := true
+		p.TCPPrefilter = &v
 	}
 }
 

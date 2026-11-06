@@ -60,6 +60,21 @@ type Options struct {
 	ExitProbe        *bool                             // D8 exit-IP echo (nil = ON)
 	ExitIPURL        string                            // exit-IP echo endpoint override
 	Limiter          *AdaptiveLimiter                  // optional dynamic concurrency limiter
+	// TCPPrefilter gates the wave-1 TCP pre-filter stage (prefilter.go):
+	// plain TCP-dial each unique endpoint before batching; closed endpoints
+	// never reach an xray boot. Tri-state like ExitProbe: nil (absent) = ON
+	// (the owner default — the stage ships on); an explicit false disables
+	// the stage with zero dials.
+	TCPPrefilter *bool
+	// TCPPrefilterWorkers bounds concurrent pre-filter dials (0 = default
+	// 256, capped at the unique endpoint count).
+	TCPPrefilterWorkers int
+	// TCPPrefilterTimeout bounds ONE TCP dial, DNS resolution included
+	// (0 = default 1s).
+	TCPPrefilterTimeout time.Duration
+	// dialer is the test seam for the pre-filter's TCP dials (nil =
+	// net.Dialer; production leaves it nil).
+	dialer dialFunc
 }
 
 // SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;
@@ -113,6 +128,8 @@ func Run(
 // batches of size opts.BatchSize (default 10) and processed with fewer
 // xray process spawns. The single-node factory `f` is used as a fallback for
 // any nodes not handled by the batch factory (e.g., remainder nodes).
+// Before any batching, the wave-1 TCP pre-filter (prefilter.go) excludes
+// TCP-dead endpoints from the wave when enabled (default ON).
 func RunWithBatchFactory(
 	ctx context.Context, nodes []*model.Node, f Factory, batchFactory BatchFactory, opts Options, resultsPath string,
 ) ([]store.ProbeResult, error) {
@@ -145,6 +162,14 @@ func RunWithBatchFactory(
 		byLink[link] = job
 		ordered = append(ordered, job)
 	}
+
+	// Wave-1 TCP pre-filter: decide WHO reaches batching before any temp
+	// xray boot. Closed endpoints are excluded from this wave entirely (no
+	// outcome, no log entry — their previous probe results stay untouched);
+	// UDP transports bypass; the stage reports one summary line with the
+	// drop-reason breakdown. An explicit [probe].tcp_prefilter=false skips
+	// the stage (byte-identical to the pre-wave-1 behavior).
+	ordered = prefilterOrdered(ctx, ordered, opts)
 
 	var outcomes []*outcome
 	if batchFactory != nil && len(ordered) > 0 {
