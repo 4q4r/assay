@@ -314,8 +314,8 @@ func Run(ctx context.Context, in Input) ([]*model.GeoRecord, Summary, error) {
 		byKey[reports[i].Key] = &reports[i]
 	}
 	// Phase-1 unlock stage: quality + media probes once per distinct exit IP
-	// whose cached state is older than UnlockTTL (gated by [geo].unlock_probes;
-	// no-op when off — zero production behavior change).
+	// whose cached state is older than UnlockTTL (gated by [geo].unlock_probes,
+	// default ON; an explicit false = no-op — zero unlock requests).
 	runUnlockWave(ctx, in, reporter, reports, exitIPs)
 	records, err := mergeGeoRecords(in, byKey)
 	if err != nil {

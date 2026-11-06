@@ -153,10 +153,12 @@ self_report_concurrency = 8           # max concurrent temp instances during geo
                                        # (each is a full xray process). 0 = default 8.
                                        # Negative = invalid.
 max_ttl = "30s"                       # cap for the rate-limit retry sleep (X-Ttl honor)
-# unlock_probes = true                 # Phase 1 (default off): probe ChatGPT/Netflix/YouTube/
-#                                      # Disney+/TikTok unlocks + IP quality THROUGH each
-#                                      # distinct exit's own tunnel (3s per request), cached
-#                                      # per exit IP for 7 days in geo-base.jsonl
+unlock_probes = true                   # Phase 1 (default ON — owner ruling 2026-11-06):
+                                       # probe ChatGPT/Netflix/YouTube/Disney+/TikTok
+                                       # unlocks + IP quality THROUGH each distinct exit's
+                                       # own tunnel (3s per request), cached per exit IP
+                                       # for 7 days in geo-base.jsonl; false keeps the
+                                       # stage off (zero unlock requests)
 [select]
 # W19 (owner order): every cap defaults to UNBOUNDED — absent/0 = ALL alive
 # nodes go active (the unknown-geo group included) and land in the country/

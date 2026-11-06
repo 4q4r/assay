@@ -4,7 +4,7 @@
 //
 //	env -u http_proxy -u https_proxy go test -tags live -run TestLiveW20 ./internal/plugins/
 //
-// Hits the real upstreams of the seven W20 sources (public data;
+// Hits the real upstreams of the remaining W20 sources (public data;
 // owner-named). Off by default — the default suite is hermetic (the fixture
 // twins live in w20_internal_test.go). barry-far has been GitHub
 // ToS-blocked before (403): a loud github_files failure for that plugin is
@@ -27,7 +27,7 @@ import (
 func TestLiveW20Plugins(t *testing.T) {
 	eng := NewEngine(fetch.ClientConfig{Timeout: 60 * time.Second, Retries: 2}, io.Discard)
 	for _, id := range []string{
-		"hidashimora", "kort0881", "au1rxx", "barryfar", "nirevil", "mehdirzfx", "mhditaheri",
+		"hidashimora", "kort0881", "au1rxx", "barryfar", "mehdirzfx",
 	} {
 		code, ok := defaultSources()[id+".lua"]
 		require.True(t, ok, "embedded default %s.lua missing", id)

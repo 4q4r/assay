@@ -122,11 +122,11 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 
 Since W10 the sources are **Lua plugins**, not config tables. Every `.lua` file in `[plugins].dir` is one source: it fetches and iterates, hands raw links to Go as `publicvpn.node` records, and Go keeps owning URI normalization, parsing, rejection counting, and dedupe (the same `parse`/`filter` pipeline as before — plugins only discover). The runtime is [gopher-lua](https://github.com/yuin/gopher-lua) (pure-Go Lua 5.1, no cgo).
 
-**Lifecycle:** the built-in plugins — `matin`, `radikal`, `stintikvpn` (the network-API reference plugin), the seven W20 sources `hidashimora`, `kort0881`, `au1rxx`, `barryfar`, `nirevil`, `mehdirzfx`, `mhditaheri` and the four newer sources `flat447`, `luxxuria`, `igareck`, `nodesradar` — materialize into the plugins dir on **first run only**. Owner edits and removals persist (delete the whole dir to restore all defaults). A plugin file present = source **active**; remove or rename it (e.g. `radikal.lua.off`) to disable. The `publicvpn watch` daemon hot-reloads the dir: a new provider is a new `.lua` file — no rebuild, no restart.
+**Lifecycle:** the built-in plugins — `matin`, `radikal`, `stintikvpn` (the network-API reference plugin), the five W20 sources `hidashimora`, `kort0881`, `au1rxx`, `barryfar`, `mehdirzfx` and the four newer sources `flat447`, `luxxuria`, `igareck`, `nodesradar` — materialize into the plugins dir on **first run only**. Owner edits and removals persist (delete the whole dir to restore all defaults). A plugin file present = source **active**; remove or rename it (e.g. `radikal.lua.off`) to disable. The `publicvpn watch` daemon hot-reloads the dir: a new provider is a new `.lua` file — no rebuild, no restart.
 
 **Existing installs:** because materialization is first-run-only, an install that already has a plugins dir does not grow the new defaults by itself — copy the wanted `.lua` files from `internal/plugins/defaults/` into the dir (or delete the dir to restore the full set).
 
-### Built-in sources (14)
+### Built-in sources (12)
 
 | Plugin | Upstream | Cadence | Ingests (max-first) | Skips loud |
 | :-- | :-- | :-- | :-- | :-- |
@@ -137,9 +137,7 @@ Since W10 the sources are **Lua plugins**, not config tables. Every `.lua` file 
 | `kort0881` | kort0881/vpn-vless-configs-russia | ~15 min | `data/githubmirror/clean/*` + `output/vless.txt` (~36k candidates; ~5% lines carry upstream `&amp;` entities — parse owns them) | empty merge tier (`data/subscriptions/all*`) |
 | `au1rxx` | Au1rxx/free-vpn-subscriptions | ~15 min | `output/all-verified/v2ray-base64-*.txt` (8181 links; by-country shards are a strict subset — not fetched) | in-dir `clash-*.yaml`, `singbox-*.json` |
 | `barryfar` | barry-far/V2ray-Config | ~1 h | `All_Configs_Sub.txt` + its base64 twin (~17k candidates) | `#profile-*` metadata, `ssr://` (out of protocol set). ⚠️ GitHub ToS-blocked this repo before (403) — the plugin fails loud as a normal per-plugin failure when it returns; the source may vanish |
-| `nirevil` | NiREvil/vless | curated | `sub/SSTime` only (96 ss/hysteria2 links — the repo's one ingestible file) | Cloudflare clean-IP scanner output (`country_proxies/*`), CSV IP lists, WG/warp/sing-box/clash/worker files |
 | `mehdirzfx` | mehdirzfx/v2ray-sub | curated | README catalog crawl: URI/base64 sections, section round-robin, **budget 25 fetches × 3s** (safe under the default 120s `run_timeout`; raise `MAX_FETCHES` in the file + the timeout for full depth) | Clash/Mihomo + Sing-box/JSON sections and `.yaml/.yml/.json` URLs, Sources-and-Credits, dup URLs |
-| `mhditaheri` | MhdiTaheri/V2rayCollector | ~1 h | `sub/mix` + `sub/mixbase64` (~4k candidates; raw-TG-parser output with a high malformed-junk rate — ~41% malformed in the 2026-10-30 live wave, loud-counted by parse by design; the `trojan://127.0.0.1` update marker is kept — parse owns rejection) | per-protocol subsets (dedupe would collapse them) |
 | `flat447` | FLAT447/v2ray-lists | ~2 h | `BLACK_FULL.txt` + `WHITE_FULL.txt` merge lists (per-protocol splits are strict subsets — not fetched) | `#announce`/`#profile-*` metadata header lines |
 | `luxxuria` | luxxuria/harvester | curated | `ping_tested.txt` + `speed_tested.txt` (latency- and throughput-verified vless lists; untested variants are strict supersets — not fetched) | — |
 | `igareck` | igareck/vpn-configs-for-russia | curated | 5 research-verified files: 2 BLACK vless lists (desktop + mobile), 2 BLACK ss lists (all + weak-DPI), 1 white REALITY mobile list (one ss filename carries a literal `+` — pinned verbatim) | — |

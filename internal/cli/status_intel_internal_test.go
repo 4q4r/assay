@@ -938,6 +938,15 @@ func TestStatusDashboardASCIIFallbacks(t *testing.T) {
 // is the point of factor dropout).
 func TestStatusProbesOffCleanNAEverywhere(t *testing.T) {
 	cfgPath := statusIntelFixture(t)
+	// Pin the off-state via an EXPLICIT false: the [geo].unlock_probes
+	// default flipped ON (owner ruling 2026-11-06), so knob absence no
+	// longer means off — the invariant under test (probes off = clean%
+	// n/a/null everywhere) is pinned against the explicit knob value.
+	f, err := os.OpenFile(cfgPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString("\n[geo]\nunlock_probes = false\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
 	// Rewrite the cold base with legacy-only records (no Phase-1 fields —
 	// exactly what waves leave behind while the geo unlock stage is off).
 	home := os.Getenv("HOME")
