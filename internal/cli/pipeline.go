@@ -2464,13 +2464,10 @@ func printCalibrationStatus(out io.Writer, p paths, cfg *config.Config, color bo
 			time.Duration(timeoutcal.CeilingMs)*time.Millisecond,
 			probeCV,
 			st.Probe.Global.Waves), color))
-	// geo
-	geoCur := st.Geo.TimeoutFor("global")
-	if geoCur == 0 {
-		geoCur = probeBase
-	}
-	outf(out, "%s\n", ui.ChipKV("  geo:     ",
-		fmt.Sprintf("%s (base %s, wave %d)", geoCur, probeBase, st.Geo.Global.Waves), color))
+	// The state file's geo slot is legacy compatibility only: since the
+	// classification merge no stage calibrates or consumes geo timeouts
+	// separately (the probe budget governs the whole classification pass),
+	// so the slot stays in the state file but is intentionally not rendered.
 	// regions slowest 3
 	type regionKV struct {
 		key string

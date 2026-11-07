@@ -98,7 +98,8 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if len(pool) == 0 {
 		return nil, errors.New(
 			"check: no checkable nodes (cold base empty or no alive nodes — " +
-				"run `publicvpn probe` + `publicvpn geo` first, or pass --with-dead)")
+				"run `publicvpn probe` first — classification is merged into the probe " +
+				"pass and writes the cold base; or pass --with-dead)")
 	}
 
 	now := time.Now().UTC()

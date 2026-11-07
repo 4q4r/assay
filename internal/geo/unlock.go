@@ -1185,11 +1185,14 @@ func extractIPv4Token(s string) (string, bool) {
 // verdict to blocked (a cert/body-contract intercept proves the answers
 // are not the services' own — "yes" is unreachable by construction, which
 // kills the poisoned-verdict class the v1 battery fabricated). CheckedAt
-// is stamped whenever the probes actually ran — an all-unknown outcome
-// caches for UnlockUnknownTTL (24h), a definite outcome for UnlockTTL, and
-// the verdict carries the current battery version (freshUnlock re-probes
-// anything older than it: the migration semantics). A canceled context
-// returns nil (a partial verdict must not be cached as checked).
+// is stamped whenever the probes actually ran — the verdict carries the
+// freshness data contract (unknown-carrying fields expire after
+// UnlockUnknownTTL (24h), fully definite ones after UnlockTTL, and the
+// battery version marks pre-current verdicts stale). freshUnlock stays the
+// shared contract helper, but since the classification merge nothing caches
+// verdicts or consults it in production — consumers read the geo-base
+// records fresh each wave. A canceled context returns nil (a partial
+// verdict must not be recorded as checked).
 func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStatus, *IPInfoWidget, *ExitEvidence) {
 	ev := &ExitEvidence{}
 	st := &model.MediaUnlockStatus{}

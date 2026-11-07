@@ -18,13 +18,15 @@
 # in your real paths. NOTHING here identifies a specific deployment.
 #
 # INTENTIONAL PLACEHOLDERS (documented): [render].template and [activate].target
-# use ~/path/to/... placeholders. `status`, `fetch`, `parse`, `filter`, `probe`
-# and `geo` load this file as-is; `render`/`activate` fail LOUD until those two
-# paths point at a real xray client template/config. There are no active
-# [[render.pool_routes]] entries — routes are per-deployment operator policy
-# (see the commented example in [render] below).
+# use ~/path/to/... placeholders. `status`, `fetch`, `parse`, `filter` and
+# `probe` load this file as-is (the probe pass merges exit classification in
+# and writes the geo-base cold base itself); `render`/`activate` fail LOUD
+# until those two paths point at a real xray client template/config. There are
+# no active [[render.pool_routes]] entries — routes are per-deployment
+# operator policy (see the commented example in [render] below).
 #
-# Stages: fetch → parse → filter → probe → geo → select → render → activate.
+# Stages: fetch → parse → filter → probe (classification merged) → select →
+# render → activate.
 
 data_dir = "~/.local/share/publicvpn"
 

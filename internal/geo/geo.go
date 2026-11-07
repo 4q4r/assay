@@ -249,7 +249,7 @@ func mergeGeoRecords(
 	sorted := make([]*model.Node, len(nodes))
 	copy(sorted, nodes)
 	sort.Slice(sorted, func(i, j int) bool {
-		a, b := nodes[i], nodes[j]
+		a, b := sorted[i], sorted[j]
 		if a.Scheme != b.Scheme {
 			return a.Scheme < b.Scheme
 		}

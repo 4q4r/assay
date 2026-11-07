@@ -44,6 +44,9 @@ data_dir = %q
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no checkable nodes")
 	assert.Contains(t, err.Error(), "publicvpn probe")
+	assert.NotContains(t, err.Error(), "publicvpn geo",
+		"the removed geo verb must not resurface in user-facing guidance — "+
+			"classification is merged into the probe pass")
 }
 
 func TestCheckLoudOnBadTarget(t *testing.T) {
