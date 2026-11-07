@@ -93,7 +93,7 @@ flowchart LR
 | :-- | :-- | :-- |
 | 🌐 fetch | `publicvpn fetch` | run the **Lua source plugins** (W10): each plugin fetches and iterates, hands raw links to Go; the results land in the cache + manifest exactly like the old file downloads — parse/dedupe are untouched |
 | 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
-| 🩺 probe | `publicvpn probe` | **W14 real-xray engine**: a temp single-node xray per node (same factory as check/geo) — liveness attempts, RTT, tunnel exit IP (D8), through-tunnel speedtest; uniform hysteria2 coverage |
+| 🩺 probe | `publicvpn probe` | **W14 real-xray engine**: a temp single-node xray per node (same factory as check) — liveness attempts, RTT, tunnel exit IP (D8), exit classification merged in (self-report + unlock battery → the cold base), through-tunnel speedtest; uniform hysteria2 coverage |
 | 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
 | ✂️ prune | `maintain` sub-step | dead/ttl-stale-orphan removal with a `.bak-<ts>` backup |
 | 🏆 select | `publicvpn select` | rank (alive → checks → speed); **W19: every cap defaults to UNBOUNDED — ALL alive nodes go active** (unknown-geo group included); an explicit `per_country_cap` K / `soft_cap` / `ceiling` still caps (D7) |
@@ -347,7 +347,7 @@ For picky sites that open only from specific countries/cities/ASNs, `check` answ
 
 ## 🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)
 
-The geo stage asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
+The classification pass (merged into the probe batch lifecycle — there is no separate geo stage) asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
 
 1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID). Every rung of the ladder below rides that SAME instance.
 2. **Rung 1 — plain-HTTP ip-api self-report.** Through the instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
@@ -372,14 +372,14 @@ Unknown-geo nodes keep the D5 tag grammar intact with the `xx` pseudo-code (`poo
 
 ## 🩺 The probe wave (W14, real xray)
 
-The probe stage migrates from the `xray-knife` subprocess to **real temporary single-node xray instances** — the same factory the `check`/`geo` stages use (`render.BuildOutbound` product, hardening knobs included, one builder, no drift). The knife is gone completely: code, config keys, database — every removed `[probe]` key (`path`, `db_path`, `check_preset`, `url_success_threshold`, `max_passed`) fails the config load with a loud migration naming the replacement.
+The probe stage migrates from the `xray-knife` subprocess to **real temporary single-node xray instances** — the same factory the `check` stage uses (`render.BuildOutbound` product, hardening knobs included, one builder, no drift). The knife is gone completely: code, config keys, database — every removed `[probe]` key (`path`, `db_path`, `check_preset`, `url_success_threshold`, `max_passed`) fails the config load with a loud migration naming the replacement.
 
 **Why:** one probe engine covers **every rendered protocol uniformly — hysteria2 included** (the old "does the prober even support hysteria2" question dies with the knife; the real core is the prober). Per node, the wave:
 
 1. Boots a temp instance (socks inbound on a free `127.0.0.1:18xxx` port, exact-PID kill, serialized boot windows).
 2. Runs `[probe].attempts` (default `3`) HTTP GETs through the tunnel to `[probe].url`: per-attempt status, TTFB, total, redirect chain; the blockpage classifier (checker's — `403/451/429/5xx` and signature pages are never silently alive) grades every answer.
 3. `passed` = all attempts success-class, `semi-passed` = some, `failed` = none. Only success-class is **alive** — a blockpage proves reachability, not service.
-4. Reads the **exit IP (D8)** through the same tunnel (`http://ip-api.com/json/`, the same self-report call the geo stage makes — best-effort, never fatal).
+4. Reads the **exit IP (D8)** through the same tunnel (`http://ip-api.com/json/`, the same self-report the classification pass makes — best-effort, never fatal).
 5. When `[probe].speedtest` is on (**default OFF since round-8** — owner ruling «Только спидтест выключи», reversing the W10 default-on; the weekly speedtest wave carries it regardless): downloads the `[probe].speedtest_url` sample (default Cloudflare 25 MB) through the tunnel inside `[probe].speedtest_timeout` → `bytes/time` → `speed_bps` into the probe result (same store schema as before — select/geo-base consumers untouched).
 
 `[probe].threads` is now the parallel **temp-instance worker count** (W19 default `32` — each worker owns a real xray process; boot windows serialize inside the factory at ~10 boots/sec, the HTTP phase is fully parallel: 32 workers saturate that ceiling, so wave wall time stays **bounded-minutes per 1000 nodes** — e.g. 1000 nodes ≈ 2–8 min depending on link health — while the semaphore still bounds instantaneous load to 32 concurrent instances). The protocol breadth comes from `[filter].protocols` — **W14 default: all five** `vless,vmess,trojan,ss,hysteria2` (round-7 owner ruling); the security filter (`reality|tls`, `allow_insecure=false` default) stays untouched.
@@ -463,7 +463,7 @@ public_vpn/
 
 - **Go ≥ 1.27** to build (`go build -o publicvpn ./cmd/publicvpn`).
 - **xray-core 26.3.27** present locally (the `-test` gate and the stats API both exec it; do **not** upgrade the core — L11).
-- **xray binary** at `[activate].xray_bin` — the probe wave (W14), check/geo temp instances, and the `-test` gate all exec it; `publicvpn xray-update` keeps it current.
+- **xray binary** at `[activate].xray_bin` — the probe wave (W14, its merged classification included), check temp instances, and the `-test` gate all exec it; `publicvpn xray-update` keeps it current.
 - A working xray client config to use as the render template (read-only reference — the renderer never writes your template).
 
 ## ⚡ Quick Start

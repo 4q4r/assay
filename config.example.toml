@@ -88,7 +88,7 @@ allow_insecure = false
 
 [probe]
 # W14 real-xray engine: every probed node gets a temporary single-node xray
-# (the SAME factory the check/geo stages use — [activate].xray_bin, no
+# (the SAME factory the check stage uses — [activate].xray_bin, no
 # separate prober binary or database), so liveness and the speedtest cover
 # EVERY rendered protocol uniformly, hysteria2 included. The removed
 # xray-knife keys (path/db_path/check_preset/url_success_threshold/max_passed)

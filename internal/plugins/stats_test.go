@@ -133,7 +133,7 @@ func TestPluginStatsCollection(t *testing.T) {
 		t.Errorf("GetStats returned %d plugins, want 2", len(allStats))
 	}
 
-	// Test nil geo records (during fetch before geo stage)
+	// Test nil geo records (during fetch; classification rides the probe wave)
 	collectorNoGeo := NewPluginStatsCollector(nil)
 	collectorNoGeo.AddPluginNodes("pluginC", []Node{
 		{Raw: "vless://uuid@test.com:443?security=tls#node", Source: "pluginC", Scheme: "vless", Host: "test.com", Port: 443},
