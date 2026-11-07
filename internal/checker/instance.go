@@ -82,8 +82,9 @@ func SetTestPortBand(minPort, maxPort int) {
 // TLS fingerprint is applied — hardening IS uniform across live and temp.
 // Nothing here ever touches the live client, its config, or geo-base.
 //
-// Exported for the W11 geo stage: the per-node self-report piggybacks on ONE
-// such instance per node (the CLI wires this factory into geo.Input.Factory).
+// Exported for the per-node self-report (W11 origin): the classification
+// pass piggybacks on ONE such instance per node (the CLI wires this factory
+// into geo.Input.Factory).
 func NewXrayFactory(xrayBin, workDir string, knobs render.Config) InstanceFactory {
 	return func(ctx context.Context, n *model.Node) (SocksInstance, error) {
 		// Zero knobs normalize to the config defaults — a caller passing a

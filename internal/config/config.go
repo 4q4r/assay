@@ -114,9 +114,9 @@ type FilterConfig struct {
 
 // ProbeConfig controls the real-xray probe wave (W14): every probed node
 // gets a temporary single-node xray instance (the SAME infrastructure the
-// check/geo stages use — one factory, no drift), so liveness and speed
+// check stage uses — one factory, no drift), so liveness and speed
 // measurement uniformly cover every rendered protocol, hysteria2 included.
-// The xray binary is [activate].xray_bin (one knob, shared with check/geo).
+// The xray binary is [activate].xray_bin (one knob, shared with check).
 type ProbeConfig struct {
 	Timeout Duration `toml:"timeout"`
 	// Threads is the parallel temp-instance worker count (each worker owns
@@ -208,9 +208,10 @@ func (p ProbeConfig) IsSpeedtest() bool {
 	return p.Speedtest != nil && *p.Speedtest
 }
 
-// GeoConfig controls the geo stage (W11 self-report design; W16 adds the
-// HTTPS third hop): every alive node asks geo endpoints THROUGH ITS OWN
-// TUNNEL, so the requests originate from thousands of distinct node IPs and
+// GeoConfig controls the exit-classification knobs (W11 self-report design;
+// W16 adds the HTTPS third hop; since the classification merge the pass
+// rides the probe wave): every alive node asks geo endpoints THROUGH ITS
+// OWN TUNNEL, so the requests originate from thousands of distinct node IPs and
 // per-source budgets never pool — the old aggregate batch clamp
 // (endpoint/batch_size/per_minute, retired loud) is gone in principle. The
 // failure ladder per node: (1) HTTP ip-api self-report, (2) HTTPS self-geo
@@ -228,13 +229,16 @@ type GeoConfig struct {
 	// source). Structural https check only — ANY https endpoint is accepted
 	// verbatim (owner ruling: a plain string knob, no allowlist). Default:
 	// DefaultGeoHTTPSURL.
-	HTTPSURL      string   `toml:"https_url"`
-	ExitIPEchoURL string   `toml:"exit_ip_echo_url"`
-	TTL           Duration `toml:"ttl"`
-	// MaxTTL caps the rate-limit retry sleep (the X-Ttl honor on a 429
-	// batch fallback). 0 = unset → DefaultGeoMaxTTL; an explicit 0 after
-	// defaults? defaults apply only on absent, so 0 stays 0 = no cap (owner
-	// no-floor ruling; the default is the safety net).
+	HTTPSURL      string `toml:"https_url"`
+	ExitIPEchoURL string `toml:"exit_ip_echo_url"`
+	// TTL is the legacy geo-freshness knob of the REMOVED geo stage's
+	// exit-IP cache (classification now refreshes every wave — the 24h
+	// freshness gates are gone). Still live for `publicvpn check` (GeoTTL).
+	TTL Duration `toml:"ttl"`
+	// MaxTTL was the rate-limit retry-sleep cap of the REMOVED geo-stage
+	// batch fallback (the local-machine ip-api overlay is gone with the
+	// stage). Retained for config compatibility; classification honors the
+	// 429 X-Ttl by falling through to the HTTPS/DoH rungs instead.
 	MaxTTL Duration `toml:"max_ttl"`
 	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
 	// (self-report and each fallback hop alike).
@@ -244,15 +248,20 @@ type GeoConfig struct {
 	// unset → DefaultGeoSelfReportConcurrency). Negative values are
 	// structurally invalid. No upper bound (owner ruling).
 	SelfReportConcurrency int `toml:"self_report_concurrency"`
-	// UnlockProbes gates the Phase-1 IP quality & media unlock stage: once
-	// per distinct exit IP whose cached state is older than 7 days, probe
-	// ChatGPT/Netflix/YouTube/Disney+/TikTok unlocks and IP quality THROUGH
-	// that exit's own tunnel (3s per request; results keyed by exit IP and
-	// persisted in geo-base.jsonl). Default TRUE (owner ruling 2026-11-06:
-	// unlock probes ship on by default, like the ip quality fields they
-	// carry); an explicit false keeps the stage off (zero unlock requests;
-	// quality/media fields stay unchecked). Tri-state like auto_restart:
-	// nil (absent) materializes as true in applyGeoDefaults.
+	// UnlockProbes gates the merged classification pass (owner order
+	// 2026-11-07 «сразу на чеке»): every node the probe stage proves ALIVE
+	// gets the FULL battery — the ip-api self-report ladder (country/city/
+	// ISP/AS + hosting/proxy flags) plus the unlock battery v2 (cftrace
+	// echo, 3-source consensus, DNS-over-TCP, media probes, hijack
+	// detection, OK_FLAKY retry, STUN for hysteria2) — THROUGH THE SAME HOT
+	// xray instance the probe just passed, before that instance is torn
+	// down; the geo-base records refresh every wave. The separate geo and
+	// unlock stages with their 24h freshness gates are REMOVED (merged into
+	// the probe batch lifecycle). Default TRUE (owner ruling 2026-11-06
+	// stands); an explicit false is the escape hatch = probe-only wave
+	// (zero classification requests; the geo-base keeps its last state).
+	// Tri-state like auto_restart: nil (absent) materializes as true in
+	// applyGeoDefaults.
 	UnlockProbes *bool `toml:"unlock_probes"`
 }
 
@@ -633,8 +642,9 @@ func Load(path string) (*Config, error) {
 // migration path. Two removed generations live here:
 //   - [sources.*] (W10): the ingest layer is Lua plugins — no silent fallback
 //     chain from the old section;
-//   - [geo] batch knobs (W11): the geo stage self-reports per node through
-//     its own tunnel, so geo.endpoint / geo.batch_size / geo.per_minute are
+//   - [geo] batch knobs (W11): the per-node self-report (since the
+//     classification merge, part of the probe pass) rides each node's own
+//     tunnel, so geo.endpoint / geo.batch_size / geo.per_minute are
 //     dead — requests originate from thousands of distinct node IPs and the
 //     aggregate limit they clamped cannot pool. The self-report is automatic
 //     (no knob); the surviving knobs are ttl / timeout / doh_url.
@@ -662,7 +672,7 @@ func checkRemovedSections(raw []byte) error {
 				return fmt.Errorf(
 					"%s: removed — the probe wave no longer shells out to xray-knife (W14): every "+
 						"probed node now gets a temporary single-node xray instance (the SAME "+
-						"infrastructure the check/geo stages use), so liveness and the speedtest "+
+						"infrastructure the check stage uses), so liveness and the speedtest "+
 						"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
 						"delete the dead key(s); the temp instances use [activate].xray_bin (there is "+
 						"no separate prober binary or database anymore); panel grading moved to the "+
@@ -680,7 +690,8 @@ func checkRemovedSections(raw []byte) error {
 			}
 			if len(dead) > 0 {
 				return fmt.Errorf(
-					"%s: removed — the geo stage now SELF-REPORTS per node: every alive node asks "+
+					"%s: removed — the classification pass (merged into the probe wave) "+
+						"self-reports per node: every alive node asks "+
 						"ip-api (http://ip-api.com/json/, no ip parameter) through its own tunnel, so "+
 						"requests come from thousands of distinct node IPs and the aggregate per-source "+
 						"limit these batch knobs clamped can never pool (W11). The self-report is "+

@@ -38,7 +38,6 @@ func (r *stageRecorder) stages() *maintainStages {
 		parse:    r.stage("parse"),
 		filter:   r.stage("filter"),
 		probe:    r.stage("probe"),
-		geo:      r.stage("geo"),
 		stats:    r.stage("stats"),
 		prune:    r.stage("prune"),
 		selectS:  r.stage("select"),
@@ -68,8 +67,8 @@ func runMaintainForTest(t *testing.T, cfg *config.Config, opts maintainOptions, 
 func TestMaintainRunsFullStageOrderInWaveOrder(t *testing.T) {
 	rec := &stageRecorder{}
 	runMaintainForTest(t, maintainCfg(t), maintainOptions{}, rec.stages())
-	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "geo", "stats", "prune", "select", "render", "activate"},
-		rec.order, "one invocation = the full refresh wave in DESIGN §4 order (stats and prune between geo and select)")
+	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "stats", "prune", "select", "render", "activate"},
+		rec.order, "one invocation = the full refresh wave (classification rides the probe stage — the separate geo stage is merged into the batch lifecycle)")
 }
 
 func TestMaintainNoActivateSkipsActivationButRenders(t *testing.T) {
@@ -77,17 +76,19 @@ func TestMaintainNoActivateSkipsActivationButRenders(t *testing.T) {
 	runMaintainForTest(t, maintainCfg(t), maintainOptions{noActivate: true}, rec.stages())
 	assert.NotContains(t, rec.order, "activate", "--no-activate: render+diff only")
 	assert.Contains(t, rec.order, "render")
-	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "geo", "stats", "prune", "select", "render"}, rec.order)
+	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "stats", "prune", "select", "render"}, rec.order)
 }
 
-func TestMaintainSkipProbeSkipsProbeAndGeo(t *testing.T) {
-	// --skip-probe reselects from the cold base: probe and geo are skipped
-	// (geo consumes fresh probe exit IPs — re-running it without probes would
-	// burn ip-api quota for nothing, L6); select still re-ranks, and rank's
-	// geo.ttl freshness gate drops stale-alive records on its own.
+func TestMaintainSkipProbeSkipsProbeStage(t *testing.T) {
+	// --skip-probe reselects from the cold base: the probe stage (now carrying
+	// the merged classification pass) is skipped — classification only runs
+	// for nodes whose tunnel was just proven hot. Select still re-ranks from
+	// the cold base.
 	rec := &stageRecorder{}
 	runMaintainForTest(t, maintainCfg(t), maintainOptions{skipProbe: true}, rec.stages())
 	assert.Equal(t, []string{"fetch", "parse", "filter", "stats", "prune", "select", "render", "activate"}, rec.order)
+	assert.NotContains(t, rec.order, "geo",
+		"the geo stage is GONE — classification lives inside the probe batch lifecycle")
 }
 
 func TestMaintainStageFailureFailsLoudAndStops(t *testing.T) {
@@ -105,7 +106,7 @@ func TestMaintainStatsFailureWarnsButWaveContinues(t *testing.T) {
 	// the refresh wave. The failure is surfaced as a loud warning line.
 	rec := &stageRecorder{fail: map[string]error{"stats": errors.New("connection refused")}}
 	out := runMaintainForTest(t, maintainCfg(t), maintainOptions{}, rec.stages())
-	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "geo", "prune", "select", "render", "activate"}, rec.order,
+	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "prune", "select", "render", "activate"}, rec.order,
 		"the wave continues past a stats failure (the recorder only logs successful stages)")
 	assert.Contains(t, out, "stats poll unavailable", "the failure is surfaced, never swallowed")
 	assert.Contains(t, out, "connection refused")

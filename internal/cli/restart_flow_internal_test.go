@@ -374,7 +374,7 @@ func TestW17MidActivateShutdownCannotInterruptRestart(t *testing.T) {
 	stages := defaultMaintainStages(maintainOptions{})
 	noop := func(*cobra.Command, *config.Config) error { return nil }
 	stages.fetch, stages.parse, stages.filter = noop, noop, noop
-	stages.probe, stages.geo = noop, noop
+	stages.probe = noop
 	stages.stats, stages.prune, stages.selectS, stages.render = noop, noop, noop, noop
 	stages.activate = func(c *cobra.Command, cc *config.Config) error {
 		return runActivateStage(c, cc, &restartWiring{Executor: rec, Dialer: rec.dial, Sleep: noSleep})

@@ -3,6 +3,7 @@ package geo
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -107,7 +108,7 @@ func TestMergeGeoRecordsSameIdentityWinnerIsOrderIndependent(t *testing.T) {
 	winner := func(nodes []*model.Node) *model.GeoRecord {
 		t.Helper()
 		dir := t.TempDir()
-		recs, err := mergeGeoRecords(Input{DataDir: dir, Nodes: nodes, ProbeByKey: probeByKey}, reports)
+		recs, err := mergeGeoRecords(dir, nodes, probeByKey, 0, reports)
 		require.NoError(t, err)
 		require.Len(t, recs, 2, "both same-identity nodes produce records")
 		path := filepath.Join(dir, "geo-base.jsonl")
@@ -128,6 +129,71 @@ func TestMergeGeoRecordsSameIdentityWinnerIsOrderIndependent(t *testing.T) {
 		"the surviving last_probe must not depend on node arrival order")
 	assert.Equal(t, a.Country, b.Country,
 		"the surviving geo must not depend on node arrival order")
+}
+
+// TestMergeGeoRecordsEmissionOrderKeySortedUnderAllFeedPermutations pins the
+// (identity, node key) emission determinism for 3+ same-identity records:
+// records must emit in ascending (identity, key) order regardless of the
+// caller's feed order. Regression pin for the sort comparator indexing the
+// CALLER's fixed-order slice while sorting the copy — with n=2 every feed
+// order coincidentally emitted sorted (why the suite missed it); with n≥3
+// fed non-sorted the emission was a garbage permutation (confirmed class:
+// feed [2,0,1] → emission [0,2,1]).
+func TestMergeGeoRecordsEmissionOrderKeySortedUnderAllFeedPermutations(t *testing.T) {
+	keyed := make([]*model.Node, 0, 3)
+	for _, cred := range []string{"uuid-a", "uuid-b", "uuid-c"} {
+		keyed = append(keyed, model.NewNode("s", "vless", cred, "dupe.example.com", 443,
+			map[string]string{"security": "tls", "type": "tcp"}))
+	}
+	require.Len(t, keyed, 3, "distinct credentials → distinct node keys")
+	identity := model.GeoIdentity(&model.GeoRecord{
+		Scheme: keyed[0].Scheme, Host: keyed[0].Host, Port: keyed[0].Port})
+	for i, n := range keyed {
+		for j, m := range keyed {
+			if i != j {
+				require.NotEqual(t, n.Key, m.Key, "distinct credentials → distinct node keys")
+			}
+		}
+		require.Equal(t, identity,
+			model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port}),
+			"all three nodes share one cold-base identity")
+	}
+
+	// Ascending (identity, key) order defines the expected emission order;
+	// each node carries a distinct RTT so every emitted record identifies
+	// the node key it came from.
+	sorted := append([]*model.Node(nil), keyed...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
+	now := time.Now().UTC()
+	rttByKey := make(map[string]float64, len(sorted))
+	probeByKey := make(map[string]store.ProbeResult, len(sorted))
+	for rank, n := range sorted {
+		rttByKey[n.Key] = float64(10 * (rank + 1))
+		probeByKey[n.Key] = store.ProbeResult{
+			Key: n.Key, Alive: true, RTTMs: rttByKey[n.Key], CheckedAt: now,
+		}
+	}
+	wantRTTs := make([]float64, len(sorted))
+	for i, n := range sorted {
+		wantRTTs[i] = rttByKey[n.Key]
+	}
+
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, perm := range perms {
+		feed := make([]*model.Node, 0, len(perm))
+		for _, idx := range perm {
+			feed = append(feed, sorted[idx])
+		}
+		recs, err := mergeGeoRecords(t.TempDir(), feed, probeByKey, 0, map[string]*NodeReport{})
+		require.NoError(t, err)
+		require.Len(t, recs, len(feed), "every probed same-identity node emits a record")
+		gotRTTs := make([]float64, len(recs))
+		for i, rec := range recs {
+			gotRTTs[i] = rec.RTTMs
+		}
+		assert.Equal(t, wantRTTs, gotRTTs,
+			"feed permutation %v must emit in ascending (identity, node key) order", perm)
+	}
 }
 
 // TestResponseASNExtractsNumber pins the as-field token extraction on the
