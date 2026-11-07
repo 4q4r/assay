@@ -270,9 +270,20 @@ type Selection struct {
 	// every [select] cap defaults to UNBOUNDED, so when no cap is configured
 	// CapApplied equals len(Nodes) (every alive node went active); an
 	// explicit cap knob reports the bound it enforced.
-	CapApplied  int            `json:"cap_applied"`
-	CitiesAlive int            `json:"cities_alive"`
-	Nodes       []SelectedNode `json:"nodes"`
+	CapApplied int `json:"cap_applied"`
+	// HijackExcluded counts select-stage candidates excluded by the
+	// TLS-intercept gate (owner-ordered safety cut): their OWN geo evidence
+	// carries MediaUnlocks.Hijack=true, so the exit intercepts TLS and its
+	// traffic must never be routed. The exclusion is selection-level only —
+	// the geo record stays in the cold base (classification history /
+	// dashboard visibility) — but the node is not rendered into any pool,
+	// balancer, or outbound, and is not counted active. The count makes the
+	// exclusion loud and auditable (mirrored in the select stage log);
+	// 0/absent = no hijack evidence acted on this wave (legacy selection
+	// files decode as 0).
+	HijackExcluded int            `json:"hijack_excluded,omitempty"`
+	CitiesAlive    int            `json:"cities_alive"`
+	Nodes          []SelectedNode `json:"nodes"`
 }
 
 // SelectedNode is one node admitted into the active pool with its tag.

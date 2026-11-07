@@ -592,3 +592,82 @@ func TestProbeAllowsFailClosedOnUnprobedWhenProbesActive(t *testing.T) {
 	selBootstrapEmpty := rank.Select(nodes, geo, map[string]store.ProbeResult{}, config.SelectConfig{}, 0, ka)
 	assert.Len(t, selBootstrapEmpty.Nodes, 3, "bootstrap path with empty probeByKey preserves admission for valid geo nodes")
 }
+
+// TestHijackExitIsExcludedFromSelection pins the owner-ordered safety cut
+// (2026-11-07): a selection candidate whose OWN geo evidence carries
+// MediaUnlocks.Hijack=true is excluded from selection entirely — not
+// selected (absent from Selection.Nodes, so never rendered into any
+// pool/balancer/outbound) even with the best metrics in the wave — and the
+// exclusion is counted loud (Selection.HijackExcluded), never silent. The
+// geo record itself stays in the cold base: the cut is selection-level
+// only (classification history / dashboard visibility preserved).
+func TestHijackExitIsExcludedFromSelection(t *testing.T) {
+	f := newFixture()
+	f.add(t, "nl", "Amsterdam", true, 3, 5_000_000, 50)
+	hijack := f.add(t, "us", "Ashburn", true, 3, 9_000_000, 20) // best checks+speed: must still drop
+	f.geo[len(f.geo)-1].MediaUnlocks = model.MediaUnlockStatus{
+		ChatGPT: model.UnlockBlocked, Hijack: true, Rotating: true, BatteryVersion: 2,
+	}
+
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(5), 0)
+	require.Len(t, sel.Nodes, 1, "the hijack exit is excluded despite the best metrics")
+	for _, sn := range sel.Nodes {
+		assert.NotEqual(t, hijack.Key, sn.Key, "a TLS-intercepting exit is never selectable")
+	}
+	assert.Equal(t, "Amsterdam", sel.Nodes[0].City, "the clean candidate keeps its slot")
+	assert.Equal(t, 1, sel.HijackExcluded, "the exclusion is counted, not silent")
+}
+
+// TestHijackGateFailsClosedOnPositiveEvidenceOnly pins the fail-closed
+// semantics (absence of evidence is not hijack): a candidate whose geo
+// record carries no unlock verdicts at all (never unlock-probed —
+// MediaUnlocks zero value) passes the gate, and so does a record that was
+// checked with Hijack=false. The W16 unknown-geo admission (empty country,
+// zero MediaUnlocks) is the same fail-closed shape. A node with NO geo
+// record at all never reaches this gate — the pre-existing identity-join
+// admission boundary is untouched.
+func TestHijackGateFailsClosedOnPositiveEvidenceOnly(t *testing.T) {
+	f := newFixture()
+	noEvidence := f.add(t, "de", "Berlin", true, 3, 1_000_000, 100) // MediaUnlocks zero value
+	unknownGeo := f.add(t, "", "", true, 3, 1_000_000, 100)         // W16: no country, no verdicts
+	hijackFalse := f.add(t, "de", "Munich", true, 3, 1_000_000, 100)
+	f.geo[len(f.geo)-1].MediaUnlocks = model.MediaUnlockStatus{
+		ChatGPT: model.UnlockYes, BatteryVersion: 2, // checked; Hijack stays false
+	}
+
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(5), 0)
+	require.Len(t, sel.Nodes, 3, "absence of hijack evidence never drops a candidate")
+	active := map[string]bool{}
+	for _, sn := range sel.Nodes {
+		active[sn.Key] = true
+	}
+	assert.True(t, active[noEvidence.Key], "no unlock evidence at all → passes (not hijack)")
+	assert.True(t, active[unknownGeo.Key], "unknown-geo candidate without verdicts → passes (W16 intact)")
+	assert.True(t, active[hijackFalse.Key], "checked with hijack=false → passes")
+	assert.Equal(t, 0, sel.HijackExcluded)
+}
+
+// TestMixedWaveHijackExcludedCleanSelected pins the wave-level contract:
+// in a mixed wave the clean candidate is selected while the hijack
+// candidate is counted and excluded; the exclusion happens at candidate
+// admission (per-candidate evidence gate, joined to probeAllows), so it
+// composes with explicit caps — the hijack node consumes no per-country
+// slot and the clean node takes it.
+func TestMixedWaveHijackExcludedCleanSelected(t *testing.T) {
+	f := newFixture()
+	cleanUS := f.add(t, "us", "Ashburn", true, 3, 5_000_000, 50)
+	hijackUS := f.add(t, "us", "Dallas", true, 3, 5_000_000, 60)
+	f.geo[len(f.geo)-1].MediaUnlocks = model.MediaUnlockStatus{Hijack: true, BatteryVersion: 2}
+	f.add(t, "nl", "Amsterdam", true, 2, 1_000_000, 200)
+
+	sel := rank.Select(f.nodes, f.geo, f.probe, cfg(1), 0) // explicit K=1 per country
+	require.Len(t, sel.Nodes, 2, "one per country: the clean US node survives, the hijack US node is gone")
+	active := map[string]bool{}
+	for _, sn := range sel.Nodes {
+		active[sn.Key] = true
+	}
+	assert.True(t, active[cleanUS.Key], "the clean candidate is selected")
+	assert.False(t, active[hijackUS.Key], "the hijack candidate is excluded")
+	assert.Equal(t, 1, sel.HijackExcluded, "the hijack drop is counted even under an explicit cap")
+	assert.Equal(t, "pool-us-01", sel.Nodes[0].Tag, "the clean node takes the US slot (stable tag sequence intact)")
+}
