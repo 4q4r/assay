@@ -914,14 +914,15 @@ func funnelBar(pct float64, color bool) string {
 }
 
 // printGlobalQuality renders the classified-pool quality and the regional
-// spread. Zero classified records is the explicit cold start — the geo
-// unlock stage has never classified anything, and claiming a 100% clean
-// pool from flag-less legacy records would be fabrication.
+// spread. Zero classified records is the explicit cold start — the
+// classification pass (merged into the probe batch lifecycle) has never
+// classified anything, and claiming a 100% clean pool from flag-less legacy
+// records would be fabrication.
 func printGlobalQuality(out io.Writer, g *geoIntel, color bool) {
 	outln(out, ui.Header("global quality & pool distribution", color))
 	if g.Classified == 0 {
 		outf(out, "%s\n", ui.ChipKV("quality:   ",
-			"no ip-quality evidence yet — the geo unlock stage has not classified any node", color))
+			"no ip-quality evidence yet — the classification pass has not classified any node", color))
 	} else {
 		outf(out, "%s\n", ui.ChipKV("quality:   ", fmt.Sprintf(
 			"%s classified — clean %s (%.1f%%), hosting %s (%.1f%%), proxy %s (%.1f%%)",
@@ -1312,13 +1313,14 @@ func asciiSparklineString(spark string) string {
 
 // printOverlapMatrix renders the pairwise identity-overlap matrix plus the
 // pruning recommendations (spec §1.2). A manifest without the matrix is the
-// documented cold start: the enrichment pass computes it after geo.
+// documented cold start: the classification pass computes it during the
+// probe wave.
 func printOverlapMatrix(out io.Writer, si *statusIntel, color bool) {
 	outln(out, ui.Header("provider overlap inspection", color))
 	m := si.manifestOverlap()
 	if m == nil {
 		outf(out, "%s\n", ui.ChipKV("overlap:   ",
-			"matrix not computed yet — the plugin-stats enrichment pass builds it after the geo stage", color))
+			"matrix not computed yet — the classification pass builds it during the probe wave", color))
 		printRecommendations(out, si, color)
 		return
 	}

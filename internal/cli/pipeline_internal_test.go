@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,6 @@ import (
 
 	"public_vpn/internal/config"
 	"public_vpn/internal/fetch"
-	"public_vpn/internal/geo"
 	"public_vpn/internal/model"
 	"public_vpn/internal/plugins"
 	"public_vpn/internal/stats"
@@ -518,14 +518,6 @@ func TestWireAdaptConcurrencySeamCallable(t *testing.T) {
 	assert.Equal(t, 3, got)
 }
 
-func TestWireSizingEngineResizeAppliesCap(t *testing.T) {
-	c := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour})
-	c.Resize(42)
-	assert.Equal(t, 42, c.Capacity())
-	// Need geo import
-	_ = geo.NewSizingEngine()
-}
-
 // enrichFixture builds one wave's worth of pipeline artifacts in dir:
 // a fetch manifest with fetch-stage plugin stats, filtered parse records,
 // probe outcomes, and geo records. The fixture exercises the W19 landmine:
@@ -873,4 +865,29 @@ func TestRunFetchWithCarriesOverEnrichedStats(t *testing.T) {
 		require.Len(t, m.PluginStats, 1)
 		assert.Zero(t, m.PluginStats[0].LiveNodes)
 	})
+}
+
+// TestClassifierForKnobFalseIsNil pins the escape hatch: [geo].unlock_probes
+// = false wires NO classifier — a probe-only wave (zero classification
+// requests; geo-base untouched; probe outcomes byte-identical, pinned at the
+// engine level by TestClassifierNilIsProbeOnly).
+func TestClassifierForKnobFalseIsNil(t *testing.T) {
+	off := false
+	cfg := &config.Config{DataDir: t.TempDir()}
+	cfg.Geo.UnlockProbes = &off
+	assert.Nil(t, classifierFor(cfg, newPaths(cfg), io.Discard),
+		"an explicit false = probe-only wave (no classification)")
+}
+
+// TestClassifierForDefaultIsWired pins the default: the knob absent (the
+// production shape after applyGeoDefaults materializes true — and a
+// hand-built nil pointer via the accessor) wires the classifier.
+func TestClassifierForDefaultIsWired(t *testing.T) {
+	cfg := &config.Config{DataDir: t.TempDir()}
+	assert.NotNil(t, classifierFor(cfg, newPaths(cfg), io.Discard),
+		"the knob absent/true = the full classification battery rides every alive probe")
+	on := true
+	cfg.Geo.UnlockProbes = &on
+	assert.NotNil(t, classifierFor(cfg, newPaths(cfg), io.Discard),
+		"an explicit true wires the classifier like the absent default")
 }

@@ -68,9 +68,6 @@ type fetchManifest struct {
 // directory (internal/stats owns its schema and atomic persistence).
 const providerHistoryFile = "provider-history.json"
 
-// newSizingEngineFunc is the sizing-engine constructor seam (tests may swap).
-var newSizingEngineFunc = geo.NewSizingEngine
-
 // adaptConcurrencyFunc is the in-wave adaptation seam (tests may swap).
 var adaptConcurrencyFunc = AdaptConcurrency
 
@@ -663,8 +660,8 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 
 // probeOptions translates config + CLI flags into one probe wave's options.
 // The prober binary and its database are GONE (W14): every node gets a
-// temporary single-node xray from the SAME factory the check/geo stages
-// use, so there is no per-stage tooling left to configure. ExitProbe stays
+// temporary single-node xray from the SAME factory the check stage uses,
+// so there is no per-stage tooling left to configure. ExitProbe stays
 // nil: the D8 exit-IP echo defaults ON in production (nil = on — every
 // alive record carries its tunnel exit IP).
 func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
@@ -730,8 +727,45 @@ func loadKnownAliveForProbe(p paths, opts probe.Options) (map[string]store.Known
 	return ka, opts, nil
 }
 
-//nolint:cyclop,gocognit // runProbe orchestrates the whole probe stage
+// classifierFor wires the merged classification pass: nil when the
+// [geo].unlock_probes escape hatch is explicitly false (a probe-only wave —
+// zero classification requests), a fresh wave Classifier otherwise. The
+// seam keeps the knob decision unit-testable without running a wave.
+func classifierFor(cfg *config.Config, p paths, progress io.Writer) *geo.Classifier {
+	if !cfg.Geo.UnlockProbesEnabled() {
+		return nil
+	}
+	return geo.NewClassifier(geo.ClassifyInput{
+		DataDir:   p.dataDir,
+		Cfg:       cfg.Geo,
+		UserAgent: cfg.HTTP.UserAgent,
+		Progress:  progress,
+	})
+}
+
+// flushClassifier merges the wave's classification outcomes into geo-base
+// after probe.Run persisted the wave's outcomes: the same merge-and-upsert
+// contract the old separate geo stage had (probe outcomes on every probed
+// record, classification where it ran), minus the freshness gates. Failures
+// are loud but never fail the wave (the probe outcomes stand).
+func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*model.Node, started time.Time) {
+	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+	if err != nil {
+		outf(cmd.OutOrStdout(), "ERROR: classification flush skipped — probe store read failed: %v\n", err)
+		return
+	}
+	wave := uint64(0)
+	if ws, werr := store.ReadWaveState(p.waveState); werr == nil {
+		wave = ws.CurrentWaveSeq
+	}
+	if _, _, ferr := clf.Flush(cmd.OutOrStdout(), nodes, probeByKey, wave, started); ferr != nil {
+		outf(cmd.OutOrStdout(), "ERROR: classification flush failed: %v\n", ferr)
+	}
+}
+
+//nolint:cyclop,gocognit // runProbe orchestrates the whole probe stage (probe + merged classification)
 func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool) error {
+	classifyStart := time.Now()
 	p := newPaths(cfg)
 	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
 	defer func() { _ = os.RemoveAll(p.workDir) }()
@@ -758,7 +792,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	if err := os.MkdirAll(p.workDir, 0o750); err != nil {
 		return err
 	}
-	// The SAME temp-instance infrastructure the check/geo stages use — one
+	// The SAME temp-instance infrastructure the check stage uses — one
 	// factory, one render.BuildOutbound outbound builder, zero drift (W14).
 	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
 		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
@@ -825,6 +859,15 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	ka, opts, err := loadKnownAliveForProbe(p, opts)
 	if err != nil {
 		return err
+	}
+	// The merged classification pass (owner order 2026-11-07 «сразу на чеке»):
+	// every alive node gets the FULL battery — ip-api self-report ladder +
+	// unlock battery v2 — through the SAME hot xray instance the probe just
+	// passed, before that instance is torn down. [geo].unlock_probes is the
+	// explicit-off escape hatch: false = probe-only wave (no classification).
+	if clf := classifierFor(cfg, p, cmd.OutOrStdout()); clf != nil {
+		opts.Classifier = clf.ClassifyNode
+		defer flushClassifier(clf, cmd, p, nodes, classifyStart)
 	}
 	results, err := probe.RunWithBatchFactory(context.Background(), nodes, factory, batchFactory, opts, p.probeResults)
 	if err != nil {
@@ -918,174 +961,6 @@ func updateKnownAliveSet(
 	return nil
 }
 
-func newGeoCommand(cfgPath *string) *cobra.Command {
-	return &cobra.Command{
-		Use:   "geo",
-		Short: "Exit-geo self-report: every alive node asks ip-api through its own tunnel (no aggregate limit)",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			res, err := resolveCommand(*cfgPath)
-			if err != nil {
-				return err
-			}
-			reportConfigSource(cmd.OutOrStdout(), res)
-			return runGeo(cmd, res.Config)
-		},
-	}
-}
-
-//nolint:cyclop // runGeo orchestrates the geo stage
-func runGeo(cmd *cobra.Command, cfg *config.Config) error {
-	p := newPaths(cfg)
-	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
-	defer func() { _ = os.RemoveAll(p.workDir) }()
-	if cfg.Probe.CalibrationEnabled {
-		if st, err := timeoutcal.Load(p.dataDir); err == nil {
-			if v := st.Geo.TimeoutFor("global"); v > 0 {
-				cfg.Geo.Timeout.Duration = v
-			}
-		}
-	}
-	nodes, err := store.ReadNodes(p.filtered)
-	if err != nil {
-		return err
-	}
-	if len(nodes) == 0 {
-		return fmt.Errorf("no filtered nodes (%s) — run `publicvpn filter` first", p.filtered)
-	}
-	probeByKey, err := store.LatestProbeByKey(p.probeResults)
-	if err != nil {
-		return err
-	}
-	if len(probeByKey) == 0 {
-		return fmt.Errorf("no probe results (%s) — run `publicvpn probe` first (geo keys on exit IPs, D8)",
-			p.probeResults)
-	}
-	// The self-report piggybacks on the SAME per-node temp-instance
-	// infrastructure the check stage uses (one render.BuildOutbound-hardened
-	// xray per node — no second implementation, no drift). The adapter makes
-	// the structural handoff explicit: checker's instance satisfies geo's
-	// SocksInstance seam 1:1.
-	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
-		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
-		TLSFingerprint: cfg.Render.TLSFingerprint,
-	})
-	factory := geo.Factory(func(ctx context.Context, n *model.Node) (geo.SocksInstance, error) {
-		return xrayFactory(ctx, n)
-	})
-	portBudget := cfg.Probe.Threads
-	if portBudget < 1 {
-		portBudget = cfg.Resources.EffectiveCPUCores()
-	}
-	dynConc := ComputeConcurrencyBudget(cfg, portBudget)
-	// Wave state: read current seq (0 if absent).
-	ws, _ := store.ReadWaveState(p.waveState)
-	// Construct + rehydrate hot exit-IP cache.
-	exitCache := geo.NewExitGeoCache(geo.ExitCacheConfig{
-		TTL: cfg.Geo.TTL.Duration,
-	})
-	if exitCache == nil {
-		exitCache = geo.NewExitGeoCache()
-	}
-	defer func() { _ = exitCache.Close() }()
-	if recs, err := store.ReadGeo(p.geoBase); err == nil {
-		exitCache.Rehydrate(recs)
-	}
-	// Wire SizingEngine: compute the cache cap from memory + inputs + stats,
-	// apply via Resize, and log the resize decision (reason, old cap, new cap).
-	prevCap := exitCache.Capacity()
-	memSnap := newSizingEngineFunc().MeasureMemory()
-	distinctExitIPs := 0
-	seenExitIPs := map[string]bool{}
-	for _, n := range nodes {
-		if pr, ok := probeByKey[n.Key]; ok && pr.Alive && pr.ExitIP != "" {
-			if !seenExitIPs[pr.ExitIP] {
-				seenExitIPs[pr.ExitIP] = true
-				distinctExitIPs++
-			}
-		}
-	}
-	sizingInputs := geo.SizingInputs{
-		DistinctExitIPs: distinctExitIPs,
-		TotalNodes:      len(nodes),
-		MemLimitBytes:   memSnap.MemLimitBytes,
-		HeapAllocBytes:  memSnap.HeapAllocBytes,
-		ReserveBytes:    0,
-		HardCeiling:     0,
-		CurrentWave:     ws.CurrentWaveSeq,
-		ProviderClass:   "",
-	}
-	sizingMetrics := exitCache.Stats()
-	prevSnap := geo.CapacitySnapshot{Cap: prevCap, LastResizeWave: 0}
-	newCap, resizeReason := newSizingEngineFunc().RecomputeCap(prevSnap, sizingInputs, sizingMetrics)
-	exitCache.SetSizingMeta(sizingMetrics.ProviderClass, distinctExitIPs, len(nodes), memSnap.MemLimitBytes,
-		memSnap.MemLimitBytes-memSnap.HeapAllocBytes, sizingMetrics.SharingRatio, ws.CurrentWaveSeq)
-	exitCache.SetLastResizeReason(resizeReason)
-	exitCache.Resize(newCap)
-	outf(cmd.OutOrStdout(), "geo cache resize: reason=%s old=%d new=%d\n", resizeReason, prevCap, newCap)
-	exitCache.SetCurrentWave(ws.CurrentWaveSeq)
-	records, summary, err := geo.Run(context.Background(), geo.Input{
-		DataDir:            p.dataDir,
-		Nodes:              nodes,
-		ProbeByKey:         probeByKey,
-		Cfg:                cfg.Geo,
-		UserAgent:          cfg.HTTP.UserAgent,
-		Factory:            factory,
-		Progress:           cmd.OutOrStdout(),
-		Concurrency:        dynConc,
-		DynamicConcurrency: dynConc,
-		ExitCache:          exitCache,
-		WaveSeq:            ws.CurrentWaveSeq,
-	})
-	if err != nil {
-		return err
-	}
-	if cfg.Probe.CalibrationEnabled {
-		tc := timeoutcal.Config{
-			Margin:               cfg.Probe.CalibrationMargin,
-			Alpha:                0.3,
-			MinSamples:           50,
-			HighTimeoutRate:      0.15,
-			HistorySize:          20,
-			MinHistory:           3,
-			MaxHistory:           50,
-			StabilityCVThreshold: 0.10,
-			MinChange:            0.5,
-		}
-		_ = timeoutcal.UpdateWithConfig(p.dataDir, "geo", timeoutcal.Observation{
-			Key:      "global",
-			Stage:    "geo",
-			Total:    summary.Eligible,
-			TimedOut: summary.TimedOutCount,
-			RTTsMs:   summary.RequestRTTMs,
-			At:       time.Now().UTC(),
-		}, tc)
-	}
-	if err != nil {
-		return err
-	}
-	withGeo := 0
-	alive := 0
-	for _, r := range records {
-		if r.Country != "" {
-			withGeo++
-		}
-		if r.Alive {
-			alive++
-		}
-	}
-	outf(cmd.OutOrStdout(),
-		"geo complete: %d eligible nodes — %d self-report, %d self-report-https, %d doh-fallback, %d unknown "+
-			"(nodes stay usable; geo preserved) → %s\n",
-		summary.Eligible, summary.SelfReport, summary.SelfReportHTTPS, summary.DoHFallback, summary.Unknown, p.geoBase)
-	if summary.Churn > 0 {
-		outf(cmd.OutOrStdout(),
-			"WARNING: %d node(s) reported an exit IP different from the probe wave "+
-				"(exit churn — geo reflects the freshest tunnel truth)\n", summary.Churn)
-	}
-	outf(cmd.OutOrStdout(), "geo store: %d records (%d alive, %d geo-enriched)\n", len(records), alive, withGeo)
-	return nil
-}
-
 func newSelectCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "select",
@@ -1115,7 +990,9 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 		return err
 	}
 	if len(geoRecs) == 0 {
-		return fmt.Errorf("geo base empty (%s) — run `publicvpn geo` first", p.geoBase)
+		return fmt.Errorf(
+			"geo base empty (%s) — run `publicvpn probe` first — classification is "+
+				"merged into the probe pass and writes the cold base", p.geoBase)
 	}
 	probeByKey, err := store.LatestProbeByKey(p.probeResults)
 	if err != nil {
@@ -1518,7 +1395,6 @@ type maintainStages struct {
 	parse             func(*cobra.Command, *config.Config) error
 	filter            func(*cobra.Command, *config.Config) error
 	probe             func(*cobra.Command, *config.Config) error
-	geo               func(*cobra.Command, *config.Config) error
 	pluginStatsEnrich func(*cobra.Command, *config.Config) error
 	stats             func(*cobra.Command, *config.Config) error
 	prune             func(*cobra.Command, *config.Config) error
@@ -1546,7 +1422,6 @@ func defaultMaintainStages(opts maintainOptions) *maintainStages {
 		parse:  runParse,
 		filter: func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
 		probe:  func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest) },
-		geo:    runGeo,
 		pluginStatsEnrich: func(c *cobra.Command, cc *config.Config) error {
 			return runPluginStatsEnrichment(c, cc, waveReg)
 		},
@@ -1612,9 +1487,6 @@ func runMaintainGraceful(
 	}
 	if !opts.skipProbe {
 		if !run("probe", stages.probe) {
-			return wave.pauseOrErr()
-		}
-		if !run("geo", stages.geo) {
 			return wave.pauseOrErr()
 		}
 	}
@@ -1967,8 +1839,9 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 }
 
 // runPluginStatsEnrichment enriches the plugin stats in the fetch manifest
-// with live nodes (from probe) and hosting/proxy/clean counts (from geo).
-// Called after probe and geo stages have completed. reg is the WAVE's
+// with live nodes and hosting/proxy/clean counts — both come from the probe
+// pass now (classification is merged into it and refreshes the cold base).
+// Called after the probe stage has completed. reg is the WAVE's
 // registry: the MinLivePercent enforcement lands its breaker failures there
 // — in the daemon that is the long-lived watchdog registry, so a disabled
 // plugin stays disabled across waves. The wave always has a registry (the
@@ -2594,13 +2467,10 @@ func printCalibrationStatus(out io.Writer, p paths, cfg *config.Config, color bo
 			time.Duration(timeoutcal.CeilingMs)*time.Millisecond,
 			probeCV,
 			st.Probe.Global.Waves), color))
-	// geo
-	geoCur := st.Geo.TimeoutFor("global")
-	if geoCur == 0 {
-		geoCur = probeBase
-	}
-	outf(out, "%s\n", ui.ChipKV("  geo:     ",
-		fmt.Sprintf("%s (base %s, wave %d)", geoCur, probeBase, st.Geo.Global.Waves), color))
+	// The state file's geo slot is legacy compatibility only: since the
+	// classification merge no stage calibrates or consumes geo timeouts
+	// separately (the probe budget governs the whole classification pass),
+	// so the slot stays in the state file but is intentionally not rendered.
 	// regions slowest 3
 	type regionKV struct {
 		key string

@@ -93,9 +93,8 @@ flowchart LR
 | :-- | :-- | :-- |
 | 🌐 fetch | `publicvpn fetch` | run the **Lua source plugins** (W10): each plugin fetches and iterates, hands raw links to Go; the results land in the cache + manifest exactly like the old file downloads — parse/dedupe are untouched |
 | 📜 parse | `publicvpn parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
-| 🩺 probe | `publicvpn probe` | **W14 real-xray engine**: a temp single-node xray per node (same factory as check/geo) — liveness attempts, RTT, tunnel exit IP (D8), through-tunnel speedtest; uniform hysteria2 coverage |
+| 🩺 probe | `publicvpn probe` | **W14 real-xray engine**: a temp single-node xray per node (same factory as check) — liveness attempts, RTT, tunnel exit IP (D8), exit classification merged in (self-report + unlock battery → the cold base), through-tunnel speedtest; uniform hysteria2 coverage |
 | 🛡️ filter | `publicvpn filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
-| 🌍 geo | `publicvpn geo` | **W11 per-node self-report + W16 HTTPS rung**: every alive node asks geo endpoints through its own tunnel (exit-truth geo; the old aggregate batch clamp is retired) |
 | ✂️ prune | `maintain` sub-step | dead/ttl-stale-orphan removal with a `.bak-<ts>` backup |
 | 🏆 select | `publicvpn select` | rank (alive → checks → speed); **W19: every cap defaults to UNBOUNDED — ALL alive nodes go active** (unknown-geo group included); an explicit `per_country_cap` K / `soft_cap` / `ceiling` still caps (D7) |
 | 📝 render | `publicvpn render` | template + pool outbounds + balancers (country / city / `pool_unknown` / `pool_all`) + Plan A observatory, L1-gated |
@@ -108,13 +107,12 @@ One `publicvpn maintain` invocation runs the whole refresh wave end-to-end:
 1. **fetch** — resolve current source paths and download changed files into the cache.
 2. **parse** — decode the cached bodies into normalized node records.
 3. **filter** — apply the ingest security filter; the survivors are the wave's reference set.
-4. **probe** — real temp-xray liveness + exit-IP discovery (skipped by `--skip-probe`).
-5. **geo** — per-node in-tunnel self-report: every alive node asks ip-api through its own tunnel (fallback = DoH view; skipped together with probe).
-6. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent. CLOSED RULING (owner, round-7 M1): a strict/stats-fatal mode was rejected — stats poll failures are warning-class and **never** fail a wave; the write-loss LOUD exception (data integrity) is the only carve-out, and it stays.
-7. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
-8. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
-9. **render** — rebuild the full client config (template + pool + balancers + observatory, stats/policy ensured).
-10. **activate-if-changed** — if the rendered bytes equal the live config: `no changes`, nothing touched, nothing restarted. Otherwise the W3 activate path runs: `xray run -test` gate → date-stamped backup → atomic replace → **auto-restart (W13)** — the daemon restarts the live client itself (`systemctl --user restart xray-raw.service`, exactly once per real activation) and then runs the post-restart health check (`is-active` + the socks port from the activated config) on a **bounded retry ladder (W17)** — 5 attempts, 1s/2s/4s/8s backoff, PASS on any attempt (xray may not have bound the socks port yet when `systemctl restart` returns; the ladder absorbs the boot race within ~30s), all attempts failing into the same loud `DONE_WITH health-failure`. `[maintain].auto_restart` defaults to **true** (hands-off — zero manual restarts ever); an explicit `false` restores the old semantics: the command prints the restart hint instead. A failed restart or a failed health check is **loud** (the wave completes as `DONE_WITH restart-failure` / `DONE_WITH health-failure` — the gated new config is already on disk; the report names the backup to restore from, and nothing is auto-restored). The replace→restart→health sequence is **one non-interruptible step** (W17): a daemon shutdown can only pause the wave *between* stages, never between the replace and the restart — the live client can never be left orphaned mid-activation.
+4. **probe** — real temp-xray liveness + exit-IP discovery, with the classification merged in: every alive node's battery (exit-geo self-report with the DoH fallback + media unlocks) fires through its own still-hot tunnel right after its probe passes and lands in `geo-base.jsonl` (skipped by `--skip-probe`; `[geo].unlock_probes = false` runs a probe-only wave).
+5. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent. CLOSED RULING (owner, round-7 M1): a strict/stats-fatal mode was rejected — stats poll failures are warning-class and **never** fail a wave; the write-loss LOUD exception (data integrity) is the only carve-out, and it stays.
+6. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
+7. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
+8. **render** — rebuild the full client config (template + pool + balancers + observatory, stats/policy ensured).
+9. **activate-if-changed** — if the rendered bytes equal the live config: `no changes`, nothing touched, nothing restarted. Otherwise the W3 activate path runs: `xray run -test` gate → date-stamped backup → atomic replace → **auto-restart (W13)** — the daemon restarts the live client itself (`systemctl --user restart xray-raw.service`, exactly once per real activation) and then runs the post-restart health check (`is-active` + the socks port from the activated config) on a **bounded retry ladder (W17)** — 5 attempts, 1s/2s/4s/8s backoff, PASS on any attempt (xray may not have bound the socks port yet when `systemctl restart` returns; the ladder absorbs the boot race within ~30s), all attempts failing into the same loud `DONE_WITH health-failure`. `[maintain].auto_restart` defaults to **true** (hands-off — zero manual restarts ever); an explicit `false` restores the old semantics: the command prints the restart hint instead. A failed restart or a failed health check is **loud** (the wave completes as `DONE_WITH restart-failure` / `DONE_WITH health-failure` — the gated new config is already on disk; the report names the backup to restore from, and nothing is auto-restored). The replace→restart→health sequence is **one non-interruptible step** (W17): a daemon shutdown can only pause the wave *between* stages, never between the replace and the restart — the live client can never be left orphaned mid-activation.
 
 `--no-activate` stops after the render+diff. `--speedtest` adds the throughput measurement explicitly — **the config default is OFF since round-8** (owner ruling «Только спидтест выключи», reversing the W10 default-on): refresh waves are probe-only, and the dedicated weekly speedtest wave carries `-S` on its own schedule (or pass `--speedtest` for a one-off). The daemonized form of this wave is [`publicvpn watch`](#️-the-watch-daemon).
 
@@ -349,7 +347,7 @@ For picky sites that open only from specific countries/cities/ASNs, `check` answ
 
 ## 🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)
 
-The geo stage asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
+The classification pass (merged into the probe batch lifecycle — there is no separate geo stage) asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
 
 1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID). Every rung of the ladder below rides that SAME instance.
 2. **Rung 1 — plain-HTTP ip-api self-report.** Through the instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
@@ -374,14 +372,14 @@ Unknown-geo nodes keep the D5 tag grammar intact with the `xx` pseudo-code (`poo
 
 ## 🩺 The probe wave (W14, real xray)
 
-The probe stage migrates from the `xray-knife` subprocess to **real temporary single-node xray instances** — the same factory the `check`/`geo` stages use (`render.BuildOutbound` product, hardening knobs included, one builder, no drift). The knife is gone completely: code, config keys, database — every removed `[probe]` key (`path`, `db_path`, `check_preset`, `url_success_threshold`, `max_passed`) fails the config load with a loud migration naming the replacement.
+The probe stage migrates from the `xray-knife` subprocess to **real temporary single-node xray instances** — the same factory the `check` stage uses (`render.BuildOutbound` product, hardening knobs included, one builder, no drift). The knife is gone completely: code, config keys, database — every removed `[probe]` key (`path`, `db_path`, `check_preset`, `url_success_threshold`, `max_passed`) fails the config load with a loud migration naming the replacement.
 
 **Why:** one probe engine covers **every rendered protocol uniformly — hysteria2 included** (the old "does the prober even support hysteria2" question dies with the knife; the real core is the prober). Per node, the wave:
 
 1. Boots a temp instance (socks inbound on a free `127.0.0.1:18xxx` port, exact-PID kill, serialized boot windows).
 2. Runs `[probe].attempts` (default `3`) HTTP GETs through the tunnel to `[probe].url`: per-attempt status, TTFB, total, redirect chain; the blockpage classifier (checker's — `403/451/429/5xx` and signature pages are never silently alive) grades every answer.
 3. `passed` = all attempts success-class, `semi-passed` = some, `failed` = none. Only success-class is **alive** — a blockpage proves reachability, not service.
-4. Reads the **exit IP (D8)** through the same tunnel (`http://ip-api.com/json/`, the same self-report call the geo stage makes — best-effort, never fatal).
+4. Reads the **exit IP (D8)** through the same tunnel (`http://ip-api.com/json/`, the same self-report the classification pass makes — best-effort, never fatal).
 5. When `[probe].speedtest` is on (**default OFF since round-8** — owner ruling «Только спидтест выключи», reversing the W10 default-on; the weekly speedtest wave carries it regardless): downloads the `[probe].speedtest_url` sample (default Cloudflare 25 MB) through the tunnel inside `[probe].speedtest_timeout` → `bytes/time` → `speed_bps` into the probe result (same store schema as before — select/geo-base consumers untouched).
 
 `[probe].threads` is now the parallel **temp-instance worker count** (W19 default `32` — each worker owns a real xray process; boot windows serialize inside the factory at ~10 boots/sec, the HTTP phase is fully parallel: 32 workers saturate that ceiling, so wave wall time stays **bounded-minutes per 1000 nodes** — e.g. 1000 nodes ≈ 2–8 min depending on link health — while the semaphore still bounds instantaneous load to 32 concurrent instances). The protocol breadth comes from `[filter].protocols` — **W14 default: all five** `vless,vmess,trojan,ss,hysteria2` (round-7 owner ruling); the security filter (`reality|tls`, `allow_insecure=false` default) stays untouched.
@@ -465,7 +463,7 @@ public_vpn/
 
 - **Go ≥ 1.27** to build (`go build -o publicvpn ./cmd/publicvpn`).
 - **xray-core 26.3.27** present locally (the `-test` gate and the stats API both exec it; do **not** upgrade the core — L11).
-- **xray binary** at `[activate].xray_bin` — the probe wave (W14), check/geo temp instances, and the `-test` gate all exec it; `publicvpn xray-update` keeps it current.
+- **xray binary** at `[activate].xray_bin` — the probe wave (W14, its merged classification included), check temp instances, and the `-test` gate all exec it; `publicvpn xray-update` keeps it current.
 - A working xray client config to use as the render template (read-only reference — the renderer never writes your template).
 
 ## ⚡ Quick Start
@@ -474,12 +472,11 @@ public_vpn/
 2. **`publicvpn fetch`** — run the Lua source plugins and cache their raw links.
 3. **`publicvpn parse`** — decode the cached bodies into normalized node records.
 4. **`publicvpn filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
-5. **`publicvpn probe`** — out-of-band liveness + exit-IP wave (add `--speedtest` for a one-off throughput measurement; the default is probe-only since round-8).
-6. **`publicvpn geo`** — per-node self-report of the exit geo into the cold base.
-7. **`publicvpn select`** — rank and cap the active set.
-8. **`publicvpn render`** — render the full client config into `rendered/config.json`.
-9. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then the auto-restart (W13, default on): the daemon/live wave restarts `xray-raw.service` itself and health-checks it; a manual `publicvpn activate` run prints the same flow with `[maintain].auto_restart = false` restoring the print-the-hint semantics.
-10. **`publicvpn maintain`** — from now on, one command — or the [`publicvpn watch` daemon](#️-the-watch-daemon) installed by `publicvpn install` — does the whole wave on schedule, activating only on real diffs.
+5. **`publicvpn probe`** — out-of-band liveness + exit-IP wave with the classification merged in (exit geo + media unlocks land in the cold base; add `--speedtest` for a one-off throughput measurement; the default is probe-only since round-8).
+6. **`publicvpn select`** — rank and cap the active set.
+7. **`publicvpn render`** — render the full client config into `rendered/config.json`.
+8. **`publicvpn activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then the auto-restart (W13, default on): the daemon/live wave restarts `xray-raw.service` itself and health-checks it; a manual `publicvpn activate` run prints the same flow with `[maintain].auto_restart = false` restoring the print-the-hint semantics.
+9. **`publicvpn maintain`** — from now on, one command — or the [`publicvpn watch` daemon](#️-the-watch-daemon) installed by `publicvpn install` — does the whole wave on schedule, activating only on real diffs.
 
 ## 📦 Self-install / uninstall
 
@@ -602,7 +599,7 @@ Every command prints the resolved source as a `config:` line (`explicit -c <path
 
 > **Migration (one line):** `mkdir -p ~/.local/share/publicvpn && mv ~/.config/publicvpn/config.toml ~/.local/share/publicvpn/config.toml` — see [Migration notes](#migration-notes-w13-deploy).
 
-**What works without any config file** (pure defaults, out of the box): `fetch`, `parse`, `filter`, `probe`, `geo`, `select`, `check`, `list`, `status`, and the `watch` daemon's data stages. Stage commands that find no pipeline data yet fail with their normal loud "run the previous stage first" messages — that is data flow, not configuration.
+**What works without any config file** (pure defaults, out of the box): `fetch`, `parse`, `filter`, `probe`, `select`, `check`, `list`, `status`, and the `watch` daemon's data stages. Stage commands that find no pipeline data yet fail with their normal loud "run the previous stage first" messages — that is data flow, not configuration.
 
 **What REQUIRES a config (loud stage boundaries):**
 

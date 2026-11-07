@@ -1,7 +1,9 @@
-// Package geo implements the exit-geo enrichment stage (W11 self-report
-// design; W16 adds the HTTPS rung): EVERY alive node asks geo endpoints
-// THROUGH ITS OWN TUNNEL. The per-node failure ladder, every rung riding the
-// SAME temp socks instance:
+// Package geo implements the exit-geo classification pass (W11 self-report
+// design; W16 adds the HTTPS rung; owner order 2026-11-07 merges the pass
+// into the probe batch lifecycle — «сразу на чеке»): EVERY node the probe
+// just proved alive is classified THROUGH ITS OWN HOT TUNNEL — the same
+// temp instance's socks endpoint, before that instance is torn down. The
+// per-node failure ladder, every rung riding the SAME hot instance:
 //
 //  1. HTTP ip-api self-report — GET http://ip-api.com/json/ with no ip
 //     parameter, so ip-api answers "who is asking" and the response IS that
@@ -16,6 +18,14 @@
 //     THAT IP rides the same tunnel (indirect — the resolver network).
 //  4. Unknown — no geo evidence; geo fields stay untouched.
 //
+// On top of the ladder, the SAME hot instance carries the unlock battery v2
+// (unlock.go): cftrace echo, 3-source consensus, DNS-over-TCP, media probes,
+// hijack detection, OK_FLAKY retry, STUN for hysteria2. One pass, one
+// tunnel, per wave per alive node — no freshness gates, no exit-IP cache,
+// no eligibility layer (all removed with the separate geo/unlock stages).
+// A tunnel that dies mid-battery records honest unknowns for this wave; the
+// next wave re-classifies.
+//
 // Why the old aggregate limit disappears in principle: the batch era POSTed
 // groups of exit IPs from THIS box's single source IP against a 15 req/min
 // clamp (landmine L6). The self-report's requests originate from thousands
@@ -23,7 +33,8 @@
 // req/min per source on the ip-api single endpoint; ipinfo's free tier is
 // likewise limited per source IP), so the budget never pools. A small
 // politeness pacing (DefaultSelfReportPacing between external request
-// starts) remains: hourly waves have no reason to burst nodes or DoH.
+// starts per node) remains: hourly waves have no reason to burst nodes or
+// DoH.
 //
 // Failure classes fall back, never drop: each rung's transport reset,
 // timeout, non-200, or API-level failure advances the ladder. A node whose
@@ -37,7 +48,6 @@
 package geo
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,15 +55,12 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"public_vpn/internal/config"
 	"public_vpn/internal/model"
 	"public_vpn/internal/store"
 
@@ -81,41 +88,11 @@ const (
 	ClassUnknown         = "unknown"
 )
 
-// DefaultSelfReportPacing spaces external request starts across the wave
-// (politeness toward nodes and the DoH endpoint — NOT a rate-limit honor:
-// each node's requests carry their own per-source budget). Roughly the old
-// batch era's per-IP throughput; deliberately not a config knob.
+// DefaultSelfReportPacing spaces a node's external request starts (ladder
+// rungs + battery probes alike — politeness toward nodes and the DoH
+// endpoint, NOT a rate-limit honor: each node's requests carry their own
+// per-source budget). Deliberately not a config knob.
 const DefaultSelfReportPacing = 100 * time.Millisecond
-
-// DefaultSelfReportConcurrency bounds how many temp instances exist at once
-// (each is a full xray process — parity with the checker's default) when
-// [geo].self_report_concurrency is unset (0).
-const DefaultSelfReportConcurrency = 8
-
-// DynamicGeoConcurrency returns the dynamic concurrency for geo given a budget.
-// A non-positive budget falls back to DefaultSelfReportConcurrency.
-func DynamicGeoConcurrency(budget int) int {
-	if budget <= 0 {
-		return DefaultSelfReportConcurrency
-	}
-	return budget
-}
-
-// ComputeGeoConcurrency is an alias for DynamicGeoConcurrency.
-func ComputeGeoConcurrency(budget int) int {
-	return DynamicGeoConcurrency(budget)
-}
-
-// DynamicConcurrency is an alias for DynamicGeoConcurrency.
-func DynamicConcurrency(budget int) int {
-	return DynamicGeoConcurrency(budget)
-}
-
-// DefaultMaxTTL caps the rate-limit retry sleep when [geo].max_ttl is unset.
-const DefaultMaxTTL = 30 * time.Second
-
-// DefaultGeoMaxTTL is an alias for DefaultMaxTTL.
-const DefaultGeoMaxTTL = DefaultMaxTTL
 
 // dohProbeName is the special domain whose TXT answer (queried THROUGH the
 // tunnel) carries the IP of the resolver that asked Google — the exit
@@ -179,19 +156,8 @@ func (r InfoResponse) ASNPair() (string, string) {
 	return f[0], strings.Join(f[1:], " ")
 }
 
-// SocksInstance is one live temp SOCKS5 endpoint (structural mirror of the
-// checker's type: the production instance is a temp single-node xray).
-type SocksInstance interface {
-	Addr() string
-	Close() error
-}
-
-// Factory spawns one instance per node — the piggyback infrastructure. The
-// CLI wires checker.NewXrayFactory here (same render.BuildOutbound outbound,
-// same hardening, same bootMu port handout as the check stage).
-type Factory func(ctx context.Context, n *model.Node) (SocksInstance, error)
-
-// NodeReport is one node's geo outcome.
+// NodeReport is one node's classification outcome (geo ladder + battery
+// fold), keyed by the node and persisted through Flush.
 type NodeReport struct {
 	Key string
 	// ProbeExitIP is the probe wave's observed exit (the D8 anchor the
@@ -226,13 +192,6 @@ type NodeReport struct {
 	RequestRTTMs []float64
 	// TimedOut counts timed-out requests for this node.
 	TimedOut int
-	// LadderRan marks a report whose geo ladder actually ran in THIS wave (a
-	// temp instance was spawned and the rungs were attempted). Cache-served
-	// clones never carry it: the cached Geo/HTTPS/RateLimited fields are the
-	// evidence of the wave that produced the entry, never in-wave evidence.
-	// The flag is in-wave only — stripped before every cache write and
-	// cleared on every cache-hit clone.
-	LadderRan bool
 }
 
 // Summary aggregates the wave's classes for the wave log.
@@ -245,107 +204,6 @@ type Summary struct {
 	Churn           int
 	RequestRTTMs    []float64
 	TimedOutCount   int
-}
-
-// Input bundles the geo stage dependencies.
-type Input struct {
-	DataDir    string
-	Nodes      []*model.Node
-	ProbeByKey map[string]store.ProbeResult
-	Cfg        config.GeoConfig
-	// UserAgent is [http].user_agent — the ONE pipeline UA knob; empty falls
-	// back to config.DefaultUserAgent inside the tunnel client.
-	UserAgent string
-	// Factory is the temp-instance infrastructure the self-report piggybacks
-	// on (production: checker.NewXrayFactory). REQUIRED — nil fails loud.
-	Factory Factory
-	// Concurrency overrides [geo].self_report_concurrency when > 0 (dynamic,
-	// CPU/RAM-aware budget). 0 = fall back to the config value.
-	Concurrency int
-	// DynamicConcurrency is an alias for Concurrency.
-	DynamicConcurrency int
-	// Progress receives the loud per-node class lines. nil = discard.
-	Progress io.Writer
-	// SelfURL overrides the self-report endpoint (test seam; empty = the
-	// production SelfReportURL constant).
-	SelfURL string
-	// UnlockEndpoints overrides the Phase-1 unlock probe URLs (test seam;
-	// nil = the production defaultUnlockEndpoints set).
-	UnlockEndpoints *UnlockEndpoints
-	// Now is the clock seam for pacing (tests inject; nil = time.Now).
-	Now func() time.Time
-	// Sleep is the sleeper seam for pacing (tests inject; nil = timer wait).
-	Sleep func(ctx context.Context, d time.Duration) error
-	// ExitCache is the hot in-memory exit-IP cache (may be nil = disabled).
-	ExitCache *ExitGeoCache
-	// WaveSeq is the current wave sequence number for run-count liveness.
-	WaveSeq uint64
-}
-
-// Run enriches alive nodes' exit geo via per-node self-report, merges probe
-// outcomes, and upserts the geo-base.jsonl cold store. Records are returned
-// for reporting, together with the wave's class summary.
-func Run(ctx context.Context, in Input) ([]*model.GeoRecord, Summary, error) {
-	if in.Factory == nil {
-		return nil, Summary{}, errors.New(
-			"geo: no temp-instance factory wired — the self-report piggybacks on the checker infrastructure")
-	}
-	concurrency := in.Cfg.SelfReportConcurrency
-	if in.Concurrency > 0 {
-		concurrency = in.Concurrency
-	}
-	if in.DynamicConcurrency > 0 {
-		concurrency = in.DynamicConcurrency
-	}
-	reporter := &Reporter{
-		Factory:               in.Factory,
-		SelfURL:               in.SelfURL,
-		HTTPSURL:              in.Cfg.HTTPSURL,
-		ExitIPEchoURL:         in.Cfg.ExitIPEchoURL,
-		DoHURL:                in.Cfg.DoHURL,
-		Timeout:               in.Cfg.Timeout.Duration,
-		UserAgent:             in.UserAgent,
-		MinDelay:              DefaultSelfReportPacing,
-		SelfReportConcurrency: concurrency,
-		MaxTTL:                in.Cfg.MaxTTL.Duration,
-		Now:                   in.Now,
-		Sleep:                 in.Sleep,
-		Progress:              in.Progress,
-		Cache:                 in.ExitCache,
-		UnlockEndpoints:       in.UnlockEndpoints,
-	}
-	exitIPs := collectExitIPs(in.Nodes, in.ProbeByKey)
-	reports := reporter.reportAll(ctx, in.Nodes, exitIPs.byNode)
-	byKey := make(map[string]*NodeReport, len(reports))
-	for i := range reports {
-		byKey[reports[i].Key] = &reports[i]
-	}
-	// Phase-1 unlock stage: quality + media probes once per distinct exit IP
-	// with an unlock-NEED — classification missing, any unknown/unchecked
-	// field, or the verdict past its own TTL (gated by [geo].unlock_probes,
-	// default ON; an explicit false = no-op — zero unlock requests). The
-	// eligibility layers are decoupled (owner order 2026-11-06): this stage
-	// needs a tunnel independently of the geo ladder's 24h freshness gate —
-	// a fresh-geo exit with unlock-need gets an unlock-only sweep (no ip-api
-	// hop, quota preserved), a geo-stale exit gets the full ladder.
-	runUnlockWave(ctx, in, reporter, reports, exitIPs)
-	records, err := mergeGeoRecords(in, byKey)
-	if err != nil {
-		return nil, Summary{}, err
-	}
-	// Batch fallback: resolve exit IPs of rate-limited nodes from the local
-	// machine (a different source IP, not rate-limited). Honor ip-api's X-Ttl
-	// by sleeping the max advertised delay before the batch (best-effort),
-	// capped at Cfg.MaxTTL.
-	applyRateLimitedFallback(ctx, in, reporter, reports, records)
-
-	if err := store.UpsertGeo(filepath.Join(in.DataDir, "geo-base.jsonl"), records); err != nil {
-		return nil, Summary{}, err
-	}
-	// Eligible = nodes with a live probe exit IP — exactly the jobs the
-	// reporter ran (NOT the distinct-IP count: several nodes may share one
-	// exit).
-	return records, summarize(reports, len(exitIPs.byNode)), nil
 }
 
 func summarize(reports []NodeReport, eligible int) Summary {
@@ -369,33 +227,11 @@ func summarize(reports []NodeReport, eligible int) Summary {
 	}
 	return s
 }
-
-type exitIPIndex struct {
-	distinct []string
-	byNode   map[string]string // node key -> exit ip
-}
-
-// collectExitIPs indexes the tunnel exit IPs of alive probes (D8): only nodes
-// with a live probe carrying an exit IP enter geo self-report.
-func collectExitIPs(nodes []*model.Node, probeByKey map[string]store.ProbeResult) exitIPIndex {
-	idx := exitIPIndex{byNode: map[string]string{}}
-	seen := map[string]bool{}
-	for _, n := range nodes {
-		pr, ok := probeByKey[n.Key]
-		if !ok || !pr.Alive || pr.ExitIP == "" {
-			continue
-		}
-		idx.byNode[n.Key] = pr.ExitIP
-		if !seen[pr.ExitIP] {
-			seen[pr.ExitIP] = true
-			idx.distinct = append(idx.distinct, pr.ExitIP)
-		}
-	}
-	return idx
-}
-
-func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoRecord, error) {
-	existing, err := store.ReadGeo(filepath.Join(in.DataDir, "geo-base.jsonl"))
+func mergeGeoRecords(
+	dataDir string, nodes []*model.Node, probeByKey map[string]store.ProbeResult, waveSeq uint64,
+	reports map[string]*NodeReport,
+) ([]*model.GeoRecord, error) {
+	existing, err := store.ReadGeo(filepath.Join(dataDir, "geo-base.jsonl"))
 	if err != nil {
 		return nil, err
 	}
@@ -410,10 +246,10 @@ func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoReco
 	// that survives the store's last-write merge never depends on the
 	// caller's arrival order — identical inputs always yield the same winner
 	// (M-b).
-	nodes := make([]*model.Node, len(in.Nodes))
-	copy(nodes, in.Nodes)
-	sort.Slice(nodes, func(i, j int) bool {
-		a, b := nodes[i], nodes[j]
+	sorted := make([]*model.Node, len(nodes))
+	copy(sorted, nodes)
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
 		if a.Scheme != b.Scheme {
 			return a.Scheme < b.Scheme
 		}
@@ -425,9 +261,9 @@ func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoReco
 		}
 		return a.Key < b.Key
 	})
-	records := make([]*model.GeoRecord, 0, len(in.ProbeByKey))
-	for _, n := range nodes {
-		pr, ok := in.ProbeByKey[n.Key]
+	records := make([]*model.GeoRecord, 0, len(probeByKey))
+	for _, n := range sorted {
+		pr, ok := probeByKey[n.Key]
 		if !ok {
 			// Partial probe wave: the node has no probe outcome in the map,
 			// so this wave carries no new liveness truth for it. Emit nothing
@@ -451,8 +287,8 @@ func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoReco
 		// Run-count liveness (W8).
 		if pr.Alive {
 			rec.AliveStreak++
-			if in.WaveSeq > 0 {
-				rec.AliveWaveSeq = int(in.WaveSeq) //nolint:gosec // wave seq fits in int
+			if waveSeq > 0 {
+				rec.AliveWaveSeq = int(waveSeq) //nolint:gosec // wave seq fits in int
 			} else {
 				rec.AliveWaveSeq++
 			}
@@ -463,85 +299,6 @@ func mergeGeoRecords(in Input, reports map[string]*NodeReport) ([]*model.GeoReco
 		records = append(records, rec)
 	}
 	return records, nil
-}
-
-// applyBatchRecords overlays ip-api batch results (resolved from the local
-// machine) onto records whose exit IP was rate-limited through the tunnel.
-// Flags are verified (ip-api is the source) — FlagsVerified = true.
-func applyBatchRecords(records []*model.GeoRecord, batch map[string]*Response) {
-	for _, rec := range records {
-		g, ok := batch[rec.IP]
-		if !ok || g == nil || g.Status != "success" {
-			continue
-		}
-		rec.Country = strings.ToLower(g.CountryCode)
-		rec.City = g.City
-		rec.ASN = g.ASN()
-		rec.ASName = g.ASName
-		rec.ISP = g.ISP
-		rec.ProxyFlag = g.Proxy
-		rec.HostingFlag = g.Hosting
-		rec.GeoSource = "batch-fallback"
-		rec.FlagsVerified = true
-		if g.Query != "" {
-			rec.IP = g.Query
-		}
-	}
-}
-
-// applyRateLimitedFallback resolves exit IPs of rate-limited nodes from the
-// local machine (a different source IP, not rate-limited). Honor ip-api's
-// X-Ttl by sleeping the max advertised delay before the batch (best-effort),
-// capped at Cfg.MaxTTL.
-//
-//nolint:cyclop // batch fallback branches are inherent
-func applyRateLimitedFallback(
-	ctx context.Context, in Input, reporter *Reporter, reports []NodeReport, records []*model.GeoRecord,
-) {
-	rateLimitedIPs := map[string]bool{}
-	for i := range reports {
-		if !reports[i].RateLimited {
-			continue
-		}
-		if ip := reports[i].ProbeExitIP; ip != "" {
-			rateLimitedIPs[ip] = true
-		}
-		if reports[i].EchoIP != "" {
-			rateLimitedIPs[reports[i].EchoIP] = true
-		}
-	}
-	if len(rateLimitedIPs) == 0 {
-		return
-	}
-	maxTTL := time.Duration(0)
-	for i := range reports {
-		if reports[i].RateLimited && reports[i].RateLimitTTL > maxTTL {
-			maxTTL = reports[i].RateLimitTTL
-		}
-	}
-	capTTL := reporter.MaxTTL
-	if capTTL <= 0 {
-		capTTL = in.Cfg.MaxTTL.Duration
-	}
-	if capTTL > 0 && maxTTL > capTTL {
-		maxTTL = capTTL
-	}
-	if maxTTL > 0 {
-		// best-effort honor of X-Ttl; ignore cancellation errors here
-		_ = reporter.sleepFn()(ctx, maxTTL)
-	}
-	ips := make([]string, 0, len(rateLimitedIPs))
-	for ip := range rateLimitedIPs {
-		ips = append(ips, ip)
-	}
-	batch, berr := BatchLookup(ctx, ips, in.UserAgent)
-	if berr != nil {
-		if reporter.Progress != nil {
-			_, _ = fmt.Fprintf(reporter.Progress, "geo batch fallback: %v\n", berr)
-		}
-	} else {
-		applyBatchRecords(records, batch)
-	}
 }
 
 // applyReport folds one node's ladder outcome into its cold record.
@@ -637,120 +394,6 @@ func applyReport(rec *model.GeoRecord, report *NodeReport, probeExitIP string) {
 	}
 }
 
-// Reporter drives the per-node self-report wave: one temp instance per node
-// (the piggyback — every ladder rung rides the SAME socks endpoint),
-// politeness pacing between external request starts, loud per-node class
-// lines on Progress.
-type Reporter struct {
-	Factory               Factory
-	SelfURL               string // test seam; empty = SelfReportURL
-	HTTPSURL              string // the [geo].https_url knob; empty = config.DefaultGeoHTTPSURL
-	ExitIPEchoURL         string // the [geo].exit_ip_echo_url knob; empty = config.DefaultGeoExitIPEchoURL
-	DoHURL                string
-	Timeout               time.Duration // per through-tunnel request
-	UserAgent             string
-	MinDelay              time.Duration // pacing between external request starts
-	SelfReportConcurrency int           // max concurrent temp instances (0 = default)
-	MaxTTL                time.Duration // cap for the rate-limit retry sleep (0 = no cap)
-	Now                   func() time.Time
-	Sleep                 func(ctx context.Context, d time.Duration) error
-	Progress              io.Writer
-	// in-wave cache by exit IP (unexported, lazily init) — legacy fallback
-	// used only when Cache (ExitGeoCache) is nil.
-	cacheMu sync.Mutex
-	cache   map[string]NodeReport
-	// Hot cross-wave exit-IP cache (may be nil = disabled).
-	Cache *ExitGeoCache
-	// UnlockEndpoints carries the Phase-1 probe URL seam (nil = defaults).
-	UnlockEndpoints *UnlockEndpoints
-}
-
-// reportAll runs the wave over the eligible nodes (bounded concurrency, one
-// instance per node, results in stable node order).
-func (r *Reporter) reportAll(ctx context.Context, nodes []*model.Node, exitIPs map[string]string) []NodeReport {
-	type job struct {
-		node   *model.Node
-		exitIP string
-	}
-	jobs := make([]job, 0, len(exitIPs))
-	for _, n := range nodes { // input order — deterministic progress lines
-		if ip, ok := exitIPs[n.Key]; ok {
-			jobs = append(jobs, job{node: n, exitIP: ip})
-		}
-	}
-	out := make([]NodeReport, len(jobs))
-	concurrency := r.SelfReportConcurrency
-	if concurrency <= 0 {
-		concurrency = DefaultSelfReportConcurrency
-	}
-	workers := min(concurrency, len(jobs))
-	if workers < 1 {
-		return out
-	}
-	p := &pacer{minDelay: r.MinDelay, now: r.nowFn(), sleep: r.sleepFn()}
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= len(jobs) {
-					return
-				}
-				if err := ctx.Err(); err != nil {
-					return
-				}
-				out[i] = r.reportNode(ctx, p, jobs[i].node, jobs[i].exitIP)
-			}
-		}()
-	}
-	wg.Wait()
-	return out
-}
-
-func (r *Reporter) nowFn() func() time.Time {
-	if r.Now != nil {
-		return r.Now
-	}
-	return time.Now
-}
-
-func (r *Reporter) sleepFn() func(context.Context, time.Duration) error {
-	if r.Sleep != nil {
-		return r.Sleep
-	}
-	return func(ctx context.Context, d time.Duration) error {
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return nil
-		}
-	}
-}
-
-func (r *Reporter) selfEndpoint() string {
-	if r.SelfURL != "" {
-		return r.SelfURL
-	}
-	return SelfReportURL
-}
-
-func (r *Reporter) httpsEndpoint() string {
-	if r.HTTPSURL != "" {
-		return r.HTTPSURL
-	}
-	return config.DefaultGeoHTTPSURL
-}
-
-func (r *Reporter) exitIPEchoEndpoint() string {
-	return r.ExitIPEchoURL
-}
-
 // fetchExitIPEcho performs ONE GET against an HTTPS echo endpoint through the
 // tunnel and returns the trimmed exit IP string. Used for exit-IP recovery
 // when self-report fails entirely.
@@ -779,320 +422,6 @@ func fetchExitIPEcho(ctx context.Context, cl *http.Client, endpoint, userAgent s
 	return ip, nil
 }
 
-// reportNode drives one node: ONE temp instance (the piggyback) → the paced
-// four-rung ladder: plain-HTTP ip-api self-report → HTTPS self-geo → DoH
-// fallback → unknown. Every rung rides the SAME instance.
-//
-//nolint:cyclop,gocognit // per-node ladder is inherently branchy
-func (r *Reporter) reportNode(ctx context.Context, p *pacer, n *model.Node, probeExitIP string) NodeReport {
-	// In-wave cache by exit IP: reuse a previous result for the same exit IP.
-	if probeExitIP != "" {
-		if r.Cache != nil {
-			if cached, ok := r.Cache.Get(probeExitIP); ok && cached != nil {
-				clone := cached.Report
-				clone.Key = n.Key
-				clone.ProbeExitIP = probeExitIP
-				clone.RequestRTTMs = append([]float64(nil), cached.Report.RequestRTTMs...)
-				clone.TimedOut = cached.Report.TimedOut
-				clone.LadderRan = false // in-wave fact: a served clone is not a ladder run
-				r.logNode(n, clone)
-				return clone
-			}
-		} else {
-			r.cacheMu.Lock()
-			if cached, ok := r.cache[probeExitIP]; ok {
-				clone := cached
-				clone.Key = n.Key
-				clone.ProbeExitIP = probeExitIP
-				clone.RequestRTTMs = append([]float64(nil), cached.RequestRTTMs...)
-				clone.TimedOut = cached.TimedOut
-				clone.LadderRan = false // in-wave fact: a served clone is not a ladder run
-				r.cacheMu.Unlock()
-				r.logNode(n, clone)
-				return clone
-			}
-			r.cacheMu.Unlock()
-		}
-	}
-
-	// From here on the geo ladder RUNS for this node (geo-need): the report
-	// is a fresh in-wave outcome, whatever the rungs conclude.
-	rep := NodeReport{Key: n.Key, RequestRTTMs: []float64{}, LadderRan: true}
-	inst, err := r.Factory(ctx, n)
-	if err != nil {
-		rep.Class = ClassUnknown
-		rep.Detail = fmt.Sprintf("temp instance: %v", err)
-		r.logNode(n, rep)
-		return rep
-	}
-	defer func() { _ = inst.Close() }()
-
-	cl, err := NewTunnelClient(inst.Addr(), r.Timeout)
-	if err != nil {
-		rep.Class = ClassUnknown
-		rep.Detail = fmt.Sprintf("tunnel client: %v", err)
-		r.logNode(n, rep)
-		return rep
-	}
-
-	// Rung 1 — the self-report: the node asks ip-api who is asking.
-	if err := p.wait(ctx); err != nil {
-		rep.Class = ClassUnknown
-		rep.Detail = fmt.Sprintf("canceled: %v", err)
-		r.logNode(n, rep)
-		return rep
-	}
-	rep.ProbeExitIP = probeExitIP
-	var selfErr error
-	selfStart := time.Now()
-	rep.Geo, selfErr = fetchIPAPI(ctx, cl, r.selfEndpoint(), r.userAgent())
-	selfElapsed := time.Since(selfStart).Milliseconds()
-	if selfErr != nil {
-		if isTimeoutErr(selfErr) {
-			rep.TimedOut++
-		}
-	} else {
-		rep.RequestRTTMs = append(rep.RequestRTTMs, float64(selfElapsed))
-	}
-	rateLimited := false
-	var rateLimitTTL time.Duration
-	if rle, ok := errors.AsType[*RateLimitError](selfErr); ok {
-		rateLimited = true
-		rateLimitTTL = rle.TTL
-		rep.RateLimited = true
-		rep.RateLimitTTL = rateLimitTTL
-	}
-	if selfErr == nil && rep.Geo != nil {
-		rep.Class = ClassSelfReport
-		rep.Churn = probeExitIP != "" && rep.Geo.Query != probeExitIP
-		cacheResult(r, probeExitIP, rep)
-		r.logNode(n, rep)
-		return rep
-	}
-
-	// Rung 2 — the HTTPS self-geo through the SAME instance. Skipped when
-	// the failure was a 429? No — a different service (ipinfo) may still
-	// answer; only ip-api retries are suppressed.
-	if err := p.wait(ctx); err != nil {
-		rep.Class = ClassUnknown
-		rep.Detail = "canceled during fallback"
-		r.logNode(n, rep)
-		return rep
-	}
-	httpsStart := time.Now()
-	info, infoErr := fetchHTTPSInfo(ctx, cl, r.httpsEndpoint(), r.userAgent())
-	httpsElapsed := time.Since(httpsStart).Milliseconds()
-	if infoErr != nil {
-		if isTimeoutErr(infoErr) {
-			rep.TimedOut++
-		}
-	} else {
-		rep.RequestRTTMs = append(rep.RequestRTTMs, float64(httpsElapsed))
-	}
-	if infoErr == nil && info != nil {
-		rep.HTTPS = info
-		rep.Class = ClassSelfReportHTTPS
-		rep.Churn = probeExitIP != "" && info.IP != probeExitIP
-		rep.Detail = fmt.Sprintf("self-report failed (%v); https self-geo ok", selfErr)
-		cacheResult(r, probeExitIP, rep)
-		r.logNode(n, rep)
-		return rep
-	}
-
-	// Rung 3 — DoH fallback (skipped when rate-limited: it would issue
-	// another ip-api request through the same exit, still rate-limited).
-	rep.Class = ClassUnknown
-	if rateLimited {
-		rep.Detail = fmt.Sprintf("self-report: %v (rate-limited, X-Ttl=%s); https: %v",
-			selfErr, rateLimitTTL, infoErr)
-	} else {
-		done := r.doHFallback(ctx, p, cl, selfErr, infoErr, &rep)
-		if strings.Contains(rep.Detail, "canceled during fallback") {
-			r.logNode(n, rep)
-			return rep
-		}
-		if rep.Class == ClassDoHFallback {
-			cacheResult(r, probeExitIP, rep)
-			r.logNode(n, rep)
-			return rep
-		}
-		if done {
-			r.logNode(n, rep)
-			return rep
-		}
-	}
-
-	// Exit IP echo fallback: recover the exit IP over HTTPS when self-report
-	// fully failed. Does not provide geo flags.
-	if ep := r.exitIPEchoEndpoint(); ep != "" {
-		if echoIP, echoErr := fetchExitIPEcho(ctx, cl, ep, r.userAgent()); echoErr == nil {
-			rep.EchoIP = echoIP
-			if rep.Detail != "" {
-				rep.Detail += "; exit-ip echo ok"
-			}
-		}
-	}
-
-	cacheResult(r, probeExitIP, rep)
-	r.logNode(n, rep)
-	return rep
-}
-
-// doHFallback attempts the DoH rung. It returns true when the caller should
-// return immediately (cancellation or success); false when it should continue
-// to the exit-IP echo fallback.
-func (r *Reporter) doHFallback(
-	ctx context.Context, p *pacer, cl *http.Client, selfErr, infoErr error, rep *NodeReport,
-) bool {
-	if err := p.wait(ctx); err != nil {
-		rep.Detail = fmt.Sprintf("canceled during fallback (self-report: %v; https: %v)", selfErr, infoErr)
-		return true
-	}
-	dohStart := time.Now()
-	resolver, dohErr := r.resolveExitResolver(ctx, cl)
-	dohElapsed := time.Since(dohStart).Milliseconds()
-	if dohErr != nil {
-		if isTimeoutErr(dohErr) {
-			rep.TimedOut++
-		}
-	} else {
-		rep.RequestRTTMs = append(rep.RequestRTTMs, float64(dohElapsed))
-	}
-	if dohErr != nil {
-		rep.Detail = fmt.Sprintf("self-report: %v; https: %v; doh-fallback: %v", selfErr, infoErr, dohErr)
-		return false
-	}
-	if err := p.wait(ctx); err != nil {
-		rep.Detail = fmt.Sprintf("canceled during fallback (self-report: %v; https: %v)", selfErr, infoErr)
-		return true
-	}
-	lookupURL := strings.TrimSuffix(r.selfEndpoint(), "/") + "/" + url.PathEscape(resolver)
-	lookupStart := time.Now()
-	fb, lookupErr := fetchIPAPI(ctx, cl, lookupURL, r.userAgent())
-	lookupElapsed := time.Since(lookupStart).Milliseconds()
-	if lookupErr != nil {
-		if isTimeoutErr(lookupErr) {
-			rep.TimedOut++
-		}
-	} else {
-		rep.RequestRTTMs = append(rep.RequestRTTMs, float64(lookupElapsed))
-	}
-	if lookupErr == nil {
-		rep.Geo = fb
-		rep.Class = ClassDoHFallback
-		rep.Detail = fmt.Sprintf("self-report failed (%v); https failed (%v); doh fallback via resolver %s",
-			selfErr, infoErr, resolver)
-		// unreachable on success path
-		return true
-	}
-	rep.Detail = fmt.Sprintf("self-report: %v; https: %v; doh-fallback (resolver %s): %v",
-		selfErr, infoErr, resolver, lookupErr)
-	if rle, ok := errors.AsType[*RateLimitError](lookupErr); ok {
-		rep.RateLimited = true
-		rep.RateLimitTTL = rle.TTL
-	}
-	return false
-}
-
-func cacheResult(r *Reporter, exitIP string, rep NodeReport) {
-	if exitIP == "" {
-		return
-	}
-	if r.Cache != nil {
-		entry := nodeReportToEntry(exitIP, rep)
-		_ = r.Cache.Set(exitIP, entry)
-		return
-	}
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	if r.cache == nil {
-		r.cache = map[string]NodeReport{}
-	}
-	// store a copy without Key (Key is per-node) and without the in-wave
-	// ladder marker (a cached report must never claim this wave's evidence)
-	stored := rep
-	stored.Key = ""
-	stored.LadderRan = false
-	r.cache[exitIP] = stored
-}
-
-func nodeReportToEntry(exitIP string, rep NodeReport) *ExitGeoEntry {
-	entry := &ExitGeoEntry{
-		ExitIP:    exitIP,
-		GeoSource: rep.Class,
-		Report:    rep,
-	}
-	// store a copy without Key (Key is per-node) and without the in-wave
-	// ladder marker (a cached report must never claim this wave's evidence)
-	stored := rep
-	stored.Key = ""
-	stored.LadderRan = false
-	entry.Report = stored
-	if rep.Geo != nil {
-		entry.Country = strings.ToLower(rep.Geo.CountryCode)
-		entry.City = rep.Geo.City
-		entry.ASN = rep.Geo.ASN()
-		entry.ASName = rep.Geo.ASName
-		entry.ISP = rep.Geo.ISP
-		entry.ProxyFlag = rep.Geo.Proxy
-		entry.HostingFlag = rep.Geo.Hosting
-		entry.GeoSource = rep.Class
-		entry.FlagsVerified = rep.Geo != nil // refined below
-	}
-	if rep.Class == ClassSelfReport {
-		entry.FlagsVerified = true
-	} else {
-		entry.FlagsVerified = false
-	}
-	if rep.ProbeExitIP != "" {
-		if net.ParseIP(rep.ProbeExitIP) != nil {
-			entry.ExitIP = rep.ProbeExitIP
-		}
-	}
-	if entry.ExitIP == "" {
-		entry.ExitIP = exitIP
-	}
-	return entry
-}
-
-// resolveExitResolver queries the DoH endpoint THROUGH the tunnel for the
-// probe domain's TXT answer and extracts the resolver IP (the quoted string
-// in the dns.google/resolve JSON answer).
-func (r *Reporter) resolveExitResolver(ctx context.Context, cl *http.Client) (string, error) {
-	endpoint := r.DoHURL + "?name=" + url.QueryEscape(dohProbeName) + "&type=TXT"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-	req.Header.Set("User-Agent", r.userAgent())
-	resp, err := cl.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("doh: %s", resp.Status)
-	}
-	var dr struct {
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&dr); err != nil {
-		return "", fmt.Errorf("decode doh answer: %w", err)
-	}
-	for _, a := range dr.Answer {
-		// Type 16 = TXT; the data is the RFC1035 quoted string ("203.0.113.7").
-		candidate := strings.Trim(a.Data, `"`)
-		if a.Type == 16 && net.ParseIP(candidate) != nil {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("doh answer carries no resolver IP for %s", dohProbeName)
-}
-
 // RateLimitError signals an HTTP 429 from ip-api, carrying the retry delay
 // advertised via the X-Ttl header (if any).
 type RateLimitError struct {
@@ -1102,21 +431,6 @@ type RateLimitError struct {
 
 func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("ip-api: 429 (retry after %s)", e.TTL)
-}
-
-// IsRateLimit reports whether err is a *RateLimitError.
-func IsRateLimit(err error) bool {
-	var rle *RateLimitError
-	return errors.As(err, &rle)
-}
-
-// RateLimitTTL extracts the retry delay from a *RateLimitError.
-func RateLimitTTL(err error) time.Duration {
-	var rle *RateLimitError
-	if errors.As(err, &rle) && rle != nil {
-		return rle.TTL
-	}
-	return 0
 }
 
 // fetchIPAPI performs ONE GET against an ip-api single-IP endpoint through
@@ -1211,13 +525,6 @@ func parseTTL(v string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-func (r *Reporter) userAgent() string {
-	if r.UserAgent == "" {
-		return config.DefaultUserAgent
-	}
-	return r.UserAgent
-}
-
 func isTimeoutErr(err error) bool {
 	if err == nil {
 		return false
@@ -1229,107 +536,8 @@ func isTimeoutErr(err error) bool {
 	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded")
 }
 
-func (r *Reporter) logNode(n *model.Node, rep NodeReport) {
-	if r.Progress == nil {
-		return
-	}
-	switch rep.Class {
-	case ClassSelfReport:
-		if rep.Churn && rep.Geo != nil {
-			_, _ = fmt.Fprintf(r.Progress,
-				"geo: %s (%s): self-report ok — exit-ip churn (probe saw %s, node now reports %s)\n",
-				n.Key, n.Host, rep.ProbeExitIP, rep.Geo.Query)
-		}
-	case ClassSelfReportHTTPS:
-		// A rung-2 success means rung 1 failed — the degraded evidence class
-		// is loud, same as the DoH fallback's line.
-		_, _ = fmt.Fprintf(r.Progress, "geo: %s (%s): %s\n", n.Key, n.Host, rep.Detail)
-		if rep.Churn && rep.HTTPS != nil {
-			_, _ = fmt.Fprintf(r.Progress,
-				"geo: %s (%s): https self-geo — exit-ip churn (probe saw %s, node now reports %s)\n",
-				n.Key, n.Host, rep.ProbeExitIP, rep.HTTPS.IP)
-		}
-	case ClassDoHFallback:
-		_, _ = fmt.Fprintf(r.Progress, "geo: %s (%s): %s\n", n.Key, n.Host, rep.Detail)
-	case ClassUnknown:
-		_, _ = fmt.Fprintf(r.Progress, "geo: %s (%s): UNKNOWN geo — %s (node stays usable; geo fields preserved)\n",
-			n.Key, n.Host, rep.Detail)
-	}
-}
-
-// BatchLookup queries ip-api's batch endpoint from the LOCAL machine (no
-// tunnel) for the given exit IPs. Returns a map IP -> *Response. Up to 100
-// IPs per request (ip-api batch limit).
-func BatchLookup(ctx context.Context, ips []string, userAgent string) (map[string]*Response, error) {
-	out := map[string]*Response{}
-	uniq := dedupeIPs(ips)
-	const batchSize = 100
-	for i := 0; i < len(uniq); i += batchSize {
-		end := min(i+batchSize, len(uniq))
-		chunk := uniq[i:end]
-		if err := batchLookupChunk(ctx, chunk, userAgent, out); err != nil {
-			return out, err
-		}
-	}
-	return out, nil
-}
-
-func dedupeIPs(ips []string) []string {
-	seen := map[string]bool{}
-	out := []string{}
-	for _, ip := range ips {
-		if ip == "" || seen[ip] {
-			continue
-		}
-		seen[ip] = true
-		out = append(out, ip)
-	}
-	return out
-}
-
-func batchLookupChunk(ctx context.Context, chunk []string, userAgent string, out map[string]*Response) error {
-	body, err := json.Marshal(chunk)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://ip-api.com/batch", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	_ = resp.Body.Close()
-	if rerr != nil {
-		return rerr
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ip-api batch: %s", resp.Status)
-	}
-	var arr []Response
-	if err := json.Unmarshal(respBody, &arr); err != nil {
-		return err
-	}
-	for j := range arr {
-		r := arr[j]
-		key := r.Query
-		if key == "" && j < len(chunk) {
-			key = chunk[j]
-		}
-		cp := r
-		out[key] = &cp
-	}
-	return nil
-}
-
 // NewTunnelClient builds the production through-tunnel HTTP client for one
-// temp instance's socks endpoint (exported for the L5 pin test; the Reporter
+// temp instance's socks endpoint (exported for the L5 pin test; the Classifier
 // is the production caller). The x/net socks dialer forwards HOSTNAMES to the
 // proxy (ATYP=domain) — resolution happens at the EXIT (socks5h semantics).
 // User-Agent is a per-request concern (the pipeline UA rides each request).

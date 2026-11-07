@@ -46,8 +46,9 @@ serve the site (blockpage answers are classified, never counted as success).
 
 READ-ONLY by construction: the cold base and the live client are never
 touched, nothing is rendered or activated, all dialing is out-of-band.
-Liveness comes from the LAST probe wave — re-run ` + "`publicvpn probe` + `publicvpn geo`" + `
-(or maintain) for freshness; a staleness hint prints when data is older than
+Liveness and exit classification come from the LAST probe wave — re-run ` + "`publicvpn probe`" + `
+(classification is merged into the probe pass, or ` + "`publicvpn maintain`" + ` for a
+full wave) for freshness; a staleness hint prints when data is older than
 geo.ttl.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

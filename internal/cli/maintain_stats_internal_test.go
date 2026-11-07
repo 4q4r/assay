@@ -102,7 +102,6 @@ func statsOnlyStages(order *[]string) *maintainStages {
 		parse:    noopStage("parse", order),
 		filter:   noopStage("filter", order),
 		probe:    noopStage("probe", order),
-		geo:      noopStage("geo", order),
 		stats:    runStatsStage,
 		prune:    noopStage("prune", order),
 		selectS:  noopStage("select", order),
@@ -130,7 +129,7 @@ func TestStatsFirstRunTargetLacksAPIShapeIsINFO(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "the poll must not exec xray when the target lacks the api shape")
 	// "stats" is the real stage under test (not a recorder), so the recorded
 	// order carries the other nine — the wave continued through ALL of them.
-	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "geo", "prune", "select", "render", "activate"},
+	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "prune", "select", "render", "activate"},
 		order, "the wave continues through every stage after the INFO")
 }
 
@@ -184,7 +183,7 @@ func TestStatsEndpointUnexpectedResponseIsWARNING(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "WARNING: stats poll unavailable", "today's warning behavior is preserved")
 	assert.NotContains(t, out, "INFO:", "a reachable endpoint is not the first-run shape")
-	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "geo", "prune", "select", "render", "activate"},
+	assert.Equal(t, []string{"fetch", "parse", "filter", "probe", "prune", "select", "render", "activate"},
 		order, "the wave continues past a WARNING (stats is the real stage under test)")
 }
 
