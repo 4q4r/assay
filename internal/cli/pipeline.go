@@ -660,8 +660,8 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 
 // probeOptions translates config + CLI flags into one probe wave's options.
 // The prober binary and its database are GONE (W14): every node gets a
-// temporary single-node xray from the SAME factory the check/geo stages
-// use, so there is no per-stage tooling left to configure. ExitProbe stays
+// temporary single-node xray from the SAME factory the check stage uses,
+// so there is no per-stage tooling left to configure. ExitProbe stays
 // nil: the D8 exit-IP echo defaults ON in production (nil = on — every
 // alive record carries its tunnel exit IP).
 func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
@@ -792,7 +792,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	if err := os.MkdirAll(p.workDir, 0o750); err != nil {
 		return err
 	}
-	// The SAME temp-instance infrastructure the check/geo stages use — one
+	// The SAME temp-instance infrastructure the check stage uses — one
 	// factory, one render.BuildOutbound outbound builder, zero drift (W14).
 	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
 		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
@@ -990,7 +990,9 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 		return err
 	}
 	if len(geoRecs) == 0 {
-		return fmt.Errorf("geo base empty (%s) — run `publicvpn geo` first", p.geoBase)
+		return fmt.Errorf(
+			"geo base empty (%s) — run `publicvpn probe` first — classification is "+
+				"merged into the probe pass and writes the cold base", p.geoBase)
 	}
 	probeByKey, err := store.LatestProbeByKey(p.probeResults)
 	if err != nil {
@@ -1837,8 +1839,9 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 }
 
 // runPluginStatsEnrichment enriches the plugin stats in the fetch manifest
-// with live nodes (from probe) and hosting/proxy/clean counts (from geo).
-// Called after probe and geo stages have completed. reg is the WAVE's
+// with live nodes and hosting/proxy/clean counts — both come from the probe
+// pass now (classification is merged into it and refreshes the cold base).
+// Called after the probe stage has completed. reg is the WAVE's
 // registry: the MinLivePercent enforcement lands its breaker failures there
 // — in the daemon that is the long-lived watchdog registry, so a disabled
 // plugin stays disabled across waves. The wave always has a registry (the

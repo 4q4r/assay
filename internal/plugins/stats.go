@@ -142,7 +142,8 @@ func NewPluginStatsCollector(geoRecords []*GeoRecord) *PluginStatsCollector {
 	}
 }
 
-// SetGeoRecords updates the geo records for enrichment (called after geo stage).
+// SetGeoRecords updates the geo records for enrichment (called after the
+// probe pass completes — classification included).
 func (c *PluginStatsCollector) SetGeoRecords(geoRecords []*GeoRecord) {
 	c.GeoByKey = make(map[string]*GeoRecord, len(geoRecords))
 	for _, g := range geoRecords {

@@ -1,6 +1,6 @@
 // Package probe implements the out-of-band liveness wave (W2, W14 engine):
 // every probed node gets a temporary single-node xray instance — the SAME
-// infrastructure the check/geo stages use (one factory, no drift) — so
+// infrastructure the check stage uses (one factory, no drift) — so
 // real-tunnel HTTP probes deliver latency, the tunnel EXIT IP (D8 — never
 // the advertised host) and an optional through-tunnel speedtest uniformly
 // across EVERY rendered protocol, hysteria2 included. The live client is
@@ -33,7 +33,7 @@ import (
 const DefaultConcurrency = 12
 
 // exitIPURL is the through-tunnel endpoint the engine reads the D8 exit IP
-// from (the SAME ip-api self-report call the geo stage makes — one mental
+// from (the SAME ip-api self-report the classification pass makes — one mental
 // model, one rate-limit surface; the free tier's budget is per requesting
 // IP, and our requests originate from thousands of distinct exits). Test
 // seam: ExitIPURL (zero in production).
@@ -688,9 +688,9 @@ func (o *outcome) noteFailure(a checker.Attempt) {
 }
 
 // exitIPOf reads the tunnel exit IP (D8) through the node's own instance —
-// the same self-report call the geo stage makes. Best-effort: a failed echo
-// leaves the anchor empty (geo falls back gracefully); it must never fail
-// the probe of an alive node.
+// the same self-report the classification pass makes. Best-effort: a failed
+// echo leaves the anchor empty (the classification ladder falls back
+// gracefully); it must never fail the probe of an alive node.
 func exitIPOf(ctx context.Context, tc *checker.TunnelClient, endpoint string) string {
 	if endpoint == "" {
 		endpoint = exitIPURL

@@ -114,9 +114,9 @@ type FilterConfig struct {
 
 // ProbeConfig controls the real-xray probe wave (W14): every probed node
 // gets a temporary single-node xray instance (the SAME infrastructure the
-// check/geo stages use — one factory, no drift), so liveness and speed
+// check stage uses — one factory, no drift), so liveness and speed
 // measurement uniformly cover every rendered protocol, hysteria2 included.
-// The xray binary is [activate].xray_bin (one knob, shared with check/geo).
+// The xray binary is [activate].xray_bin (one knob, shared with check).
 type ProbeConfig struct {
 	Timeout Duration `toml:"timeout"`
 	// Threads is the parallel temp-instance worker count (each worker owns
@@ -208,9 +208,10 @@ func (p ProbeConfig) IsSpeedtest() bool {
 	return p.Speedtest != nil && *p.Speedtest
 }
 
-// GeoConfig controls the geo stage (W11 self-report design; W16 adds the
-// HTTPS third hop): every alive node asks geo endpoints THROUGH ITS OWN
-// TUNNEL, so the requests originate from thousands of distinct node IPs and
+// GeoConfig controls the exit-classification knobs (W11 self-report design;
+// W16 adds the HTTPS third hop; since the classification merge the pass
+// rides the probe wave): every alive node asks geo endpoints THROUGH ITS
+// OWN TUNNEL, so the requests originate from thousands of distinct node IPs and
 // per-source budgets never pool — the old aggregate batch clamp
 // (endpoint/batch_size/per_minute, retired loud) is gone in principle. The
 // failure ladder per node: (1) HTTP ip-api self-report, (2) HTTPS self-geo
@@ -641,8 +642,9 @@ func Load(path string) (*Config, error) {
 // migration path. Two removed generations live here:
 //   - [sources.*] (W10): the ingest layer is Lua plugins — no silent fallback
 //     chain from the old section;
-//   - [geo] batch knobs (W11): the geo stage self-reports per node through
-//     its own tunnel, so geo.endpoint / geo.batch_size / geo.per_minute are
+//   - [geo] batch knobs (W11): the per-node self-report (since the
+//     classification merge, part of the probe pass) rides each node's own
+//     tunnel, so geo.endpoint / geo.batch_size / geo.per_minute are
 //     dead — requests originate from thousands of distinct node IPs and the
 //     aggregate limit they clamped cannot pool. The self-report is automatic
 //     (no knob); the surviving knobs are ttl / timeout / doh_url.
@@ -670,7 +672,7 @@ func checkRemovedSections(raw []byte) error {
 				return fmt.Errorf(
 					"%s: removed — the probe wave no longer shells out to xray-knife (W14): every "+
 						"probed node now gets a temporary single-node xray instance (the SAME "+
-						"infrastructure the check/geo stages use), so liveness and the speedtest "+
+						"infrastructure the check stage uses), so liveness and the speedtest "+
 						"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
 						"delete the dead key(s); the temp instances use [activate].xray_bin (there is "+
 						"no separate prober binary or database anymore); panel grading moved to the "+
@@ -688,7 +690,8 @@ func checkRemovedSections(raw []byte) error {
 			}
 			if len(dead) > 0 {
 				return fmt.Errorf(
-					"%s: removed — the geo stage now SELF-REPORTS per node: every alive node asks "+
+					"%s: removed — the classification pass (merged into the probe wave) "+
+						"self-reports per node: every alive node asks "+
 						"ip-api (http://ip-api.com/json/, no ip parameter) through its own tunnel, so "+
 						"requests come from thousands of distinct node IPs and the aggregate per-source "+
 						"limit these batch knobs clamped can never pool (W11). The self-report is "+

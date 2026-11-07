@@ -1313,13 +1313,14 @@ func asciiSparklineString(spark string) string {
 
 // printOverlapMatrix renders the pairwise identity-overlap matrix plus the
 // pruning recommendations (spec §1.2). A manifest without the matrix is the
-// documented cold start: the enrichment pass computes it after geo.
+// documented cold start: the classification pass computes it during the
+// probe wave.
 func printOverlapMatrix(out io.Writer, si *statusIntel, color bool) {
 	outln(out, ui.Header("provider overlap inspection", color))
 	m := si.manifestOverlap()
 	if m == nil {
 		outf(out, "%s\n", ui.ChipKV("overlap:   ",
-			"matrix not computed yet — the plugin-stats enrichment pass builds it after the geo stage", color))
+			"matrix not computed yet — the classification pass builds it during the probe wave", color))
 		printRecommendations(out, si, color)
 		return
 	}

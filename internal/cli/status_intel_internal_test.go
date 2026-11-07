@@ -570,7 +570,9 @@ func TestStatusDashboardColdStart(t *testing.T) {
 	sOverlap := runStatusCaptured(t, cfgPath, func(cmd *cobra.Command) {
 		require.NoError(t, cmd.Flags().Set("overlap", "true"))
 	})
-	assert.Contains(t, sOverlap, "matrix not computed yet", "cold overlap is explicit")
+	assert.Contains(t, sOverlap,
+		"matrix not computed yet — the classification pass builds it during the probe wave",
+		"cold overlap is explicit")
 	assert.Contains(t, sOverlap, "no strong pruning signal", "advice stays silent without data")
 }
 
