@@ -1149,6 +1149,14 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 	}
 	outf(cmd.OutOrStdout(), "select complete: %d active nodes (cap %d, %d alive cities), countries: %v → %s\n",
 		len(sel.Nodes), sel.CapApplied, sel.CitiesAlive, byCountry, p.selection)
+	// TLS-intercept exclusions are loud (owner-ordered safety cut): the
+	// counted drop is reported at the select stage every wave it fires.
+	if sel.HijackExcluded > 0 {
+		outf(cmd.OutOrStdout(),
+			"select: %d candidate(s) excluded — TLS-intercepting exit "+
+				"(hijack=true on own geo evidence): not rendered, not active\n",
+			sel.HijackExcluded)
+	}
 	return nil
 }
 
