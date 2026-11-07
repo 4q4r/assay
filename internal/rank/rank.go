@@ -41,11 +41,11 @@ func Select(
 	if len(knownAlive) > 0 && knownAlive[0] != nil {
 		ka = knownAlive[0]
 	}
-	cands := collectCandidates(nodes, geo, probeByKey, cfg, maxAliveAge, ka)
+	cands, hijackExcluded := collectCandidates(nodes, geo, probeByKey, cfg, maxAliveAge, ka)
 	sortByPrimaryMetrics(cands)
 	capApplied := effectiveCap(cands, cfg)
 	selected := greedySelect(cands, cfg, capApplied)
-	return assignTags(selected, capApplied, cands)
+	return assignTags(selected, capApplied, cands, hijackExcluded)
 }
 
 // candidate couples a node with its geo+probe facts.
@@ -62,6 +62,11 @@ type candidate struct {
 // group like a country (owner item 14a: "unknown" never drops a usable
 // node); their tags carry the xx pseudo-code and the pool_unknown balancer
 // groups them at render time.
+//
+// The second return value counts TLS-intercept exclusions: candidates whose
+// OWN geo record carries MediaUnlocks.Hijack=true (owner-ordered safety
+// cut). The count is reported loud at the select stage — the exclusion must
+// be visible, not silent.
 func collectCandidates(
 	nodes []*model.Node,
 	geo []*model.GeoRecord,
@@ -69,7 +74,7 @@ func collectCandidates(
 	cfg config.SelectConfig,
 	maxAliveAge time.Duration,
 	knownAlive ...map[string]store.KnownAliveRecord,
-) []candidate {
+) ([]candidate, int) {
 	ka := map[string]store.KnownAliveRecord{}
 	if len(knownAlive) > 0 && knownAlive[0] != nil {
 		ka = knownAlive[0]
@@ -79,18 +84,25 @@ func collectCandidates(
 		geoByKey[model.GeoIdentity(g)] = g
 	}
 	var cands []candidate
+	hijackExcluded := 0
 	now := time.Now()
 	for _, n := range nodes {
-		c, ok := admitCandidate(n, geoByKey, probeByKey, cfg, maxAliveAge, ka, now)
-		if ok {
+		c, ok, hijacked := admitCandidate(n, geoByKey, probeByKey, cfg, maxAliveAge, ka, now)
+		switch {
+		case ok:
 			cands = append(cands, c)
+		case hijacked:
+			hijackExcluded++
 		}
 	}
-	return cands
+	return cands, hijackExcluded
 }
 
-// admitCandidate evaluates one node for inclusion. Returns (candidate, true)
-// when the node should be admitted.
+// admitCandidate evaluates one node for inclusion. Returns (candidate,
+// admitted, hijackExcluded): admitted=false with hijackExcluded=true marks a
+// TLS-intercept exclusion (counted loud at the select stage); admitted=false
+// with hijackExcluded=false is any other drop (no geo record, stale, dead,
+// dirty, probe-dead) — those keep their existing silent semantics.
 func admitCandidate(
 	n *model.Node,
 	geoByKey map[string]*model.GeoRecord,
@@ -99,10 +111,10 @@ func admitCandidate(
 	maxAliveAge time.Duration,
 	ka map[string]store.KnownAliveRecord,
 	now time.Time,
-) (candidate, bool) {
+) (candidate, bool, bool) {
 	orig, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
 	if !ok {
-		return candidate{}, false
+		return candidate{}, false, false
 	}
 	// Clone GeoRecord so mutations (e.g. from knownAlive or node-specific probe status)
 	// do not leak across distinct candidates sharing the same pointer or identity.
@@ -110,20 +122,35 @@ func admitCandidate(
 	g := &gCopy
 
 	if !ensureAlive(g, n, ka) {
-		return candidate{}, false
+		return candidate{}, false, false
 	}
 	if !ensureFresh(g, n, ka, maxAliveAge, now) {
-		return candidate{}, false
+		return candidate{}, false, false
 	}
 	if cfg.OnlyClean != nil && *cfg.OnlyClean && !cleanIP(g) {
-		return candidate{}, false
+		return candidate{}, false, false
 	}
 	if !probeAllows(n, probeByKey, ka) {
-		return candidate{}, false
+		return candidate{}, false, false
+	}
+	// TLS-intercept gate (owner-ordered safety cut, 2026-11-07): a candidate
+	// whose OWN exit evidence carries MediaUnlocks.Hijack=true is excluded
+	// from selection entirely — its tunnel intercepts TLS (blanket-MITM
+	// across independent endpoints, or exit-DNS TLS intercept), so routing
+	// user traffic through it is never acceptable. The gate joins
+	// probeAllows as the second per-candidate evidence gate (W19
+	// discipline: candidates gated by their OWN evidence, never a
+	// sibling's). Fail-closed in the positive-evidence direction only: no
+	// hijack flag = absence of evidence is not hijack. The geo record
+	// itself stays in the cold base (classification history); render-side
+	// service pools keep their own structural hijack exclusion (blocked ≠
+	// yes, PR #17) — this gate removes the node before any pool sees it.
+	if g.MediaUnlocks.Hijack {
+		return candidate{}, false, true
 	}
 	c := candidate{node: n, rec: g}
 	applyProbeOutcome(&c, n, probeByKey, ka)
-	return c, true
+	return c, true, false
 }
 
 // probeAllows gates candidates by their OWN latest probe result. The
@@ -351,13 +378,18 @@ func pickWithCityTieBreak(
 // pick order. W16: unknown-geo nodes (raw empty country) tag with the xx
 // pseudo-code — pool-xx-NN — keeping the D5 grammar intact; SelectedNode
 // carries the RAW country (""), so the renderer's grouping mirrors resolved
-// geo presence (pool_unknown), not a synthesized code.
-func assignTags(selected []candidate, capApplied int, all []candidate) *model.Selection {
+// geo presence (pool_unknown), not a synthesized code. hijackExcluded is
+// the TLS-intercept exclusion count from candidate collection: it rides the
+// Selection manifest so the drop stays visible after the wave (selection
+// file + select stage log), while the excluded nodes themselves stay absent
+// from Nodes.
+func assignTags(selected []candidate, capApplied int, all []candidate, hijackExcluded int) *model.Selection {
 	seqByCountry := map[string]int{}
 	sel := &model.Selection{
-		GeneratedAt: time.Now().UTC(),
-		CapApplied:  capApplied,
-		CitiesAlive: distinctCities(all),
+		GeneratedAt:    time.Now().UTC(),
+		CapApplied:     capApplied,
+		HijackExcluded: hijackExcluded,
+		CitiesAlive:    distinctCities(all),
 	}
 	for _, c := range selected {
 		seqByCountry[c.rec.Country]++
