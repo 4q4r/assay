@@ -1,7 +1,6 @@
 package geo_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"public_vpn/internal/config"
 	"public_vpn/internal/geo"
 	"public_vpn/internal/model"
 	"public_vpn/internal/store"
@@ -23,9 +23,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// unlockDouble serves EVERY Phase-1 probe URL from one httptest server (a
+// unlockDouble serves EVERY battery probe URL from one httptest server (a
 // single socks relay covers the whole set) and records the hits it saw: the
-// per-exit dedup and the cache-hit contract are asserted on the wire.
+// per-wave battery contract is asserted on the wire.
 type unlockDouble struct {
 	srv      *httptest.Server
 	bodies   map[string]string
@@ -68,14 +68,6 @@ func (d *unlockDouble) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(out))
-}
-
-// setBody swaps one fixture answer between waves (the alive-bypass tests
-// flip the ChatGPT trace from an evidence-less body to a definite one).
-func (d *unlockDouble) setBody(path, body string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.bodies[path] = body
 }
 
 func (d *unlockDouble) endpoints() *geo.UnlockEndpoints {
@@ -137,9 +129,9 @@ func (d *unlockDouble) reset() {
 	d.hits = map[string]int{}
 }
 
-// syncLog is a mutex-guarded Progress capture: reportAll writes the log
-// lines from concurrent per-node goroutines, so a bare strings.Builder
-// would be a data race under -race.
+// syncLog is a mutex-guarded Progress capture: classification runs on
+// concurrent per-node goroutines, so a bare strings.Builder would be a data
+// race under -race.
 type syncLog struct {
 	mu  sync.Mutex
 	buf strings.Builder
@@ -184,200 +176,57 @@ func unlockBodies() map[string]string {
 	}
 }
 
-// unlockInput builds a geo Input with the Phase-1 stage explicitly ON
-// (baseInput's explicit-false fixture overridden — also pins that an
-// explicit true is honored), both nodes sharing ONE exit IP (the dedup
-// contract), and every probe riding the given doubles through the
-// in-process socks relay.
-func unlockInput(t *testing.T, dir string, f geo.Factory, selfURL string, ep *geo.UnlockEndpoints,
-	cache *geo.ExitGeoCache,
-) geo.Input {
+// classifyUnlockInput builds a ClassifyInput whose geo ladder rides the
+// given self-report endpoint double and whose battery rides the given
+// endpoints, through the given test doubles — the merged flow's exact
+// inputs for a hot-instance classification.
+func classifyUnlockInput(t *testing.T, dir string, selfURL string, ep *geo.UnlockEndpoints) geo.ClassifyInput {
 	t.Helper()
-	n1, n2 := node("1", "one.example.com"), node("2", "two.example.com")
-	probes := map[string]store.ProbeResult{
-		n1.Key: liveProbe(n1, "203.0.113.7"),
-		n2.Key: liveProbe(n2, "203.0.113.7"),
+	return geo.ClassifyInput{
+		DataDir: dir,
+		Cfg: config.GeoConfig{
+			Timeout:  config.Duration{Duration: 5 * time.Second},
+			DoHURL:   "https://dns.google/resolve",
+			HTTPSURL: "http://127.0.0.1:1/json", // dead loopback: rung 2 fails fast unless overridden
+		},
+		UserAgent:       "geo-agent/11",
+		SelfURL:         selfURL,
+		UnlockEndpoints: ep,
+		Sleep:           func(context.Context, time.Duration) error { return nil },
 	}
-	in := baseInput(dir, []*model.Node{n1, n2}, probes, f, selfURL)
-	on := true
-	in.Cfg.UnlockProbes = &on
-	in.UnlockEndpoints = ep
-	in.ExitCache = cache
-	return in
 }
 
-// noTraceEvidenceBodies is the dead-tunnel-at-probe-time fixture set: every
-// service answers, but the ChatGPT trace carries no loc evidence — the
-// verdict caches chatgpt=unknown (the production 72/99 shape) with the rest
-// definite.
-func noTraceEvidenceBodies() map[string]string {
-	b := unlockBodies()
-	b["/cdn-cgi/trace"] = "fl=1.1\nip=203.0.113.7\n" // no loc= line → unknown
-	return b
-}
-
-// agedStamp renders an RFC3339 stamp offset from now (test-time aging).
-func agedStamp(offset time.Duration) string {
-	return time.Now().Add(offset).UTC().Format(time.RFC3339)
-}
-
-// ageUnlockCache ages the cached verdict for one exit IP in BOTH halves —
-// the hot entry and every geo-base record carrying the exit — the same
-// dual-half aging the 7-day-expiry contract test uses.
-func ageUnlockCache(t *testing.T, dir string, cache *geo.ExitGeoCache, exitIP string, offset time.Duration) {
+// classifyNodeFlush classifies ONE alive node through the given hot socks
+// endpoint and flushes the wave (per-wave per-alive-node — every test here
+// drives the merged flow's exact path). Returns the persisted records and
+// the wave summary.
+func classifyNodeFlush(
+	t *testing.T, _ string, socksAddr string, n *model.Node, exitIP string, in geo.ClassifyInput,
+) ([]*model.GeoRecord, geo.Summary) {
 	t.Helper()
-	aged := agedStamp(offset)
-	path := filepath.Join(dir, "geo-base.jsonl")
-	recs, err := store.ReadGeo(path)
+	clf := geo.NewClassifier(in)
+	clf.ClassifyNode(context.Background(), n, socksAddr, exitIP)
+	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, exitIP)}
+	recs, sum, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
-	require.NotEmpty(t, recs)
-	for _, r := range recs {
-		if r.IP == exitIP {
-			r.MediaUnlocks.CheckedAt = aged
-		}
-	}
-	require.NoError(t, store.WriteGeo(path, recs))
-	if e, ok := cache.Get(exitIP); ok && e != nil && e.MediaUnlocks != nil {
-		e.MediaUnlocks.CheckedAt = aged
-	}
+	return recs, sum
 }
 
-// TestUnlockAliveBypassReprobesCachedUnknown pins the owner's alive-bypass
-// rule (2026-11-06): when the exit's tunnel demonstrably works in the
-// current wave (the geo ladder's self-report answered through it), a FRESH
-// cached verdict that still carries an unknown media field is bypassed and
-// re-probed — the working tunnel yields a definite answer. A fully definite
-// cached verdict is NEVER bypassed (wave 3: zero re-probes).
-func TestUnlockAliveBypassReprobesCachedUnknown(t *testing.T) {
-	api := newIPAPIDouble(t, documentedSingleSuccess(t))
-	ud := newUnlockDouble(t, noTraceEvidenceBodies())
-	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
-	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2) // two nodes share the exit IP
-	require.Equal(t, model.UnlockUnknown, records[0].MediaUnlocks.ChatGPT,
-		"fixture: wave 1 must cache the dead-tunnel unknown")
-
-	// Age the verdict by an hour (inside the 24h unknown window): the wave-2
-	// re-stamp must then differ from the cached one — RFC3339 has second
-	// precision, so a same-second back-to-back stamp would hide the
-	// re-probe. This also pins the bypass firing through the cold geo-base
-	// half (the geo ladder re-caches the hot entry without verdicts every
-	// wave — the cold half is the serving layer for fresh verdicts).
-	ageUnlockCache(t, dir, cache, "203.0.113.7", -time.Hour)
-
-	// The tunnel works NOW (the self-report just answered through it) and
-	// the cached verdict carries an unknown → the next wave must bypass the
-	// cache and re-probe, flipping unknown→yes.
-	ud.setBody("/cdn-cgi/trace", "fl=1.1\nip=203.0.113.7\nloc=DE\n")
-	ud.reset()
-	records, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
-	assert.Equal(t, 1, ud.hitsOf("/cdn-cgi/trace"),
-		"alive exit + cached unknown = bypass, the wave must re-probe")
-	assert.Equal(t, 1, ud.hitsOf("/premium"),
-		"the bypass re-probe refreshes ALL media fields (one probe pass)")
-	assert.Equal(t, model.UnlockYes, records[0].MediaUnlocks.ChatGPT,
-		"the re-probe through the working tunnel must flip unknown→yes")
-	assert.Equal(t, records[0].MediaUnlocks, records[1].MediaUnlocks,
-		"the flipped verdict lands on every node sharing the exit")
-	assert.NotEqual(t, agedStamp(-time.Hour), records[0].MediaUnlocks.CheckedAt,
-		"the bypassed verdict must be re-stamped, not served from cache")
-
-	// Wave 3 — the verdict is now fully definite: the cache hit stands even
-	// though the exit is alive again (definite verdicts are never bypassed).
-	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Zero(t, ud.totalHits(),
-		"definite cached verdict + alive exit = cache hit, no re-probe")
-}
-
-// TestUnlockDeadExitUnknownStalesAfter24h pins the 24h unknown TTL end to
-// end (owner order 2026-11-06, FIX 2): for an exit that is NOT alive in the
-// current wave (every geo-ladder rung failed hermetically), a cached
-// unknown verdict still serves as a cache hit inside 24h but goes stale at
-// 25h — the wave re-probes instead of serving the week-old dead-tunnel
-// unknown. A definite verdict keeps the 7-day window (pinned by
-// TestFreshUnlock and the existing cache-hit contract).
-func TestUnlockDeadExitUnknownStalesAfter24h(t *testing.T) {
-	// The self-report truth must MATCH the unlock exit key so the cold
-	// geo-base record is keyed by the same IP the unlock cache uses (the
-	// stock fixture answers query=203.0.113.77 — a churned mismatch).
-	body := bytes.ReplaceAll(
-		documentedSingleSuccess(t), []byte("203.0.113.77"), []byte("203.0.113.7"))
-	api := newIPAPIDouble(t, body)
-	ud := newUnlockDouble(t, noTraceEvidenceBodies())
-	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
-	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	// /json/ = the no-param hop the double's failMode shapes; alive waves
-	// serve the healthy body there, dead waves a 503.
-	in.SelfURL = api.URL() + "/json/"
-
-	// Wave 1 — alive (the self-report answers through the tunnel): the
-	// probes cache an unknown-carrying verdict AND anchor the exit IP in the
-	// cold geo-base (production exits earn their cached unknowns while
-	// alive; the tunnel dies afterwards).
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2) // two nodes share the exit IP
-	require.Equal(t, model.UnlockUnknown, records[0].MediaUnlocks.ChatGPT)
-	require.Positive(t, ud.totalHits(), "wave 1 must probe (no cache yet)")
-
-	// 23h old — inside the unknown window: cache hit, zero network calls.
-	ageUnlockCache(t, dir, cache, "203.0.113.7", -23*time.Hour)
-
-	// Waves 2+ — the tunnel is DEAD: drop the hot entry (the geo ladder
-	// reuses it unconditionally — without this it would never dial), the
-	// self-report hop answers 503, and the HTTPS/DoH rungs ride dead
-	// loopbacks (hermetic fail-fast, no real resolver).
-	cache.Delete("203.0.113.7")
-	api.failMode.Store(1)
-	in.Cfg.DoHURL = "http://127.0.0.1:1/resolve"
-
-	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Zero(t, ud.totalHits(), "unknown verdict inside 24h = cache hit")
-
-	// 25h old — past the unknown window: re-probe (the dead exit is not
-	// hammered every wave, but a day-old dead-tunnel unknown must not shield
-	// it for a week either).
-	ageUnlockCache(t, dir, cache, "203.0.113.7", -25*time.Hour)
-	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Positive(t, ud.totalHits(), "unknown verdict past 24h = re-probe")
-}
-
-// TestUnlockProbeThroughTunnel pins the end-to-end happy path: one temp
-// instance per distinct exit, every service probed through the SAME tunnel,
-// the reference headers on the wire, and the verdict folded into BOTH
-// records sharing the exit.
+// TestUnlockProbeThroughTunnel pins the end-to-end happy path: the FULL
+// battery rides the SAME hot tunnel the probe just proved, the reference
+// headers are on the wire, and the verdict folds into the geo record (which
+// lands in geo-base via the flush).
 func TestUnlockProbeThroughTunnel(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	ud := newUnlockDouble(t, unlockBodies())
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 
-	// Exactly one probe set per DISTINCT exit (two nodes share it).
+	// Exactly one probe request per battery endpoint (one node, one pass).
 	assert.Equal(t, 1, ud.hitsOf("/cdn-cgi/trace"))
 	assert.Equal(t, 1, ud.hitsOf("/compliance/cookie_requirements"))
 	assert.Equal(t, 1, ud.hitsOf("/title/81280792"))
@@ -394,7 +243,7 @@ func TestUnlockProbeThroughTunnel(t *testing.T) {
 	assert.Equal(t, 1, ud.hitsOf("/ipapi"))
 	assert.Equal(t, 1, ud.hitsOf("/generate_204"))
 
-	// The verdict lands on every record sharing the exit.
+	// The verdict lands on the record (and persisted through the flush).
 	st := records[0].MediaUnlocks
 	assert.Equal(t, model.UnlockYes, st.ChatGPT)
 	assert.Equal(t, model.UnlockNetflixFull, st.Netflix)
@@ -404,7 +253,6 @@ func TestUnlockProbeThroughTunnel(t *testing.T) {
 	checkedAt, perr := time.Parse(time.RFC3339, st.CheckedAt)
 	require.NoError(t, perr, "CheckedAt must be an RFC3339 stamp")
 	assert.LessOrEqual(t, time.Since(checkedAt), time.Minute)
-	assert.Equal(t, st, records[1].MediaUnlocks)
 
 	// v2 battery evidence contract: the echo consensus pinned the exit
 	// (3 agree, one /24, no rotation), the cftrace evidence fields ride,
@@ -450,104 +298,25 @@ func TestUnlockProbeThroughTunnel(t *testing.T) {
 	assert.Contains(t, ud.bodyOf("/graph/v1/device/graphql"), `"refreshToken":"RT-1"`)
 }
 
-// TestUnlockCacheHitZeroNetworkCalls is the spec'd cache contract: the
-// repeat check of the SAME exit IP inside the 7-day window costs ZERO
-// network calls — hot cache first, then the geo-base.jsonl cold half — and
-// an expired verdict re-probes.
-func TestUnlockCacheHitZeroNetworkCalls(t *testing.T) {
+// TestUnlockBatteryRunsEveryAliveWave pins the per-wave contract at the
+// battery level: two consecutive waves each run the FULL battery for the
+// alive node — no cache, no freshness gate (the self-report side of this
+// contract is pinned by TestClassifyPerWaveFreshnessGateGone).
+func TestUnlockBatteryRunsEveryAliveWave(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	ud := newUnlockDouble(t, unlockBodies())
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+	n := node()
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
-	freshCheckedAt := records[0].MediaUnlocks.CheckedAt
-	require.NotEmpty(t, freshCheckedAt)
-	firstWave := ud.totalHits()
-	require.Positive(t, firstWave, "the first wave must probe")
-
-	// Wave 2 — hot cache hit: zero unlock network calls, same verdict.
-	ud.reset()
-	records, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
-	assert.Equal(t, 0, ud.totalHits(), "fresh hot entry = zero network calls")
-	assert.Equal(t, freshCheckedAt, records[0].MediaUnlocks.CheckedAt)
-	assert.Equal(t, model.UnlockYes, records[0].MediaUnlocks.ChatGPT)
-
-	// Wave 3 — expired everywhere (hot entry + geo-base): re-probe.
-	aged := time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	path := filepath.Join(dir, "geo-base.jsonl")
-	recs, rerr := store.ReadGeo(path)
-	require.NoError(t, rerr)
-	require.NotEmpty(t, recs)
-	for _, r := range recs {
-		r.MediaUnlocks.CheckedAt = aged
+	for range 2 {
+		_, _ = classifyNodeFlush(t, dir, socks.Addr(), n, "198.51.100.7", in)
 	}
-	require.NoError(t, store.WriteGeo(path, recs))
-	e, ok := cache.Get("203.0.113.7")
-	require.True(t, ok)
-	require.NotNil(t, e.MediaUnlocks)
-	e.MediaUnlocks.CheckedAt = aged
-	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Equal(t, firstWave, ud.totalHits(), "expired verdict re-probes every service")
-}
-
-// TestUnlockStageExplicitDisabled pins the opt-out contract: an EXPLICIT
-// unlock_probes = false (baseInput's fixture — the production default
-// flipped ON by the owner ruling 2026-11-06) keeps the stage off: zero
-// probe requests, every Phase-1 field stays unchecked.
-func TestUnlockStageExplicitDisabled(t *testing.T) {
-	api := newIPAPIDouble(t, documentedSingleSuccess(t))
-	ud := newUnlockDouble(t, unlockBodies())
-	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
-	n1 := node("1", "one.example.com")
-	probes := map[string]store.ProbeResult{n1.Key: liveProbe(n1, "203.0.113.7")}
-	in := baseInput(t.TempDir(), []*model.Node{n1}, probes, f, api.URL())
-	require.NotNil(t, in.Cfg.UnlockProbes)
-	require.False(t, *in.Cfg.UnlockProbes, "baseInput carries the explicit-false fixture")
-	in.UnlockEndpoints = ud.endpoints()
-	in.ExitCache = geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 1)
-	assert.Zero(t, ud.totalHits(), "stage off = zero probe requests")
-	assert.Equal(t, -1, records[0].RiskScore)
-	assert.Empty(t, records[0].IPType)
-	assert.Empty(t, records[0].MediaUnlocks)
-}
-
-// TestUnlockStageNilKnobEnabled pins the accessor's nil branch end to end:
-// a hand-built config that never went through applyDefaults (knob nil — the
-// absent case) runs the stage, exactly like a loaded config with the key
-// absent (applyGeoDefaults materializes true). This is what keeps
-// hand-built and loaded configs in agreement after the default flip.
-func TestUnlockStageNilKnobEnabled(t *testing.T) {
-	api := newIPAPIDouble(t, documentedSingleSuccess(t))
-	ud := newUnlockDouble(t, unlockBodies())
-	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
-	n1 := node("1", "one.example.com")
-	probes := map[string]store.ProbeResult{n1.Key: liveProbe(n1, "203.0.113.7")}
-	in := baseInput(t.TempDir(), []*model.Node{n1}, probes, f, api.URL())
-	in.Cfg.UnlockProbes = nil // absent: the pre-defaults shape a loaded config materializes to true
-	in.UnlockEndpoints = ud.endpoints()
-	in.ExitCache = geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 1)
-	assert.Positive(t, ud.totalHits(), "absent knob = stage on")
-	assert.NotEmpty(t, records[0].MediaUnlocks)
+	assert.Equal(t, 2, ud.hitsOf("/cdn-cgi/trace"),
+		"per-wave classification: both waves run the full battery")
+	assert.Equal(t, 2, ud.hitsOf("/generate_204"),
+		"the tunnel-alive gate fires on every wave too")
 }
 
 // TestUnlockParsers tables the pure probe parsers/classifiers against the
@@ -693,131 +462,6 @@ func TestUnlockParsers(t *testing.T) {
 	})
 }
 
-// TestComputeIPQuality tables the evidence→verdict mapping (spec formulas).
-func TestComputeIPQuality(t *testing.T) {
-	widget := func(json string) *geo.IPInfoWidget {
-		t.Helper()
-		w, err := geo.ParseIPInfoWidget(json)
-		require.NoError(t, err)
-		return w
-	}
-	ipAPIHosting := &geo.Response{Status: "success", Proxy: false, Hosting: true, Mobile: false}
-	ipAPIClean := &geo.Response{Status: "success", Proxy: false, Hosting: false, Mobile: false}
-	ipAPIProxy := &geo.Response{Status: "success", Proxy: true, Hosting: false, Mobile: false}
-
-	tests := []struct {
-		name                 string
-		g                    *geo.Response
-		widgetJSON           string
-		wantType             string
-		wantRisk             int
-		residential, hosting bool
-		proxy, mobile        bool
-	}{
-		{"no evidence", nil, "", "", 0, false, false, false, false},
-		{"ip-api hosting only", ipAPIHosting, "", model.IPTypeDataCenter, 25, false, true, false, false},
-		{"ip-api proxy", ipAPIProxy, "", model.IPTypeUnknown, 70, false, false, true, false},
-		{"ip-api clean, no widget", ipAPIClean, "", model.IPTypeUnknown, 0, false, false, false, false},
-		{"widget isp residential", ipAPIClean, `{"data":{"asn":{"type":"isp"}}}`,
-			model.IPTypeResidential, 0, true, false, false, false},
-		{"widget mobile residential", ipAPIClean, `{"data":{"is_mobile":true}}`,
-			model.IPTypeMobile, 0, true, false, false, true},
-		{"widget privacy vpn = proxy", ipAPIClean, `{"data":{"privacy":{"vpn":true}}}`,
-			model.IPTypeUnknown, 70, false, false, true, false},
-		{"widget hosting upgrades", ipAPIClean, `{"data":{"asn":{"type":"hosting"}}}`,
-			model.IPTypeDataCenter, 25, false, true, false, false},
-		{"widget business type", ipAPIClean, `{"data":{"asn":{"type":"business"}}}`,
-			model.IPTypeBusiness, 0, false, false, false, false},
-		{"proxy keeps network type", ipAPIHosting, `{"data":{"privacy":{"proxy":true}}}`,
-			model.IPTypeDataCenter, 70, false, true, true, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			var w *geo.IPInfoWidget
-			if tc.widgetJSON != "" {
-				w = widget(tc.widgetJSON)
-			}
-			q := geo.ComputeIPQuality(tc.g, w)
-			if tc.g == nil && tc.widgetJSON == "" {
-				assert.Nil(t, q, "no evidence = no verdict")
-				return
-			}
-			require.NotNil(t, q)
-			assert.Equal(t, tc.wantType, q.IPType)
-			assert.Equal(t, tc.wantRisk, q.RiskScore)
-			assert.Equal(t, tc.residential, q.IsResidential)
-			assert.Equal(t, tc.hosting, q.IsHosting)
-			assert.Equal(t, tc.proxy, q.IsProxy)
-			assert.Equal(t, tc.mobile, q.IsMobile)
-			assert.Equal(t, -1, q.ScamalyticsScore, "Phase 1 probes no Scamalytics source")
-			assert.Equal(t, -1, q.AbuseScore, "Phase 1 probes no AbuseIPDB source")
-		})
-	}
-}
-
-// TestRiskBands pins the exact spec ranges and the reference thresholds.
-func TestRiskBands(t *testing.T) {
-	t.Run("ComputeRiskScore", func(t *testing.T) {
-		tests := []struct {
-			name           string
-			proxy, hosting bool
-			abuse          float64
-			want           int
-		}{
-			{"clean", false, false, 0, 0},
-			{"clean worst abuse", false, false, 1, 15},
-			{"hosting", false, true, 0, 25},
-			{"hosting worst abuse", false, true, 1, 40},
-			{"proxy", true, false, 0, 70},
-			{"proxy worst abuse", true, false, 1, 100},
-			{"proxy clamps abuse", true, false, 2, 100},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				assert.Equal(t, tc.want, geo.ComputeRiskScore(tc.proxy, tc.hosting, tc.abuse))
-			})
-		}
-	})
-
-	t.Run("BandScore", func(t *testing.T) {
-		tests := []struct {
-			name       string
-			score      int
-			thresholds []int
-			want       float64
-		}{
-			{"below first", 19, []int{20, 60, 90}, 0},
-			{"middle", 59, []int{20, 60, 90}, 0.5},
-			{"high", 89, []int{20, 60, 90}, 0.75},
-			{"top", 90, []int{20, 60, 90}, 1},
-			{"two thresholds top out at 0.75", 75, []int{25, 75}, 0.75},
-			{"two thresholds mid", 24, []int{25, 75}, 0},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				assert.InDelta(t, tc.want, geo.BandScore(tc.score, tc.thresholds), 1e-9)
-			})
-		}
-	})
-
-	t.Run("WorstAbuse", func(t *testing.T) {
-		assert.InDelta(t, 0.0, geo.WorstAbuse(-1, -1, -1), 1e-9, "nothing checked = 0")
-		assert.InDelta(t, 1.0, geo.WorstAbuse(95, -1, -1), 1e-9, "scamalytics ≥90")
-		assert.InDelta(t, 0.75, geo.WorstAbuse(-1, 80, -1), 1e-9, "abuseipdb ≥75")
-		assert.InDelta(t, 1.0, geo.WorstAbuse(-1, -1, 92), 1e-9, "ipqs ≥90")
-		assert.InDelta(t, 1.0, geo.WorstAbuse(10, -1, 92), 1e-9, "worst of present wins")
-	})
-
-	t.Run("composite", func(t *testing.T) {
-		abuse := geo.WorstAbuse(95, -1, -1)
-		assert.Equal(t, 100, geo.ComputeRiskScore(true, false, abuse))
-		assert.Equal(t, 40, geo.ComputeRiskScore(false, true, abuse))
-	})
-}
-
-// deadAliveEndpoints blanks the tunnel-alive endpoints: both OS
-// connectivity checks answer 404, so the gate must judge the tunnel dead
-// and the battery must skip the rest of the probe set.
 func deadAliveEndpoints(d *unlockDouble) *geo.UnlockEndpoints {
 	ep := d.endpoints()
 	ep.AlivePrimary = d.srv.URL + "/alive-dead-1"
@@ -829,9 +473,7 @@ func deadAliveEndpoints(d *unlockDouble) *geo.UnlockEndpoints {
 // (the poisoned-verdict kill): a self-signed TLS fixture is what a MITM
 // exit presents, and the production path validates certificates against
 // the SYSTEM pool — every HTTPS probe fails validation, the exit is
-// hijack-flagged, and the media verdicts are BLOCKED (never yes/full, the
-// v1 battery's false-positive class). blocked answers are definite → the
-// verdict caches 7 days honestly.
+// flagged hijack, and EVERY media verdict lands blocked (never yes).
 func TestUnlockHijackTLSCertBlockedNotYes(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -848,12 +490,10 @@ func TestUnlockHijackTLSCertBlockedNotYes(t *testing.T) {
 	defer srv.Close()
 
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
 	u := srv.URL
-	in := unlockInput(t, dir, f, api.URL(), &geo.UnlockEndpoints{
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", &geo.UnlockEndpoints{
 		ChatGPCTrace:      u + "/cdn-cgi/trace",
 		ChatGPTCompliance: u + "/compliance/cookie_requirements",
 		NetflixTitleA:     u + "/title/81280792",
@@ -871,11 +511,10 @@ func TestUnlockHijackTLSCertBlockedNotYes(t *testing.T) {
 		IPAPIContract:     u + "/ipapi",
 		AlivePrimary:      u + "/generate_204",
 		AliveFallback:     u + "/connecttest.txt",
-	}, cache)
+	})
 
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	require.NotEmpty(t, st.CheckedAt, "the battery ran (the TLS answers prove a live tunnel)")
 	assert.True(t, st.Hijack, "a self-signed cert through the tunnel = the hijack class")
@@ -900,14 +539,11 @@ func TestUnlockIPAPIBodyContractHijack(t *testing.T) {
 	bodies["/ipapi"] = `{"err":true}` // the fake 24-byte answer: no query field
 	ud := newUnlockDouble(t, bodies)
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.True(t, st.Hijack, "a contract-breaking ip-api answer = the hijack/garbage class")
 	assert.Equal(t, model.UnlockBlocked, st.ChatGPT, "media verdicts are forced blocked")
@@ -932,14 +568,11 @@ func TestUnlockPlaintextOnTLSHijack(t *testing.T) {
 	ep := ud.endpoints()
 	ep.CFTrace = "https://" + strings.TrimPrefix(ud.srv.URL, "http://") + "/cftrace"
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ep, cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.True(t, st.Hijack, "plaintext where TLS was mandated = the hijack class")
 	assert.Equal(t, model.UnlockBlocked, st.ChatGPT)
@@ -957,14 +590,11 @@ func TestUnlockEchoRotatingNoPin(t *testing.T) {
 	bodies["/ipsb"] = "198.52.100.10\n"
 	ud := newUnlockDouble(t, bodies)
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.True(t, st.Rotating, "echo IPs across three /24s = rotating")
 	assert.Empty(t, st.ExitIP, "a rotating exit pins no single IP as its identity")
@@ -984,14 +614,11 @@ func TestUnlockEchoMajorityPinsMinorityNoted(t *testing.T) {
 	bodies["/ipsb"] = "203.0.113.7\n"
 	ud := newUnlockDouble(t, bodies)
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.Equal(t, "203.0.113.7", st.ExitIP, "the majority pins the exit IP")
 	assert.Equal(t, 2, st.ConsensusCount)
@@ -1039,17 +666,13 @@ func TestUnlockRetryOKFlaky(t *testing.T) {
 		orig.ServeHTTP(w, r)
 	})
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	in.Sleep = func(context.Context, time.Duration) error { return nil } // no real stagger waits
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
 	var log syncLog
 	in.Progress = &log // the evidence tail carries the OK_FLAKY counter pin
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.Equal(t, "DE", st.YouTubeRegion,
 		"the retry recovered the premium answer — the verdict stands (OK_FLAKY)")
@@ -1067,20 +690,18 @@ func TestUnlockRetryOKFlaky(t *testing.T) {
 // the OS connectivity-check endpoints are the battery's FIRST probe — a
 // tunnel failing both (after the retry-once wrapper) is dead-now, the rest
 // of the battery is skipped entirely (no media/echo requests), and the
-// verdict is the honest all-unknown with a fresh stamp.
+// verdict is the honest all-unknown with a fresh stamp. The merged flow
+// records that honest unknown (the wave does not fail; the next wave
+// re-classifies).
 func TestUnlockTunnelAliveGateSkipsDeadBattery(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	ud := newUnlockDouble(t, unlockBodies())
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), deadAliveEndpoints(ud), cache)
-	in.Sleep = func(context.Context, time.Duration) error { return nil }
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", deadAliveEndpoints(ud))
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	require.NotEmpty(t, st.CheckedAt, "the alive check ran and is stamped honestly")
 	assert.Equal(t, model.UnlockUnknown, st.ChatGPT)
@@ -1096,60 +717,44 @@ func TestUnlockTunnelAliveGateSkipsDeadBattery(t *testing.T) {
 	assert.Equal(t, 1, ud.hitsOf("/alive-dead-2"))
 }
 
-// TestUnlockMigrationV1DefiniteStaleReprobed pins the battery_version
-// migration: a fresh cached DEFINITE verdict stamped by battery v1 (the
-// pre-hijack-detector era — possibly poisoned) is STALE under battery v2
-// regardless of its age, gets re-probed exactly once, and the v2 verdict
-// then serves its normal window (zero hits on the follow-up wave).
-func TestUnlockMigrationV1DefiniteStaleReprobed(t *testing.T) {
+// TestUnlockMigrationV1VerdictRefreshed pins the battery-version contract in
+// the merged flow: the stored verdict ALWAYS carries the current battery
+// version, and every alive wave re-classifies — so a v1-stamped (poisoned-
+// era) verdict on the cold record is overwritten by the fresh v2 verdict on
+// the very next alive wave (freshUnlock still rejects pre-current verdicts
+// as a DATA contract — pinned by TestFreshUnlockBatteryMigration; the
+// merged flow has no cache that could serve them).
+func TestUnlockMigrationV1VerdictRefreshed(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	ud := newUnlockDouble(t, unlockBodies())
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
+	n := node()
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
 
-	in := unlockInput(t, dir, f, api.URL(), ud.endpoints(), cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), n, "203.0.113.7", in)
+	require.Len(t, records, 1)
 	require.Equal(t, geo.UnlockBatteryVersion, records[0].MediaUnlocks.BatteryVersion)
-	firstWave := ud.totalHits()
-	require.Positive(t, firstWave)
 
-	// Downgrade the cached verdict to battery v1 (fresh definite — exactly
-	// the poisoned-chatgpt=yes shape the migration must not serve), in both
-	// the hot cache and the cold geo-base half.
-	downgradeToV1 := func() {
-		path := filepath.Join(dir, "geo-base.jsonl")
-		recs, rerr := store.ReadGeo(path)
-		require.NoError(t, rerr)
-		for _, r := range recs {
-			r.MediaUnlocks.BatteryVersion = 1
-		}
-		require.NoError(t, store.WriteGeo(path, recs))
-		e, ok := cache.Get("203.0.113.7")
-		require.True(t, ok)
-		require.NotNil(t, e.MediaUnlocks)
-		e.MediaUnlocks.BatteryVersion = 1
+	// Downgrade the PERSISTED verdict to battery v1 (the poisoned-era shape
+	// the migration semantics must never serve again).
+	path := filepath.Join(dir, "geo-base.jsonl")
+	recs, rerr := store.ReadGeo(path)
+	require.NoError(t, rerr)
+	for _, r := range recs {
+		r.MediaUnlocks.BatteryVersion = 1
 	}
-	downgradeToV1()
-	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
-	assert.Equal(t, firstWave, ud.totalHits(),
-		"a battery-v1 definite verdict is stale under v2 — the full battery re-ran (the migration sweep)")
+	require.NoError(t, store.WriteGeo(path, recs))
 
-	// The re-probe rewrote the verdict at the current battery version: the
-	// next wave is a clean cache hit.
+	// The next alive wave re-runs the battery (per-wave classification) and
+	// the record carries the current battery version again.
 	ud.reset()
-	_, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Zero(t, ud.totalHits(), "battery-v2 definite verdict = normal cache hit")
-	records, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	assert.Equal(t, geo.UnlockBatteryVersion, records[0].MediaUnlocks.BatteryVersion)
+	records, _ = classifyNodeFlush(t, dir, socks.Addr(), n, "203.0.113.7", in)
+	require.Len(t, records, 1)
+	assert.Positive(t, ud.totalHits(),
+		"per-wave classification: the battery re-ran regardless of the stored verdict")
+	assert.Equal(t, geo.UnlockBatteryVersion, records[0].MediaUnlocks.BatteryVersion,
+		"the refreshed verdict carries the current battery version")
 }
 
 // dnsTCPFixture is a minimal framed DNS-over-TCP test server: it verifies
@@ -1256,7 +861,7 @@ func buildDNSTXTAnswer(ip string, rcode int, withAnswer bool) []byte {
 
 // TestUnlockDNSChannelRecorded pins the DNS-authoritative second channel
 // (item 4): TXT o-o.myaddr.l.google.com queried over FRAMED TCP through the
-// tunnel; the parsed TXT IP lands as dns_ip evidence. A failing DNS
+// hot tunnel; the parsed TXT IP lands as dns_ip evidence. A failing DNS
 // channel (port-53 egress filtering) is recorded non-fatally — the verdict
 // stands without it.
 func TestUnlockDNSChannelRecorded(t *testing.T) {
@@ -1267,14 +872,11 @@ func TestUnlockDNSChannelRecorded(t *testing.T) {
 	ep.DNSServer = fx.ln.Addr().String()
 	ep.DNSName = "o-o.myaddr.l.google.com"
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
 
-	in := unlockInput(t, dir, f, api.URL(), ep, cache)
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
 	st := records[0].MediaUnlocks
 	assert.Equal(t, "198.51.100.53", st.DNSIP, "the authoritative TXT echo is dns_ip evidence")
 	require.NotNil(t, fx.lastQ.Load())
@@ -1287,14 +889,41 @@ func TestUnlockDNSChannelRecorded(t *testing.T) {
 	fx2 := newDNSTCPFixture(t, []byte{0xFF, 0xFF, 0x00}) // garbage frame
 	ep2 := ud.endpoints()
 	ep2.DNSServer = fx2.ln.Addr().String()
-	cache2 := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-	in = unlockInput(t, dir, f, api.URL(), ep2, cache2)
-	records, _, err = geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 2)
+	in2 := classifyUnlockInput(t, dir, api.URL()+"/json/", ep2)
+	records, _ = classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in2)
+	require.Len(t, records, 1)
 	assert.Empty(t, records[0].MediaUnlocks.DNSIP)
 	assert.Equal(t, model.UnlockYes, records[0].MediaUnlocks.ChatGPT,
 		"a failed DNS channel never degrades the verdict")
+}
+
+// TestUnlockStunHysteriaRecorded pins the STUN channel (item 6) end to end:
+// a hysteria2 node's battery carries an RFC 5389 Binding through the socks
+// UDP path (the hysteria instances are the only ones whose socks inbound
+// enables UDP), and the decoded XOR-MAPPED-ADDRESS lands as stun_ip
+// evidence. Failure is recorded non-fatally: a vless node's battery never
+// sends a Binding at all.
+func TestUnlockStunHysteriaRecorded(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	fx := newGeoStunFixture(t, [4]byte{198, 51, 100, 99}, 3478)
+	ep := ud.endpoints()
+	ep.STUNServer = fx.addr()
+	socks := newSocksServer(t)
+	dir := t.TempDir()
+
+	// One hysteria2 node (the STUN rider) — the per-node battery shape.
+	h := model.NewNode("stunsrc", "hysteria2", "stun-cred", "stun.example.com", 443, nil)
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), h, "203.0.113.7", in)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, "198.51.100.99", st.StunIP,
+		"the hysteria2 node's battery carries the STUN echo as stun_ip evidence")
+	require.NotNil(t, fx.gotRequest(), "the Binding request rode the socks UDP path")
+	require.Len(t, fx.gotRequest(), 20, "the Binding request is the 20-byte header shape")
+	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "STUN is additive evidence, never a verdict gate")
 }
 
 // geoStunFixture is a minimal UDP "STUN" server: it captures the Binding
@@ -1354,43 +983,4 @@ func (fx *geoStunFixture) gotRequest() []byte {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 	return fx.request
-}
-
-// TestUnlockStunHysteriaRecorded pins the STUN channel (item 6) end to end:
-// a hysteria2 node's battery carries an RFC 5389 Binding through the socks
-// UDP path (the hysteria instances are the only ones whose socks inbound
-// enables UDP), and the decoded XOR-MAPPED-ADDRESS lands as stun_ip
-// evidence. Failure is recorded non-fatally: a vless node's battery never
-// sends a Binding at all.
-func TestUnlockStunHysteriaRecorded(t *testing.T) {
-	api := newIPAPIDouble(t, documentedSingleSuccess(t))
-	ud := newUnlockDouble(t, unlockBodies())
-	fx := newGeoStunFixture(t, [4]byte{198, 51, 100, 99}, 3478)
-	ep := ud.endpoints()
-	ep.STUNServer = fx.addr()
-	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
-	dir := t.TempDir()
-	cache := geo.NewExitGeoCache(geo.ExitCacheConfig{TTL: time.Hour, MaxEntries: 16})
-
-	// One hysteria2 node (the STUN rider) — the single-node shape keeps the
-	// UDP relay state machine serial.
-	h := model.NewNode("stunsrc", "hysteria2", "stun-cred", "stun.example.com", 443, nil)
-	probes := map[string]store.ProbeResult{h.Key: liveProbe(h, "203.0.113.7")}
-	in := baseInput(dir, []*model.Node{h}, probes, f, api.URL())
-	on := true
-	in.Cfg.UnlockProbes = &on
-	in.UnlockEndpoints = ep
-	in.ExitCache = cache
-
-	records, _, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
-	require.Len(t, records, 1)
-	st := records[0].MediaUnlocks
-	assert.Equal(t, "198.51.100.99", st.StunIP,
-		"the hysteria2 node's battery carries the STUN echo as stun_ip evidence")
-	require.NotNil(t, fx.gotRequest(), "the Binding request rode the socks UDP path")
-	require.Len(t, fx.gotRequest(), 20, "the Binding request is the 20-byte header shape")
-	assert.Equal(t, geo.UnlockBatteryVersion, st.BatteryVersion)
-	assert.Equal(t, model.UnlockYes, st.ChatGPT, "STUN is additive evidence, never a verdict gate")
 }

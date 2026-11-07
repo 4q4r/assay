@@ -34,7 +34,6 @@ func New() *cobra.Command {
 		newParseCommand(&cfgPath),
 		newFilterCommand(&cfgPath),
 		newProbeCommand(&cfgPath),
-		newGeoCommand(&cfgPath),
 		newSelectCommand(&cfgPath),
 		newRenderCommand(&cfgPath),
 		newActivateCommand(&cfgPath),

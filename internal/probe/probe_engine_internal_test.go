@@ -602,3 +602,232 @@ func TestSkipFreshSkippedNodeKeepsHistory(t *testing.T) {
 	assert.NotContains(t, got, nodes[0].Key, "a skipped node must not gain a synthetic (dead) record")
 	assert.Contains(t, got, nodes[1].Key)
 }
+
+// classifyRecorder records the classifier hook's calls and a monotonic
+// sequence shared with the fixture instance's Close — the ordering pin
+// (classification happens BEFORE the teardown).
+type classifyRecorder struct {
+	mu    sync.Mutex
+	calls []string // "key@addr=exitIP"
+	seq   int
+	close int
+}
+
+func (c *classifyRecorder) classifier() ClassifyFunc {
+	return func(_ context.Context, n *model.Node, addr string, exitIP string) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.seq++
+		c.calls = append(c.calls, n.Key+"@"+addr+"="+exitIP)
+	}
+}
+
+func (c *classifyRecorder) noteClose() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.close = c.seq + 1
+	c.seq = c.close
+}
+
+func (c *classifyRecorder) got() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+func (c *classifyRecorder) classifiedBeforeClose() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls) > 0 && c.seq >= c.close && c.close >= 1
+}
+
+// closingBatchInstance sequences its Close against the recorder.
+type closingBatchInstance struct {
+	fakeBatchInstance
+
+	rec *classifyRecorder
+}
+
+func (f *closingBatchInstance) Close() error {
+	f.rec.noteClose()
+	return f.fakeBatchInstance.Close()
+}
+
+// TestClassificationRidesHotBatchInstance pins the merged flow (owner order
+// 2026-11-07 «сразу на чеке»): every ALIVE node of a batch is classified
+// through the SAME hot instance address its probe just used, BEFORE the
+// batch instance is torn down, carrying the probe's D8 exit IP — and the
+// classification's own traffic demonstrably rides that same socks port (the
+// battery-hits-on-the-wire pin). Dead nodes never reach the classifier.
+func TestClassificationRidesHotBatchInstance(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	echoURL := exitIPEcho(t, "5.6.7.8")
+	socks.addRoute(strings.TrimPrefix(echoURL, "http://"), strings.TrimPrefix(echoURL, "http://"))
+
+	aliveA, aliveB, dead := node(t, "alive-a"), node(t, "alive-b"), node(t, "dead-x")
+	nodes := []*model.Node{aliveA, aliveB, dead}
+	rec := &classifyRecorder{}
+
+	// The batch factory hands every batch node the socks endpoint its probe
+	// will use — alive nodes the working relay, the dead node a refusing
+	// endpoint (a dead tunnel) — and sequences Close against the recorder.
+	factory := func(_ context.Context, batch []*model.Node) (BatchSocksInstance, error) {
+		addrs := make([]string, len(batch))
+		for i, bn := range batch {
+			if bn.Key == dead.Key {
+				addrs[i] = "127.0.0.1:1" // dead tunnel: every attempt dial-fails
+				continue
+			}
+			addrs[i] = socks.Addr()
+		}
+		return &closingBatchInstance{fakeBatchInstance{addrs: addrs}, rec}, nil
+	}
+
+	opts := baseOpts(site.URL, echoURL)
+	opts.Threads = 1
+	opts.BatchSize = 10
+	opts.BatchConcurrency = 8
+	opts.Attempts = 1
+	// ExitProbe stays nil = ON: the D8 anchor rides to the classifier.
+	opts.Classifier = rec.classifier()
+
+	out, err := RunWithBatchFactory(context.Background(), nodes, nil, factory, opts, "")
+	require.NoError(t, err)
+	require.Len(t, out, 3)
+	alive, deadCount := 0, 0
+	for _, r := range out {
+		if r.Alive {
+			alive++
+			assert.Equal(t, "5.6.7.8", r.ExitIP)
+		} else {
+			deadCount++
+		}
+	}
+	require.Equal(t, 2, alive, "fixture sanity: two alive nodes")
+	require.Equal(t, 1, deadCount, "fixture sanity: the dead node fails")
+
+	calls := rec.got()
+	require.Len(t, calls, 2, "exactly the ALIVE nodes are classified — the dead node is not")
+	byKey := map[string]string{}
+	for _, call := range calls {
+		parts := strings.SplitN(call, "@", 2)
+		byKey[parts[0]] = parts[1]
+	}
+	for _, n := range []*model.Node{aliveA, aliveB} {
+		got, ok := byKey[n.Key]
+		require.True(t, ok, "alive node %s classified", n.Key)
+		addrIP := strings.SplitN(got, "=", 2)
+		assert.Equal(t, socks.Addr(), addrIP[0],
+			"classification rides the SAME hot instance address the probe used")
+		assert.Equal(t, "5.6.7.8", addrIP[1], "the classifier carries the probe's D8 exit IP")
+	}
+	assert.NotContains(t, byKey, dead.Key, "the dead node is never classified")
+	assert.True(t, rec.classifiedBeforeClose(),
+		"classification happened BEFORE the batch instance teardown")
+	assert.Positive(t, socks.Connects.Load(), "probe traffic rode the tunnel seam")
+}
+
+// TestClassifierNilIsProbeOnly pins the escape hatch at the engine level: a
+// nil Classifier means a probe-only wave — outcomes byte-identical to a
+// classified run of the same wave.
+func TestClassifierNilIsProbeOnly(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	echoURL := exitIPEcho(t, "5.6.7.8")
+	socks.addRoute(strings.TrimPrefix(echoURL, "http://"), strings.TrimPrefix(echoURL, "http://"))
+	nodes := halvingNodes(t, "parity", 5)
+
+	run := func(withClassifier bool) []store.ProbeResult {
+		rec := &classifyRecorder{}
+		factory := func(_ context.Context, batch []*model.Node) (BatchSocksInstance, error) {
+			addrs := make([]string, len(batch))
+			for i := range addrs {
+				addrs[i] = socks.Addr()
+			}
+			return &fakeBatchInstance{addrs: addrs}, nil
+		}
+		opts := baseOpts(site.URL, echoURL)
+		opts.Threads = 1
+		opts.BatchSize = 10
+		opts.BatchConcurrency = 8
+		opts.Attempts = 1
+		if withClassifier {
+			opts.Classifier = rec.classifier()
+		}
+		out, err := RunWithBatchFactory(context.Background(), nodes, nil, factory, opts, "")
+		require.NoError(t, err)
+		return out
+	}
+	plain := run(false)
+	classified := run(true)
+	require.Len(t, plain, len(classified))
+	for i := range plain {
+		assert.Equal(t, plain[i].Alive, classified[i].Alive, "probe outcome %d unchanged", i)
+		assert.Equal(t, plain[i].Status, classified[i].Status, "probe status %d unchanged", i)
+		assert.Equal(t, plain[i].ExitIP, classified[i].ExitIP, "probe exit IP %d unchanged", i)
+		assert.Equal(t, plain[i].FailureKind, classified[i].FailureKind, "probe failure class %d unchanged", i)
+	}
+}
+
+// TestClassifierRunsOnSingleNodeFactoryPath pins the same contract on the
+// non-batch path: the hook fires with the single-node instance's address,
+// before its teardown.
+func TestClassifierRunsOnSingleNodeFactoryPath(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	echoURL := exitIPEcho(t, "5.6.7.8")
+	socks.addRoute(strings.TrimPrefix(echoURL, "http://"), strings.TrimPrefix(echoURL, "http://"))
+	n := node(t, "single")
+	rec := &classifyRecorder{}
+
+	opts := baseOpts(site.URL, echoURL)
+	opts.Attempts = 1
+	opts.Classifier = rec.classifier()
+
+	out, err := Run(context.Background(), []*model.Node{n}, tunnelFactory(socks.Addr()), opts, "")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.True(t, out[0].Alive, "fixture sanity: the node is alive")
+	calls := rec.got()
+	require.Len(t, calls, 1)
+	parts := strings.SplitN(calls[0], "@", 2)
+	assert.Equal(t, n.Key, parts[0])
+	assert.Equal(t, socks.Addr(), strings.SplitN(parts[1], "=", 2)[0],
+		"the single-node path classifies through the SAME hot instance")
+	assert.True(t, strings.HasSuffix(parts[1], "=5.6.7.8"), "the exit IP rides along")
+}
+
+// TestClassificationSkippedWhenWaveContextDead pins the shutdown contract: a
+// canceled wave context skips the classification pass entirely (the
+// adaptive layer re-decides the batch; the next wave re-classifies) — no
+// battery is started against a dying context.
+func TestClassificationSkippedWhenWaveContextDead(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	echoURL := exitIPEcho(t, "5.6.7.8")
+	socks.addRoute(strings.TrimPrefix(echoURL, "http://"), strings.TrimPrefix(echoURL, "http://"))
+	nodes := halvingNodes(t, "ctxdead", 3)
+	rec := &classifyRecorder{}
+
+	factory := func(_ context.Context, batch []*model.Node) (BatchSocksInstance, error) {
+		addrs := make([]string, len(batch))
+		for i := range addrs {
+			addrs[i] = socks.Addr()
+		}
+		return &fakeBatchInstance{addrs: addrs}, nil
+	}
+	opts := baseOpts(site.URL, echoURL)
+	opts.Threads = 1
+	opts.BatchSize = 10
+	opts.BatchConcurrency = 8
+	opts.Attempts = 1
+	opts.Classifier = rec.classifier()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // dead before the wave starts: every phase skips
+	out, err := RunWithBatchFactory(ctx, nodes, nil, factory, opts, "")
+	require.NoError(t, err)
+	require.Len(t, out, 3)
+	assert.Empty(t, rec.got(), "a dead context never starts the classification pass")
+}

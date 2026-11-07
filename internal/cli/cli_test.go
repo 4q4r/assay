@@ -71,9 +71,11 @@ func TestCommandTreeCompletes(t *testing.T) {
 	for _, c := range root.Commands() {
 		names[c.Name()] = true
 	}
-	for _, want := range []string{"fetch", "parse", "filter", "probe", "geo", "select", "render", "activate", "status", "maintain"} {
+	for _, want := range []string{"fetch", "parse", "filter", "probe", "select", "render", "activate", "status", "maintain"} {
 		assert.True(t, names[want], "command %q must exist", want)
 	}
+	assert.False(t, names["geo"],
+		"the standalone geo verb is GONE — classification merged into the probe batch lifecycle")
 	assert.False(t, names["completion"], "completion helper hidden")
 }
 
