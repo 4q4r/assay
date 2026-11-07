@@ -914,14 +914,15 @@ func funnelBar(pct float64, color bool) string {
 }
 
 // printGlobalQuality renders the classified-pool quality and the regional
-// spread. Zero classified records is the explicit cold start — the geo
-// unlock stage has never classified anything, and claiming a 100% clean
-// pool from flag-less legacy records would be fabrication.
+// spread. Zero classified records is the explicit cold start — the
+// classification pass (merged into the probe batch lifecycle) has never
+// classified anything, and claiming a 100% clean pool from flag-less legacy
+// records would be fabrication.
 func printGlobalQuality(out io.Writer, g *geoIntel, color bool) {
 	outln(out, ui.Header("global quality & pool distribution", color))
 	if g.Classified == 0 {
 		outf(out, "%s\n", ui.ChipKV("quality:   ",
-			"no ip-quality evidence yet — the geo unlock stage has not classified any node", color))
+			"no ip-quality evidence yet — the classification pass has not classified any node", color))
 	} else {
 		outf(out, "%s\n", ui.ChipKV("quality:   ", fmt.Sprintf(
 			"%s classified — clean %s (%.1f%%), hosting %s (%.1f%%), proxy %s (%.1f%%)",

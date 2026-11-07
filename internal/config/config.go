@@ -228,13 +228,16 @@ type GeoConfig struct {
 	// source). Structural https check only — ANY https endpoint is accepted
 	// verbatim (owner ruling: a plain string knob, no allowlist). Default:
 	// DefaultGeoHTTPSURL.
-	HTTPSURL      string   `toml:"https_url"`
-	ExitIPEchoURL string   `toml:"exit_ip_echo_url"`
-	TTL           Duration `toml:"ttl"`
-	// MaxTTL caps the rate-limit retry sleep (the X-Ttl honor on a 429
-	// batch fallback). 0 = unset → DefaultGeoMaxTTL; an explicit 0 after
-	// defaults? defaults apply only on absent, so 0 stays 0 = no cap (owner
-	// no-floor ruling; the default is the safety net).
+	HTTPSURL      string `toml:"https_url"`
+	ExitIPEchoURL string `toml:"exit_ip_echo_url"`
+	// TTL is the legacy geo-freshness knob of the REMOVED geo stage's
+	// exit-IP cache (classification now refreshes every wave — the 24h
+	// freshness gates are gone). Still live for `publicvpn check` (GeoTTL).
+	TTL Duration `toml:"ttl"`
+	// MaxTTL was the rate-limit retry-sleep cap of the REMOVED geo-stage
+	// batch fallback (the local-machine ip-api overlay is gone with the
+	// stage). Retained for config compatibility; classification honors the
+	// 429 X-Ttl by falling through to the HTTPS/DoH rungs instead.
 	MaxTTL Duration `toml:"max_ttl"`
 	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
 	// (self-report and each fallback hop alike).
@@ -244,15 +247,20 @@ type GeoConfig struct {
 	// unset → DefaultGeoSelfReportConcurrency). Negative values are
 	// structurally invalid. No upper bound (owner ruling).
 	SelfReportConcurrency int `toml:"self_report_concurrency"`
-	// UnlockProbes gates the Phase-1 IP quality & media unlock stage: once
-	// per distinct exit IP whose cached state is older than 7 days, probe
-	// ChatGPT/Netflix/YouTube/Disney+/TikTok unlocks and IP quality THROUGH
-	// that exit's own tunnel (3s per request; results keyed by exit IP and
-	// persisted in geo-base.jsonl). Default TRUE (owner ruling 2026-11-06:
-	// unlock probes ship on by default, like the ip quality fields they
-	// carry); an explicit false keeps the stage off (zero unlock requests;
-	// quality/media fields stay unchecked). Tri-state like auto_restart:
-	// nil (absent) materializes as true in applyGeoDefaults.
+	// UnlockProbes gates the merged classification pass (owner order
+	// 2026-11-07 «сразу на чеке»): every node the probe stage proves ALIVE
+	// gets the FULL battery — the ip-api self-report ladder (country/city/
+	// ISP/AS + hosting/proxy flags) plus the unlock battery v2 (cftrace
+	// echo, 3-source consensus, DNS-over-TCP, media probes, hijack
+	// detection, OK_FLAKY retry, STUN for hysteria2) — THROUGH THE SAME HOT
+	// xray instance the probe just passed, before that instance is torn
+	// down; the geo-base records refresh every wave. The separate geo and
+	// unlock stages with their 24h freshness gates are REMOVED (merged into
+	// the probe batch lifecycle). Default TRUE (owner ruling 2026-11-06
+	// stands); an explicit false is the escape hatch = probe-only wave
+	// (zero classification requests; the geo-base keeps its last state).
+	// Tri-state like auto_restart: nil (absent) materializes as true in
+	// applyGeoDefaults.
 	UnlockProbes *bool `toml:"unlock_probes"`
 }
 

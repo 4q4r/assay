@@ -107,7 +107,7 @@ func TestMergeGeoRecordsSameIdentityWinnerIsOrderIndependent(t *testing.T) {
 	winner := func(nodes []*model.Node) *model.GeoRecord {
 		t.Helper()
 		dir := t.TempDir()
-		recs, err := mergeGeoRecords(Input{DataDir: dir, Nodes: nodes, ProbeByKey: probeByKey}, reports)
+		recs, err := mergeGeoRecords(dir, nodes, probeByKey, 0, reports)
 		require.NoError(t, err)
 		require.Len(t, recs, 2, "both same-identity nodes produce records")
 		path := filepath.Join(dir, "geo-base.jsonl")

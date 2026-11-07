@@ -89,17 +89,14 @@ func TestHTTPSSelfGeoSecondHopMapsFieldsHonestly(t *testing.T) {
 	info := newInfoDouble(t, documentedInfoSuccess(t))
 	doh := dohDouble(t, "198.51.100.9") // served but MUST NOT be consulted
 	socks := newSocksServer(t)
-	f, spawns, closes := newTestFactory(socks)
 
-	n := node("1", "one.example.com")
+	n := node()
 	dir := t.TempDir()
-	in := baseInput(dir, []*model.Node{n},
-		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in := classifyInput(dir, api.URL()+"/json/")
 	in.Cfg.HTTPSURL = info.URL() + "/json"
 	in.Cfg.DoHURL = doh.URL
 
-	records, summary, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
+	records, summary := classifyOne(t, dir, socks.Addr(), n, "203.0.113.77", in)
 	require.Len(t, records, 1)
 	rec := records[0]
 
@@ -122,12 +119,10 @@ func TestHTTPSSelfGeoSecondHopMapsFieldsHonestly(t *testing.T) {
 	assert.True(t, strings.HasSuffix(paths[0], "/json"), "the configured endpoint path is honored, got %q", paths[0])
 	assert.Equal(t, "geo-agent/11", uagents[0])
 
-	// L5 tunnel-path: the hop rode the SAME piggybacked instance (2 tunnel
-	// relays: hop 1 + hop 2; keep-alives are off so each request dials), and
-	// the DoH fallback was never consulted.
+	// L5 tunnel-path: the hop rode the SAME hot tunnel (2 CONNECT relays:
+	// hop 1 + hop 2; keep-alives are off so each request dials), and the
+	// DoH fallback was never consulted.
 	assert.Equal(t, int32(2), socks.Connects.Load(), "hop 2 rides the same tunnel: two CONNECT relays total")
-	assert.Equal(t, int32(1), spawns.Load(), "piggyback: ONE instance per node across the whole ladder")
-	assert.Equal(t, int32(1), closes.Load(), "the instance is closed exactly once")
 
 	// Ladder classes.
 	assert.Equal(t, 1, summary.Eligible)
@@ -153,17 +148,14 @@ func TestHTTPSRescuesPlainHTTPBlockedExit(t *testing.T) {
 	api.blanket.Store(true)
 	info := newInfoDouble(t, documentedInfoSuccess(t))
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 
-	n := node("1", "one.example.com")
+	n := node()
 	dir := t.TempDir()
-	in := baseInput(dir, []*model.Node{n},
-		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in := classifyInput(dir, api.URL()+"/json/")
 	in.Cfg.HTTPSURL = info.URL() + "/json"
 	in.Cfg.DoHURL = "http://127.0.0.1:1/resolve" // dead DoH: hop 3 must stay unreached
 
-	records, summary, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
+	records, summary := classifyOne(t, dir, socks.Addr(), n, "203.0.113.77", in)
 	require.Len(t, records, 1)
 	rec := records[0]
 	assert.Equal(t, "self-report-https", rec.GeoSource, "the plain-HTTP-blocked class is rescued by the https hop")
@@ -186,12 +178,10 @@ func TestHTTPSRunsBeforeDoHAndEveryStartIsPaced(t *testing.T) {
 	info.status.Store(1) // hop 2: 503 — the ladder advances to DoH
 	doh := dohDouble(t, "198.51.100.7")
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 
-	n := node("1", "one.example.com")
+	n := node()
 	dir := t.TempDir()
-	in := baseInput(dir, []*model.Node{n},
-		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in := classifyInput(dir, api.URL()+"/json/")
 	in.Cfg.HTTPSURL = info.URL() + "/json"
 	in.Cfg.DoHURL = doh.URL
 	now := time.Unix(1700000000, 0)
@@ -203,7 +193,10 @@ func TestHTTPSRunsBeforeDoHAndEveryStartIsPaced(t *testing.T) {
 		return nil
 	}
 
-	records, summary, err := geo.Run(context.Background(), in)
+	clf := geo.NewClassifier(in)
+	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77")
+	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}
+	records, summary, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	require.Equal(t, "doh-fallback", records[0].GeoSource,
@@ -211,10 +204,11 @@ func TestHTTPSRunsBeforeDoHAndEveryStartIsPaced(t *testing.T) {
 	assert.Equal(t, 1, summary.DoHFallback)
 	assert.Equal(t, 0, summary.SelfReportHTTPS)
 
-	// Three paced starts: the https self-geo, the DoH probe, and the fallback
-	// lookup. The priming hop-1 slot never sleeps. (Single node = one
-	// worker: the pacer, the sleeper, and this slice are one goroutine.)
-	require.Len(t, waits, 3, "https start, DoH probe start, and fallback lookup start are each paced")
+	// Three paced LADDER starts: the https self-geo, the DoH probe, and the
+	// fallback lookup. The priming hop-1 slot never sleeps. (Single node =
+	// one pacer; the battery's own starts pace after the ladder — the first
+	// three waits are exactly the ladder's.)
+	require.GreaterOrEqual(t, len(waits), 3, "https start, DoH probe start, and fallback lookup start are each paced")
 	assert.Equal(t, geo.DefaultSelfReportPacing, waits[0], "the https hop start waits out the default pacing")
 	assert.Equal(t, geo.DefaultSelfReportPacing, waits[1], "the DoH probe start is paced")
 	assert.Equal(t, geo.DefaultSelfReportPacing, waits[2], "the fallback lookup start is paced")
@@ -238,18 +232,15 @@ func TestHTTPSSelfGeoChurnIsReportedLoudly(t *testing.T) {
 	body := strings.ReplaceAll(string(documentedInfoSuccess(t)), "203.0.113.77", "198.51.100.9")
 	info := newInfoDouble(t, []byte(body))
 	socks := newSocksServer(t)
-	f, _, _ := newTestFactory(socks)
 
-	n := node("1", "one.example.com")
+	n := node()
 	dir := t.TempDir()
-	in := baseInput(dir, []*model.Node{n},
-		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
+	in := classifyInput(dir, api.URL()+"/json/")
 	in.Cfg.HTTPSURL = info.URL() + "/json"
 	var log strings.Builder
 	in.Progress = &log
 
-	records, summary, err := geo.Run(context.Background(), in)
-	require.NoError(t, err)
+	records, summary := classifyOne(t, dir, socks.Addr(), n, "203.0.113.77", in)
 	require.Len(t, records, 1)
 	rec := records[0]
 	assert.Equal(t, "198.51.100.9", rec.IP, "the https self-report's ip is the freshest exit truth")
@@ -265,19 +256,16 @@ func TestLadderEndsUnknownWhenEveryHopFails(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
 	api.failMode.Store(1)
 	socks := newSocksServer(t)
-	f, spawns, _ := newTestFactory(socks)
 
-	n := node("1", "one.example.com")
+	n := node()
 	dir := t.TempDir()
-	in := baseInput(dir, []*model.Node{n},
-		map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}, f, api.URL()+"/json/")
-	// Cfg.HTTPSURL and Cfg.DoHURL keep baseInput's dead-loopback defaults.
+	in := classifyInput(dir, api.URL()+"/json/")
+	// Cfg.HTTPSURL and Cfg.DoHURL keep classifyInput's dead-loopback defaults.
 	in.Cfg.DoHURL = "http://127.0.0.1:1/resolve"
 	var log strings.Builder
 	in.Progress = &log
 
-	records, summary, err := geo.Run(context.Background(), in)
-	require.NoError(t, err, "unknown geo is a classified outcome, not a wave failure")
+	records, summary := classifyOne(t, dir, socks.Addr(), n, "203.0.113.77", in)
 	require.Len(t, records, 1)
 	rec := records[0]
 	assert.True(t, rec.Alive, "the node stays usable — missing geo never flips liveness")
@@ -286,6 +274,5 @@ func TestLadderEndsUnknownWhenEveryHopFails(t *testing.T) {
 	assert.Equal(t, "203.0.113.77", rec.IP, "the probe's exit IP remains the D8 anchor")
 	assert.Equal(t, 1, summary.Unknown)
 	assert.Contains(t, log.String(), "UNKNOWN geo", "the wave log names the class loudly")
-	assert.Equal(t, int32(1), spawns.Load(), "one instance carried the whole ladder")
 	assert.Contains(t, log.String(), "(one.example.com)", "the wave log attributes the failure to the node")
 }

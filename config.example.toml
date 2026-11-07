@@ -170,16 +170,17 @@ exit_ip_echo_url = "https://icanhazip.com" # HTTPS echo fallback for exit-IP rec
                                        # empty disables the fallback
 timeout = "8s"                         # bounds ONE through-tunnel HTTP request (self-report
                                        # and each fallback hop alike)
-self_report_concurrency = 8           # max concurrent temp instances during geo self-report
-                                       # (each is a full xray process). 0 = default 8.
-                                       # Negative = invalid.
-max_ttl = "30s"                       # cap for the rate-limit retry sleep (X-Ttl honor)
-unlock_probes = true                   # Phase 1 (default ON — owner ruling 2026-11-06):
-                                       # probe ChatGPT/Netflix/YouTube/Disney+/TikTok
-                                       # unlocks + IP quality THROUGH each distinct exit's
-                                       # own tunnel (3s per request), cached per exit IP
-                                       # for 7 days in geo-base.jsonl; false keeps the
-                                       # stage off (zero unlock requests)
+self_report_concurrency = 8           # LEGACY: the geo stage's instance-concurrency knob —
+                                       # the stage is gone (classification rides the probe
+                                       # batch lifecycle); retained for config compatibility
+max_ttl = "30s"                       # LEGACY: was the batch-fallback retry-sleep cap — the
+                                       # fallback is gone with the geo stage
+unlock_probes = true                   # Classification pass (default ON): every node the probe
+                                       # proves ALIVE gets the FULL battery through the SAME
+                                       # hot xray instance — ip-api self-report + unlock
+                                       # battery v2 (media/consensus/DNS/STUN/hijack) — and
+                                       # geo-base refreshes EVERY wave (no 24h gates).
+                                       # false = probe-only wave (zero classification)
 [select]
 # W19 (owner order): every cap defaults to UNBOUNDED — absent/0 = ALL alive
 # nodes go active (the unknown-geo group included) and land in the country/

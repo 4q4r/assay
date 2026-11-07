@@ -75,7 +75,25 @@ type Options struct {
 	// dialer is the test seam for the pre-filter's TCP dials (nil =
 	// net.Dialer; production leaves it nil).
 	dialer dialFunc
+
+	// Classifier runs the FULL classification battery (ip-api self-report +
+	// unlock battery v2) for ONE alive node THROUGH the SAME hot instance
+	// address the node's probe just passed (addr) — the tunnel is proven
+	// working RIGHT NOW, so the verdicts describe a verified-hot tunnel
+	// instead of a stale cross-wave respawn (owner order 2026-11-07:
+	// «сразу на чеке чекать медиа, блоки, страны»). The hook runs BEFORE the
+	// batch instance is torn down; a nil Classifier = probe-only wave (the
+	// [geo].unlock_probes explicit-off escape hatch). The hook owns its
+	// honesty: it never fails the probe, and a battery that dies mid-flight
+	// records honest unknowns for this wave (the next wave re-classifies).
+	Classifier ClassifyFunc
 }
+
+// ClassifyFunc is the classification hook the probe engine invokes per alive
+// node while the batch instance is still open. exitIP carries the probe
+// wave's observed D8 anchor (may be empty when the echo failed — the battery
+// does not need it; the ladder's churn check degrades gracefully).
+type ClassifyFunc func(ctx context.Context, node *model.Node, addr string, exitIP string)
 
 // SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;
 // tests: an in-process server). Structural twin of the checker/geo seams —
@@ -468,7 +486,43 @@ func runBatchJobOnce(ctx context.Context, bf BatchFactory, jobs []*probeJob, opt
 	if cerr := ctx.Err(); cerr != nil {
 		return results, fmt.Errorf("batch context ended mid-probe: %w", cerr)
 	}
+	// Classification rides the hot instance: every ALIVE outcome gets the
+	// full battery through its own per-node socks port BEFORE the deferred
+	// instance teardown. A dead wave context skips the pass (the adaptive
+	// layer re-decides this batch; the next wave re-classifies).
+	classifyAliveNodes(ctx, opts, jobs, addrs, results)
 	return results, nil
+}
+
+// classifyAliveNodes runs the Options.Classifier hook for every alive
+// outcome of a batch, concurrently within the batch's own probe concurrency,
+// while the batch instance is still open. The hook is best-effort by
+// contract: it never changes the probe outcomes, and a nil hook is the
+// probe-only wave.
+func classifyAliveNodes(ctx context.Context, opts Options, jobs []*probeJob, addrs []string, results []*outcome) {
+	if opts.Classifier == nil || ctx.Err() != nil {
+		return
+	}
+	sem := make(chan struct{}, max(opts.BatchConcurrency, 1))
+	done := make([]chan struct{}, len(jobs))
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	for i, job := range jobs {
+		if results[i] == nil || !results[i].alive {
+			close(done[i])
+			continue
+		}
+		go func(i int, job *probeJob, addr string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			opts.Classifier(ctx, job.node, addr, results[i].exitIP)
+			close(done[i])
+		}(i, job, addrs[i])
+	}
+	for i := range done {
+		<-done[i]
+	}
 }
 
 // unprobedIdxs returns the positions lacking a trustworthy outcome: never-
@@ -589,6 +643,12 @@ func runJob(ctx context.Context, f Factory, job *probeJob, opts Options) *outcom
 			o.rttMS = median(totals)
 		}
 		measureAliveExtras(ctx, tc, o, opts)
+		if opts.Classifier != nil && ctx.Err() == nil {
+			// Classification rides the hot single-node instance (same
+			// contract as the batch path): the battery runs BEFORE the
+			// deferred teardown.
+			opts.Classifier(ctx, job.node, inst.Addr(), o.exitIP)
+		}
 	}
 	return o
 }
