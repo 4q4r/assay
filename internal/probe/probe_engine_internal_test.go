@@ -899,6 +899,8 @@ func TestClassifierCarriesEachNodeOwnProbeRTT(t *testing.T) {
 	require.True(t, okSlow, "the slow node's classification call is recorded")
 	require.True(t, okFast, "the fast node's classification call is recorded")
 	assert.GreaterOrEqual(t, slowRTT, 20.0, "the slow node carries its own measured (delayed) probe RTT")
-	assert.Less(t, fastRTT, 10.0, "the fast node carries its own (near-instant) probe RTT")
+	// The fast node has no absolute ceiling (a contended loopback can
+	// answer slower than any picked number); the property the test needs
+	// is the strict per-node ordering below.
 	assert.Greater(t, slowRTT, fastRTT, "each node's RTT is its OWN measurement — never a sibling's, never a shared value")
 }
