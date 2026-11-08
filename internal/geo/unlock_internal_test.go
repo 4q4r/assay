@@ -365,7 +365,7 @@ func TestDefaultUnlockEndpoints(t *testing.T) {
 	assert.Equal(t, "https://api.ip.sb/ip", ep.EchoIPSB)
 	assert.Equal(t, "http://ip-api.com/json/", ep.IPAPIContract)
 	assert.Equal(t, "https://connectivitycheck.gstatic.com/generate_204", ep.AlivePrimary)
-	assert.Equal(t, "https://www.msftconnecttest.com/connecttest.txt", ep.AliveFallback)
+	assert.Equal(t, "https://cp.cloudflare.com/generate_204", ep.AliveFallback)
 	assert.Equal(t, "216.239.32.10:53", ep.DNSServer)
 	assert.Equal(t, "o-o.myaddr.l.google.com", ep.DNSName)
 	assert.Equal(t, "stun.l.google.com:19302", ep.STUNServer)
