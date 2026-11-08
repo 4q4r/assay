@@ -39,8 +39,11 @@ type unlockDouble struct {
 func newUnlockDouble(t *testing.T, bodies map[string]string) *unlockDouble {
 	t.Helper()
 	d := &unlockDouble{
-		bodies:   bodies,
-		statuses: map[string]int{"/generate_204": http.StatusNoContent},
+		bodies: bodies,
+		statuses: map[string]int{
+			"/generate_204":    http.StatusNoContent,
+			"/cp-generate-204": http.StatusNoContent,
+		},
 		hits:     map[string]int{},
 		lastHdr:  map[string]http.Header{},
 		lastBody: map[string][]byte{},
@@ -89,7 +92,7 @@ func (d *unlockDouble) endpoints() *geo.UnlockEndpoints {
 		EchoIPSB:          u + "/ipsb",
 		IPAPIContract:     u + "/ipapi",
 		AlivePrimary:      u + "/generate_204",
-		AliveFallback:     u + "/connecttest.txt",
+		AliveFallback:     u + "/cp-generate-204",
 		// DNSServer/STUNServer stay "" — those channels are disabled unless
 		// a test provides its local fixture addresses (hermetic default).
 	}
@@ -153,7 +156,8 @@ func (l *syncLog) String() string {
 // clean, parseable body (the through-tunnel test pins the full happy path).
 // The v2 battery channels answer contract-valid: cftrace with ip/loc/colo,
 // agreeing plain-text echoes, an ip-api JSON with the query field, and the
-// gstatic 204 the tunnel-alive gate rides.
+// 204 answers the tunnel-alive gate rides on both endpoints (gstatic
+// primary, cp.cloudflare fallback).
 func unlockBodies() map[string]string {
 	return map[string]string{
 		"/cdn-cgi/trace":                  "fl=1.1\nip=203.0.113.7\nloc=DE\n",
@@ -172,7 +176,7 @@ func unlockBodies() map[string]string {
 		"/ipsb":                           "203.0.113.7\n",
 		"/ipapi":                          `{"status":"success","query":"203.0.113.7","hosting":true}`,
 		"/generate_204":                   "",
-		"/connecttest.txt":                "Microsoft Connect Test CDN service",
+		"/cp-generate-204":                "",
 	}
 }
 
@@ -462,10 +466,14 @@ func TestUnlockParsers(t *testing.T) {
 	})
 }
 
+// deadAliveEndpoints kills the whole alive apparatus: both gate endpoints
+// AND the cftrace echo (the equalizer's rescue candidate) point at dead
+// paths — a node failing all three is dead-now, honest unknown.
 func deadAliveEndpoints(d *unlockDouble) *geo.UnlockEndpoints {
 	ep := d.endpoints()
 	ep.AlivePrimary = d.srv.URL + "/alive-dead-1"
 	ep.AliveFallback = d.srv.URL + "/alive-dead-2"
+	ep.CFTrace = d.srv.URL + "/alive-dead-cf"
 	return ep
 }
 
@@ -510,7 +518,7 @@ func TestUnlockHijackTLSCertBlockedNotYes(t *testing.T) {
 		EchoIPSB:          u + "/ipsb",
 		IPAPIContract:     u + "/ipapi",
 		AlivePrimary:      u + "/generate_204",
-		AliveFallback:     u + "/connecttest.txt",
+		AliveFallback:     u + "/cp-generate-204",
 	})
 
 	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
@@ -690,8 +698,10 @@ func TestUnlockRetryOKFlaky(t *testing.T) {
 // the OS connectivity-check endpoints are the battery's FIRST probe — a
 // tunnel failing both (after the retry-once wrapper) is dead-now, the rest
 // of the battery is skipped entirely (no media/echo requests), and the
-// verdict is the honest all-unknown with a fresh stamp. The merged flow
-// records that honest unknown (the wave does not fail; the next wave
+// verdict is the honest all-unknown with a fresh stamp. The cftrace
+// equalizer gets its ONE rescue attempt against the dead echo and finds
+// nothing parseable — the honest unknown stands. The merged flow records
+// that honest unknown (the wave does not fail; the next wave
 // re-classifies).
 func TestUnlockTunnelAliveGateSkipsDeadBattery(t *testing.T) {
 	api := newIPAPIDouble(t, documentedSingleSuccess(t))
@@ -706,15 +716,154 @@ func TestUnlockTunnelAliveGateSkipsDeadBattery(t *testing.T) {
 	require.NotEmpty(t, st.CheckedAt, "the alive check ran and is stamped honestly")
 	assert.Equal(t, model.UnlockUnknown, st.ChatGPT)
 	assert.Equal(t, model.UnlockUnknown, st.Netflix)
-	assert.Zero(t, ud.hitsOf("/cdn-cgi/trace"), "a dead tunnel skips the whole battery")
-	assert.Zero(t, ud.hitsOf("/premium"))
-	assert.Zero(t, ud.hitsOf("/cftrace"))
+	assert.Zero(t, ud.hitsOf("/premium"), "a dead tunnel skips the whole battery")
 	// Statuses are DATA (the getRetry contract): a wrong-status alive
 	// answer is a gate miss, not a transport failure — exactly one attempt
-	// per gate endpoint, then the battery is skipped.
+	// per gate endpoint plus the single equalizer attempt at the dead
+	// cftrace echo, then the battery is skipped.
 	assert.Equal(t, 2, ud.hitsOf("/alive-dead-1")+ud.hitsOf("/alive-dead-2"),
 		"primary and fallback each got one attempt, then the battery was skipped")
 	assert.Equal(t, 1, ud.hitsOf("/alive-dead-2"))
+	assert.Equal(t, 1, ud.hitsOf("/alive-dead-cf"),
+		"the cftrace equalizer got exactly its one rescue attempt")
+}
+
+// TestUnlockGateFallbackCloudflare204Alive pins the fallback swap: the
+// gate's second endpoint is cp.cloudflare.com/generate_204 with the 204
+// contract (the same contract kutovoys/xray-checker ships as its default
+// proxy status check) — the primary failing does NOT kill a node the
+// twin-candidate answers. A 204 on the fallback alone carries the battery
+// to full verdicts.
+func TestUnlockGateFallbackCloudflare204Alive(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	ud.mu.Lock()
+	ud.statuses["/generate_204"] = http.StatusInternalServerError // gate miss: wrong-status, never retried
+	ud.mu.Unlock()
+	socks := newSocksServer(t)
+	dir := t.TempDir()
+
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ud.endpoints())
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "the cp.cloudflare fallback carried the battery")
+	assert.Equal(t, "DE", st.YouTubeRegion)
+	assert.Equal(t, 3, st.ConsensusCount, "the echo consensus ran normally past the gate")
+	assert.False(t, st.Hijack)
+	// One attempt per gate endpoint: the 500 primary is a gate miss (no
+	// retry), the 204 fallback is the pass.
+	assert.Equal(t, 1, ud.hitsOf("/generate_204"))
+	assert.Equal(t, 1, ud.hitsOf("/cp-generate-204"))
+}
+
+// TestUnlockGateEqualizerCFTraceRescueAlive pins the CFTRACE-ALIVE
+// EQUALIZER: both gate endpoints failing does NOT dead a node whose cftrace
+// echo returns a parseable ip= contract — the same network family as the
+// gate, and a live experiment measured the gate false-negativing working
+// tunnels transiently (2/60 passes). The rescue keeps the node ALIVE: the
+// battery completes, verdicts land (never all-unknown), the echo result
+// rides the normal consensus exactly once, and the journal evidence tail
+// carries the gate_rescue marker.
+func TestUnlockGateEqualizerCFTraceRescueAlive(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	socks := newSocksServer(t)
+	dir := t.TempDir()
+
+	ep := ud.endpoints()
+	ep.AlivePrimary = ud.srv.URL + "/alive-dead-1"
+	ep.AliveFallback = ud.srv.URL + "/alive-dead-2"
+	// CFTrace stays the contract-valid fixture: the equalizer's candidate.
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+	var log syncLog
+	in.Progress = &log
+
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, model.UnlockYes, st.ChatGPT, "the cftrace rescue kept the node alive")
+	assert.Equal(t, model.UnlockNetflixFull, st.Netflix)
+	assert.Equal(t, "DE", st.YouTubeRegion)
+	assert.Equal(t, 3, st.ConsensusCount, "the rescued echo rides the normal consensus")
+	assert.False(t, st.Hijack, "a rescue is not hostile evidence")
+	// The cftrace echo ran EXACTLY once: the equalizer pass, no re-shot in
+	// the echo phase.
+	assert.Equal(t, 1, ud.hitsOf("/cftrace"))
+	assert.Equal(t, 1, ud.hitsOf("/alive-dead-1"))
+	assert.Equal(t, 1, ud.hitsOf("/alive-dead-2"))
+	assert.Contains(t, log.String(), "gate_rescue=cftrace ip=203.0.113.7",
+		"the journal evidence tail carries the rescue marker")
+	assert.Contains(t, log.String(), "alive=true")
+}
+
+// TestUnlockGateEqualizerGarbageStillDead pins the honest-unknown boundary
+// of the equalizer: a cftrace answer that breaks its contract (no parseable
+// ip= line) does NOT rescue the node — both gate endpoints failing plus a
+// garbage echo is dead-now, the all-unknown verdict stands, and the battery
+// media probes stay untouched. The contract break is the suspect class, so
+// the exit also carries the hijack evidence honestly.
+func TestUnlockGateEqualizerGarbageStillDead(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	bodies := unlockBodies()
+	bodies["/cftrace"] = "fl=1.1\ncolo=FRA\nloc=DE\n" // contract break: no ip=
+	ud := newUnlockDouble(t, bodies)
+	socks := newSocksServer(t)
+	dir := t.TempDir()
+
+	ep := ud.endpoints()
+	ep.AlivePrimary = ud.srv.URL + "/alive-dead-1"
+	ep.AliveFallback = ud.srv.URL + "/alive-dead-2"
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	assert.Equal(t, model.UnlockUnknown, st.ChatGPT, "garbage echo does not rescue — honest unknown")
+	assert.Equal(t, model.UnlockUnknown, st.Netflix)
+	require.NotEmpty(t, st.CheckedAt, "the alive apparatus ran and is stamped honestly")
+	assert.Zero(t, ud.hitsOf("/premium"), "the battery media probes stay skipped")
+	assert.Equal(t, 1, ud.hitsOf("/cftrace"), "the equalizer got its one attempt")
+	assert.True(t, st.Hijack, "the garbage trace is the suspect/hijack evidence class")
+}
+
+// TestUnlockGateFallbackInterceptAliveHijack pins the TLS-intercept rule
+// THROUGH the swapped fallback: an intercept signature on the
+// cp.cloudflare gate endpoint is the opposite of dead — the tunnel
+// DELIVERED bytes to the endpoint — so the node stays alive AND carries the
+// hijack evidence (the existing rule, preserved through the swap).
+func TestUnlockGateFallbackInterceptAliveHijack(t *testing.T) {
+	api := newIPAPIDouble(t, documentedSingleSuccess(t))
+	ud := newUnlockDouble(t, unlockBodies())
+	ud.mu.Lock()
+	ud.statuses["/generate_204"] = http.StatusInternalServerError // plain gate miss on the primary
+	ud.mu.Unlock()
+
+	// The fallback rides a self-signed TLS endpoint: the MITM-cert
+	// signature through the gate.
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cp-generate-204" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(tls.Close)
+
+	socks := newSocksServer(t)
+	dir := t.TempDir()
+	ep := ud.endpoints()
+	ep.AliveFallback = tls.URL + "/cp-generate-204"
+	in := classifyUnlockInput(t, dir, api.URL()+"/json/", ep)
+
+	records, _ := classifyNodeFlush(t, dir, socks.Addr(), node(), "203.0.113.7", in)
+	require.Len(t, records, 1)
+	st := records[0].MediaUnlocks
+	require.NotEmpty(t, st.CheckedAt, "the battery ran")
+	assert.True(t, st.Hijack, "the intercept on the CF gate is the hijack evidence")
+	assert.Equal(t, model.UnlockBlocked, st.ChatGPT,
+		"alive through the intercept: verdicts are the definite hijack-blocked class, never unknown")
+	assert.Equal(t, model.UnlockBlocked, st.Netflix)
+	assert.Equal(t, model.UnlockBlocked, st.YouTubeRegion)
 }
 
 // TestUnlockMigrationV1VerdictRefreshed pins the battery-version contract in
