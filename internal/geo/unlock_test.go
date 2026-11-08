@@ -209,7 +209,7 @@ func classifyNodeFlush(
 ) ([]*model.GeoRecord, geo.Summary) {
 	t.Helper()
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), n, socksAddr, exitIP)
+	clf.ClassifyNode(context.Background(), n, socksAddr, exitIP, 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, exitIP)}
 	recs, sum, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)

@@ -240,8 +240,12 @@ type GeoConfig struct {
 	// stage). Retained for config compatibility; classification honors the
 	// 429 X-Ttl by falling through to the HTTPS/DoH rungs instead.
 	MaxTTL Duration `toml:"max_ttl"`
-	// Timeout bounds ONE through-tunnel HTTP request of the geo wave
-	// (self-report and each fallback hop alike).
+	// Timeout is the per-node FLOOR (minimum effective timeout) of ONE
+	// through-tunnel classification request. The effective per-request
+	// timeout is RTT-adaptive (owner order 2026-11-08):
+	// clamp(adaptiveRTTMultiplier x probe RTT, Timeout,
+	// adaptiveTimeoutCeiling) — see geo.classifyTimeout. A node with no
+	// usable probe RTT (rttMs <= 0 or NaN) fails safe to this floor.
 	Timeout Duration `toml:"timeout"`
 	// SelfReportConcurrency is the maximum number of concurrent temp
 	// instances during geo self-report (each is a full xray process; 0 =
