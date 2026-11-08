@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,11 +21,25 @@ import (
 	"public_vpn/internal/store"
 )
 
-// DefaultClassifyTimeout bounds one through-tunnel classification request
-// when the config materialized no [geo].timeout (hand-built configs in
-// tests; production configs pass applyGeoDefaults' 8s). Same value as the
-// config default — a request with no deadline would hang the hot instance.
+// DefaultClassifyTimeout is the per-node FLOOR (minimum effective timeout)
+// of one through-tunnel classification request when the config materialized
+// no [geo].timeout (hand-built configs in tests; production configs pass
+// applyGeoDefaults' 8s). The effective per-request timeout is
+// RTT-adaptive (owner order 2026-11-08): classifyTimeout clamps
+// 10x the node's measured probe RTT into [floor, adaptiveTimeoutCeiling] —
+// a request with no deadline would hang the hot instance.
 const DefaultClassifyTimeout = 8 * time.Second
+
+// adaptiveRTTMultiplier is the endpoint-speed headroom over the node's own
+// measured probe RTT: ladder and media endpoints are observed up to ~5-8x
+// slower per-request than the CF-trace probe anchor through the same
+// tunnel, so 10x covers the observed ratio with margin.
+const adaptiveRTTMultiplier = 10
+
+// adaptiveTimeoutCeiling bounds one adaptive-derived per-request timeout:
+// it caps the battery worst-case arithmetic at the 30s slot cost (the
+// battery stays bounded by classifyNodeBudget regardless).
+const adaptiveTimeoutCeiling = 30 * time.Second
 
 // classifyNodeBudget bounds ONE node's full classification battery (the
 // self-report ladder plus the unlock battery v2, pacing included). The
@@ -33,12 +48,35 @@ const DefaultClassifyTimeout = 8 * time.Second
 // that accepts the tunnel dial and silently answers nothing would hold a
 // battery goroutine forever, and in the merged flow the batch lifecycle
 // waits on every battery (one wedge = one stalled batch). The budget is a
-// code-level constant (no new config surface): a healthy battery finishes
-// in seconds at the production per-request timeout, so five minutes
-// absorbs the worst request-count × timeout arithmetic several times over.
-// A budget-burning battery records NOTHING for the node this wave — the
-// honesty contract's skip (the next wave re-classifies).
-var classifyNodeBudget = 5 * time.Minute
+// code-level constant (no new config surface): with the RTT-adaptive
+// per-request timeout (owner order 2026-11-08), the worst-case battery
+// arithmetic at the 30s per-request ceiling is ~35 HTTP request slots
+// (ladder 4 single-attempt + gate 2x2 retry slots + consensus echoes 3x2 +
+// ip-api body-contract echo 1x2 + media probes 8 retried endpoints x2 plus
+// 3 single-shot Disney POSTs) x 30s ≈ 1050s, + ~10s pacing/retry stagger
+// ≈ 1060s — twenty minutes is ≈ 1.14x that arithmetic. The margin is thin
+// and deliberate: every HTTP channel already bounds itself with its
+// per-request deadline, so the budget's real job is the deadline-less
+// raw-TCP channels (DNS-over-TCP, STUN), where a wedged framed read has no
+// other bound. A budget-burning battery records NOTHING for the node this
+// wave — the honesty contract's skip (the next wave re-classifies).
+var classifyNodeBudget = 20 * time.Minute
+
+// classifyTimeout derives ONE node's per-request classification timeout
+// from that node's own measured probe RTT (owner order 2026-11-08 — no
+// blanket value for all nodes). rttMs <= 0 or NaN (no usable probe
+// measurement) fails safe to the floor: byte-stable with the pre-adaptive
+// behavior. Otherwise raw = rttMs x adaptiveRTTMultiplier, clamped into
+// [floor, adaptiveTimeoutCeiling] — the ceiling wins when a config floor
+// sits above it, keeping the battery worst-case arithmetic bounded. The
+// [geo].timeout knob is the FLOOR (minimum effective timeout).
+func classifyTimeout(rttMs float64, floor time.Duration) time.Duration {
+	if rttMs <= 0 || math.IsNaN(rttMs) {
+		return floor
+	}
+	raw := time.Duration(rttMs*adaptiveRTTMultiplier) * time.Millisecond
+	return min(max(raw, floor), adaptiveTimeoutCeiling)
+}
 
 // ClassifyInput bundles the classification pass's shared dependencies. The
 // pass rides the probe batch lifecycle (owner order 2026-11-07 «сразу на
@@ -105,12 +143,15 @@ func NewClassifier(in ClassifyInput) *Classifier {
 // next wave re-classifies); a canceled wave records nothing (partial
 // verdicts must never masquerade as checked).
 //
-// The signature matches probe.ClassifyFunc 1:1 — probe never imports geo;
-// the CLI bridges the seam.
-func (c *Classifier) ClassifyNode(ctx context.Context, n *model.Node, addr string, exitIP string) {
+// rttMs is the node's OWN measured probe RTT (median TTFB in ms, as the
+// probe engine measured it) — the input of the RTT-adaptive per-request
+// timeout every battery client is built with; <=0 fails safe to the floor
+// ([geo].timeout, default 8s). The signature matches probe.ClassifyFunc
+// 1:1 — probe never imports geo; the CLI bridges the seam.
+func (c *Classifier) ClassifyNode(ctx context.Context, n *model.Node, addr string, exitIP string, rttMs float64) {
 	done := make(chan struct{})
 	go func() {
-		c.classifyNode(ctx, n, addr, exitIP)
+		c.classifyNode(ctx, n, addr, exitIP, rttMs)
 		close(done)
 	}()
 	timer := time.NewTimer(classifyNodeBudget)
@@ -137,11 +178,12 @@ func (c *Classifier) ClassifyNode(ctx context.Context, n *model.Node, addr strin
 
 // classifyNode is ClassifyNode's battery body (see ClassifyNode for the
 // budget contract that wraps it).
-func (c *Classifier) classifyNode(ctx context.Context, n *model.Node, addr string, exitIP string) {
-	timeout := c.in.Cfg.Timeout.Duration
-	if timeout <= 0 {
-		timeout = DefaultClassifyTimeout
+func (c *Classifier) classifyNode(ctx context.Context, n *model.Node, addr string, exitIP string, rttMs float64) {
+	floor := c.in.Cfg.Timeout.Duration
+	if floor <= 0 {
+		floor = DefaultClassifyTimeout
 	}
+	timeout := classifyTimeout(rttMs, floor)
 	p := &pacer{minDelay: DefaultSelfReportPacing, now: c.nowFn(), sleep: c.sleepFn()}
 	rep := NodeReport{Key: n.Key, ProbeExitIP: exitIP, RequestRTTMs: []float64{}}
 	cl, err := NewTunnelClient(addr, timeout)
@@ -171,7 +213,7 @@ func (c *Classifier) classifyNode(ctx context.Context, n *model.Node, addr strin
 		if probed != nil {
 			rep.Unlocks = probed
 			rep.Quality = ComputeIPQuality(rep.Geo, widget)
-			logUnlock(c.in.Progress, exitIP, probed, rep.Quality, ev)
+			logUnlock(c.in.Progress, exitIP, probed, rep.Quality, ev, timeout)
 		}
 	}
 	if ctx.Err() != nil {

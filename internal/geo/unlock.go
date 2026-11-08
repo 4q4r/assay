@@ -1363,7 +1363,9 @@ func freshUnlock(st *model.MediaUnlockStatus, now time.Time) bool {
 	return now.Sub(t) <= unlockTTL(st)
 }
 
-func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *IPQuality, ev *ExitEvidence) {
+func logUnlock(
+	w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *IPQuality, ev *ExitEvidence, timeout time.Duration,
+) {
 	if w == nil {
 		return
 	}
@@ -1406,5 +1408,8 @@ func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *I
 	if ev.GateRescue != "" {
 		flags += " gate_rescue=" + ev.GateRescue
 	}
+	// The effective per-node timeout (RTT-adaptive, owner order 2026-11-08)
+	// rides the evidence line so the rollout is verifiable from the journal.
+	flags += " tmo=" + timeout.String()
 	_, _ = fmt.Fprintf(w, "unlock: %s evidence %s\n", exitIP, flags)
 }

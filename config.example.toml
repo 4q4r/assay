@@ -170,8 +170,10 @@ ttl = "24h"                            # alive-data freshness: records whose las
 exit_ip_echo_url = "https://icanhazip.com" # HTTPS echo fallback for exit-IP recovery when
                                        # self-report fails entirely (keyless, TLS-only);
                                        # empty disables the fallback
-timeout = "8s"                         # bounds ONE through-tunnel HTTP request (self-report
-                                       # and each fallback hop alike)
+timeout = "8s"                         # the per-node FLOOR (minimum effective timeout) of ONE
+                                       # through-tunnel classification request; the effective
+                                       # per-request timeout is RTT-adaptive:
+                                       # clamp(10 x probe RTT, [geo].timeout, 30s)
 self_report_concurrency = 8           # LEGACY: the geo stage's instance-concurrency knob —
                                        # the stage is gone (classification rides the probe
                                        # batch lifecycle); retained for config compatibility

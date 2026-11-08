@@ -1,6 +1,7 @@
 package geo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -178,6 +179,7 @@ func TestClassifyNodeReturnsBoundedUnderBlackholedBatteryChannel(t *testing.T) {
 	}))
 	t.Cleanup(site.Close)
 
+	var progress bytes.Buffer
 	in := ClassifyInput{
 		DataDir: t.TempDir(),
 		Cfg: config.GeoConfig{
@@ -187,6 +189,9 @@ func TestClassifyNodeReturnsBoundedUnderBlackholedBatteryChannel(t *testing.T) {
 		},
 		UserAgent: "budget-test/1",
 		SelfURL:   site.URL + "/json", // ladder rung 1 succeeds — the battery still runs
+		// The budget burn must stay LOUD: the skip line is the journal's
+		// only record that this node stayed unknown this wave (and why).
+		Progress: &progress,
 	}
 	// Every battery channel dead-except the DNS-over-TCP target, which is
 	// the blackhole through the relay: the wedge the budget must survive.
@@ -220,7 +225,7 @@ func TestClassifyNodeReturnsBoundedUnderBlackholedBatteryChannel(t *testing.T) {
 	n := model.NewNode("s", "vless", "u-budget", "budget.example.com", 443, map[string]string{"security": "tls", "type": "tcp"})
 	done := make(chan struct{})
 	go func() {
-		clf.ClassifyNode(context.Background(), n, relay, "1.2.3.4")
+		clf.ClassifyNode(context.Background(), n, relay, "1.2.3.4", 0)
 		close(done)
 	}()
 	select {
@@ -228,4 +233,7 @@ func TestClassifyNodeReturnsBoundedUnderBlackholedBatteryChannel(t *testing.T) {
 	case <-time.After(45 * time.Second):
 		t.Fatalf("ClassifyNode hung past the %s node budget — the merged batch lifecycle would stall on this node", classifyNodeBudget)
 	}
+	require.Contains(t, progress.String(),
+		"battery exceeded the 2s node budget — skipping (wedged channel; node stays unknown this wave)",
+		"the budget burn is a loud journal line, never a silent skip")
 }
