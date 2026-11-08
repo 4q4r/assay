@@ -155,8 +155,9 @@ type UnlockEndpoints struct {
 	// the fake-answer hijack signature (the 24-byte magiclampcloud shape).
 	IPAPIContract string
 	// AlivePrimary / AliveFallback are the OS connectivity-check endpoints
-	// the tunnel-alive gate rides (gstatic generate_204, msft
-	// connecttest.txt) — the highest blocking cost an operator can pay.
+	// the tunnel-alive gate rides (gstatic generate_204 primary, the
+	// cp.cloudflare.com/generate_204 twin as fallback — same network family
+	// as the cftrace echo, plain 204 contract).
 	AlivePrimary  string
 	AliveFallback string
 	// DNSServer is the DNS-over-TCP authoritative echo target
@@ -187,7 +188,7 @@ func defaultUnlockEndpoints() UnlockEndpoints {
 		EchoIPSB:          "https://api.ip.sb/ip",
 		IPAPIContract:     "http://ip-api.com/json/",
 		AlivePrimary:      "https://connectivitycheck.gstatic.com/generate_204",
-		AliveFallback:     "https://www.msftconnecttest.com/connecttest.txt",
+		AliveFallback:     "https://cp.cloudflare.com/generate_204",
 		DNSServer:         "216.239.32.10:53",
 		DNSName:           "o-o.myaddr.l.google.com",
 		STUNServer:        "stun.l.google.com:19302",
@@ -233,6 +234,11 @@ type ExitEvidence struct {
 	DNSIP         string
 	StunIP        string
 	FlakyCount    int // endpoints recovered on the retry pass (OK_FLAKY)
+	// GateRescue records the cftrace equalizer: both gate endpoints failed
+	// but the cftrace echo answered a parseable ip= contract, so the node
+	// is alive and the battery continued (journal evidence-tail marker,
+	// never hostile evidence).
+	GateRescue string
 }
 
 // flag marks a hijack reason (evidence list) and raises the exit-level flag.
@@ -997,13 +1003,14 @@ func (p *unlockProbe) ipinfo(ctx context.Context) *IPInfoWidget {
 
 // tunnelAlive is the tunnel-alive gate (item 5): the OS connectivity-check
 // endpoints — connectivitycheck.gstatic.com/generate_204 primary,
-// msftconnecttest.com/connecttest.txt fallback. Blocking THESE breaks the
-// operating system's own internet detection — the maximum blocking cost an
-// operator can pay, so an exit failing both (after the retry-once wrapper)
-// is dead-now: the battery records all-unknown verdicts and skips the rest
-// of the probe set. A TLS intercept signature through the gate is the
-// opposite of dead — the tunnel DELIVERED bytes to the endpoint — so it
-// keeps the exit alive AND raises the hijack evidence.
+// cp.cloudflare.com/generate_204 fallback (the plain 204 contract the
+// xray-checker class of tools ships as their default proxy status check).
+// Blocking THESE breaks the operating system's own internet detection — the
+// maximum blocking cost an operator can pay, so an exit failing both (after
+// the retry-once wrapper) is dead-now: the battery records all-unknown
+// verdicts and skips the rest of the probe set. A TLS intercept signature
+// through the gate is the opposite of dead — the tunnel DELIVERED bytes to
+// the endpoint — so it keeps the exit alive AND raises the hijack evidence.
 func (p *unlockProbe) tunnelAlive(ctx context.Context, ev *ExitEvidence) bool {
 	hijackedOrOK := func(err error, ok bool) bool {
 		if err != nil && hijackTLSError(err) {
@@ -1019,9 +1026,8 @@ func (p *unlockProbe) tunnelAlive(ctx context.Context, ev *ExitEvidence) bool {
 		}
 	}
 	if p.ep.AliveFallback != "" {
-		st, body, err := p.getRetry(ctx, p.ep.AliveFallback, nil)
-		if hijackedOrOK(err, err == nil && st == http.StatusOK &&
-			strings.Contains(body, "Microsoft Connect Test")) {
+		st, _, err := p.getRetry(ctx, p.ep.AliveFallback, nil)
+		if hijackedOrOK(err, err == nil && st == http.StatusNoContent) {
 			return true
 		}
 	}
@@ -1174,6 +1180,28 @@ func extractIPv4Token(s string) (string, bool) {
 	return "", false
 }
 
+// cftraceEqualizer is the CFTRACE-ALIVE-EQUALIZER, the post-gate rescue:
+// the gate endpoints can false-negative a working tunnel transiently (live
+// experiment: 2/60 passes on gate-dead/cftrace-OK) while the same network
+// family's cftrace echo answers. A parseable ip= trace proves the tunnel
+// carries traffic — the node is ALIVE and the battery continues; the echo
+// result rides the normal consensus phase. A rescue is honest evidence,
+// never hostile: the hijack flag stays off unless a separate intercept
+// signature fires. Returns true when the echo was shot here, so the caller
+// never re-runs cftrace in the echo phase.
+func (p *unlockProbe) cftraceEqualizer(ctx context.Context, ev *ExitEvidence) bool {
+	if ev.TunnelAlive || p.ep.CFTrace == "" {
+		return false
+	}
+	res := p.cfTraceEcho(ctx, ev)
+	ev.Echo = append(ev.Echo, res)
+	if res.Class == echoOK && res.IP != "" {
+		ev.TunnelAlive = true
+		ev.GateRescue = "cftrace ip=" + res.IP
+	}
+	return true
+}
+
 // probeUnlockSet runs the v2 battery for ONE exit through ONE tunnel
 // client. Flow: the tunnel-alive gate first (dead tunnels are recorded
 // all-unknown without burning the full battery); then the exit-echo
@@ -1204,6 +1232,7 @@ func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStat
 	}
 	// Tunnel-alive gate: the OS connectivity-check endpoints.
 	ev.TunnelAlive = p.tunnelAlive(ctx, ev)
+	cfEchoRan := p.cftraceEqualizer(ctx, ev)
 	if !ev.TunnelAlive {
 		st.ChatGPT, st.Netflix, st.YouTubeRegion = model.UnlockUnknown, model.UnlockUnknown, model.UnlockUnknown
 		st.Disney, st.TikTok = model.UnlockUnknown, model.UnlockUnknown
@@ -1213,7 +1242,7 @@ func probeUnlockSet(ctx context.Context, p *unlockProbe) (*model.MediaUnlockStat
 		return stamp(), nil, ev
 	}
 	// Exit-echo channels: the consensus + the exit-level hijack evidence.
-	if p.ep.CFTrace != "" {
+	if p.ep.CFTrace != "" && !cfEchoRan {
 		ev.Echo = append(ev.Echo, p.cfTraceEcho(ctx, ev))
 	}
 	if p.ep.EchoIPify != "" {
@@ -1373,6 +1402,9 @@ func logUnlock(w io.Writer, exitIP string, status *model.MediaUnlockStatus, q *I
 	}
 	if status.StunIP != "" {
 		flags += " stun_ip=" + status.StunIP
+	}
+	if ev.GateRescue != "" {
+		flags += " gate_rescue=" + ev.GateRescue
 	}
 	_, _ = fmt.Fprintf(w, "unlock: %s evidence %s\n", exitIP, flags)
 }
