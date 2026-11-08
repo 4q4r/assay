@@ -92,8 +92,10 @@ type Options struct {
 // ClassifyFunc is the classification hook the probe engine invokes per alive
 // node while the batch instance is still open. exitIP carries the probe
 // wave's observed D8 anchor (may be empty when the echo failed — the battery
-// does not need it; the ladder's churn check degrades gracefully).
-type ClassifyFunc func(ctx context.Context, node *model.Node, addr string, exitIP string)
+// does not need it; the ladder's churn check degrades gracefully). rttMs
+// carries the node's own measured probe RTT (median TTFB in ms; the input
+// the RTT-adaptive per-request timeout derives from).
+type ClassifyFunc func(ctx context.Context, node *model.Node, addr string, exitIP string, rttMs float64)
 
 // SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;
 // tests: an in-process server). Structural twin of the checker/geo seams —
@@ -516,7 +518,7 @@ func classifyAliveNodes(ctx context.Context, opts Options, jobs []*probeJob, add
 		go func(i int, job *probeJob, addr string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			opts.Classifier(ctx, job.node, addr, results[i].exitIP)
+			opts.Classifier(ctx, job.node, addr, results[i].exitIP, results[i].rttMS)
 			close(done[i])
 		}(i, job, addrs[i])
 	}
@@ -647,7 +649,7 @@ func runJob(ctx context.Context, f Factory, job *probeJob, opts Options) *outcom
 			// Classification rides the hot single-node instance (same
 			// contract as the batch path): the battery runs BEFORE the
 			// deferred teardown.
-			opts.Classifier(ctx, job.node, inst.Addr(), o.exitIP)
+			opts.Classifier(ctx, job.node, inst.Addr(), o.exitIP, o.rttMS)
 		}
 	}
 	return o

@@ -194,7 +194,7 @@ func TestHTTPSRunsBeforeDoHAndEveryStartIsPaced(t *testing.T) {
 	}
 
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77")
+	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77", 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}
 	records, summary, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
