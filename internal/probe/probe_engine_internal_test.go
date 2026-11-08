@@ -605,21 +605,36 @@ func TestSkipFreshSkippedNodeKeepsHistory(t *testing.T) {
 
 // classifyRecorder records the classifier hook's calls and a monotonic
 // sequence shared with the fixture instance's Close — the ordering pin
-// (classification happens BEFORE the teardown).
+// (classification happens BEFORE the teardown). rtts additionally captures
+// the per-node probe RTT the engine hands the hook (the adaptive-timeout
+// input).
 type classifyRecorder struct {
 	mu    sync.Mutex
 	calls []string // "key@addr=exitIP"
+	rtts  map[string]float64
 	seq   int
 	close int
 }
 
 func (c *classifyRecorder) classifier() ClassifyFunc {
-	return func(_ context.Context, n *model.Node, addr string, exitIP string) {
+	return func(_ context.Context, n *model.Node, addr string, exitIP string, rttMs float64) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.seq++
 		c.calls = append(c.calls, n.Key+"@"+addr+"="+exitIP)
+		if c.rtts == nil {
+			c.rtts = map[string]float64{}
+		}
+		c.rtts[n.Key] = rttMs
 	}
+}
+
+// rttOf returns the probe RTT the hook received for one node's key.
+func (c *classifyRecorder) rttOf(key string) (float64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rtt, ok := c.rtts[key]
+	return rtt, ok
 }
 
 func (c *classifyRecorder) noteClose() {
@@ -830,4 +845,60 @@ func TestClassificationSkippedWhenWaveContextDead(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, out, 3)
 	assert.Empty(t, rec.got(), "a dead context never starts the classification pass")
+}
+
+// TestClassifierCarriesEachNodeOwnProbeRTT pins the adaptive-timeout input
+// (owner order 2026-11-08): the engine hands each node its OWN measured
+// probe RTT — neither zero nor a sibling's — so the battery can derive the
+// per-node timeout from the node the verdict describes. Two alive nodes
+// probe targets with different injected delays (30ms vs none) through
+// separate socks endpoints; the recorded RTTs must match their own band.
+func TestClassifierCarriesEachNodeOwnProbeRTT(t *testing.T) {
+	slowSite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		_, _ = w.Write([]byte("OK — the tunnel reached the target."))
+	}))
+	t.Cleanup(slowSite.Close)
+	fastSite := healthySite(t)
+	socksSlow := newSocksServer(t, strings.TrimPrefix(slowSite.URL, "http://"))
+	socksFast := newSocksServer(t, strings.TrimPrefix(fastSite.URL, "http://"))
+
+	slow, fast := node(t, "rtt-slow"), node(t, "rtt-fast")
+	nodes := []*model.Node{slow, fast}
+	rec := &classifyRecorder{}
+	factory := func(_ context.Context, batch []*model.Node) (BatchSocksInstance, error) {
+		addrs := make([]string, len(batch))
+		for i, bn := range batch {
+			if bn.Key == slow.Key {
+				addrs[i] = socksSlow.Addr()
+				continue
+			}
+			addrs[i] = socksFast.Addr()
+		}
+		return &fakeBatchInstance{addrs: addrs}, nil
+	}
+	opts := baseOpts(slowSite.URL, "")
+	opts.Threads = 1
+	opts.BatchSize = 10
+	opts.BatchConcurrency = 8
+	opts.Attempts = 1
+	// ExitProbe off: this pin is about the RTT input, not the D8 anchor.
+	off := false
+	opts.ExitProbe = &off
+	opts.Classifier = rec.classifier()
+
+	out, err := RunWithBatchFactory(context.Background(), nodes, nil, factory, opts, "")
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+	for _, r := range out {
+		require.True(t, r.Alive, "fixture sanity: both nodes alive")
+	}
+
+	slowRTT, okSlow := rec.rttOf(slow.Key)
+	fastRTT, okFast := rec.rttOf(fast.Key)
+	require.True(t, okSlow, "the slow node's classification call is recorded")
+	require.True(t, okFast, "the fast node's classification call is recorded")
+	assert.GreaterOrEqual(t, slowRTT, 20.0, "the slow node carries its own measured (delayed) probe RTT")
+	assert.Less(t, fastRTT, 10.0, "the fast node carries its own (near-instant) probe RTT")
+	assert.Greater(t, slowRTT, fastRTT, "each node's RTT is its OWN measurement — never a sibling's, never a shared value")
 }

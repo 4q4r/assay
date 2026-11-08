@@ -189,7 +189,7 @@ func classifyOne(
 ) ([]*model.GeoRecord, geo.Summary) {
 	t.Helper()
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), n, socksAddr, exitIP)
+	clf.ClassifyNode(context.Background(), n, socksAddr, exitIP, 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, exitIP)}
 	recs, sum, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
@@ -277,7 +277,7 @@ func TestFallbackLookupStartIsPacedLikeSelfReport(t *testing.T) {
 	}
 
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77")
+	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77", 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}
 	records, summary, err := clf.Flush(nil, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
@@ -453,8 +453,8 @@ func TestSameIdentityEachTunnelSelfReports(t *testing.T) {
 	in := classifyInput(dir, api.URL()+"/json/")
 
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), na, socks.Addr(), "203.0.113.77")
-	clf.ClassifyNode(context.Background(), nb, socks.Addr(), "203.0.113.78")
+	clf.ClassifyNode(context.Background(), na, socks.Addr(), "203.0.113.77", 0)
+	clf.ClassifyNode(context.Background(), nb, socks.Addr(), "203.0.113.78", 0)
 	probeByKey := map[string]store.ProbeResult{
 		na.Key: liveProbe(na, "203.0.113.77"),
 		nb.Key: liveProbe(nb, "203.0.113.78"),
@@ -509,7 +509,7 @@ func TestClassifyPerWaveFreshnessGateGone(t *testing.T) {
 	in := classifyInput(dir, d.URL()+"/json/")
 	for range 2 { // two consecutive waves, same node alive both times
 		clf := geo.NewClassifier(in)
-		clf.ClassifyNode(context.Background(), n1, socks.Addr(), "203.0.113.9")
+		clf.ClassifyNode(context.Background(), n1, socks.Addr(), "203.0.113.9", 0)
 		probeByKey := map[string]store.ProbeResult{n1.Key: liveProbe(n1, "203.0.113.9")}
 		_, _, err := clf.Flush(nil, []*model.Node{n1}, probeByKey, 1, time.Now())
 		require.NoError(t, err)
@@ -548,7 +548,7 @@ func TestClassifyDeadTunnelHonestUnknown(t *testing.T) {
 	clf := geo.NewClassifier(in)
 	// The battery's tunnel-alive gate rides the DEAD loopback endpoints (the
 	// classifyInput default) — the mid-battery tunnel-death shape.
-	clf.ClassifyNode(context.Background(), n, "127.0.0.1:1", "203.0.113.77")
+	clf.ClassifyNode(context.Background(), n, "127.0.0.1:1", "203.0.113.77", 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}
 	var log strings.Builder
 	records, summary, err := clf.Flush(&log, []*model.Node{n}, probeByKey, 1, time.Now())
@@ -578,7 +578,7 @@ func TestFlushSummariesCarryWaveLines(t *testing.T) {
 	in.Progress = &log
 
 	clf := geo.NewClassifier(in)
-	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77")
+	clf.ClassifyNode(context.Background(), n, socks.Addr(), "203.0.113.77", 0)
 	probeByKey := map[string]store.ProbeResult{n.Key: liveProbe(n, "203.0.113.77")}
 	_, _, err := clf.Flush(&log, []*model.Node{n}, probeByKey, 1, time.Now())
 	require.NoError(t, err)
