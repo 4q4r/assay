@@ -212,7 +212,7 @@ func (c *Classifier) classifyNode(ctx context.Context, n *model.Node, addr strin
 		probed, widget, ev := probeUnlockSet(ctx, &unlockProbe{
 			cl: ucl, tc: tc, ua: c.userAgent(), ep: c.unlockEndpoints(), pac: p,
 			sleep: c.sleepFn(), now: c.nowFn(), exitIP: exitIP,
-			scheme: n.Scheme,
+			scheme: n.Scheme, requestTimeout: timeout,
 		})
 		if probed != nil {
 			rep.Unlocks = probed
