@@ -89,49 +89,6 @@ func ResourceBudget(cfg *config.Config) int {
 	return ComputeConcurrencyBudget(cfg, cfg.Resources.EffectiveCPUCores())
 }
 
-// AdaptConcurrency applies in-wave adaptation rules:
-//   - memory pressure above 85% (or port exhaustion) -> reduce 25%
-//   - CPU idle -> increase 25%
-//   - otherwise unchanged. Never below 1.
-func AdaptConcurrency(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	current = max(current, 1)
-	memPressure := memUsedPct > 85.0
-	if memPressure || portExhausted {
-		next := int(math.Floor(float64(current) * 0.75))
-		return max(next, 1)
-	}
-	if cpuIdle {
-		next := int(math.Ceil(float64(current) * 1.25))
-		return max(next, current+1)
-	}
-	return current
-}
-
-// Adapt is an alias for AdaptConcurrency.
-func Adapt(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	return AdaptConcurrency(current, memUsedPct, cpuIdle, portExhausted)
-}
-
-// InWaveAdaptation is an alias for AdaptConcurrency.
-func InWaveAdaptation(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	return AdaptConcurrency(current, memUsedPct, cpuIdle, portExhausted)
-}
-
-// AdaptInWaveConcurrency is an alias.
-func AdaptInWaveConcurrency(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	return AdaptConcurrency(current, memUsedPct, cpuIdle, portExhausted)
-}
-
-// AdaptInWave is an alias for AdaptConcurrency.
-func AdaptInWave(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	return AdaptConcurrency(current, memUsedPct, cpuIdle, portExhausted)
-}
-
-// InWaveAdapt is an alias for AdaptConcurrency.
-func InWaveAdapt(current int, memUsedPct float64, cpuIdle bool, portExhausted bool) int {
-	return AdaptConcurrency(current, memUsedPct, cpuIdle, portExhausted)
-}
-
 // MemoryPressure reports whether memory usage exceeds the 85% threshold.
 func MemoryPressure(memUsedPct float64) bool {
 	return memUsedPct > 85.0

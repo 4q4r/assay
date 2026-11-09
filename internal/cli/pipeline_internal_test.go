@@ -513,11 +513,6 @@ func TestWireRecordStageStatPersistedAfterWave(t *testing.T) {
 	assert.NotEmpty(t, string(b))
 }
 
-func TestWireAdaptConcurrencySeamCallable(t *testing.T) {
-	got := adaptConcurrencyFunc(4, 90.0, false, false)
-	assert.Equal(t, 3, got)
-}
-
 // enrichFixture builds one wave's worth of pipeline artifacts in dir:
 // a fetch manifest with fetch-stage plugin stats, filtered parse records,
 // probe outcomes, and geo records. The fixture exercises the W19 landmine:

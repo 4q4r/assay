@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,17 +67,11 @@ type fetchManifest struct {
 // directory (internal/stats owns its schema and atomic persistence).
 const providerHistoryFile = "provider-history.json"
 
-// adaptConcurrencyFunc is the in-wave adaptation seam (tests may swap).
-var adaptConcurrencyFunc = AdaptConcurrency
-
 // recordStageStatFunc is the per-stage stat persistence seam (tests may swap).
 var recordStageStatFunc = RecordStageStat
 
 // adjustBaseConcurrencyFunc is the inter-wave EMA seam (tests may swap).
 var adjustBaseConcurrencyFunc = AdjustBaseConcurrency
-
-// adaptTickerInterval is the in-wave adaptation tick cadence.
-var adaptTickerInterval = 5 * time.Second
 
 // outf writes formatted output; terminal writes never fail in practice and a
 // broken pipe must not mask the command result — the error is deliberately
@@ -763,7 +756,7 @@ func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*
 	}
 }
 
-//nolint:cyclop,gocognit // runProbe orchestrates the whole probe stage (probe + merged classification)
+//nolint:cyclop // runProbe orchestrates the whole probe stage (probe + merged classification)
 func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool) error {
 	classifyStart := time.Now()
 	p := newPaths(cfg)
@@ -819,43 +812,6 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 		}
 	}
 	opts.Progress = cmd.OutOrStdout()
-	// Wire AdaptConcurrency: in-wave adaptation goroutine ticks every 5s,
-	// sampling memory/CPU/port pressure and adjusting the worker count.
-	adaptCtx, cancelAdapt := context.WithCancel(context.Background())
-	defer cancelAdapt()
-	go func() {
-		runAdapt := func(current int) int {
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-			maxRAM := uint64(512 * 1024 * 1024)
-			memUsedPct := 0.0
-			if maxRAM > 0 {
-				memUsedPct = float64(ms.HeapAlloc) / float64(maxRAM) * 100.0
-			}
-			cpuIdle := runtime.NumGoroutine() < 1000
-			portExhausted := false
-			return adaptConcurrencyFunc(current, memUsedPct, cpuIdle, portExhausted)
-		}
-		current := max(opts.Threads, 1)
-		// immediate tick
-		if next := runAdapt(current); next != current {
-			outf(cmd.OutOrStdout(), "probe concurrency adapted: %d -> %d\n", current, next)
-			current = next
-		}
-		ticker := time.NewTicker(adaptTickerInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-adaptCtx.Done():
-				return
-			case <-ticker.C:
-				if next := runAdapt(current); next != current {
-					outf(cmd.OutOrStdout(), "probe concurrency adapted: %d -> %d\n", current, next)
-					current = next
-				}
-			}
-		}
-	}()
 	ka, opts, err := loadKnownAliveForProbe(p, opts)
 	if err != nil {
 		return err

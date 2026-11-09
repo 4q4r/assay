@@ -50,16 +50,20 @@ const adaptiveTimeoutCeiling = 30 * time.Second
 // waits on every battery (one wedge = one stalled batch). The budget is a
 // code-level constant (no new config surface): with the RTT-adaptive
 // per-request timeout (owner order 2026-11-08), the worst-case battery
-// arithmetic at the 30s per-request ceiling is ~35 HTTP request slots
-// (ladder 4 single-attempt + gate 2x2 retry slots + consensus echoes 3x2 +
-// ip-api body-contract echo 1x2 + media probes 8 retried endpoints x2 plus
-// 3 single-shot Disney POSTs) x 30s ≈ 1050s, + ~10s pacing/retry stagger
-// ≈ 1060s — twenty minutes is ≈ 1.14x that arithmetic. The margin is thin
-// and deliberate: every HTTP channel already bounds itself with its
+// arithmetic at the 30s per-request ceiling is ~38 HTTP request slots
+// (ladder 5 single-attempt — four rungs plus the exit-IP echo that fires
+// when the rungs all fail — + gate 2x2 retry slots + consensus echoes 3x2 +
+// ip-api body-contract echo 1x2 + media probes 9 retried endpoints x2
+// (TikTok contributes three: home, explore, and the header-variant re-shot)
+// plus 3 single-shot Disney POSTs) x 30s ≈ 1140s, + ~10s pacing/retry
+// stagger ≈ 1150s — twenty minutes is ≈ 1.04x that arithmetic. The margin
+// is thin and deliberate: every HTTP channel already bounds itself with its
 // per-request deadline, so the budget's real job is the deadline-less
 // raw-TCP channels (DNS-over-TCP, STUN), where a wedged framed read has no
-// other bound. A budget-burning battery records NOTHING for the node this
-// wave — the honesty contract's skip (the next wave re-classifies).
+// other bound. One fragility note: a future media probe adds +60s at the
+// ceiling — more than the ~50s of headroom this recount leaves. A
+// budget-burning battery records NOTHING for the node this wave — the
+// honesty contract's skip (the next wave re-classifies).
 var classifyNodeBudget = 20 * time.Minute
 
 // classifyTimeout derives ONE node's per-request classification timeout
