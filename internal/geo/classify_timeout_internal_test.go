@@ -53,9 +53,10 @@ func TestZeroRTTKeepsTodaysExactBehavior(t *testing.T) {
 }
 
 // TestClassifyNodeBudgetPinned pins the node budget at 20 minutes: the
-// worst-case battery arithmetic at the 30s per-request ceiling (~32 request
-// slots + pacing/retry stagger ≈ 985s) needs a ≥1.2x margin, and the merged
-// batch lifecycle waits on every battery — the constant is the only bound.
+// worst-case battery arithmetic at the 30s per-request ceiling (~38 request
+// slots + pacing/retry stagger ≈ 1150s) leaves a ≈1.04x margin, and the
+// merged batch lifecycle waits on every battery — the constant is the only
+// bound.
 func TestClassifyNodeBudgetPinned(t *testing.T) {
 	require.Equal(t, 20*time.Minute, classifyNodeBudget)
 }
