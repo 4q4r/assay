@@ -1,7 +1,10 @@
 package geo
 
 import (
+	"context"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -50,6 +53,46 @@ func TestAdaptiveClassifyTimeoutDerivation(t *testing.T) {
 func TestZeroRTTKeepsTodaysExactBehavior(t *testing.T) {
 	require.Equal(t, DefaultClassifyTimeout, classifyTimeout(0, DefaultClassifyTimeout))
 	require.Equal(t, DefaultClassifyTimeout, classifyTimeout(math.NaN(), DefaultClassifyTimeout))
+}
+
+// TestUnlockProbeRequestTimeoutFailSafe pins the request-side guard of the
+// battery's derived adaptive window (owner decision, option (а),
+// 2026-11-09): an unset or negative probe window (hand-built configs and
+// tests) fails safe to DefaultClassifyTimeout — never a zero/negative
+// context deadline, which would kill every request instantly; a positive
+// window passes through verbatim (the clamp output actually governs).
+func TestUnlockProbeRequestTimeoutFailSafe(t *testing.T) {
+	const delay = 1500 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	cases := []struct {
+		name   string
+		window time.Duration // <= 0 = unset (the hand-built probe shape)
+		wantOK bool
+	}{
+		{"unset field fails safe to the default floor — never a zero deadline", 0, true},
+		{"negative field fails safe equally", -time.Second, true},
+		{"positive window is honored verbatim", 500 * time.Millisecond, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &unlockProbe{
+				cl: srv.Client(), ua: "fail-safe-test",
+				pac: &pacer{minDelay: 0, now: time.Now}, now: time.Now,
+				requestTimeout: tc.window,
+			}
+			st, _, err := p.getRetry(context.Background(), srv.URL, nil)
+			if tc.wantOK {
+				require.NoError(t, err, "the fail-safe window must cover the 1.5s answer")
+				require.Equal(t, http.StatusNoContent, st)
+			} else {
+				require.Error(t, err, "a positive window below the delay must time out")
+			}
+		})
+	}
 }
 
 // TestClassifyNodeBudgetPinned pins the node budget at 20 minutes: the
