@@ -479,11 +479,16 @@ func TestEngineDeadNodeNeverScoresOKUnderConcurrency(t *testing.T) {
 	assert.Empty(t, entries, "every temp config dir must be cleaned after the run")
 }
 
-// I1b: the child environment must carry NONE of the six proxy variables —
-// ambient proxy inheritance would silently route check traffic through the
-// live client (L5).
+// I1b: the child environment must carry NONE of the six canonical proxy
+// variables as whole entries — ambient proxy inheritance would silently route
+// check traffic through the live client (L5). The guard matches per-line
+// exact prefixes, never substrings: ambient harness variables such as
+// ZCODE_HTTP_PROXY legitimately contain the substring "HTTP_PROXY=" and are
+// inherited by the child on purpose (Go's proxy stack reads only the
+// canonical six).
 func TestStartTempXrayStripsProxyEnv(t *testing.T) {
-	for _, v := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+	names := []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+	for _, v := range names {
 		t.Setenv(v, "http://127.0.0.1:10809")
 	}
 	dump := filepath.Join(t.TempDir(), "child-env.txt")
@@ -497,9 +502,17 @@ func TestStartTempXrayStripsProxyEnv(t *testing.T) {
 	require.NoError(t, rerr, "the fake must dump the child env")
 	require.NoError(t, inst.Close())
 
-	for _, v := range []string{"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY="} {
-		assert.NotContains(t, string(childEnv), v,
-			"proxy variable %s must be stripped from the child env (L5)", strings.TrimSuffix(v, "="))
+	// Whole-entry guard: no dumped line may begin with "NAME=" for any of the
+	// six names — per-line prefixes mirror dropProxyEnv's per-entry prefix
+	// semantics, while a substring scan would false-positive on ambient
+	// ZCODE_HTTP_PROXY-style variables.
+	lines := strings.Split(string(childEnv), "\n")
+	for _, name := range names {
+		prefix := name + "="
+		for _, line := range lines {
+			assert.False(t, strings.HasPrefix(line, prefix),
+				"proxy variable %s must be stripped from the child env as a whole entry (L5), found %q", name, line)
+		}
 	}
 	entries, rerr := os.ReadDir(workDir)
 	require.NoError(t, rerr)
