@@ -58,10 +58,6 @@ const (
 	// after the upgrade — the one-time migration sweep — and v2 verdicts
 	// then serve their normal windows.
 	UnlockBatteryVersion = 2
-	// unlockRequestTimeout bounds ONE probe request (the spec's 3s): every
-	// request carries its own context budget, so no slow service hangs a
-	// wave.
-	unlockRequestTimeout = 3 * time.Second
 	// unlockRetryStagger is the inter-attempt delay of the retry-once
 	// wrapper: an endpoint that failed transport-level gets ONE re-shot
 	// after this stagger; a pass after exactly one failure is the OK_FLAKY
@@ -724,6 +720,16 @@ type unlockProbe struct {
 	exitIP string
 	scheme string // the representative node's scheme (STUN rides hysteria2/hy2 only)
 	flaky  int    // endpoints recovered on the retry pass (OK_FLAKY count)
+	// requestTimeout is the per-node DERIVED adaptive request window — the
+	// same clamp(10x RTT, [geo].timeout floor, 30s ceiling) the battery's
+	// HTTP clients are built with. ONE derived timeout governs the whole
+	// battery, ladder and media alike (owner decision, option (а),
+	// 2026-11-09: the Phase-1 3s per-request spec cap is retired, so slow
+	// tunnels get the same media-probe window as the ladder; the trade-off
+	// is that a fully failing media battery now burns up to the ceiling per
+	// slot, which the 20m classifyNodeBudget already prices). <= 0
+	// (hand-built configs and tests) fails safe to DefaultClassifyTimeout.
+	requestTimeout time.Duration
 }
 
 // buildUnlockClient builds the battery's HTTP client: the ONLY transport
@@ -793,17 +799,22 @@ func (p *unlockProbe) postForm(
 	return p.do(ctx, http.MethodPost, endpoint, formURLEncodedContentType, body, headers, unlockBodyLimit)
 }
 
-// do performs ONE probe request: its own pacing slot and 3s context budget,
-// a bounded body read, the pipeline UA and the caller's headers. A non-2xx
-// status is DATA (the classifiers interpret it), not an error — only
-// transport failures are err.
+// do performs ONE probe request: its own pacing slot and the probe's
+// derived adaptive request window (p.requestTimeout; unset values fail safe
+// to DefaultClassifyTimeout), a bounded body read, the pipeline UA and the
+// caller's headers. A non-2xx status is DATA (the classifiers interpret it),
+// not an error — only transport failures are err.
 func (p *unlockProbe) do(ctx context.Context, method, endpoint, contentType, body string,
 	headers map[string]string, limit int64,
 ) (int, string, error) {
 	if err := p.pac.wait(ctx); err != nil {
 		return 0, "", err
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, unlockRequestTimeout)
+	reqTimeout := p.requestTimeout
+	if reqTimeout <= 0 {
+		reqTimeout = DefaultClassifyTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, reqTimeout)
 	defer cancel()
 	var rdr io.Reader
 	if body != "" {
