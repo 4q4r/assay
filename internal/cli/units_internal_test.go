@@ -11,7 +11,7 @@ import (
 )
 
 // The systemd user unit is a REPO TEMPLATE (single source of truth,
-// embedded by internal/install via go:embed): `publicvpn install` renders it
+// embedded by internal/install via go:embed): `assay install` renders it
 // into the user unit dir and enables the daemon via the allowlisted executor
 // seam. These tests pin the template content so the Restart=always daemon
 // contract, the watch verb, and the placeholder set cannot silently drift.
@@ -28,7 +28,7 @@ func readUnit(t *testing.T, name string) string {
 }
 
 func TestWatchUnitTemplate(t *testing.T) {
-	service := readUnit(t, "public_vpn-watch.service")
+	service := readUnit(t, "assay-watch.service")
 	assert.Contains(t, service, "Type=notify", "sd_notify(3): READY=1 + WATCHDOG=1 pings")
 	assert.Contains(t, service, "WatchdogSec=300",
 		"a wedged daemon stops pinging — systemd kills and restarts it")
@@ -50,7 +50,7 @@ func TestWatchUnitTemplate(t *testing.T) {
 func TestSystemdReadmeDocumentsInstallSteps(t *testing.T) {
 	readme := readUnit(t, "README.md")
 	for _, want := range []string{
-		"publicvpn install",
+		"assay install",
 		"~/.config/systemd/user",
 		"daemon-reload",
 		"enable --now",

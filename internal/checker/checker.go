@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/render"
-	"public_vpn/internal/store"
+	"assay/internal/model"
+	"assay/internal/render"
+	"assay/internal/store"
 )
 
 // Engine defaults (exported: the CLI flag defaults reference the same
@@ -98,7 +98,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 	if len(pool) == 0 {
 		return nil, errors.New(
 			"check: no checkable nodes (cold base empty or no alive nodes — " +
-				"run `publicvpn probe` first — classification is merged into the probe " +
+				"run `assay probe` first — classification is merged into the probe " +
 				"pass and writes the cold base; or pass --with-dead)")
 	}
 

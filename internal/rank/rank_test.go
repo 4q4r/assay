@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/rank"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/rank"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

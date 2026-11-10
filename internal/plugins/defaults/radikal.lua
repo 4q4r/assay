@@ -13,7 +13,7 @@ local function body_lines(body)
   if trimmed:find("://", 1, true) then
     return body
   end
-  local ok, decoded = pcall(publicvpn.base64.decode, trimmed)
+  local ok, decoded = pcall(assay.base64.decode, trimmed)
   if ok and decoded:find("://", 1, true) then
     return decoded
   end
@@ -22,7 +22,7 @@ end
 
 local function collect()
   local nodes = {}
-  local files = publicvpn.github_files{
+  local files = assay.github_files{
     repo = REPO,
     manifest = MANIFEST,
     include = INCLUDE,
@@ -36,7 +36,7 @@ local function collect()
     for line in text:gmatch("([^\r\n]*)\n") do
       line = line:gsub("^%s+", ""):gsub("%s+$", "")
       if line ~= "" and not line:find("^#") and not line:find("^//") then
-        nodes[#nodes + 1] = publicvpn.node{ raw = line }
+        nodes[#nodes + 1] = assay.node{ raw = line }
       end
     end
   end

@@ -93,7 +93,7 @@ local function catalog_lists(md)
     local heading = line:match("^##%s+(.-)%s*$")
     if heading then
       if current == nil and skipped > 0 then
-        publicvpn.log("skip section '", name, "': ", skipped,
+        assay.log("skip section '", name, "': ", skipped,
           " out-of-scope links (clash/singbox/credits or yaml/json)")
       end
       current = nil
@@ -111,7 +111,7 @@ local function catalog_lists(md)
       if url then
         url = url:gsub("[%)%]%,>%.]+$", "")
         if url_skipped(url) then
-          publicvpn.log("skip out-of-scope url ", url)
+          assay.log("skip out-of-scope url ", url)
           skipped = skipped + 1
         elseif current == nil then
           skipped = skipped + 1
@@ -122,7 +122,7 @@ local function catalog_lists(md)
     end
   end
   if current == nil and skipped > 0 then
-    publicvpn.log("skip section '", name, "': ", skipped,
+    assay.log("skip section '", name, "': ", skipped,
       " out-of-scope links (clash/singbox/credits or yaml/json)")
   end
   return lists
@@ -176,7 +176,7 @@ local function body_lines(body)
   -- Whitespace-flattened retry: line-wrapped base64 subscriptions must not
   -- be misclassified as junk just for interior newlines.
   local flat = trimmed:gsub("%s+", "")
-  local ok, decoded = pcall(publicvpn.base64.decode, flat)
+  local ok, decoded = pcall(assay.base64.decode, flat)
   if ok and decoded:find("://", 1, true) then
     return decoded
   end
@@ -186,7 +186,7 @@ end
 local function harvest(nodes, file)
   local src = body_lines(file.content)
   if src == nil then
-    publicvpn.log("skip ", file.path, ": not URI/base64 content")
+    assay.log("skip ", file.path, ": not URI/base64 content")
     return
   end
   -- Plain-local call in the for-in header: the gopher-lua v1.1.2 VM panics
@@ -195,17 +195,17 @@ local function harvest(nodes, file)
   for line in src:gmatch("([^\r\n]+)") do
     line = line:gsub("^%s+", ""):gsub("%s+$", "")
     if ingestible(line) then
-      nodes[#nodes + 1] = publicvpn.node{ raw = line }
+      nodes[#nodes + 1] = assay.node{ raw = line }
       kept = kept + 1
     end
   end
   if kept == 0 then
-    publicvpn.log("skip ", file.path, ": no ingestible links")
+    assay.log("skip ", file.path, ": no ingestible links")
   end
 end
 
 local function collect()
-  local resp = publicvpn.http{ url = CATALOG_URL, timeout = 30 }
+  local resp = assay.http{ url = CATALOG_URL, timeout = 30 }
   if resp.status ~= 200 then
     error("catalog fetch returned HTTP " .. tostring(resp.status))
   end
@@ -215,7 +215,7 @@ local function collect()
   local used = 0
   for _, raw_url in ipairs(queue) do
     if used >= MAX_FETCHES then
-      publicvpn.log("catalog crawl capped at ", MAX_FETCHES,
+      assay.log("catalog crawl capped at ", MAX_FETCHES,
         " fetches per run — raising MAX_FETCHES in this file goes deeper")
       break
     end
@@ -223,12 +223,12 @@ local function collect()
     if not seen[url] then
       seen[url] = true
       used = used + 1
-      local ok, sub = pcall(publicvpn.http,
+      local ok, sub = pcall(assay.http,
     { url = url, timeout = 3, max_body_bytes = 2 * 1024 * 1024 })
       if not ok then
-        publicvpn.log("fetch failed ", url, ": ", tostring(sub))
+        assay.log("fetch failed ", url, ": ", tostring(sub))
       elseif sub.status ~= 200 then
-        publicvpn.log("skip ", url, ": HTTP ", tostring(sub.status))
+        assay.log("skip ", url, ": HTTP ", tostring(sub.status))
       else
         harvest(nodes, { path = url, content = sub.body })
       end

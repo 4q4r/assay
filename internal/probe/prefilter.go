@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/model"
+	"assay/internal/model"
 )
 
 // dialFunc is one TCP dial (production: net.Dialer.DialContext; tests: the

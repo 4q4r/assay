@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/fetch"
-	"public_vpn/internal/plugins"
+	"assay/internal/fetch"
+	"assay/internal/plugins"
 
 	"github.com/stretchr/testify/require"
 )

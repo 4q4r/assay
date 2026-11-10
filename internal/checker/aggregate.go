@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"public_vpn/internal/model"
+	"assay/internal/model"
 )
 
 // Aggregate computes the node-level aggregates from the raw attempts:

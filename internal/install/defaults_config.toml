@@ -1,7 +1,7 @@
-# publicvpn default configuration — materialized by `publicvpn install`
+# assay default configuration — materialized by `assay install`
 # (W13-deploy deploy layout). This file IS the default config: without -c
 # every command resolves to it first (one file wins whole — nothing is ever
-# merged). A re-install NEVER overwrites it; `publicvpn uninstall --purge`
+# merged). A re-install NEVER overwrites it; `assay uninstall --purge`
 # removes it along with the data dir. Edit in place.
 
 data_dir = "{{ .DataDir }}"

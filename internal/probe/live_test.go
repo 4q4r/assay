@@ -21,12 +21,12 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/probe"
-	"public_vpn/internal/render"
-	"public_vpn/internal/store"
+	"assay/internal/checker"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/probe"
+	"assay/internal/render"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

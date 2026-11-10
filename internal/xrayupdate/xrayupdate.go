@@ -1,4 +1,4 @@
-// Package xrayupdate implements `publicvpn xray-update` (W14): fetch the
+// Package xrayupdate implements `assay xray-update` (W14): fetch the
 // latest Xray-core release for this platform, VERIFY its published sha256
 // (every release asset ships a .dgst companion), unpack, validate the NEW
 // binary with `xray run -test`, and atomically replace the configured
@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/ui"
+	"assay/internal/ui"
 )
 
 // Platform names for the release asset map (goconst: repeated literals).

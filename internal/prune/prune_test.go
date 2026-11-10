@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/prune"
-	"public_vpn/internal/rank"
-	"public_vpn/internal/store"
+	"assay/internal/model"
+	"assay/internal/prune"
+	"assay/internal/rank"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

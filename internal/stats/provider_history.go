@@ -32,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/store"
+	"assay/internal/store"
 )
 
 // Model constants (owner-approved Phase-2 numbers — every threshold lives

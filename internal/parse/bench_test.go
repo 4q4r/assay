@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/parse"
+	"assay/internal/parse"
 )
 
 // buildMixed returns a deterministic mixed corpus of n lines: ~85% valid

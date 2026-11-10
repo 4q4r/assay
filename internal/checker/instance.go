@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/render"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/render"
 )
 
 // SocksInstance is one live temp SOCKS5 endpoint (production: a temp xray;

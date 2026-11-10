@@ -52,7 +52,7 @@ local function body_lines(body)
   -- Whitespace-flattened retry: line-wrapped base64 subscriptions must not
   -- be misclassified as junk just for interior newlines.
   local flat = trimmed:gsub("%s+", "")
-  local ok, decoded = pcall(publicvpn.base64.decode, flat)
+  local ok, decoded = pcall(assay.base64.decode, flat)
   if ok and decoded:find("://", 1, true) then
     return decoded
   end
@@ -62,7 +62,7 @@ end
 local function harvest(nodes, file)
   local src = body_lines(file.content)
   if src == nil then
-    publicvpn.log("skip ", file.path, ": not URI/base64 content")
+    assay.log("skip ", file.path, ": not URI/base64 content")
     return
   end
   -- Plain-local call in the for-in header: the gopher-lua v1.1.2 VM panics
@@ -71,20 +71,20 @@ local function harvest(nodes, file)
   for line in src:gmatch("([^\r\n]+)") do
     line = line:gsub("^%s+", ""):gsub("%s+$", "")
     if ingestible(line) then
-      nodes[#nodes + 1] = publicvpn.node{ raw = line }
+      nodes[#nodes + 1] = assay.node{ raw = line }
       kept = kept + 1
     end
   end
   if kept == 0 then
-    publicvpn.log("skip ", file.path, ": no ingestible links")
+    assay.log("skip ", file.path, ": no ingestible links")
   end
 end
 
 local function collect()
-  -- pcall form: publicvpn.http raises on transport errors and on bodies
+  -- pcall form: assay.http raises on transport errors and on bodies
   -- exceeding max_body_bytes; either way the guard re-raises one loud,
   -- plugin-attributed message.
-  local ok, resp = pcall(publicvpn.http, {
+  local ok, resp = pcall(assay.http, {
     url = SOURCE_URL,
     timeout = 30,
     max_body_bytes = MAX_BODY_BYTES,
@@ -96,7 +96,7 @@ local function collect()
     error("radarhub fetch returned HTTP " .. tostring(resp.status))
   end
   if resp.body == "" then
-    publicvpn.log("radarhub body is empty — zero nodes this run")
+    assay.log("radarhub body is empty — zero nodes this run")
     return {}
   end
   local nodes = {}

@@ -4,7 +4,7 @@ import (
 	"sort"
 	"time"
 
-	"public_vpn/internal/store"
+	"assay/internal/store"
 )
 
 // OutcomeAggregation aggregates a probe wave's outcomes for calibration.

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/fetch"
+	"assay/internal/config"
+	"assay/internal/fetch"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

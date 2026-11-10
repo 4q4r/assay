@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/cli"
-	"public_vpn/internal/model"
+	"assay/internal/cli"
+	"assay/internal/model"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

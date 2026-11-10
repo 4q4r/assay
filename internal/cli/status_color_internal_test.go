@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/install"
+	"assay/internal/config"
+	"assay/internal/install"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -46,7 +46,7 @@ func statusFixture(t *testing.T) (*cobra.Command, *bytes.Buffer, string) {
 	// legacy W5 timer → LEGACY hint.
 	require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.RefreshTimer), []byte("[Unit]\n"), 0o644))
 	// binary drift → STALE line.
-	installed := filepath.Join(binDir, "publicvpn")
+	installed := filepath.Join(binDir, "assay")
 	current, err := os.ReadFile(installed)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(installed,

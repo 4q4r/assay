@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
-	"public_vpn/internal/ui"
+	"assay/internal/checker"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/store"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 )

@@ -3,7 +3,7 @@ package model_test
 import (
 	"testing"
 
-	"public_vpn/internal/model"
+	"assay/internal/model"
 
 	"github.com/stretchr/testify/assert"
 )

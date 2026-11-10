@@ -10,8 +10,8 @@ import (
 	"io"
 	"os"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/ui"
+	"assay/internal/config"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -55,7 +55,7 @@ type installResolution struct {
 // its exact path so the owner's tuned config keeps working); else — and
 // this is the W13-deploy canonical user flow — a CONFIGLESS resolution and
 // a non-empty materializePath: install materializes the default config at
-// ~/.local/share/publicvpn/config.toml and the daemon unit runs plain
+// ~/.local/share/assay/config.toml and the daemon unit runs plain
 // `watch`. A no--c install is default-location FOREVER: even after the
 // first install materialized the share config, a re-install renders plain
 // `watch` (the daemon reads the default location — the unit never flips to
@@ -100,10 +100,21 @@ func resolveInstallPath(explicit string) (installResolution, error) {
 	if err != nil {
 		return installResolution{}, err
 	}
-	return installResolution{
-		res:             res,
-		materializePath: config.DefaultShareConfigPath(home),
-	}, nil
+	if res.Source == config.SourceConfigless {
+		return installResolution{
+			res:             res,
+			materializePath: config.DefaultShareConfigPath(home),
+		}, nil
+	}
+	// A real config came back through the chain — the pre-rename local-share
+	// courtesy (found-if-exists). Honor it exactly like the legacy home tier:
+	// the unit embeds its exact path so the owner's tuned config keeps
+	// working (the daemon's default location is the NEW path now — plain
+	// `watch` there would lose the tuned config), and NOTHING is materialized
+	// at the new canonical path: a defaults file there would shadow the
+	// honored config forever. NO auto-migration — the owner moves the file
+	// by hand in the deploy wave.
+	return installResolution{res: res, embedsConfig: true}, nil
 }
 
 func pathExists(p string) bool {

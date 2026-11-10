@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/plugins"
+	"assay/internal/config"
+	"assay/internal/plugins"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -36,7 +36,7 @@ func breakerFixtureRegistry(t *testing.T) *plugins.Registry {
 	t.Helper()
 	reg := plugins.NewRegistry()
 	reg.Set(&plugins.Plugin{ID: "healthy", Path: "healthy.lua", Code: []byte(
-		`return function() return { publicvpn.node{ raw = "vless://a@h:1?s=1" } } end`)})
+		`return function() return { assay.node{ raw = "vless://a@h:1?s=1" } } end`)})
 	reg.Set(&plugins.Plugin{ID: "flaky", Path: "flaky.lua", Code: []byte(failingPluginCode)})
 	return reg
 }

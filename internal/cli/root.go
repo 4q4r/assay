@@ -1,4 +1,4 @@
-// Package cli wires the publicvpn command tree: the W1–W3 stages (fetch,
+// Package cli wires the assay command tree: the W1–W3 stages (fetch,
 // parse, filter, probe, geo, select, render, activate, status) and the W4
 // maintenance surface (maintain wave with stats poll + pruning).
 package cli
@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/spf13/cobra"
 )
@@ -16,7 +16,7 @@ import (
 func New() *cobra.Command {
 	var cfgPath string
 	root := &cobra.Command{
-		Use:           "publicvpn",
+		Use:           "assay",
 		Short:         "Third-party public-node location pool pipeline for the owner's xray client",
 		SilenceUsage:  true,
 		SilenceErrors: false,

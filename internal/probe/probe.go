@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/checker"
+	"assay/internal/model"
+	"assay/internal/store"
 )
 
 // DefaultConcurrency bounds how many temp instances exist at once (each is

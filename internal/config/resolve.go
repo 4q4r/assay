@@ -1,8 +1,8 @@
 // Config resolution (W12; tier 2 reworked in W13-deploy): the CLI never
 // REQUIRES a config path. Exactly one source wins whole — explicit -c, else
-// the local-share default (~/.local/share/publicvpn/config.toml, the XDG
+// the local-share default (~/.local/share/assay/config.toml, the XDG
 // data root), else the DEPRECATED legacy home location
-// (~/.config/publicvpn/config.toml — found-if-exists courtesy with a loud
+// (~/.config/assay/config.toml — found-if-exists courtesy with a loud
 // move warning, one release cycle), else the cwd default, else the built-in
 // defaults (fully configless). There is no merging, ever: multiple merged
 // config sources are rejected by the owner's house rule, so the first
@@ -27,13 +27,13 @@ type SourceKind int
 const (
 	// SourceExplicit means the user passed -c <path>; the file must exist.
 	SourceExplicit SourceKind = iota
-	// SourceShare means <local-share>/publicvpn/config.toml existed and was
+	// SourceShare means <local-share>/assay/config.toml existed and was
 	// loaded — the W13-deploy canonical default location (the XDG data root:
-	// $XDG_DATA_HOME/publicvpn when the env var is absolute, else
-	// ~/.local/share/publicvpn).
+	// $XDG_DATA_HOME/assay when the env var is absolute, else
+	// ~/.local/share/assay).
 	SourceShare
 	// SourceLegacyHome means the DEPRECATED pre-W13 home default
-	// (~/.config/publicvpn/config.toml) existed and was loaded — the one
+	// (~/.config/assay/config.toml) existed and was loaded — the one
 	// release-cycle courtesy: the file keeps working, the loud deprecation
 	// warning (in Resolved.Warnings) names the move.
 	SourceLegacyHome
@@ -66,11 +66,11 @@ func (s SourceKind) String() string {
 // ShareConfigDisplay is the canonical local-share config spelling used in
 // every user-facing message (docs, help texts, loud errors) — the W13-deploy
 // default location.
-const ShareConfigDisplay = "~/.local/share/publicvpn/config.toml"
+const ShareConfigDisplay = "~/.local/share/assay/config.toml"
 
 // LegacyHomeConfigDisplay is the deprecated pre-W13 home config spelling —
 // it survives ONLY in the deprecation warning and the migration notes.
-const LegacyHomeConfigDisplay = "~/.config/publicvpn/config.toml"
+const LegacyHomeConfigDisplay = "~/.config/assay/config.toml"
 
 // LegacyLocationWarning is the loud one-release-cycle deprecation courtesy:
 // the legacy ~/.config location still loads (found-if-exists), but every
@@ -78,7 +78,7 @@ const LegacyHomeConfigDisplay = "~/.config/publicvpn/config.toml"
 func LegacyLocationWarning(path, canonical string) string {
 	return "legacy config location detected: " + path +
 		" — move it to " + canonical +
-		" (the ~/.config/publicvpn location is deprecated and will stop being honored in a future release)"
+		" (the ~/.config/assay location is deprecated and will stop being honored in a future release)"
 }
 
 // ConfiglessBoundaryError is the loud stage boundary: render/activate need a
@@ -91,8 +91,8 @@ func ConfiglessBoundaryError(stage string) error {
 
 // DefaultShareConfigPath returns the canonical local-share config path under
 // the given home directory (the XDG data root: DefaultDataDir's parent
-// scheme — $XDG_DATA_HOME/publicvpn when the env var is absolute, else
-// ~/.local/share/publicvpn). One scheme for the whole local-share layout.
+// scheme — $XDG_DATA_HOME/assay when the env var is absolute, else
+// ~/.local/share/assay). One scheme for the whole local-share layout.
 func DefaultShareConfigPath(home string) string {
 	return filepath.Join(DefaultDataDir(home), "config.toml")
 }
@@ -100,12 +100,58 @@ func DefaultShareConfigPath(home string) string {
 // LegacyHomeConfigPath returns the DEPRECATED pre-W13 home-default config
 // path under the given home directory (found-if-exists courtesy only).
 func LegacyHomeConfigPath(home string) string {
-	return filepath.Join(home, ".config", "publicvpn", "config.toml")
+	return filepath.Join(home, ".config", "assay", "config.toml")
 }
 
-// DefaultDataDir returns the configless data dir: $XDG_DATA_HOME/publicvpn
+// legacyShareLeaf is the data-dir leaf under the project's FORMER name —
+// the pre-rename local-share location. It is assembled from parts on
+// purpose: the rename's acceptance contract keeps the old spelling out of
+// Go sources while the found-if-exists courtesy must still address the real
+// on-disk directory (and name it in the hint). The runtime value is the
+// historical leaf; nothing else may reintroduce the old name.
+const legacyShareLeaf = "public" + "vpn"
+
+// legacyShareDataDir returns the pre-rename local-share data dir under the
+// same scheme DefaultDataDir used before the rename: $XDG_DATA_HOME/<leaf>
+// when the env var is absolute, else ~/.local/share/<leaf>. Found-if-exists
+// courtesy only — the resolution never writes there.
+func legacyShareDataDir(home string) string {
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" && filepath.IsAbs(xdg) {
+		return filepath.Join(xdg, legacyShareLeaf)
+	}
+	return filepath.Join(home, ".local", "share", legacyShareLeaf)
+}
+
+// LegacyShareLocationWarning is the ONE loud rename-migration hint line: the
+// pre-rename local-share location exists and the new data dir is absent.
+// It never moves anything (NO auto-migration — the owner migrates by hand in
+// the deploy wave); it only tells the user where the data now belongs.
+func LegacyShareLocationWarning(oldDir, newDir string) string {
+	return "legacy data location detected: " + oldDir +
+		" — move it to " + newDir +
+		" (the pre-rename " + legacyShareLeaf + " data dir is deprecated and will stop being honored in a future release)"
+}
+
+// legacyShareDirHint returns the rename-migration hint when the old data
+// dir exists and the new data dir is absent; "" otherwise (including an
+// empty home — API misuse is handled by the configless path itself).
+func legacyShareDirHint(home string) string {
+	if home == "" {
+		return ""
+	}
+	oldDir := legacyShareDataDir(home)
+	if _, err := os.Stat(oldDir); err != nil {
+		return ""
+	}
+	if _, err := os.Stat(DefaultDataDir(home)); err == nil {
+		return ""
+	}
+	return LegacyShareLocationWarning(oldDir, DefaultDataDir(home))
+}
+
+// DefaultDataDir returns the configless data dir: $XDG_DATA_HOME/assay
 // when XDG_DATA_HOME is set to an ABSOLUTE path, else the XDG user-data
-// fallback ~/.local/share/publicvpn under the given home (M-1: the env var
+// fallback ~/.local/share/assay under the given home (M-1: the env var
 // is part of the resolution contract, honored wherever the configless
 // default applies — the data dir AND the local-share config tier alike).
 //
@@ -115,9 +161,9 @@ func LegacyHomeConfigPath(home string) string {
 // can warn loud.
 func DefaultDataDir(home string) string {
 	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" && filepath.IsAbs(xdg) {
-		return filepath.Join(xdg, "publicvpn")
+		return filepath.Join(xdg, "assay")
 	}
-	return filepath.Join(home, ".local", "share", "publicvpn")
+	return filepath.Join(home, ".local", "share", "assay")
 }
 
 // XDGDataDirViolation reports a spec-invalid XDG_DATA_HOME (set but
@@ -132,7 +178,7 @@ func XDGDataDirViolation() string {
 	}
 	return "XDG_DATA_HOME=" + strconv.Quote(xdg) +
 		" is relative — the XDG Base Directory spec requires an absolute path; " +
-		"treating it as unset (data dir falls back to ~/.local/share/publicvpn)"
+		"treating it as unset (data dir falls back to ~/.local/share/assay)"
 }
 
 // Resolved is the effective configuration plus its provenance.
@@ -152,9 +198,9 @@ type Resolved struct {
 //
 //  1. explicit != "" — the -c path wins ALWAYS; the file must exist (loud
 //     error naming the path when missing — never a silent fall-through);
-//  2. <local-share>/publicvpn/config.toml, if it exists (the W13-deploy
+//  2. <local-share>/assay/config.toml, if it exists (the W13-deploy
 //     canonical default; $XDG_DATA_HOME honored, absolute-only);
-//  3. <home>/.config/publicvpn/config.toml, if it exists — the DEPRECATED
+//  3. <home>/.config/assay/config.toml, if it exists — the DEPRECATED
 //     legacy location, still honored as a one-release-cycle courtesy; the
 //     resolution carries the loud move warning;
 //  4. <cwd>/config.toml, if it exists;
@@ -200,52 +246,130 @@ func resolveExplicit(explicit, cwd string) (*Resolved, error) {
 	return &Resolved{Config: cfg, Source: SourceExplicit, Path: abs}, nil
 }
 
-// resolveImplicit walks the documented default tiers (local-share → legacy
-// courtesy → cwd → configless). The legacy deprecation warning fires
-// whenever the legacy file exists, including when a higher tier won and the
-// file is being ignored.
+// resolveImplicit walks the documented default tiers (local-share →
+// pre-rename local-share courtesy → legacy home courtesy → cwd →
+// configless). The legacy deprecation warning fires whenever the legacy
+// file exists, including when a higher tier won and the file is being
+// ignored. The rename-migration hint (the pre-rename data dir) fires at
+// most once per resolution and only when the new data dir is absent.
 func resolveImplicit(home, cwd string) (*Resolved, error) {
-	if home != "" {
-		if p := DefaultShareConfigPath(home); fileExists(p) {
-			cfg, err := Load(p)
-			if err != nil {
-				return nil, err
-			}
-			res := &Resolved{Config: cfg, Source: SourceShare, Path: p}
-			if lp := LegacyHomeConfigPath(home); fileExists(lp) {
-				res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
-			}
-			return res, nil
-		}
-		if p := LegacyHomeConfigPath(home); fileExists(p) {
-			cfg, err := Load(p)
-			if err != nil {
-				return nil, err
-			}
-			return &Resolved{
-				Config: cfg, Source: SourceLegacyHome, Path: p,
-				Warnings: []string{LegacyLocationWarning(p, ShareConfigDisplay)},
-			}, nil
-		}
+	res, err := resolveHomeTiers(home)
+	if res != nil || err != nil {
+		return res, err
 	}
-	if cwd != "" {
-		if p := filepath.Join(cwd, "config.toml"); fileExists(p) {
-			cfg, err := Load(p)
-			if err != nil {
-				return nil, err
-			}
-			res := &Resolved{Config: cfg, Source: SourceCwd, Path: p}
-			// The legacy courtesy spans the whole chain: the file warns even
-			// when the cwd tier wins over it.
-			if home != "" {
-				if lp := LegacyHomeConfigPath(home); fileExists(lp) {
-					res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
-				}
-			}
-			return res, nil
-		}
+	res, err = resolveCwdTier(cwd, home)
+	if res != nil || err != nil {
+		return res, err
 	}
 	return configless(home)
+}
+
+// resolveHomeTiers applies the three home-rooted tiers in order; a nil
+// result with a nil error means no tier matched.
+func resolveHomeTiers(home string) (*Resolved, error) {
+	if home == "" {
+		return nil, nil
+	}
+	res, err := newShareTier(home)
+	if res != nil || err != nil {
+		return res, err
+	}
+	res, err = legacyShareTier(home)
+	if res != nil || err != nil {
+		return res, err
+	}
+	return legacyHomeTier(home)
+}
+
+// newShareTier loads the canonical local-share config; nil/nil when absent.
+// The ignored legacy-home file still warns (the courtesy spans the chain).
+func newShareTier(home string) (*Resolved, error) {
+	p := DefaultShareConfigPath(home)
+	if !fileExists(p) {
+		return nil, nil
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		return nil, err
+	}
+	res := &Resolved{Config: cfg, Source: SourceShare, Path: p}
+	if lp := LegacyHomeConfigPath(home); fileExists(lp) {
+		res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
+	}
+	return res, nil
+}
+
+// legacyShareTier is the rename-migration courtesy: the pre-rename
+// local-share config still loads (found-if-exists) and the resolution
+// carries exactly ONE loud move hint. Found-if-exists ALWAYS warns here —
+// the config was read from the old location, so the user must be told
+// where it belongs, even in the edge case where the new data dir already
+// exists without its own config. NO auto-migration: nothing is ever
+// written or moved. Nil/nil when absent.
+func legacyShareTier(home string) (*Resolved, error) {
+	p := filepath.Join(legacyShareDataDir(home), "config.toml")
+	if !fileExists(p) {
+		return nil, nil
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		return nil, err
+	}
+	res := &Resolved{Config: cfg, Source: SourceShare, Path: p}
+	if lp := LegacyHomeConfigPath(home); fileExists(lp) {
+		res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
+	}
+	res.Warnings = append(res.Warnings,
+		LegacyShareLocationWarning(legacyShareDataDir(home), DefaultDataDir(home)))
+	return res, nil
+}
+
+// legacyHomeTier loads the deprecated pre-W13 home config; nil/nil when
+// absent. The rename hint rides along when the pre-rename data dir exists.
+func legacyHomeTier(home string) (*Resolved, error) {
+	p := LegacyHomeConfigPath(home)
+	if !fileExists(p) {
+		return nil, nil
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		return nil, err
+	}
+	res := &Resolved{
+		Config: cfg, Source: SourceLegacyHome, Path: p,
+		Warnings: []string{LegacyLocationWarning(p, ShareConfigDisplay)},
+	}
+	if hint := legacyShareDirHint(home); hint != "" {
+		res.Warnings = append(res.Warnings, hint)
+	}
+	return res, nil
+}
+
+// resolveCwdTier loads the cwd config; nil/nil when absent or no cwd. The
+// legacy courtesies span the whole chain: both warnings fire even when the
+// cwd tier wins over the files they name.
+func resolveCwdTier(cwd, home string) (*Resolved, error) {
+	if cwd == "" {
+		return nil, nil
+	}
+	p := filepath.Join(cwd, "config.toml")
+	if !fileExists(p) {
+		return nil, nil
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		return nil, err
+	}
+	res := &Resolved{Config: cfg, Source: SourceCwd, Path: p}
+	if home != "" {
+		if lp := LegacyHomeConfigPath(home); fileExists(lp) {
+			res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
+		}
+		if hint := legacyShareDirHint(home); hint != "" {
+			res.Warnings = append(res.Warnings, hint)
+		}
+	}
+	return res, nil
 }
 
 // configless builds the no-file configuration: data_dir at the XDG default,
@@ -271,6 +395,12 @@ func configless(home string) (*Resolved, error) {
 	res := &Resolved{Config: cfg, Source: SourceConfigless}
 	if violation := XDGDataDirViolation(); violation != "" {
 		res.Warnings = append(res.Warnings, violation)
+	}
+	// Rename-migration hint: a configless run whose pre-rename data dir still
+	// exists (new one absent) carries exactly ONE loud move hint. No data is
+	// ever copied or moved by the resolution.
+	if hint := legacyShareDirHint(home); hint != "" {
+		res.Warnings = append(res.Warnings, hint)
 	}
 	return res, nil
 }

@@ -1,4 +1,4 @@
-// Package install implements `publicvpn install` / `uninstall`: self-install
+// Package install implements `assay install` / `uninstall`: self-install
 // of the running binary plus the rendered systemd user unit (the W10 watch
 // daemon, Restart=always), with the systemctl surface pinned to an exact
 // allowlist. The unit is rendered from the repo's systemd/ template (single
@@ -19,12 +19,12 @@ import (
 	"text/template"
 	"time"
 
-	units "public_vpn/systemd"
+	units "assay/systemd"
 )
 
 // defaultConfigTemplate is the embedded default-config TOML (single source
 // of truth, go:embed): the values a configless run uses, written as TOML
-// with full comments. `publicvpn install` without -c materializes it at the
+// with full comments. `assay install` without -c materializes it at the
 // canonical local-share path — the same file every command then resolves
 // first (one file wins whole, nothing is ever merged).
 //
@@ -32,21 +32,21 @@ import (
 var defaultConfigFS embed.FS
 
 // installedBinaryName is the fixed executable name in BinDir.
-const installedBinaryName = "publicvpn"
+const installedBinaryName = "assay"
 
 // WatchService is the W10 daemon unit installed into the user unit
 // directory.
-const WatchService = "public_vpn-watch.service"
+const WatchService = "assay-watch.service"
 
 // Legacy unit names from the W5 timer era: never installed again, but
 // uninstall removes them and install cleans them up (existing users get the
 // migration for free — stale timers would fire waves concurrently with the
 // daemon and stampede the probe origin).
 const (
-	RefreshService   = "public_vpn-refresh.service"
-	RefreshTimer     = "public_vpn-refresh.timer"
-	SpeedtestService = "public_vpn-speedtest.service"
-	SpeedtestTimer   = "public_vpn-speedtest.timer"
+	RefreshService   = "assay-refresh.service"
+	RefreshTimer     = "assay-refresh.timer"
+	SpeedtestService = "assay-speedtest.service"
+	SpeedtestTimer   = "assay-speedtest.timer"
 )
 
 // UnitNames lists the unit files CURRENT install renders.
@@ -351,7 +351,7 @@ func disablePresentUnits(unitDir string, exec Executor) ([]string, error) {
 	return disabled, nil
 }
 
-// copyBinary atomically copies src into dir as `publicvpn` (temp file in the
+// copyBinary atomically copies src into dir as `assay` (temp file in the
 // SAME directory → fsync → rename, so a crash never leaves a half-written
 // binary), mode 0755. Re-running over an existing install = self-upgrade.
 func copyBinary(src, dir string) (string, error) {
@@ -364,7 +364,7 @@ func copyBinary(src, dir string) (string, error) {
 	}
 	defer func() { _ = in.Close() }() // read-only handle on the running image
 	target := filepath.Join(dir, installedBinaryName)
-	tmp, err := os.CreateTemp(dir, ".publicvpn-*")
+	tmp, err := os.CreateTemp(dir, ".assay-*")
 	if err != nil {
 		return "", fmt.Errorf("install: temp file in %s: %w", dir, err)
 	}
@@ -403,7 +403,7 @@ func copyBinary(src, dir string) (string, error) {
 // writeUnits renders the embedded template and writes it into unitDir
 // (created 0750, files 0644, atomic replace — idempotent re-install).
 func writeUnits(data TemplateData, unitDir string) ([]string, error) {
-	tmpl, err := template.ParseFS(units.Units, "public_vpn-*.service")
+	tmpl, err := template.ParseFS(units.Units, "assay-*.service")
 	if err != nil {
 		return nil, fmt.Errorf("install: parse embedded unit template: %w", err)
 	}

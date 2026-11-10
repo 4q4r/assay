@@ -15,8 +15,8 @@ import (
 // off: label+value verbatim — byte-identical to the legacy plain lines.
 // Color on: dim-241 label + bold info-45 value, same literals.
 func TestChipKV(t *testing.T) {
-	plain := ChipKV("binary:    /home/u/.local/bin/publicvpn (mode -rwxr-xr-x)\n", "", false)
-	require.Equal(t, "binary:    /home/u/.local/bin/publicvpn (mode -rwxr-xr-x)\n", plain,
+	plain := ChipKV("binary:    /home/u/.local/bin/assay (mode -rwxr-xr-x)\n", "", false)
+	require.Equal(t, "binary:    /home/u/.local/bin/assay (mode -rwxr-xr-x)\n", plain,
 		"color-off ChipKV is exactly the legacy line (label carries the spacing)")
 
 	colored := ChipKV("install:", " 3 files present", true)

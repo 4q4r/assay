@@ -3,7 +3,7 @@ package cli
 import "strings"
 
 // countryNames is the display-only ISO 3166-1 alpha-2 → English short-name
-// map for `publicvpn list` (upper-case codes, matching the geo pipeline's
+// map for `assay list` (upper-case codes, matching the geo pipeline's
 // storage spelling after normalization). Data, not logic: an unknown code
 // degrades to the bare code in the location column, never an error.
 var countryNames = map[string]string{

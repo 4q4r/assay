@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"public_vpn/internal/fetch"
-	"public_vpn/internal/parse"
+	"assay/internal/fetch"
+	"assay/internal/parse"
 )
 
 // W20 fixture tests: the W20-batch embedded plugins run against an
@@ -26,7 +26,7 @@ import (
 // those exact paths. The format contract under test: URI lists
 // (vless/vmess/trojan/ss/hysteria2/hy2/tuic) and whole-body base64 are
 // ingestible; everything else (YAML/JSON profiles, credits, bookkeeping)
-// loud-skips per file — logged through publicvpn.log, never fatal.
+// loud-skips per file — logged through assay.log, never fatal.
 // (nirevil + mhditaheri left the defaults — owner order 2026-11-06 — and
 // their fixture twins went with them.)
 
@@ -76,7 +76,7 @@ func newRepoFixture(t *testing.T, repo string, raws map[string]string) *httptest
 	return srv
 }
 
-// newW20Engine builds a fixture engine: github_files routed to srv, publicvpn.log to log.
+// newW20Engine builds a fixture engine: github_files routed to srv, assay.log to log.
 func newW20Engine(srv *httptest.Server, log *strings.Builder) *Engine {
 	return newEngine(engineOptions{
 		Log: log,

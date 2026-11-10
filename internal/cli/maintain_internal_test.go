@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"

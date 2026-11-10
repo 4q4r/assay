@@ -39,7 +39,7 @@ func TestWatchdogReloadRechecksClosedAfterLock(t *testing.T) {
 	log := &syncBuffer{}
 	reg, w := startAt(t, dir, log)
 	path := filepath.Join(dir, "midflight.lua")
-	body := `return function() return { publicvpn.node{ raw = "vless://m@h:1" } } end`
+	body := `return function() return { assay.node{ raw = "vless://m@h:1" } } end`
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

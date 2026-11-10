@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/stats"
+	"assay/internal/model"
+	"assay/internal/stats"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

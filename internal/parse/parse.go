@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/model"
+	"assay/internal/model"
 )
 
 // Accepted schemes (xray-core client protocols only).

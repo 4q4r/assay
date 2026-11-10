@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/store"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"

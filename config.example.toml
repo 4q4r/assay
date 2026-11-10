@@ -1,16 +1,16 @@
-# publicvpn — sanitized EXAMPLE configuration (defaults + schema comments).
+# assay — sanitized EXAMPLE configuration (defaults + schema comments).
 #
 # OPTIONAL — the CLI works without it: with no -c and no config at the
-# local-share default (~/.local/share/publicvpn/config.toml) every data
+# local-share default (~/.local/share/assay/config.toml) every data
 # stage runs configless on the built-in defaults (data_dir =
-# ~/.local/share/publicvpn). A config file is required for
+# ~/.local/share/assay). A config file is required for
 # render/activate ([render].template / [activate].target).
 #
-# W13-deploy: `publicvpn install` WITHOUT -c is the canonical deploy — it
+# W13-deploy: `assay install` WITHOUT -c is the canonical deploy — it
 # materializes a fully commented default config at
-# ~/.local/share/publicvpn/config.toml (never overwriting an existing file)
+# ~/.local/share/assay/config.toml (never overwriting an existing file)
 # and the daemon unit runs plain `watch` (no -c). The deprecated legacy
-# location ~/.config/publicvpn/config.toml still wins when present, with a
+# location ~/.config/assay/config.toml still wins when present, with a
 # loud move warning.
 #
 # This file documents every knob with its default value. Copy it to a private
@@ -28,17 +28,17 @@
 # Stages: fetch → parse → filter → probe (classification merged) → select →
 # render → activate.
 
-data_dir = "~/.local/share/publicvpn"
+data_dir = "~/.local/share/assay"
 
 # ── Plugins (W10): the source-ingest layer is LUA PLUGINS, not config
 #    tables. Each .lua file in [plugins].dir is one source: it fetches and
-#    iterates, hands raw links to Go as publicvpn.node records, and Go keeps
+#    iterates, hands raw links to Go as assay.node records, and Go keeps
 #    owning URI parsing/dedupe. The built-in plugins (matin, radikal,
 #    stintikvpn, etc.) materialize into the dir on FIRST RUN —
 #    owner edits and removals persist; a new provider is a new .lua file, no
-#    rebuild. The `publicvpn watch` daemon hot-reloads the dir on the fly. ──
+#    rebuild. The `assay watch` daemon hot-reloads the dir on the fly. ──
 [plugins]
-# dir = "~/.local/share/publicvpn/plugins"  # default: <data_dir>/plugins
+# dir = "~/.local/share/assay/plugins"  # default: <data_dir>/plugins
 # run_timeout = "120s"  # bound on ONE plugin's whole fetch run; an explicit
 #                       # "0s" = unbounded. A plugin exceeding the bound is
 #                       # abandoned loud and the wave continues with the
@@ -261,11 +261,11 @@ backup_keep = 0               # retain only the N newest config backups (0 = unl
 # physically (stale-but-referenced records stay refreshable). Every pruning
 # pass leaves geo-base.jsonl.bak-<ts> next to the store.
 prune_dead_after = "48h"
-# Recheck periods for the `publicvpn watch` daemon's wave scheduler
+# Recheck periods for the `assay watch` daemon's wave scheduler
 # (floor 5m — anything lower fails config validation; the floor applies ONLY
 # to these two intervals, every other knob is deliberately unbounded). The
 # daemon reads these from the config LIVE: a change needs only
-# `systemctl --user restart public_vpn-watch.service`, never a re-install.
+# `systemctl --user restart assay-watch.service`, never a re-install.
 refresh_interval = "1h"      # refresh wave recheck (W10 default 1h — was 6h)
 speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly). "0s" DISABLES the
                              # speedtest wave entirely (round-8: the owner's «выключи» at the schedule
@@ -285,7 +285,7 @@ prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backu
 auto_restart = true
 
 [http]
-# user_agent = "public_vpn (pipeline; contact: owner)"
+# user_agent = "assay (pipeline; contact: owner)"
 # THE pipeline User-Agent — every HTTP client (fetch discovery + downloads,
 # geo batch enrichment) sends exactly this string.
 

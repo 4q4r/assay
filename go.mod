@@ -1,4 +1,4 @@
-module public_vpn
+module assay
 
 go 1.27.3
 
