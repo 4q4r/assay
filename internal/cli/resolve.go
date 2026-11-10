@@ -100,10 +100,21 @@ func resolveInstallPath(explicit string) (installResolution, error) {
 	if err != nil {
 		return installResolution{}, err
 	}
-	return installResolution{
-		res:             res,
-		materializePath: config.DefaultShareConfigPath(home),
-	}, nil
+	if res.Source == config.SourceConfigless {
+		return installResolution{
+			res:             res,
+			materializePath: config.DefaultShareConfigPath(home),
+		}, nil
+	}
+	// A real config came back through the chain — the pre-rename local-share
+	// courtesy (found-if-exists). Honor it exactly like the legacy home tier:
+	// the unit embeds its exact path so the owner's tuned config keeps
+	// working (the daemon's default location is the NEW path now — plain
+	// `watch` there would lose the tuned config), and NOTHING is materialized
+	// at the new canonical path: a defaults file there would shadow the
+	// honored config forever. NO auto-migration — the owner moves the file
+	// by hand in the deploy wave.
+	return installResolution{res: res, embedsConfig: true}, nil
 }
 
 func pathExists(p string) bool {

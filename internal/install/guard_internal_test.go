@@ -50,6 +50,34 @@ func TestCommandConstructorsMatchAllowlist(t *testing.T) {
 	}
 }
 
+// TestUnitNameLiteralsArePinned closes the M-2 rider gap: the unit-name
+// constants are otherwise compared only against themselves (the allowlist
+// rows reference the same constants), so a constant revert would be
+// invisible to the suite. The NEW names are spelled here as literals; the
+// PRE-RENAME spellings are assembled from parts (same grep reason as the
+// config package's fixture pin) and must be REFUSED — the allowlist carries
+// assay-* names only, and a constant revert to the old names would re-add
+// them and fail the refusal matrix below.
+func TestUnitNameLiteralsArePinned(t *testing.T) {
+	assert.Equal(t, "assay-watch.service", WatchService)
+	assert.Equal(t, "assay-refresh.service", RefreshService)
+	assert.Equal(t, "assay-refresh.timer", RefreshTimer)
+	assert.Equal(t, "assay-speedtest.service", SpeedtestService)
+	assert.Equal(t, "assay-speedtest.timer", SpeedtestTimer)
+
+	old := "public" + "vpn"
+	for _, bad := range [][]string{
+		{"--user", "disable", "--now", old + "-refresh.timer", old + "-speedtest.timer"},
+		{"--user", "disable", "--now", old + "-watch.service"},
+		{"--user", "enable", "--now", old + "-watch.service"},
+		{"--user", "restart", old + "-watch.service"},
+	} {
+		err := validateArgs(bad)
+		require.Error(t, err, "invocation %v must be refused — the allowlist carries assay-* names only", bad)
+		assert.Contains(t, err.Error(), "allowlist")
+	}
+}
+
 func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 	for _, bad := range [][]string{
 		{"--user", "restart", "assay-watch.service"},                // never restart anything

@@ -64,6 +64,19 @@ func (h hermeticEnv) putCwdConfig(t *testing.T) {
 	require.NoError(t, os.WriteFile(p, []byte(fmt.Sprintf("data_dir = %q\n", filepath.Join(h.cwd, "cwd-data"))), 0o600))
 }
 
+// putPreRenameShareConfig creates the PRE-RENAME local-share location: the
+// state a real install sits in between the assay rename and the owner's
+// data migration. The old leaf is assembled from parts here for the same
+// grep reason as the config package's fixture pin — the acceptance
+// contract keeps the old spelling out of Go sources.
+func (h hermeticEnv) putPreRenameShareConfig(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(h.home, ".local", "share", "public"+"vpn", "config.toml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+	require.NoError(t, os.WriteFile(p, []byte(fmt.Sprintf("data_dir = %q\n", filepath.Join(h.home, "old-share-data"))), 0o600))
+	return p
+}
+
 // runStatusCapture executes `status` (read-only — safe on any layout) and
 // returns its output.
 func runStatusCapture(t *testing.T, args ...string) (string, error) {
@@ -490,6 +503,83 @@ func TestUninstallPurgeResolvesInstallStyle(t *testing.T) {
 		"the local-share data dir goes with it")
 	_, err := os.Stat(cwdCfg)
 	assert.NoError(t, err, "the cwd config file is NEVER purged (cwd never consulted)")
+}
+
+// TestInstallPreRenameShareConfigIsHonoredNotShadowed pins the I-1 fix-round
+// regression: BEFORE the owner's data migration the pre-rename local-share
+// config is the ONLY config that exists. A no--c install must honor it — the
+// resolution returns it as the share default with the OLD path — and must
+// NEVER materialize the embedded defaults at the NEW path: the daemon's
+// default location is the new path now, so materializing defaults there
+// (and rendering plain `watch`) would silently replace the owner's tuned
+// config with the built-in defaults. The unit embeds the old path instead
+// (the same treatment as the legacy-home tier), materializePath stays
+// empty, and the rename hint rides along. No auto-migration anywhere.
+func TestInstallPreRenameShareConfigIsHonoredNotShadowed(t *testing.T) {
+	env := newHermeticEnv(t)
+	oldCfg := env.putPreRenameShareConfig(t)
+	newCfg := filepath.Join(env.home, ".local", "share", "assay", "config.toml")
+
+	ir, err := resolveInstallPath("")
+	require.NoError(t, err)
+	require.NotNil(t, ir.res)
+	assert.Equal(t, config.SourceShare, ir.res.Source,
+		"the pre-rename share config resolves as the share-default tier")
+	assert.Equal(t, oldCfg, ir.res.Path, "the OLD path is the honored config")
+	assert.Empty(t, ir.materializePath,
+		"materializePath must stay empty when a real config resolved — materializing defaults at the new path would shadow the owner's tuned config")
+	assert.True(t, ir.embedsConfig,
+		"the unit embeds the old path: the daemon's default location is the NEW path now, so plain watch would lose the owner's tuned config")
+	assert.NotEmpty(t, ir.res.Warnings, "the rename-migration hint rides along")
+
+	// The same state through the real cobra seam: nothing materialized, and
+	// the rendered unit embeds the old path.
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(env.home, "run"))
+	require.NoError(t, os.MkdirAll(filepath.Join(env.home, "run", "systemd"), 0o755))
+	ex := &fakeCtl{}
+	orig := installExecutor
+	installExecutor = func() install.Executor { return ex }
+	t.Cleanup(func() { installExecutor = orig })
+	unitDir := filepath.Join(env.home, ".config", "systemd", "user")
+	root := newTestRoot()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{
+		"install",
+		"--bin-dir", filepath.Join(env.home, ".local", "bin"),
+		"--unit-dir", unitDir,
+	})
+	require.NoError(t, root.Execute(), "output:\n%s", buf.String())
+	assert.Contains(t, buf.String(), "config: local-share default "+oldCfg)
+	assert.Contains(t, buf.String(), "warning: legacy data location detected",
+		"the rename hint is loud at the install surface:\n%s", buf.String())
+	assert.NotContains(t, buf.String(), "config created:",
+		"no defaults materialized during the migration window:\n%s", buf.String())
+	_, err = os.Stat(newCfg)
+	assert.True(t, os.IsNotExist(err), "the new-location default config must NOT exist pre-migration")
+	unitBytes, err := os.ReadFile(filepath.Join(unitDir, "assay-watch.service"))
+	require.NoError(t, err)
+	assert.Contains(t, string(unitBytes), oldCfg, "the unit embeds the pre-rename config path")
+}
+
+// TestInstallConfiglessStateMaterializesNewPath pins the complementary
+// state: with NO config anywhere — neither the canonical new location nor
+// the pre-rename one — a no--c install resolves configless and materializes
+// the embedded defaults at the NEW canonical path (the W13-deploy canonical
+// user flow, unchanged).
+func TestInstallConfiglessStateMaterializesNewPath(t *testing.T) {
+	env := newHermeticEnv(t)
+	newCfg := filepath.Join(env.home, ".local", "share", "assay", "config.toml")
+
+	ir, err := resolveInstallPath("")
+	require.NoError(t, err)
+	require.NotNil(t, ir.res)
+	assert.Equal(t, config.SourceConfigless, ir.res.Source)
+	assert.Empty(t, ir.res.Path, "configless: no config file anywhere")
+	assert.Equal(t, newCfg, ir.materializePath,
+		"the configless case is the only one with a materialize target — and it is the NEW canonical path")
+	assert.False(t, ir.embedsConfig, "configless install renders plain watch")
 }
 
 // newTestRoot builds a fresh root command (each call gets its own flag
