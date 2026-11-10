@@ -1,19 +1,23 @@
-# 🌍 assay
+# 🧪 Assay
 
 <div align="center">
 
-## 🛰️ assay — a geo-diverse location pool for your xray client
+**Self-hosted pool manager for third-party public proxy nodes**
 
-*Fetch, probe, geo-enrich, rank, render, and maintain a pool of third-party public proxy nodes — explicitly routed, never your default route.*
+Assay turns public xray share links into a geo-diverse, continuously re-verified pool inside your own xray client — every alive node classified through its own tunnel, rendered into per-location balancers, and activated only through a `-test` gate.
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-868-brightgreen?style=for-the-badge&logo=go&logoColor=white)](#-testing)
 [![xray-core](https://img.shields.io/badge/xray--core-26.3.27-red?style=for-the-badge)](https://github.com/XTLS/Xray-core)
-[![Plugins](https://img.shields.io/badge/sources-Lua%20plugins-blue?style=for-the-badge)](#-lua-plugins-the-source-ingest-layer)
-[![Daemon](https://img.shields.io/badge/daemon-assay%20watch-teal?style=for-the-badge)](#-the-watch-daemon)
-[![Lint](https://img.shields.io/badge/golangci--lint-0%20issues-success?style=for-the-badge)](.golangci.yml)
+[![systemd](https://img.shields.io/badge/systemd-user%20units-30A3DA?style=for-the-badge&logo=systemd&logoColor=white)](https://www.freedesktop.org/wiki/Software/systemd/)
+[![Lua](https://img.shields.io/badge/Lua-5.1%20·%20gopher--lua-000080?style=for-the-badge&logo=lua&logoColor=white)](https://github.com/yuin/gopher-lua)
+[![TOML](https://img.shields.io/badge/config-TOML-9C4121?style=for-the-badge)](https://toml.io/)
 
-[🚀 Quick Start](#-quick-start) · [🗺️ Pipeline](#️-pipeline) · [🧭 maintain](#-what-happens-on-maintain) · [📦 install](#-self-install--uninstall) · [🔒 Security](#-security-model) · [⚙️ Configuration](#️-configuration) · [📖 Design](DESIGN.md)
+[![License](https://img.shields.io/github/license/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay/blob/main/LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay/commits/main)
+[![Repo size](https://img.shields.io/github/repo-size/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay)
+[![Go Reference](https://img.shields.io/badge/Go_Reference-assay-00ADD8?style=flat-square&logo=go&logoColor=white)](https://github.com/4q4r/assay)
+
+[Architecture](#-system-architecture) · [Quick Start](#-quick-start) · [CLI](#-cli-surface) · [Configuration](#-configuration) · [Security](#-security) · [Testing](#-testing)
 
 </div>
 
@@ -21,603 +25,326 @@
 
 ## 📑 Table of Contents
 
-- [✨ What It Does](#-what-it-does)
-- [🗺️ Pipeline](#️-pipeline)
-- [🔌 Link & Transport Support](#-link--transport-support)
-- [🧭 What Happens on `maintain`](#-what-happens-on-maintain)
-- [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer)
-- [✍️ Writing Custom Plugins](#-writing-custom-plugins)
-- [👀 Pool inventory (`list`)](#-pool-inventory-list)
-- [🌍 Site check (`check`)](#-site-check-check)
-- [🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)](#️-exit-geo-self-report-w11--w16-https-rung)
-- [⚖️ Pool balancers (W16)](#️-pool-balancers-w16)
-- [🩺 The probe wave (W14, real xray)](#-the-probe-wave-w14-real-xray)
-- [🔃 xray core update (`xray-update`)](#-xray-core-update-xray-update)
-- [🖥️ Terminal UI (W18)](#️-terminal-ui-w18)
-- [🚀 Requirements](#-requirements)
-- [⚡ Quick Start](#-quick-start)
-- [📦 Self-install / uninstall](#-self-install--uninstall)
-- [⏱️ The watch daemon](#️-the-watch-daemon)
-- [🔒 Security Model](#-security-model)
-- [⚠️ Landmine Warnings](#️-landmine-warnings)
-- [⚙️ Configuration](#️-configuration)
-- [📋 Config resolution (`-c` is optional)](#️-config-resolution--c-is-optional)
-- [✅ Testing](#-testing)
-- [🗺️ Roadmap](#️-roadmap)
+- [What is assay](#-what-is-assay)
+- [System architecture](#-system-architecture)
+- [Project tree](#-project-tree)
+- [Quick Start](#-quick-start)
+- [CLI surface](#-cli-surface)
+- [Configuration](#-configuration)
+- [Security](#-security)
+- [Observability](#-observability)
+- [Testing](#-testing)
+- [License](#-license)
 
-## ✨ What It Does
+---
 
-`assay` is a single-binary Go pipeline that keeps a **cold base** (`geo-base.jsonl`: country / city / ASN / ISP per node) of hundreds of third-party public proxy nodes and promotes a small **active core** (20–25, expandable to 40 for city coverage) into your xray client config. Every stream-based pool outbound carries the owner-mandated hardening (`sockopt.tcpMaxSeg: 1440`, TLS fingerprint `firefox`; hysteria2 outbounds are QUIC/UDP and carry the fingerprint without the TCP-only clamp), every link parameter passes through **1:1** — nothing is rewritten behind your back.
+## ✨ What is assay
 
-**The pool never becomes the default route.** It participates only in routing rules you explicitly configure (`[render.pool_routes]`); everything else — including the catch-all — stays on your own nodes. Empty location → traffic dropped (block), never direct: every pool balancer carries `fallbackTag: "block"`, so a location with no healthy candidate blackholes instead of falling back.
+`assay` is a single-binary Go CLI + daemon that manages a pool of third-party public proxy/VPN nodes for your xray client. A systemd **user** watch daemon runs scheduled maintenance waves (default hourly, configurable): Lua-plugin ingest sources bring raw share links in — tens of thousands of candidates per wave — then a TCP pre-filter discards dead endpoints before any xray process is booted, the survivors are probed through **real temporary xray instances** (batches up to 1000 nodes per process), and every node the probe proves alive gets the full classification battery through its own still-hot tunnel. Selection is unbounded by default (all alive nodes go active) with a TLS-intercept exclusion gate, the renderer emits per-country/city/service balancers with observatory coverage, and activation replaces the live client config only after a passing `xray run -test` gate — followed by the daemon's own restart and health check.
 
-## 🔌 Link & Transport Support
+**Sources are bring-your-own.** The repository ships exactly one tracked ingest plugin — `internal/plugins/defaults/sample.lua` — a documented, working template of the full host API. It materializes into the plugins dir on first run; every other source is a `.lua` file you drop into the plugins dir, hot-reloaded by the daemon. Nothing provider-specific ships in-repo.
 
-The render surface targets **your pinned core (xray 26.3.27)** — every field name and every "removed" verdict below is verified against both the real binary (`xray run -test`) and the tagged Xray-core source. Links carrying a transport this core cannot express **fail the render loud with the param named** — never a silent rewrite (L9).
+**Explicit non-goals.** Assay is not a VPN provider: it runs no servers, holds no accounts, and makes no promises about nodes it does not control — it curates third-party public nodes someone else operates, for disposable geo-diverse traffic only. The pool never becomes your default route: it participates exclusively in routing rules you declare under `[[render.pool_routes]]`, and every pool balancer falls back to `block`, never to direct. The transport class RF censors block behaviorally is filtered at ingest (the security filter admits only forward-secrecy `reality`/`tls` links and drops `allowInsecure`), and every pool outbound carries the calibrated anti-TSPU TCP MSS clamp — hardening at the margins, not invisibility.
 
-| Link `type=` | Rendered as | Notes |
-| :-- | :-- | :-- |
-| `tcp` / `raw` | `tcp` + `tcpSettings` | `headerType=http` renders the http-obfs request block (`host`/`path` from the link); other header types refused loud |
-| `ws` / `websocket` | `ws` + `wsSettings` | `path`, independent `host` (the deprecated `headers.Host` spelling is not emitted), `ed` appended into the path query (that is where the core reads it), `ehs` accepted only as the fixed `Sec-WebSocket-Protocol` |
-| `httpupgrade` | `httpupgradeSettings` | `path`, `host`, same `ed`-in-path mechanics |
-| `grpc` | `grpcSettings` | `serviceName`; `mode=multi` → `multiMode` (deprecated transport — the core warns but accepts) |
-| `kcp` / `mkcp` | `kcp` (maximally bare — **no `kcpSettings` block is rendered at all**) | **`seed`/`headerType` are build-fatal on 26.3.27** — the mKCP header/seed feature was removed (migrated upstream to finalmask/mkcp-original/mkcp-aes128gcm), so a link carrying either key fails the render loud; any other kcp-namespaced param lands in the drop report |
-| `xhttp` / `splithttp` | `xhttp` + `xhttpSettings` | `mode`, `path`, `host`, and an `extra` JSON-object passthrough (validated) |
-| `http` / `h2` / `h3` | **refused loud** | the HTTP/2 transport was removed from 26.3.27 (→ XHTTP stream-one) |
-| `quic` | **refused loud** | removed from 26.3.27 (→ XHTTP stream-one H3) |
-| *(scheme)* `hysteria2` / `hy2` | `hysteria` outbound (version 2) + `hysteriaSettings` | a real hysteria2 client exists in 26.3.27 (verified against the binary + tagged source): `security=tls` renders unconditionally (the QUIC dialer refuses to run without it), the credential rides `hysteriaSettings.auth`, `sni`/`pinSHA256`/`ech` map 1:1 to `tlsSettings` (`pinnedPeerCertSha256`/`echConfigList`), fingerprint `firefox` applies, and **no `tcpMaxSeg`** renders (TCP-gated upstream; QUIC dials UDP). `obfs`/`obfs-password` (salamander) **fail the render loud** — the core has no salamander. Port-hopping links (`:123,5000-6000`) are malformed at parse. |
-
-Security layers: `none` (no TLS settings rendered), `tls` (`sni`→`serverName`, `alpn`, `fp` overridden to `firefox`), `reality` (`pbk`/`sid`/`spx`/`pqv`→`mldsa65Verify`, fingerprint `firefox`; only with `tcp`/`xhttp`/`grpc` — the core's own restriction, enforced at render time).
-
-Protocols: `vless`, `vmess` (incl. the JSON vocabulary: `net`/`type`/`host`/`path`/`scy`/`aid`, header datum preserved), `trojan`, **`ss`**, and **`hysteria2`** (with its documented `hy2://` alias) — parsed always, **accepted only when allowlisted** in `[filter].protocols` (default `vless,vmess,trojan`; ss and hysteria2 are opt-in). Shadowsocks renders as a `shadowsocks` outbound (`servers[0]` with `method`/`password` 1:1); SIP003 **plugin params cannot render** — the 26.3.27 shadowsocks outbound has no plugin support — so an ss link carrying `plugin=` fails the render loud. hysteria v1 links (`hysteria://`) stay rejected at parse: the core only speaks hysteria2 (version 2).
-
-## 🗺️ Pipeline
+## 🏗 System architecture
 
 ```mermaid
-flowchart LR
-    A["🌐 fetch"] --> B["📜 parse"] --> C["🛡️ filter"]
-    C --> D["🩺 probe"]
-    D --> E["🌍 geo"]
-    E --> F["📊 stats"]
-    F --> G["✂️ prune"]
-    G --> H["🏆 select"]
-    H --> I["📝 render"]
-    I --> J{"⚡ rendered ≠ live?"}
-    J -- "no" --> K["✔ no changes"]
-    J -- "yes" --> L["🧪 xray -test gate"]
-    L -- "fail" --> M["🛑 abort, live untouched"]
-    L -- "pass" --> N["💾 backup + atomic activate"]
-```
+flowchart TB
+    Src["Your .lua source plugins\nhot-reloaded by the watchdog"] -->|"assay.node records"| Pipeline
 
-| Stage | Binary | What it owns |
-| :-- | :-- | :-- |
-| 🌐 fetch | `assay fetch` | run the **Lua source plugins** (W10): each plugin fetches and iterates, hands raw links to Go; the results land in the cache + manifest exactly like the old file downloads — parse/dedupe are untouched |
-| 📜 parse | `assay parse` | base64/URI decode of `vless\|vmess\|trojan\|ss\|hysteria2(hy2)`, normalize, dedupe by identity hash |
-| 🩺 probe | `assay probe` | **W14 real-xray engine**: a temp single-node xray per node (same factory as check) — liveness attempts, RTT, tunnel exit IP (D8), exit classification merged in (self-report + unlock battery → the cold base), through-tunnel speedtest; uniform hysteria2 coverage |
-| 🛡️ filter | `assay filter` | `[filter].protocols` allowlist (default `vless,vmess,trojan`), keep `reality\|tls` only, drop `allowInsecure` (policy knob), drop private hosts, per-source caps |
-| ✂️ prune | `maintain` sub-step | dead/ttl-stale-orphan removal with a `.bak-<ts>` backup |
-| 🏆 select | `assay select` | rank (alive → checks → speed); **W19: every cap defaults to UNBOUNDED — ALL alive nodes go active** (unknown-geo group included); an explicit `per_country_cap` K / `soft_cap` / `ceiling` still caps (D7) |
-| 📝 render | `assay render` | template + pool outbounds + balancers (country / city / `pool_unknown` / `pool_all`) + Plan A observatory, L1-gated |
-| ⚡ activate | `assay activate` | `-test` gate → date-stamped backup → atomic replace. **Never restarts the service.** |
-
-## 🧭 What Happens on `maintain`
-
-One `assay maintain` invocation runs the whole refresh wave end-to-end:
-
-1. **fetch** — resolve current source paths and download changed files into the cache.
-2. **parse** — decode the cached bodies into normalized node records.
-3. **filter** — apply the ingest security filter; the survivors are the wave's reference set.
-4. **probe** — real temp-xray liveness + exit-IP discovery, with the classification merged in: every alive node's battery (exit-geo self-report with the DoH fallback + media unlocks) fires through its own still-hot tunnel right after its probe passes and lands in `geo-base.jsonl` (skipped by `--skip-probe`; `[geo].unlock_probes = false` runs a probe-only wave).
-5. **stats** — poll `xray api statsquery -pattern "outbound>>>pool-" -reset=true` on `127.0.0.1:<stats_port>` and fold the per-outbound byte deltas into `geo-base.jsonl`. Failures are classified: before your first activation (target lacks the rendered api/stats block, or the endpoint refuses connections) you get an **INFO** — *"stats will be available after the first activation + service restart; skipping accounting this wave"* — never a warning. A reachable endpoint that responds unexpectedly is a **WARNING** (accounting must not block node refresh). A fold/write failure into the geo-base **fails the wave loud** — traffic data loss is never silent. CLOSED RULING (owner, round-7 M1): a strict/stats-fatal mode was rejected — stats poll failures are warning-class and **never** fail a wave; the write-loss LOUD exception (data integrity) is the only carve-out, and it stays.
-6. **prune** — remove records that are dead beyond `[maintain].prune_dead_after` (default 48h) or that rank's TTL already refuses *and* whose source dropped; every removal pass leaves `geo-base.jsonl.bak-<ts>` next to the store.
-7. **select** — re-rank from the cold base; rank's TTL freshness gate drops stale-alive records on its own, so `--skip-probe` waves reselect safely from cold data.
-8. **render** — rebuild the full client config (template + pool + balancers + observatory, stats/policy ensured).
-9. **activate-if-changed** — if the rendered bytes equal the live config: `no changes`, nothing touched, nothing restarted. Otherwise the W3 activate path runs: `xray run -test` gate → date-stamped backup → atomic replace → **auto-restart (W13)** — the daemon restarts the live client itself (`systemctl --user restart xray-raw.service`, exactly once per real activation) and then runs the post-restart health check (`is-active` + the socks port from the activated config) on a **bounded retry ladder (W17)** — 5 attempts, 1s/2s/4s/8s backoff, PASS on any attempt (xray may not have bound the socks port yet when `systemctl restart` returns; the ladder absorbs the boot race within ~30s), all attempts failing into the same loud `DONE_WITH health-failure`. `[maintain].auto_restart` defaults to **true** (hands-off — zero manual restarts ever); an explicit `false` restores the old semantics: the command prints the restart hint instead. A failed restart or a failed health check is **loud** (the wave completes as `DONE_WITH restart-failure` / `DONE_WITH health-failure` — the gated new config is already on disk; the report names the backup to restore from, and nothing is auto-restored). The replace→restart→health sequence is **one non-interruptible step** (W17): a daemon shutdown can only pause the wave *between* stages, never between the replace and the restart — the live client can never be left orphaned mid-activation.
-
-`--no-activate` stops after the render+diff. `--speedtest` adds the throughput measurement explicitly — **the config default is OFF since round-8** (owner ruling «Только спидтест выключи», reversing the W10 default-on): refresh waves are probe-only, and the dedicated weekly speedtest wave carries `-S` on its own schedule (or pass `--speedtest` for a one-off). The daemonized form of this wave is [`assay watch`](#️-the-watch-daemon).
-
-## 🧩 Lua plugins (the source-ingest layer)
-
-Since W10 the sources are **Lua plugins**, not config tables. Every `.lua` file in `[plugins].dir` is one source: it fetches and iterates, hands raw links to Go as `assay.node` records, and Go keeps owning URI normalization, parsing, rejection counting, and dedupe (the same `parse`/`filter` pipeline as before — plugins only discover). The runtime is [gopher-lua](https://github.com/yuin/gopher-lua) (pure-Go Lua 5.1, no cgo).
-
-**Lifecycle:** the built-in plugins — `matin`, `radikal`, `stintikvpn` (the network-API reference plugin), the five W20 sources `hidashimora`, `kort0881`, `au1rxx`, `barryfar`, `mehdirzfx` and the four newer sources `flat447`, `luxxuria`, `igareck`, `nodesradar` — materialize into the plugins dir on **first run only**. Owner edits and removals persist (delete the whole dir to restore all defaults). A plugin file present = source **active**; remove or rename it (e.g. `radikal.lua.off`) to disable. The `assay watch` daemon hot-reloads the dir: a new provider is a new `.lua` file — no rebuild, no restart.
-
-**Existing installs:** because materialization is first-run-only, an install that already has a plugins dir does not grow the new defaults by itself — copy the wanted `.lua` files from `internal/plugins/defaults/` into the dir (or delete the dir to restore the full set).
-
-### Built-in sources (12)
-
-| Plugin | Upstream | Cadence | Ingests (max-first) | Skips loud |
-| :-- | :-- | :-- | :-- | :-- |
-| `matin` | MatinGhanbari/v2ray-configs | ~15 min | super-sub + all_sub + filtered vless (URI/base64) | — |
-| `radikal` | 0xRadikal/Free-v2ray-Configs | ~15 min | index.json manifest → secure/configs.txt | — |
-| `stintikvpn` | Stintik-123/StintikVPN | curated | data.json → nested upstream subs (per-sub isolation) | dead subs logged |
-| `hidashimora` | Hidashimora/free-vpn-anti-rkn | ~1 min | the whole `configs/` shard tree (N.M.txt parts + vpn.txt merge; ~60k candidates) | counts.json, header-only `.2` files |
-| `kort0881` | kort0881/vpn-vless-configs-russia | ~15 min | `data/githubmirror/clean/*` + `output/vless.txt` (~36k candidates; ~5% lines carry upstream `&amp;` entities — parse owns them) | empty merge tier (`data/subscriptions/all*`) |
-| `au1rxx` | Au1rxx/free-vpn-subscriptions | ~15 min | `output/all-verified/v2ray-base64-*.txt` (8181 links; by-country shards are a strict subset — not fetched) | in-dir `clash-*.yaml`, `singbox-*.json` |
-| `barryfar` | barry-far/V2ray-Config | ~1 h | `All_Configs_Sub.txt` + its base64 twin (~17k candidates) | `#profile-*` metadata, `ssr://` (out of protocol set). ⚠️ GitHub ToS-blocked this repo before (403) — the plugin fails loud as a normal per-plugin failure when it returns; the source may vanish |
-| `mehdirzfx` | mehdirzfx/v2ray-sub | curated | README catalog crawl: URI/base64 sections, section round-robin, **budget 25 fetches × 3s** (safe under the default 120s `run_timeout`; raise `MAX_FETCHES` in the file + the timeout for full depth) | Clash/Mihomo + Sing-box/JSON sections and `.yaml/.yml/.json` URLs, Sources-and-Credits, dup URLs |
-| `flat447` | FLAT447/v2ray-lists | ~2 h | `BLACK_FULL.txt` + `WHITE_FULL.txt` merge lists (per-protocol splits are strict subsets — not fetched) | `#announce`/`#profile-*` metadata header lines |
-| `luxxuria` | luxxuria/harvester | curated | `ping_tested.txt` + `speed_tested.txt` (latency- and throughput-verified vless lists; untested variants are strict supersets — not fetched) | — |
-| `igareck` | igareck/vpn-configs-for-russia | curated | 5 research-verified files: 2 BLACK vless lists (desktop + mobile), 2 BLACK ss lists (all + weak-DPI), 1 white REALITY mobile list (one ss filename carries a literal `+` — pinned verbatim) | — |
-| `nodesradar` | radarhub.top/v2ray.txt | curated | whole-body base64, ~500 tested URIs (~122 KB; 1 MiB body cap — far below the 8 MiB host default); empty body = a valid upstream wipe (loud log, zero nodes, no breaker trip) | — |
-
-**Plugin contract:** the chunk itself must stay side-effect-free and RETURN its discover `function() → nodes`. All fetching happens inside that function (the load-time check runs the chunk with the network surface loud-disabled — a plugin doing work in the chunk fails the load with a clear error).
-
-### Plugin circuit breaker (`[plugins].max_consecutive_failures`)
-
-A plugin whose run keeps failing is auto-disabled instead of failing every wave forever (owner spec: «автоотключение неотвечающих плагинов, 5 ошибок по дефолту отключают его»):
-
-- A **failure event** is a run-timeout abandonment or a loud run error. A **successful run resets** the plugin's consecutive-failure counter to zero.
-- After `max_consecutive_failures` consecutive failures (default **5**) the plugin is **auto-disabled**: the wave logs `plugin <id> DISABLED after N consecutive failures (breaker limit N)` loud, and the plugin is **excluded from subsequent wave snapshots**.
-- The counter also resets (and a disabled plugin is **re-enabled**) when the plugin **file is edited** — the watchdog reload = you touched it = fresh chance. Removing the file clears the state too.
-- `0` = **unlimited**: the breaker is off, plugins are never auto-disabled (owner no-floor ruling — the counter still accumulates for observability).
-- **Where the state lives:** in the plugin registry. A one-shot run (`assay fetch`) gets a fresh registry per process — and each plugin runs at most once per wave, so at any limit **≥ 2** a one-shot wave can never trip the breaker by itself (an explicit `max_consecutive_failures = 1` is the exception: it trips on the very first failure, one-shot wave included). The `watch` daemon shares its watchdog-maintained registry across waves, so counts and disables **persist for the daemon's lifetime**. There is no state file by design: a daemon restart is deliberately a fresh chance (you restart after fixing plugin files; a systemd WatchdogSec restart behaves the same).
-- Every wave lists currently disabled plugins: `breaker: N plugin(s) disabled — <ids> (a file edit reloads and re-enables)`.
-
-### Host API reference
-
-| Function | Signature | Notes |
-| :-- | :-- | :-- |
-| `assay.node` | `node{ raw, source?, remark?, scheme?, host?, port? }` | **`raw` is REQUIRED** (a share link) — Go owns parsing. `source` regroups the node under another source id (`[filter].source_cap` granularity; default = the plugin id). `remark` names the node when the link has no fragment. `scheme`/`host`/`port` are optional pre-parse hints (validated, reported; the parsed URI always wins). `port` must be 1–65535 when present. |
-| `assay.http` | `http{ url, method?, headers?, body?, timeout?, max_redirects?, max_body_bytes? } → { status, headers, body }` | Defaults: `GET`, 30s timeout, 10 redirects, 8 MiB body cap. Non-2xx is a **value**, not an error — plugins decide. Network errors and body-cap overruns fail loud. Multi-value headers join with `", "`. **Proxy=nil by construction** (landmine L5 — plugin traffic never rides your own VPN). |
-| `assay.github_files` | `github_files{ repo, include?, manifest? } → { path, content }[]` | The D9 discovery helper (GitHub contents API, or `manifest` + raw downloads; mirrors via `[fetch].api_base`/`raw_base`, token via `[fetch].github_token`). A truncated tree listing or zero include matches fails loud. |
-| `assay.base64` | `encode(s)`, `decode(s)` | `encode` = standard. `decode` accepts std + URL-safe alphabets, padding optional (mirrors the parser's flexible decode). |
-| `assay.json` | `decode(s) → table`, `encode(t) → string` | Objects ⇄ tables, arrays ⇄ sequences; decode errors fail loud. |
-| `assay.log` | `log(a, b, …)` | One prefixed line into the stage/daemon log. (`print` is stripped — the sandbox has no stdout.) |
-
-**Sandbox:** the Lua state opens only `base`, `string`, `table`, `math` — **no `os`, no `io`, no `package`, no `debug`**; `dofile`/`loadfile`/`print`/`require`/`module`/`newproxy` are stripped from `_G`. Plugins are trusted local code, but the callable surface is exactly the table above — touching `os` or `io` fails loud with the documented nil-index error. The sandbox bounds the *callable surface*, not the *compute*: CPU and memory inside a plugin are unbounded by design — see the [Security Model](#-security-model) for the runtime caps around that (run timeout → abandonment, `Restart=always`, `WatchdogSec`).
-
-> ⚠️ **gopher-lua v1.1.2 VM bug:** a `for … in (fn() .. "x"):gmatch(…)` loop — an *inline call-chain expression* feeding the iterator — panics with a nil dereference (even for pure-stdlib `pcall` results). Assign the loop text to a local first, then iterate. All built-in plugins follow this; `TestGopherLuaInlineGmatchWorkaround` pins it.
-
-### Minimal plugin
-
-```lua
--- mysource.lua — drop into ~/.local/share/assay/plugins/, done.
-local REPO = "Owner/v2ray-configs"
-local INCLUDE = { "sub/vless.txt" }
-
-local function body_lines(body)
-  local trimmed = body:gsub("^%s+", ""):gsub("%s+$", "")
-  if trimmed:find("://", 1, true) then return body end
-  local ok, decoded = pcall(assay.base64.decode, trimmed)
-  if ok and decoded:find("://", 1, true) then return decoded end
-  return body
-end
-
-local function collect()
-  local nodes = {}
-  for _, file in ipairs(assay.github_files{ repo = REPO, include = INCLUDE }) do
-    local text = body_lines(file.content) .. "\n"   -- assign BEFORE gmatch (see VM note)
-    for line in text:gmatch("([^\r\n]*)\n") do
-      line = line:gsub("^%s+", ""):gsub("%s+$", "")
-      if line ~= "" and not line:find("^#") and not line:find("^//") then
-        nodes[#nodes + 1] = assay.node{ raw = line }
-      end
+    subgraph Pipeline["Maintenance wave — assay watch / assay maintain"]
+      Fetch["internal/fetch\nplugin runs + link cache"]
+      Parse["internal/parse\ndecode vless vmess trojan ss hysteria2"]
+      Filter["internal/filter\nreality/tls allowlist"]
+      Prefilter["internal/probe\nTCP pre-filter — 256 dials, 1s cap"]
+      Probe["internal/probe\nreal-xray temp instances\nbatches up to 1000"]
+      Geo["internal/geo\nclassification battery\nadaptive timeout"]
+      Stats["internal/stats\nxray api statsquery\nbyte folding"]
+      Prune["internal/prune\ndead-record removal"]
+      Rank["internal/rank\nunbounded select + hijack exclusion"]
+      Render["internal/render\nbalancers + observatory"]
+      Activate["internal/activate\n-test gate + atomic replace"]
+      Fetch --> Parse --> Filter --> Prefilter --> Probe --> Geo --> Stats --> Prune --> Rank --> Render --> Activate
     end
-  end
-  return nodes
-end
 
-return collect
+    Activate -->|"only on a real diff"| Systemd["systemctl --user restart\nxray-raw.service"]
+    Systemd --> Health["restart health ladder\n5 attempts, 1s/2s/4s/8s"]
+    Health --> Client["Live xray client\n26.3.27"]
+    Client -->|"statsquery -reset"| Stats
+    Stats -->|"fold"| ColdBase["geo-base.jsonl\ncold base"]
+    ColdBase --> Rank
 ```
 
-### The StintikVPN reference plugin (network API walkthrough)
+Request flows:
 
-`stintikvpn.lua` is the full-flexibility demo — plain HTTP + JSON, no GitHub helper:
+1. **A maintenance wave, end to end.** The `assay watch` daemon (or a one-shot `assay maintain`) fires a wave: every `.lua` plugin in the plugins dir runs inside the gopher-lua sandbox and hands raw links to `internal/fetch`, which caches them (`internal/parse` decodes and dedupes by identity, `internal/filter` drops everything outside the `reality`/`tls` security policy). `internal/probe` first runs the TCP pre-filter — one plain dial per unique endpoint, no xray boot — then probes the survivors through real temporary single-node xray instances in batches of up to 1000 (a batch that dies as a batch retries at half size, recursively). While each node's tunnel is proven working, `internal/geo` runs the classification battery through the same instance. `internal/stats` polls the live client's `xray api statsquery` and folds per-outbound byte deltas into the cold base (failures are warning-class — accounting never blocks a wave, but a fold/write failure fails loud: traffic data loss is never silent), and `internal/prune` removes records that are dead beyond `[maintain].prune_dead_after` with a backup beside every removal pass. `internal/rank` then selects — unbounded by default — and `internal/render` rebuilds the full client config with balancers and observatory; `internal/activate` applies it only when the rendered bytes differ from the live file, gated, backed up, and replaced atomically. One dead plugin never kills the wave: per-plugin failures are loud and the healthy sources carry on.
+2. **One node's classification battery.** Per alive node, through the SAME hot temp instance: the tunnel-alive gate (a `generate_204` probe against gstatic primary and the Cloudflare twin as fallback) decides whether the battery runs; a dead gate can still be rescued by the cftrace equalizer — a parseable `ip=` answer from the Cloudflare trace echo marks the node alive with the rescue recorded. Then the exit-IP ladder runs (plain-HTTP ip-api self-report → HTTPS self-geo → through-tunnel DoH fallback → exit-IP echo recovery → unknown, every rung on the node's own evidence), the three-source echo consensus (cftrace + ipify + ip.sb, two agreeing sources pin the exit IP), the TLS-intercept hijack detector (certificate validation always on, plus a body-contract check of the plain-HTTP ip-api answer), DNS-over-TCP (TXT `o-o.myaddr.l.google.com` via `ns1.google.com`) and RFC 5389 STUN (hysteria2 nodes), the media-unlock battery (ChatGPT, Netflix, YouTube, Disney+, TikTok) and the ip-quality risk score. Each classification request gets an RTT-adaptive timeout — `clamp(10 × probe RTT, [geo].timeout floor, 30s ceiling)` — under a 20-minute per-node battery budget.
+3. **The activation path.** `internal/activate` runs `xray run -test` on the rendered config; a failing gate aborts loud with the live config untouched. On success it takes a date-stamped backup and atomically replaces the target — then, when the wave runs with the default `[maintain].auto_restart = true`, the daemon restarts the live client (`systemctl --user restart xray-raw.service`, the only systemd write command it may run) and health-checks it on a bounded retry ladder: 5 attempts with 1s/2s/4s/8s backoff, pass on any attempt, all failing into a loud `health-failure` that names the backup. A daemon shutdown can pause the wave only between stages — never between the replace and the restart.
 
-1. `assay.http{ url = DATA_URL }` fetches `https://raw.githubusercontent.com/Stintik-123/StintikVPN/main/docs/data.json` (the curated-subscription index; non-200 → loud `error()`).
-2. `assay.json.decode` parses it; the loop iterates `data.subscriptions`.
-3. Each subscription URL is nested-fetched **under `pcall`** — one dead upstream is logged (`assay.log`) and skipped, the rest still land (the pipeline's per-plugin continuation handles the rest).
-4. Every candidate line becomes `assay.node{ raw = line, remark = sub.id }`.
-
-Run it against the real upstreams (documented live test): `env -u http_proxy -u https_proxy go test -tags live -run TestLive ./internal/plugins/`.
-
-## ✍️ Writing Custom Plugins
-
-A plugin is a single **Lua file** (`.lua`) that discovers proxy nodes from a source and returns them as `assay.node` records. Go owns URI normalization, parsing, dedupe, and filtering — the plugin only discovers. A new provider is a new file: **no rebuild, no restart** (the `assay watch` daemon hot-reloads the dir).
-
-### Where plugins live
-
-- **Directory**: `~/.local/share/assay/plugins/` (the `[plugins].dir` default; override via config).
-- **One file = one source**. The file name (without `.lua`) becomes the plugin id and the default `source` grouping.
-- **Built-in defaults** ship in `internal/plugins/defaults/` and materialize into the dir on **first run only**; owner edits and removals persist. Delete the whole dir to restore all defaults; copy individual `.lua` files from `internal/plugins/defaults/` to add a missing default to an existing install.
-
-### File format
-
-- Lua 5.1, run by [gopher-lua](https://github.com/yuin/gopher-lua) (pure-Go, no cgo).
-- The chunk must be **side-effect-free at load time** and `return` a collector `function() → nodes`. All fetching happens inside that function; a plugin doing work in the chunk fails the load with a clear error (the load-time check runs the chunk with the network surface loud-disabled).
-- Only `base`, `string`, `table`, `math` are opened; `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `print`, `require`, `module`, `newproxy` are stripped. Plugins are trusted local code, but the callable surface is exactly the host API below.
-
-### Host API available to plugins
-
-| Function | Signature | Notes |
-| :-- | :-- | :-- |
-| `assay.node` | `node{ raw, source?, remark?, scheme?, host?, port? }` | **`raw` is required** (a share link); Go owns parsing. `source` regroups under another source id. `remark` names a node without a fragment. `scheme`/`host`/`port` are optional pre-parse hints (parsed URI wins). `port` must be 1–65535. |
-| `assay.http` | `http{ url, method?, headers?, body?, timeout?, max_redirects?, max_body_bytes? } → { status, headers, body }` | Defaults: `GET`, 30s timeout, 10 redirects, 8 MiB body cap. Non-2xx is a **value**, not an error. Network errors and body-cap overruns fail loud. Multi-value headers join with `", "`. **No proxy by construction** (plugin traffic never rides your own VPN). |
-| `assay.github_files` | `github_files{ repo, include?, manifest? } → { path, content }[]` | GitHub contents API, or `manifest` + raw downloads (mirrors via `[fetch].api_base`/`raw_base`, token via `[fetch].github_token`). A truncated tree or zero include matches fails loud. |
-| `assay.base64` | `encode(s)`, `decode(s)` | `encode` = standard. `decode` accepts std + URL-safe alphabets, padding optional (mirrors the parser's flexible decode). |
-| `assay.json` | `decode(s) → table`, `encode(t) → string` | Objects ⇄ tables, arrays ⇄ sequences; decode errors fail loud. |
-| `assay.log` | `log(a, b, …)` | One prefixed line into the stage/daemon log. (`print` is stripped — the sandbox has no stdout.) |
-
-### How the watchdog hot-reloads plugins
-
-- `assay watch` runs an **fsnotify** watcher over `[plugins].dir`.
-- **Add / modify** of a `.lua` hot-swaps it into the registry; a broken file keeps the **previous version active** with a loud error naming the Lua failure (last-good semantics).
-- **Remove** disables the source on the fly.
-- **No rebuild, no restart** of Go: a new provider is a new `.lua` file. `Close` is idempotent.
-- The plugin's consecutive-failure counter (circuit breaker) resets on a file edit — touching the file = fresh chance.
-
-### Minimal plugin example
-
-```lua
--- mysource.lua — drop into ~/.local/share/assay/plugins/, done.
-local REPO = "Owner/v2ray-configs"
-local INCLUDE = { "sub/vless.txt" }
-
-local function body_lines(body)
-  local trimmed = body:gsub("^%s+", ""):gsub("%s+$", "")
-  if trimmed:find("://", 1, true) then return body end
-  local ok, decoded = pcall(assay.base64.decode, trimmed)
-  if ok and decoded:find("://", 1, true) then return decoded end
-  return body
-end
-
-local function collect()
-  local nodes = {}
-  for _, file in ipairs(assay.github_files{ repo = REPO, include = INCLUDE }) do
-    local text = body_lines(file.content) .. "\n"   -- assign BEFORE gmatch (see VM note)
-    for line in text:gmatch("([^\r\n]*)\n") do
-      line = line:gsub("^%s+", ""):gsub("%s+$", "")
-      if line ~= "" and not line:find("^#") and not line:find("^//") then
-        nodes[#nodes + 1] = assay.node{ raw = line }
-      end
-    end
-  end
-  return nodes
-end
-
-return collect
-```
-
-> ⚠️ **gopher-lua v1.1.2 VM bug:** a `for … in (fn() .. "x"):gmatch(…)` loop — an *inline call-chain expression* feeding the iterator — panics with a nil dereference. Assign the loop text to a local first, then iterate. All built-in plugins follow this; `TestGopherLuaInlineGmatchWorkaround` pins it.
-
-### Disabling / removing a plugin
-
-- **Disable temporarily**: rename the file so it no longer ends in `.lua` (e.g. `mysource.lua.off`) — the watcher drops it from the registry.
-- **Remove permanently**: delete the `.lua` file — the source is gone from the next wave.
-- **Auto-disable (circuit breaker)**: a plugin failing `max_consecutive_failures` (default 5) consecutive waves is auto-disabled and excluded from future waves; a successful run or a file edit resets and re-enables it. Set `[plugins].max_consecutive_failures = 0` to disable the breaker (counter still accumulates for observability).
-- **Threshold-based disable**: with `[plugins].max_duplicate_percent` / `min_live_percent` set, a plugin whose duplicate% exceeds the threshold or whose live% falls below it is disabled via the same breaker (`RecordFailure`), with a loud line naming the values.
-- **Restore defaults**: delete the whole plugins dir (or copy the wanted `.lua` from `internal/plugins/defaults/`).
-
-See also: [🧩 Lua plugins (the source-ingest layer)](#-lua-plugins-the-source-ingest-layer) for the built-in source list, the circuit breaker, and the StintikVPN reference plugin.
-
-## 👀 Pool inventory (`list`)
-
-```bash
-assay list                 # active core by country: flag, code+name, nodes, alive, median RTT
-assay list --cities --all  # + indented city sub-rows (D5 view) + the cold base section
-```
-
-Read-only display over the data `status`/`check` already use (selection + probe results + geo-base) — countries ordered by node count, liveness from the latest probe wave, `--cities` expands multi-city countries, `--all` appends the cold base grouped the same way. City names group **case-insensitively**: geo sources emit case variants of one city (`Frankfurt am Main` / `Frankfurt Am Main`), which fold into a single group displayed under its deterministic lowest-sorting spelling — the same folding applies to the `check` geo summary and to the selection semantics: the ≥2-node city-balancer threshold (D5) and the distinct-city counts behind the D7 cap expansion and diversity tie-break count folded cities, so a variant pair forms ONE city balancer and counts as one city. Unknown-geo nodes in the selection render as their own `🏳 unknown` row, and the `balancers:` line names the routing targets the current selection will produce (W16: `pool_all`, country balancers, `pool_unknown` when present). Colors follow the same `auto`/`NO_COLOR`/`--no-color` contract as `check`; the table reuses the check renderer (one table implementation in the repo).
-
-### `--json` (machine-readable twin)
-
-`assay list --json` prints exactly **one JSON document** on stdout — no human config-source line, no table banners, no color codes (the W12 provenance lives inside it as the `config` object). The data is the same the table renders, same aggregation and ordering (the city sub-rows obey the table's suppression rule; the W16 unknown row and the `balancers:` line data serialize as structured fields), and is **pinned byte-for-byte by a golden test**. Schema:
-
-| Field | Type | Meaning |
-| :-- | :-- | :-- |
-| `generated_at` | string (RFC 3339) | the selection's generation timestamp |
-| `config` | `{source, path?}` | W12 provenance: the resolved config source (`path` omitted when configless) |
-| `selection` | `{path, nodes}` | the selection file read and its node count |
-| `countries[]` | array | the active core grouped by country, table sort order; unknown-geo nodes form their own entry with `code` `""`, `name` `"unknown"`, flag `🏳` (the same row the table renders) |
-| `countries[].code` | string | ISO 3166-1 alpha-2, upper case; `""` = the unknown-geo pseudo-group (not an ISO code) |
-| `countries[].name` / `.flag` | string | English short name / flag emoji (`"unknown"` / `🏳` for the unknown group) |
-| `countries[].nodes` / `.alive` | int | node count / alive count (latest probe wave truth) |
-| `countries[].median_rtt_ms` | number | median RTT of nodes with a positive RTT (`0` when none) |
-| `countries[].cities[]` | array, `--cities` only | city sub-rows (`city`, `nodes`, `alive`, `median_rtt_ms`) — the exact rows the table renders (a single-city country gets none); omitted without `--cities`. `city` groups case-insensitively and shows the group's lowest-sorting original spelling |
-| `cold_base` | object, `--all` only | `{path, records, countries[]}` — the cold base grouped the same way |
-| `balancers[]` | array | the structured W16 routing targets (`pool_all` / `pool_<cc>` / `pool_unknown` with `nodes` counts) — the data behind the table's `balancers:` line, same aggregation |
-
-## 🌍 Site check (`check`)
-
-```bash
-assay check nyaa.si https://speed.cloudflare.com/__down?bytes=25000000 --top 10
-assay check nyaa.si --countries NL,DE --attempts 3 --save reports/nyaa.json
-```
-
-For picky sites that open only from specific countries/cities/ASNs, `check` answers **"в каких странах/городах лучше держать матчинг-рулы"**: it drives the URL through EVERY pool node — each through its own **temporary single-node xray instance** (managed binary, socks inbound on a free `127.0.0.1:18xxx` port, the node's outbound built by the same `render.BuildOutbound` the live renderer uses **with the same hardening** — `tcp_max_seg` emitted mandatorily and the TLS fingerprint applied, straight from `[render]`) — and ranks the pool by how well each location actually serves the site. Resolution happens at the **exit** (`socks5h` semantics: hostnames ride the tunnel, never pre-resolved locally), and a supplementary `dns.google/resolve` query **through the tunnel** reports the IPs the exit's resolver sees (labeled `doh-via-exit`).
-
-- **Per-attempt diagnostics** via `httptrace`: connect, TLS handshake (explicit probe, negotiated version reported), TTFB, total ms, bytes, avg speed — plus the full redirect chain and final URL.
-- **Blockpages are classified, never silently successful**: `403/451/429/5xx` → `blocked-http`; a tiny 2xx body carrying a known block signature (Cloudflare `error code: 1015/1020`, Imperva, "Access Denied"…) → `blocked-page`. A node failing TLS for the target is a **distinct failure class** (`tls-fail`).
-- **Geo summary + recommendation**: per-URL table over nodes, then country and city groups with success rate / median / avg ms / avg speed, and an explicit **recommendation block** — best countries/cities for matching rules for THIS url (feed the winners into `[render.pool_routes]`).
-- **Read-only by construction**: the cold base and the live client are never touched, nothing is rendered or activated, all dialing is out-of-band. Liveness comes from the last probe wave — a staleness hint prints when the data is older than `[geo].ttl`.
-
-| Flag | Default | Meaning |
-| :-- | :-- | :-- |
-| `--countries` | *(all)* | comma-separated ISO codes to filter the pool |
-| `--limit` | `0` (all alive, ceiling 60) | max nodes to test |
-| `--attempts` | `3` | HTTP attempts per node per URL |
-| `--timeout` | `15s` | per-request timeout |
-| `--top` | `10` | geo-summary/recommendation rows per block |
-| `--concurrency` | `4` | parallel temp xray instances (each is a full process — keep modest) |
-| `--with-dead` | off | include nodes not alive in the last probe |
-| `--color` | `auto` | `auto` (colorize only on a terminal) / `always` / `never`; `NO_COLOR` forces auto off |
-| `--no-color` | off | deprecated-friendly alias for `--color=never` (wins over a conflicting `--color`) |
-| `--save` | *(none)* | write the JSON report under the data dir (relative path) or at an absolute path |
-
-## 🛰️ Exit-geo self-report (W11 + W16 HTTPS rung)
-
-The classification pass (merged into the probe batch lifecycle — there is no separate geo stage) asks **every alive node about itself through its own tunnel** — no batch lookups, no shared rate budget:
-
-1. The wave stands up ONE temporary single-node xray instance per alive node (the same `render.BuildOutbound`-hardened infrastructure the `check` stage uses: socks inbound on a free `127.0.0.1:18xxx` port, mandatory `tcp_max_seg`, TLS fingerprint; booted under the same serialized port-handout mutex, killed by exact PID). Every rung of the ladder below rides that SAME instance.
-2. **Rung 1 — plain-HTTP ip-api self-report.** Through the instance it issues `GET http://ip-api.com/json/` — **no ip parameter**, so ip-api answers *"who is asking"*. The response is that node's exit geo (country / city / ISP / AS / proxy / hosting), observed through its own tunnel: the strongest possible D8 exit-truth evidence.
-3. **Why the old limit disappeared in principle:** the batch era POSTed exit-IP groups from this box's one source IP against a 15 requests/min clamp. The self-report's requests originate from thousands of DISTINCT node exit IPs — each carries its own 45 req/min single-endpoint budget, and those budgets never pool. The retired batch knobs (`[geo].endpoint`, `[geo].batch_size`, `[geo].per_minute`) fail config load with a loud migration error naming the replacement. A small politeness pacing (≈10 request starts/s across the wave) remains — every external request start on every rung takes a pacer slot; courtesy toward nodes and the geo endpoints, not a rate-limit honor. ip-api's free tier stays **HTTP-only, non-commercial** — personal use of public geo data satisfies it.
-4. **Rung 2 — HTTPS self-geo (W16).** A rung-1 failure (reset / timeout / non-200 / `status=fail`) retries as `GET [geo].https_url` — default `https://ipinfo.io/json`, **keyless and TLS-only**, so an exit that blocks plain HTTP wholesale is rescued here (the class W11 could only offer the resolver-network DoH view). Same no-aggregate argument: ipinfo's free tier is limited per source IP, and every node is its own source; the ToS is personal-use — same footing as ip-api. The knob is a plain string: ANY https endpoint is accepted verbatim (structural https check only, no allowlist). **Field honesty:** the ipinfo free tier has no separate ISP field and no proxy/hosting flags — those are stored **empty**, with the `self-report-https` provenance marker naming the evidence class (an empty flag is never presented as a measured "not a proxy"); the composite `org` field (`AS24940 Hetzner Online GmbH`) splits honestly into `asn` + `asname`. Country / city / ip map 1:1 (field surface verified live 2026-10-29); the reported `ip` is treated as the freshest exit truth exactly like ip-api's `query`, churn logged loud.
-5. **Rung 3 — DoH fallback.** Both self-geo rungs failing retries as the through-tunnel **DoH view**: `o-o.myaddr.l.google.com` TXT via `[geo].doh_url` (default `https://dns.google/resolve`) reveals the exit network's own DNS resolver IP, and the ip-api single-IP lookup of THAT IP rides the same tunnel — still a per-node source. Honest limitation: for exits behind big anycast public resolvers the fallback describes the resolver-operator's network — exactly what the provenance marker makes visible (and why rung 2 exists).
-6. **Rung 4 — unknown (never a dropped node).** If every rung fails, the node keeps its record, stays usable, its previous geo evidence is preserved (store blank-fold), and the **unknown** class is reported loud in the wave log. Unknown-geo nodes are not wasted: they enter the selection under the `unknown` cap group and render into the `pool_unknown` balancer (below).
-7. **Provenance in the cold base:** every record carries `geo_source` — `self-report` (the node's own ip-api answer), `self-report-https` (the node's own ipinfo answer, W16), `doh-fallback` (the indirect DoH view), or empty (no evidence) — so evidence quality is always visible next to the fields it describes. A self-report whose IP differs from the probe wave's exit IP (exit churn) wins the record with the freshest tunnel truth and prints a loud churn line.
-
-## ⚖️ Pool balancers (W16)
-
-The renderer emits a leastLoad balancer per location — plus two W16 targets — and **every one of them carries `fallbackTag: "block"`** (a location with no healthy candidate blackholes instead of falling back — the W9 security invariant, not a knob):
-
-| Balancer | Selector | When it renders | Use case |
-| :-- | :-- | :-- | :-- |
-| `pool_<cc>` | `pool-<cc>-` | ≥1 node from that country selected | per-country routing (D5: leastLoad quality guarantee) |
-| `pool_<cc>_<city>` | explicit tags | ≥2 live nodes in one city | city override (D5; single-node cities route by direct tag) |
-| `pool_unknown` | `pool-xx-` | ≥1 unknown-geo node selected | the unknown-geo pseudo-location — nodes whose geo evidence failed stay usable and routable |
-| `pool_all` | `pool-` | always, with ≥1 pool node | the **whole-pool** balancer: one route target spanning every country and the unknown group |
-
-Unknown-geo nodes keep the D5 tag grammar intact with the `xx` pseudo-code (`pool-xx-NN` — not an ISO code, never confusable with a country); the grouping happens at render time over resolved geo presence, and the cold-base schema is untouched. Their cap treatment is symmetric: `unknown` acts as a cap group exactly like a country (D7 K applies). All four balancer kinds select only observatory-covered outbounds (the Plan A observatory's `pool-` prefix covers every pool tag — leastLoad ignores uncovered nodes), and `[render.pool_routes]` accepts all of them plus direct `pool-<cc>-NN` / `pool-xx-NN` tags — anything else fails the render loud (D6). `assay list` shows the same picture: unknown nodes render as a `🏳 unknown` row, and a `balancers:` line names the targets the current selection will produce.
-
-## 🩺 The probe wave (W14, real xray)
-
-The probe stage migrates from the `xray-knife` subprocess to **real temporary single-node xray instances** — the same factory the `check` stage uses (`render.BuildOutbound` product, hardening knobs included, one builder, no drift). The knife is gone completely: code, config keys, database — every removed `[probe]` key (`path`, `db_path`, `check_preset`, `url_success_threshold`, `max_passed`) fails the config load with a loud migration naming the replacement.
-
-**Why:** one probe engine covers **every rendered protocol uniformly — hysteria2 included** (the old "does the prober even support hysteria2" question dies with the knife; the real core is the prober). Per node, the wave:
-
-1. Boots a temp instance (socks inbound on a free `127.0.0.1:18xxx` port, exact-PID kill, serialized boot windows).
-2. Runs `[probe].attempts` (default `3`) HTTP GETs through the tunnel to `[probe].url`: per-attempt status, TTFB, total, redirect chain; the blockpage classifier (checker's — `403/451/429/5xx` and signature pages are never silently alive) grades every answer.
-3. `passed` = all attempts success-class, `semi-passed` = some, `failed` = none. Only success-class is **alive** — a blockpage proves reachability, not service.
-4. Reads the **exit IP (D8)** through the same tunnel (`http://ip-api.com/json/`, the same self-report the classification pass makes — best-effort, never fatal).
-5. When `[probe].speedtest` is on (**default OFF since round-8** — owner ruling «Только спидтест выключи», reversing the W10 default-on; the weekly speedtest wave carries it regardless): downloads the `[probe].speedtest_url` sample (default Cloudflare 25 MB) through the tunnel inside `[probe].speedtest_timeout` → `bytes/time` → `speed_bps` into the probe result (same store schema as before — select/geo-base consumers untouched).
-
-`[probe].threads` is now the parallel **temp-instance worker count** (W19 default `32` — each worker owns a real xray process; boot windows serialize inside the factory at ~10 boots/sec, the HTTP phase is fully parallel: 32 workers saturate that ceiling, so wave wall time stays **bounded-minutes per 1000 nodes** — e.g. 1000 nodes ≈ 2–8 min depending on link health — while the semaphore still bounds instantaneous load to 32 concurrent instances). The protocol breadth comes from `[filter].protocols` — **W14 default: all five** `vless,vmess,trojan,ss,hysteria2` (round-7 owner ruling); the security filter (`reality|tls`, `allow_insecure=false` default) stays untouched.
-
-## 🔃 xray core update (`xray-update`)
-
-```bash
-assay xray-update --check   # report latest release vs current binary; downloads nothing
-assay xray-update           # confirm → download → verify → -test → replace (backup first)
-assay xray-update --yes     # non-interactive (pipes require --yes)
-assay xray-update --bin ~/.local/bin/xray
-```
-
-The command resolves the **latest XTLS/Xray-core release dynamically** (GitHub releases API — never a hardcoded version), picks the platform asset (`Xray-linux-64.zip` for linux/amd64), and **verifies the release's published sha256** (every asset ships a `.dgst` companion) before anything else happens — a mismatch fails loud and touches nothing. The unpacked binary must then pass `xray run -test` **from the staging path** (same gate the activate stage uses). Only then:
-
-1. A **date-stamped backup** of the old binary (`<target>.bak-<ts>`, the activate convention).
-2. An **atomic replace** of `[activate].xray_bin` (same-directory temp + rename — no half-states), after which the **installed binary is re-validated in place** (`version` banner + `run -test` at the target): a failed validation rolls the backup back over the target and errors loud naming the rollback.
-
-A piped confirmation (e.g. `echo y | assay xray-update`) **is** accepted — only an empty/EOF pipe refuses; that empty-pipe case is what `--yes` is for.
-
-**Root-owned target (the `/usr/bin/xray` reality):** when the target's directory is not writable, the command stages everything under `<data_dir>/xray-staged`, prints the **exact privileged commands** (backup + `sudo install -m 0755 <staged> <target>`), and exits 1 — never a half-apply. The staged, `-test`-passed binary survives for you to apply manually. **User-level alternative:** point `[activate].xray_bin` at `~/.local/bin/xray` and `xray-update` applies freely without sudo. The GitHub API host follows the `[fetch].api_base` mirror knob (one mirror surface for the whole pipeline).
-
-## 🖥️ Terminal UI (W18)
-
-Every CLI screen is styled by **one package** (`internal/ui`) on [charmbracelet lipgloss v2](https://github.com/charmbracelet/lipgloss) — one palette, one bordered-table builder, one color contract. `NO_COLOR`, `--color=never`, and the `--no-color` alias strip **every ANSI byte** (color-off output is byte-stable and golden-pinned); `--color=always` forces styling on pipes; `auto` (the default) follows terminal detection.
-
-**Screens**
-
-| Screen | Treatment |
-| --- | --- |
-| `list` | `config:` provenance chip → `📦 pool inventory` header accent → ONE bordered table (countries; `--cities` adds tree-glyph city sub-rows under their country) → `⚖️ pools:` chip footer. `--json` is the untouched color-independent twin (zero ANSI, pinned). |
-| `check` | Bordered per-node table + geo summaries (countries; cities with tree glyphs); section titles carry the accent; recommendation locations and speeds are info-bold; `--save` JSON untouched. |
-| `status` | Title accent + every label:value line as a chip (dim label, info value); `install:` block carries a header accent; `STALE` stays a **red** warning, `LEGACY` and resolution warnings are **amber**. |
-| `maintain` / `activate` / `xray-update` / `install` | Final **verdict lines** chip-styled (`activation complete:`, `restart:` green on success, `wave verdict:` amber on DONE_WITH, `xray-update:` outcome lines); **stage progress lines stay plain** — journald-friendly by construction. |
-
-**Traffic-light legend** (code-owned display constants, not knobs): median RTT (`list`) and the `rtt` / `ttfb` / `avg` columns and geo medians/avgs (`check`) are colored by latency band — 🟢 **green 46** under 400 ms · 🟠 **amber 214** at 400–799 ms · 🔴 **red 196** at 800 ms and above. An em dash (no data) keeps the row's verdict color: missing data is not a latency.
-
-**Tree legend**: city sub-rows render under their country with `├──` / `└──` connectors in dim gray — the last sub-row always closes with `└──`. Geo case variants of one city stay ONE row (deterministic lowest-string display), and the ordering is node count first, name second — the same aggregation the `--json` twin serializes.
-
-**Chips ("плашки")**: compact `label value` pairs — dim-gray label (241) + bold info-blue value (45) — carry service info (config path, data dir, selection timestamp, balancer targets, install state). Table borders are dim (238); header rows bold (99).
-
-**Dependencies** (the W18 delta — everything else pre-existing):
-
-| Module | Version | Role |
-| :-- | :-- | :-- |
-| `charm.land/lipgloss/v2` | v2.0.6 | terminal styling, bordered tables (the current v2 line — v1 paths are frozen upstream) |
-| `github.com/charmbracelet/x/ansi` | v0.11.8 | ANSI-aware display widths (flag emoji = 2 cells) |
-| `github.com/charmbracelet/colorprofile` + `x/term`, `x/termios`, `ultraviolet` | transitives | profile detection under lipgloss v2 |
-| `github.com/clipperhouse/displaywidth`, `uax29`, `lucasb-eyer/go-colorful`, `mattn/go-runewidth`, `muesli/cancelreader`, `rivo/uniseg`, `xo/terminfo`, `golang.org/x/sync` | transitives | grapheme widths, color math, lipgloss support |
-
-## 📂 Project Structure
+## 📦 Project tree
 
 ```text
 assay/
-├── cmd/assay/          # main.go — cobra root wiring
+├── cmd/assay/main.go             cobra root wiring
 ├── internal/
-│   ├── cli/                # command tree + maintain orchestration (stage seam) + watch daemon + install/uninstall + list
-│   ├── config/             # strict-decode TOML (unknown keys fail loud), no env vars
-│   ├── model/              # Node, GeoRecord (§5 cold-base schema), tag contracts (D5/D6)
-│   ├── fetch/              # D9 dynamic discovery + raw downloads (L5 proxy-stripped) — now the plugins' github_files engine
-│   ├── plugins/            # W10 Lua source plugins: gopher-lua sandbox, host API, registry, embedded defaults
-│   ├── watchdog/           # W10 fsnotify hot-reload of the plugins dir (last-good semantics)
-│   ├── parse/              # base64/link decoding (vless/vmess/trojan/ss) → normalized Node
-│   ├── filter/             # ingest security filter (protocols allowlist + insecure policy)
-│   ├── probe/              # W14 real-xray out-of-band engine: temp instances, attempts, exit IP, speedtest (L5)
-│   ├── geo/                # W11+W16 per-node self-report ladder (ip-api → HTTPS → DoH → unknown)
-│   ├── stats/              # W4 statsquery poll + byte folding (L7-tolerant)
-│   ├── prune/              # W4 dead/ttl-stale-orphan rules (reuses rank freshness)
-│   ├── rank/               # select stage: ranking, caps D7, pool tags
-│   ├── render/             # W3/W5/W16 renderer: transports, country/city/unknown/all balancers, L1 gate
-│   ├── activate/           # -test gate + backup + atomic replace (never restarts)
-│   ├── install/            # W5 self-install: binary copy, unit rendering, allowlisted systemctl seam
-│   ├── ui/                 # W18 the ONE terminal-styling owner: lipgloss palette, traffic light, tree glyphs, chips, bordered table builder
-│   └── store/              # JSONL cold base, probe log, selection — all writes atomic
-├── systemd/                # the watch-daemon unit TEMPLATE (single source of truth, go:embed'd by install) + embed.go
-├── config.example.toml     # sanitized template (defaults + schema comments); real config.toml stays local, gitignored
-└── DESIGN.md               # full design: decisions D1–D11, landmines, resource budget
+│   ├── cli/                      command tree, maintain orchestration, watch daemon, install/uninstall, status dashboard
+│   ├── config/                   strict-decode TOML — unknown keys fail loud, no env vars
+│   ├── model/                    node + geo-record schema, unlock vocabulary
+│   ├── fetch/                    plugin runtime plumbing: cache, manifest, mirrors
+│   ├── parse/                    base64/URI decoding → normalized node records
+│   ├── filter/                   ingest security filter: reality/tls, allowInsecure drop, per-source caps
+│   ├── probe/                    real-xray probe engine: pre-filter, batches, halving
+│   ├── geo/                      classification battery: gate, ladder, consensus, hijack, media, risk
+│   ├── checker/                  site-check engine: temp instances, blockpage classifier, socks5h client, DNS/STUN
+│   ├── rank/                     selection: ranking, unbounded caps, hijack exclusion
+│   ├── render/                   client-config renderer: transports, balancers, observatory
+│   ├── activate/                 -test gate, backup, atomic replace
+│   ├── restart/                  the restart executor (byte-pinned allowlist) + health ladder
+│   ├── install/                  self-install: binary copy, config materialization, unit rendering
+│   ├── stats/                    xray api statsquery polling + byte folding into the cold base
+│   ├── prune/                    dead/stale record removal with backups
+│   ├── store/                    JSONL cold base, probe log, selection — atomic writes
+│   ├── plugins/                  gopher-lua sandbox, host API, registry, circuit breaker, embedded sample.lua
+│   ├── watchdog/                 fsnotify hot-reload of the plugins dir, last-good semantics
+│   ├── timeoutcal/               adaptive-timeout state (RTT calibration seam)
+│   ├── sdnotify/                 sd_notify(3) READY=1 / WATCHDOG=1 pinger
+│   ├── ui/                       the ONE terminal-styling owner: lipgloss palette, chips, tables
+│   └── xrayupdate/               xray core updater: release resolve, sha256 verify, staging, rollback
+├── systemd/                      assay-watch.service template (go:embed single source) + embed.go
+├── docs/                         status-dashboard spec + implementation wave plans
+├── config.example.toml           every knob with its default, schema comments
+├── DESIGN.md                     design decisions D1–D11, landmines L1–L12
+├── LICENSE                       MIT
+├── .golangci.yml                 strict lint gate
+└── go.mod / go.sum               Go 1.27, cobra, gopher-lua, fsnotify, lipgloss v2
 ```
 
-## 🚀 Requirements
+## 🚀 Quick Start
 
-- **Go ≥ 1.27** to build (`go build -o assay ./cmd/assay`).
-- **xray-core 26.3.27** present locally (the `-test` gate and the stats API both exec it; do **not** upgrade the core — L11).
-- **xray binary** at `[activate].xray_bin` — the probe wave (W14, its merged classification included), check temp instances, and the `-test` gate all exec it; `assay xray-update` keeps it current.
-- A working xray client config to use as the render template (read-only reference — the renderer never writes your template).
+### 1. Build
 
-## ⚡ Quick Start
-
-1. **Create `config.toml`** — start from [`config.example.toml`](config.example.toml) (sanitized defaults + schema comments; the real config is gitignored): copy it, set `data_dir` and your real `template`/`target` paths, review the `[plugins]` dir (the built-in Lua sources materialize there on first run — see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), and declare your pool routes under `[[render.pool_routes]]` (D2: no routes → the pool is built but carries nothing; a route target is a rendered `pool_*` balancer or a direct `pool-<cc>-NN` outbound tag for single-node cities, D5). The config is **optional**: without it every data stage runs configless on built-in defaults (see [Config resolution](#️-config-resolution--c-is-optional)) — and `assay install` without `-c` materializes a commented default config at the local-share path for you (fill `[render].template`/`[activate].target` there to activate).
-2. **`assay fetch`** — run the Lua source plugins and cache their raw links.
-3. **`assay parse`** — decode the cached bodies into normalized node records.
-4. **`assay filter`** — apply the ingest security filter (reality/tls only); the survivors are the wave's reference set.
-5. **`assay probe`** — out-of-band liveness + exit-IP wave with the classification merged in (exit geo + media unlocks land in the cold base; add `--speedtest` for a one-off throughput measurement; the default is probe-only since round-8).
-6. **`assay select`** — rank and cap the active set.
-7. **`assay render`** — render the full client config into `rendered/config.json`.
-8. **`assay activate`** — `-test` gate, backup, atomic replace of `[activate].target`, then the auto-restart (W13, default on): the daemon/live wave restarts `xray-raw.service` itself and health-checks it; a manual `assay activate` run prints the same flow with `[maintain].auto_restart = false` restoring the print-the-hint semantics.
-9. **`assay maintain`** — from now on, one command — or the [`assay watch` daemon](#️-the-watch-daemon) installed by `assay install` — does the whole wave on schedule, activating only on real diffs.
-
-## 📦 Self-install / uninstall
-
-`assay install` turns the machine you run it on into a maintained node. **Without `-c` it is the canonical user deploy (W13-deploy)** — one command, everything in the XDG local-share layout:
-
-1. **Binary** — copies the RUNNING binary (`os.Executable`) to `--bin-dir` (default `~/.local/bin`) as `assay`: atomic write (temp → fsync → rename), mode `0755`. Re-running after a rebuild **is** the self-upgrade flow.
-2. **Default config materialized** — the canonical config lands at `~/.local/share/assay/config.toml`: the same values a configless run uses, written as TOML with full comments (embedded in the binary — single source of truth). Nothing is ever overwritten: when the file already exists the install simply resolves it (reported as the daemon config; the package-level materializer keeps it byte-for-byte if a concurrent install races), and a re-install never touches it. Mode `0600` (the schema carries optional token knobs).
-3. **Unit** — renders the **watch-daemon unit** from the repo template (`systemd/assay-watch.service`, single source of truth via `go:embed`) into `--unit-dir` (default `~/.config/systemd/user`). For the default-location install `ExecStart` is a **plain `<installed binary> watch` — NO `-c`**: the daemon reads the default config location. An explicit `-c` install embeds the resolved absolute path instead. The unit carries `Restart=always` (a crashed daemon is back in 5s). Path rules unchanged: `--bin-dir` and an explicit `--config` may **not** contain whitespace (systemd argv-splits `ExecStart=`), while `--unit-dir` may (verified with `systemd-analyze verify`); only the manager's real search path is discovered by `daemon-reload` — a custom unit dir elsewhere needs `XDG_CONFIG_HOME` or symlinks.
-4. **Legacy-timer migration (W5 → W10)** — if the old `assay-refresh/speedtest` timer units are still on disk from a previous install, install **disables and removes them automatically** (a stale timer would fire waves concurrently with the daemon and stampede the probe origin). Zero owner steps; `status` flags leftover legacy units with a `LEGACY:` hint.
-5. **Activation** — `systemctl --user daemon-reload`, then `enable --now assay-watch.service`, pinned to an internal allowlist (no restarts of anything, no other units, ever — install never touches the live client; the daemon's only systemd surface is the W13 restart executor, see [Security Model](#-security-model)).
-6. **Loud summary** — what was installed, where the config lives, and what YOU still must fill: `[render].template` and `[activate].target` in the materialized config. Until both exist the render/activate stages fail loud at their boundary each wave (a configless daemon cannot render); every data stage — fetch → parse → filter → probe → geo → select — runs meanwhile, so the pool data is already warm when you fill the paths.
-
-**The user story:** `assay install` → everything in XDG/local-share → fill `[render].template` + `[activate].target` in `~/.local/share/assay/config.toml` → done; the daemon activates on real diffs from then on.
-
-**The installed binary does not self-update.** `git pull` changes the source, not `~/.local/bin/assay` — after pulling a new `main`, rebuild and re-install (`assay install` = self-copy of the running binary), then `systemctl --user restart assay-watch.service` so the daemon unit loads the new code. `assay status` flags exactly this drift: a `STALE:` line appears whenever the running binary's content differs from the installed one.
+You need Go 1.27+ and a local xray binary (the pinned core is **26.3.27** — the probe, the site check, and the `-test` gate all exec `[activate].xray_bin`).
 
 ```bash
-go build -o assay ./cmd/assay
-./assay install                              # canonical: binary + materialized default config + plain-watch unit
-./assay install -c /absolute/path/to/config.toml   # explicit path wins; must exist; the unit embeds it
+go build ./cmd/assay
 ```
 
-- **Install-style resolution**: explicit `-c` wins and must exist; else the **local-share default** `~/.local/share/assay/config.toml` when present (still a no-`-c` unit — the daemon reads the default location); else the **deprecated legacy location** `~/.config/assay/config.toml` when present (one-release-cycle courtesy: the unit embeds its exact path and a loud deprecation warning names the move); else the configless + materialize flow above. The cwd default (`./config.toml`) is deliberately ignored by install — a daemon unit must reference a stable location. A no-`-c` install renders plain `watch` **forever**: a re-install never flips the unit to `-c`.
-- **No user systemd session?** install fails loud with an actionable message; pass `--no-systemd` to copy the binary only (unit skipped; without `-c` the default config is still materialized, documented in the output).
-- **`assay uninstall`** — the symmetric teardown: disables the daemon (and any legacy timers still present) → removes every known unit file (current + the W5-era names) → `daemon-reload` → report. User data (config, data dir, installed binary) is **kept by default**; `--purge` (explicit, destructive) also removes the config file and `[data_dir]` — for a default-location layout that is `~/.local/share/assay/config.toml` + the data dir under it (the cwd file is never consulted); for an explicit `-c` purge it is that file + its data dir. Nothing else, in particular nothing xray-raw.
-- **`assay status`** — install state: installed binary, the watch unit, its enablement (read-only filesystem inspection), a `STALE:` hint when the running binary differs from the installed one (post-`git pull` rebuild without re-install — the exact stale-binary incident class), and a `LEGACY:` hint while old timer units survive. Detection reads the directories given via `--bin-dir` / `--unit-dir` (defaults identical to `install`: `~/.local/bin` and `~/.config/systemd/user`) — an install made with custom paths is tracked by passing the same values here (`status` keeps no state file, by design).
+### 2. Install
 
-### Migration notes (W13-deploy)
+`./assay install` without `-c` is the canonical user deploy — everything lives under the XDG local-share layout:
 
-- **The default config location moved**: `~/.config/assay/config.toml` → `~/.local/share/assay/config.toml`. One-line move: `mkdir -p ~/.local/share/assay && mv ~/.config/assay/config.toml ~/.local/share/assay/config.toml`. Until you move it, the old file **keeps working** with a loud `warning: legacy config location detected: … — move it to …` on every command (one release-cycle courtesy; a future release will stop honoring it).
-- **Deploy is now owner-shaped**: `assay install` without `-c` is the whole flow (see above) — «деплой это бинарь», the config materializes into the local share, the daemon unit needs no `-c`.
-- **Owner's own box**: the operational config at `~/projects/assay/config.toml` should move to `~/.local/share/assay/config.toml` (a plain `mv`; the ops pass does it with the owner's word — no auto-move ever). Until moved, it keeps working via an explicit `-c` or the legacy courtesy (it is NOT at the legacy path, so plain `assay install` would materialize a fresh default config rather than adopt it — pass `-c` until the move).
-- **Speedtest is off by default** (round-8 owner ruling, reversing the W10 default-on): `[probe].speedtest` now defaults to `false` — refresh waves are probe-only. Existing configs with an explicit `speedtest = true` keep it; the weekly speedtest wave (`[maintain].speedtest_interval`, default `168h`) still carries `-S`. To disable speedtest **entirely**, set `[maintain].speedtest_interval = "0s"` — no speedtest wave exists at all (the scheduler never schedules one and `status` reports `speedtest disabled`).
-
-## ⏱️ The watch daemon
-
-`assay watch` is the long-running form of the pipeline (what `install` enables):
-
-- **plugin watchdog** — fsnotify on `[plugins].dir`: add/modify of a `.lua` hot-swaps it into the registry (a broken file keeps the **previous version active** with a loud error naming the Lua failure); removal disables the source on the fly; `Close` is idempotent (double-close is a no-op) and a debounce callback that fires at the shutdown boundary re-checks the closed gate before touching the registry — no reload can begin after `Close` returns;
-- **wave scheduler** — refresh waves every `[maintain].refresh_interval` (**default 1h since W10**), speedtest waves every `[maintain].speedtest_interval` (**default 168h**; the speedtest tick runs the full wave with `-S` and covers the refresh; **`"0s"` disables the speedtest wave entirely** — round-8: the scheduler never schedules one and the armed line says `speedtest disabled`, while refresh waves stay probe-only since `[probe].speedtest` defaults off); waves re-arm from their START instant, so they never overlap and periods stay exact; the **first wave runs immediately** at start;
-- **stats poll** — inside every wave (the existing stage cadence);
-- **broken-plugin waves** — one dead provider never kills a refresh: per-plugin failures are loud, the healthy plugins carry the wave;
-- **auto-restart + health check (W13)** — every gated activation restarts the live client through the byte-pinned executor and then verifies it came back (`is-active` + the socks port read from the just-activated config; a failed restart or health check is loud and names the backup — report-only, no auto-restore); `[maintain].auto_restart = false` prints the manual hint instead. The health check runs on a **bounded retry ladder (W17)**: 5 attempts with 1s/2s/4s/8s backoff, PASS on any attempt — `systemctl restart` returns the instant xray is forked, and the client may not have bound the socks port yet, so a first refused dial retries instead of false-positiving a health failure (the production boot race). The whole ladder is capped at ~30s, and a client that never comes up fails into the same loud WARNING, now naming the exhausted ladder;
-- **configless boot** — the daemon runs fine with no config file at all: data stages work from the built-in defaults (plugins dir under `~/.local/share/assay/plugins`), while the render/activate stages fail loud at their boundary once per wave and the schedule keeps re-arming — the same wave-continues semantics as a broken plugin; stats accounting logs an INFO and skips;
-- **graceful shutdown** — `SIGINT`/`SIGTERM` finish the current stage, flush, exit `0` (the unit's `Restart=always` is for crashes, not for config reloads). Two production-observed refinements (W17): the unit carries **`TimeoutStopSec=1800`**, so a stop or restart of the daemon waits for the current stage (a full probe stage can run ~28 min) instead of SIGKILLing it mid-wave at the 90s default — the old behavior killed the daemon and its temp-xray children mid-wave; and an **in-flight activate is never interrupted**: once the atomic replace begins, the replace→restart→health sequence runs to completion as one non-interruptible step — the shutdown checkpoint fires only between stages, never between replace and xray-restart (a checkpoint there would orphan the live client: new config on disk, old config running, no restart issued).
-
-```toml
-[maintain]
-refresh_interval = "1h"     # refresh wave recheck (W10 default 1h, floor 5m)
-speedtest_interval = "168h" # speedtest wave recheck (default 168h = weekly, floor 5m; "0s" = no speedtest wave)
+```bash
+./assay install
+systemctl --user status assay-watch
 ```
 
-**Changing a period or the plugins dir is a config edit + `systemctl --user restart assay-watch.service`** — the daemon reads the config live; no re-install. Values below the 5-minute floor fail config validation loud.
+The install copies the running binary to `~/.local/bin/assay` (atomic write, re-running after a rebuild is the self-upgrade flow), materializes a fully commented default config at `~/.local/share/assay/config.toml` (**mode 0600, never overwritten** — an existing file always wins), and renders the `assay-watch.service` user unit (Type=notify, WatchdogSec=300, Restart=always) running plain `watch`. systemd activation goes through a byte-pinned allowlist executor: exactly `daemon-reload`, `enable --now`, and `disable --now` on assay units — nothing else, ever. `assay uninstall` is the symmetric teardown; `--purge` additionally removes the config and data dir.
 
-## 🔒 Security Model
+### 3. Bring your own sources
 
-- **Every node operator is a man-in-the-middle by design.** They see your DNS queries, inner SNI, timing, and traffic volumes. REALITY's `pbk` proves the operator to you — it proves nothing about the operator to you.
-- **Disposable traffic only.** The pool exists for geo-diversity: scraping, region checks, location-specific services. Logins, banking, and anything identity-bearing stay off it — your own nodes remain the default transport for everything else.
-- **The trust wall is structural, not advisory.** Pool traffic reaches only `[render.pool_routes]` destinations; the template's existing rules (RU-direct, SMTP-block, torrent-direct) keep precedence, so the pool can never carry them even by mistake.
-- **Ingest hygiene is a hard filter.** `allowInsecure=1` links, non-TLS transports, private/loopback hosts, and any scheme outside `[filter].protocols` never reach the cold base; forward-secrecy transports (`reality`/`tls`) only. `allow_insecure` defaults to **false** — the knob exists for explicit opt-in, but note this pinned core *removed* the `allowInsecure` feature entirely (→ `pinnedPeerCertSha256`), so an admitted link merely loses the param with a loud report entry.
-- **PSK-only shadowsocks stays opt-in and second-class.** Plain `ss` (no TLS layer) is dropped by the security stance even when allowlisted; ss links carrying SIP003 `plugin=` params fail the render loud because this core cannot express them. Prefer `reality`/`tls` transports for pool nodes.
-- **Fingerprint `firefox` only where a fingerprint can exist.** The client-side uTLS override applies to `tls`/`reality` settings; `security=none` has no TLS handshake, so an `fp` param there is reported in the drop report, not consumed.
-- **The `-test` gate is unconditional.** A config that fails validation never replaces the live file — a crash-looping client is the one failure mode this pipeline refuses to create.
-- **The daemon's systemd surface is two byte-pinned allowlist executors — nothing else.** `install` may run exactly its four pinned commands (daemon-reload, enable/disable `--now` on `assay-*` units only); the W13 restart executor may run exactly `systemctl --user restart xray-raw.service` (the owner-ruled hands-off restart, once per real activation) and its read-only `is-active` verification. Any other unit, verb, flag, or scope fails loud before a process is spawned; guard tests pin the command sets byte-for-byte, the constructor call sites, and the whole-tree fact that no other production file spawns systemctl at all. Config knobs cannot widen this surface (`[activate].service_name` names the printed manual-restart hint only; the auto path is pinned to `xray-raw.service` and refuses anything else loud).
-- **Lua plugins are trusted code: CPU and memory inside a plugin are bounded by context.** The sandbox restricts *what a plugin can call* (`os`/`io`/`package`/`debug` stripped, host API capped). Execution timeouts are strictly enforced via gopher-lua's `LState.SetContext(ctx)`: `[plugins].run_timeout` (default `120s`, explicit `0s` = unbounded) bounds the execution context. When a plugin exceeds its deadline, context cancellation terminates bytecode execution immediately, ensuring clean termination without hanging goroutines or leaked Lua states. A `string.rep` memory bomb crashes the whole process — the unit's `Restart=always` covers exactly that class. A daemon wedged by anything else stops its `sd_notify` watchdog pings, so systemd kills it at `WatchdogSec=300` and restarts it. The honest control for a plugin you do not trust is the one that has always existed: plugins are local files you edit — do not ship one you cannot vouch for.
-- **Credentials stay local.** The rendered config and pipeline state are written `0600`; the repository ships no secrets and no pinned node URLs.
+Drop `.lua` files into the plugins dir (`~/.local/share/assay/plugins/` by default) — one file is one source, the file name becomes the plugin id. The tracked template `internal/plugins/defaults/sample.lua` demonstrates the complete host API (`assay.node`, `assay.http`, `assay.base64`, `assay.github_files`, `assay.json`, `assay.log`) and materializes into the dir on first run. The chunk must be side-effect-free and return its collector function; Go owns URI parsing, dedupe, and filtering — the plugin only discovers. The `assay watch` daemon hot-reloads the dir on file changes: a new provider is a new file, no rebuild, no restart. Plugins that keep failing are retired by the circuit breaker (`[plugins].max_consecutive_failures`, default 5) and re-enabled by a file edit.
 
-## ⚠️ Landmine Warnings
+The minimal shape (a plain-HTTP subscription, decoded inline — the full GitHub / JSON-catalog variants live in the sample's comments):
 
-- **L1 — never render an observatory with an empty selector.** On xray-core 26.3.27 (pre-#6666) it busy-loops a CPU core; the renderer hard-refuses that shape on any pool state.
-- **L4 — DNS goes through NSS.** Hostname resolution uses the system resolver; direct-to-public-DNS probing is dead on split-brain setups and must not be reintroduced.
-- **L5 — strip proxy env on every network call.** The ambient `http_proxy` points at your own client; an unstripped fetch, probe, or stats dial silently tunnels through the very VPN it is measuring.
-- **L6 — the ip-api aggregate clamp is retired (W11).** The batch-era clamp (≤100 IPs/POST, ≤15 batch requests/min, honor `X-Rl` or risk a 1-hour ban) applied to lookups made from THIS box's single source IP. The W11 self-report asks ip-api from EVERY node through its own tunnel — thousands of distinct source IPs, each with its own 45 req/min single-endpoint budget that never pools — so the aggregate limit is gone in principle. The retired `[geo]` batch knobs (`endpoint`, `batch_size`, `per_minute`) fail config load with a loud migration error. A small politeness pacing (~10 request starts/s across the wave) remains — courtesy, not a rate-limit honor. The free tier stays **HTTP-only and non-commercial** (personal use, public geo data — satisfied).
-- The full list (L1–L12) with rationale lives in [DESIGN.md §8](DESIGN.md).
+```lua
+local function collect()
+  local ok, resp = pcall(assay.http, { url = "https://example.invalid/sub.txt" })
+  if not ok or resp.status ~= 200 then
+    error("fetch failed: " .. tostring(resp))   -- loud, plugin-attributed
+  end
+  local nodes = {}
+  for line in resp.body:gmatch("([^\r\n]+)") do
+    nodes[#nodes + 1] = assay.node{ raw = line }
+  end
+  return nodes
+end
+return collect
+```
+
+Every failure inside the collector is loud and feeds the breaker; a run that exceeds `[plugins].run_timeout` (default `120s`, explicit `0s` = unbounded) is abandoned and the wave continues.
+
+### 4. Run & watch
+
+The daemon is installed enabled. Follow the waves in the journal:
+
+```bash
+journalctl --user -u assay-watch -f
+```
+
+Each wave logs its stages fetch → parse → filter → probe → stats → prune → select → render → activate — the classification battery rides the probe stage (it runs through each node's still-hot tunnel right after the probe verdict, so there is no separate classify stage in the journal). Classification evidence lines carry the rollout tokens — `tmo=` (the node's adaptive per-request timeout), `gate_rescue=cftrace` (a gate-dead node rescued by the cftrace equalizer), `consensus=N` (agreeing exit-IP echo sources), and exit-ip churn notes — so you can verify what the battery actually saw. Fill `[render].template` and `[activate].target` in the materialized config to let the wave render and activate; until then every data stage still runs and the pool data is warm.
+
+### 5. First checks
+
+```bash
+assay status                        # install state, config provenance, source verdicts
+assay list                          # pool inventory by country: nodes, alive, median RTT
+assay list --cities --all           # + city sub-rows and the cold base section
+assay check nyaa.si --top 10        # rank the pool by how well each location serves a site
+```
+
+`status` renders the source dashboard (verdicts GOOD / FAIR / WEAK / POOR / DEAD, funnel and quality columns); `list` reads the same selection and probe data the render uses; `check` drives a URL through the alive pool — every alive node by default, capped at 60 (`--limit`) — each via its own temporary xray instance with exit-side DNS resolution and a blockpage classifier, and ranks by how well each location serves the site. Read-only, never activates.
+
+## 📖 CLI surface
+
+| Command | Purpose |
+| :-- | :-- |
+| `assay fetch` | Run the Lua source plugins and cache their raw links |
+| `assay parse` | Decode cached bodies into normalized node records |
+| `assay filter` | Apply the ingest security filter; survivors are the wave reference set |
+| `assay probe` | TCP pre-filter + real-xray liveness/exit-IP wave, classification merged in |
+| `assay select` | Rank and cap the active set (unbounded by default) |
+| `assay render` | Rebuild the full client config into `rendered/config.json` |
+| `assay activate` | `-test` gate → backup → atomic replace (+ gated auto-restart) |
+| `assay maintain` | One full maintenance wave end to end (stats poll + prune included) |
+| `assay status` | Install state, config resolution, source-quality dashboard |
+| `assay install` | Canonical user deploy: binary + unit + default config (see Quick Start) |
+| `assay uninstall` | Disable and remove the daemon unit; user data kept unless `--purge` |
+| `assay check` | Site-to-location ranking through the alive pool (default cap 60 nodes; temp xray instances) |
+| `assay list` | Pool inventory by country/city, `--json` machine-readable twin |
+| `assay watch` | The daemon: plugin watchdog + scheduled waves (what install enables) |
+| `assay xray-update` | Fetch the latest Xray-core release, sha256-verify, `-test`, atomic replace with rollback |
+
+Every command accepts optional `-c <path>`; without it the config resolution order is the local-share default `~/.local/share/assay/config.toml`, then the deprecated legacy home location `~/.config/assay/config.toml` when it exists (still honored, with a loud move warning), then `./config.toml`, then configless built-in defaults — one file wins whole, nothing is ever merged, and the resolved source prints as a `config:` line.
 
 ## ⚙️ Configuration
 
-Everything lives in `config.toml` — unknown keys fail loud, there are no env-var overrides.
+Configuration is TOML — unknown keys fail loud, there are no env-var overrides. [`config.example.toml`](config.example.toml) documents every knob with its default (including `[http]`, `[resources]`, and `[self_update]`, not repeated here); the tables below carry the important ones.
 
-| Section | Owns | Notable keys |
+**`[plugins]` — the source ingest**
+
+| Knob | Default | Meaning |
 | :-- | :-- | :-- |
-| `[plugins]` | **W10: the source ingest is Lua plugins** | `dir` (default `<data_dir>/plugins`; built-ins materialize on first run; see [Lua plugins](#-lua-plugins-the-source-ingest-layer)), `run_timeout` (default `120s`, `0s` = unbounded — a plugin exceeding it is abandoned loud and the wave continues), `max_consecutive_failures` (default `5`, `0` = unlimited — the circuit breaker; see below), `max_duplicate_percent` (nil = disabled by default; an explicit 0 disables; positive = auto-disable a plugin whose duplicate% exceeds the threshold), `min_live_percent` (nil = disabled by default; an explicit 0 disables; positive = auto-disable a plugin whose live% falls below the threshold). The old `[sources.*]` tables fail config load with a loud migration error. |
-| `[fetch]` | download client (the plugins' `github_files` engine) | `timeout`, `retries`, `concurrency`, `api_base`/`raw_base` (mirrors), `github_token`; `cache_max_age` is a W5-era leftover — unused by the plugin ingest |
-| `[http]` | shared HTTP client | `user_agent` — THE single pipeline User-Agent (fetch + geo) |
-| `[filter]` | ingest security | `source_cap`, `protocols` (allowlist — **W14 default: `vless,vmess,trojan,ss,hysteria2`**, the round-7 owner ruling), `allow_insecure` (default `false` — unchanged) |
-| `[probe]` | W14 real-xray wave | `threads` (parallel temp-instance workers, **default `32` since W19** — saturates the boot-serialization ceiling; the semaphore still bounds instantaneous load), `attempts` (default `3`), `url`, `timeout`, `speedtest` (**default `false` since round-8** — owner ruling «Только спидтест выключи», reversing the W10 default-on; explicit `true` keeps per-wave speed data; the weekly speedtest wave carries `-S` regardless), `speedtest_url` (default Cloudflare 25 MB sample), `speedtest_timeout`, `skip_fresh_within`; the removed knife keys (`path`/`db_path`/`check_preset`/`url_success_threshold`/`max_passed`) fail load loud |
-| `[geo]` | W11 self-report (automatic — no knob) | `doh_url` (DoH fallback endpoint, default `https://dns.google/resolve`), `ttl`, `timeout`; the batch-era `endpoint`/`batch_size`/`per_minute` are removed and fail load loud |
-| `[select]` | ranking caps (**W19: all default UNBOUNDED** — absent/`0` = ALL alive nodes go active; see [the load model](#️-unbounded-selection--the-load-model-w19)) | `per_country_cap` (K, `0` = unlimited), `soft_cap` (N, `0` = unbounded), `city_expand_threshold` (`0` = expansion off), `ceiling` (`0` = unbounded), `tie_band_rtt_tolerance` (city tie-break band width, default `1.2`), `only_clean` (nil/false = no filtering; true = keep only clean IPs — hosting=false && proxy=false; when enabled, render skips redundant clean-* balancers) |
-| `[render]` | client config render | `template`, `output_dir`, `stats_port`, `pool_routes`, `pool_inbound_tags` (validated against template inbounds — missing tag fails the render loud), `observatory_interval` (verbatim string; **absent = ADAPTIVE since W19** — the render computes `max(60s, ceil(active×200ms))` so observatory probes stay ≤ 5/s at any pool size), `tcp_max_seg` (mandatory on every pool outbound), `tls_fingerprint` (default `firefox`), `balancer_tolerance` (default `0.2`) |
-| `[activate]` | activation | `target`, `xray_bin`, `asset_dir`, `backup_dir`, `test_timeout` (`0s` = no deadline), `service_name` (names the printed manual-restart hint; the W13 auto path is byte-pinned to `xray-raw.service`), `backup_keep` (N newest, `0` = unlimited) |
-| `[maintain]` | wave schedule + the W13 auto-restart (the watch daemon reads it live) | `prune_dead_after` (default `48h`), `refresh_interval` (default **`1h`** since W10), `speedtest_interval` (default `168h`; **`"0s"` = no speedtest wave at all** — round-8; positive values below the 5m floor still fail loud), `stats_timeout` (default `10s`), `prune_backup_keep` (`0` = unlimited), `auto_restart` (**default `true`** since W13 — the daemon restarts the live client after every gated activation and health-checks it; `false` = print the manual restart hint instead) |
+| `dir` | `<data_dir>/plugins` | the watched source dir; embedded defaults materialize here on first run, 0600 |
+| `run_timeout` | `120s` | bound on one plugin's whole fetch run; `0s` = unbounded |
+| `max_consecutive_failures` | `5` | circuit breaker: N consecutive failures auto-disable the plugin; `0` = off |
+| `max_duplicate_percent` / `min_live_percent` | off | threshold-based disable via the same breaker |
 
-**Validation policy (owner ruling, binding):** the 5-minute floor applies **ONLY** to `[maintain].refresh_interval` / `speedtest_interval` (W5, owner-approved) — with the round-8 exception that `speedtest_interval = "0s"` is legal (the wave disable; positive values below the floor still fail loud). Every W6 knob (`cache_max_age`, `test_timeout`, `skip_fresh_within`, `stats_timeout`, `observatory_interval`, `tcp_max_seg`, `tls_fingerprint`, `balancer_tolerance`, `tie_band_rtt_tolerance`, `pool_inbound_tags`, `api_base`, `raw_base`, `user_agent`, `service_name`, `backup_keep`, `prune_backup_keep`) is **deliberately unbounded** — the only structural checks are value parsing, rejection of negative numbers (sign correctness), and the per-knob `0` semantics documented above. Values the xray core rejects fail the `-test` gate loud. Defaults preserve the pre-W6 behavior byte-for-byte **except where W19 flipped them** (the `[select]` caps and `observatory_interval` — no-floor/no-ceiling ruling: the knobs stay, the defaults became unbounded/adaptive; see below).
+**`[fetch]` — the plugins' HTTP engine**
 
-### ⚖️ Unbounded selection & the load model (W19)
-
-Owner order: «259 живых, значит 259 раскидываются по балансирам стран и городов… не только убрать лимит, но сделать так чтобы с ростом количества не росла нагрузка, стремиться к O(1)». The semantics flip and the honest physics:
-
-**Selection semantics (before → after).** `soft_cap`/`per_country_cap`/`city_expand_threshold`/`ceiling` absent or `0` used to refill to `25`/`3`/`25`/`40`. Now **absent/`0` = no cap at all**: every alive, geo-fresh node — the unknown-geo group included — goes active and lands in the country/city balancers (the city-expansion machinery is moot when nothing is bounded). An explicit positive value keeps the exact D7 semantics it always had (K per country; soft cap; expansion only with an explicit threshold; ceiling bounding the expansion only when present). The unbounded path is O(N log N): one sort + one pass, no greedy rescanning (`BenchmarkSelectUnboundedScaling`: 300 → 3000 nodes ≈ 12.5× ns/op).
-
-**What is honestly linear (owner-accepted).** The per-wave wall time is O(N): every alive node gets a real temp-xray probe — that is the price of "all alive IN", accepted by the owner. The **default concurrency raise** (8 → 32) keeps it bounded-minutes per 1000 nodes (see [the probe wave](#-the-probe-wave-w14-real-xray)). Fetch/parse/filter/geo stay O(N) under bounded concurrency.
-
-**What is actually O(1) — the sustained daemon load.** Between waves the only pool-size-dependent cost is the observatory: it re-probes every active outbound once per interval, so probes/sec ≈ N/interval. The render now computes the interval from the selection size — `interval = max(60s, ceil(N × 200ms))` — keeping **probes/sec ≤ 5 regardless of N** (code-owned budget, deliberately no new knob; an explicit `observatory_interval` still wins verbatim). 259 active → `60s` (identical to the old fixed default: 259 × 200ms = 51.8s < 60s floor); 1000 → `200s`; 3000 → `601s`. Coverage is untouched by the scaling: the `subjectSelector: ["pool-"]` matches EVERY pool outbound at any count (L2). Guard: `BenchmarkRenderEmissionScaling` (300 → 3000 nodes ≈ 11× ns/op through outbound + balancer emission + JSON marshal).
-
-**xray-core cost at large pools (honest, measured).** Memory and boot cost grow per outbound — that is structural (state per outbound in the core): config bytes, boot parse time, per-outbound memory, and observatory state all scale ~linearly with N. The live W19 activation measured the real slope at 259 outbounds (see the wave report): the render emission and select stay linear-ish, the observatory cadence is capped by the adaptive interval, and the daemon-side per-wave cost is bounded by the concurrency semaphore — so no load path grows faster than O(N), and the only paths that grow at all are the ones the owner explicitly accepted.
-
-## 📋 Config resolution (`-c` is optional)
-
-The CLI does not require a config path. `-c/--config` is optional on every command, and exactly **one** source wins whole — there is no merging, ever. The first existing file in this order IS the configuration:
-
-| Precedence | Source | Behavior |
+| Knob | Default | Meaning |
 | :-- | :-- | :-- |
-| 1 | `-c <path>` (explicit) | wins **always**; the file must exist — a missing explicit path fails loud naming the path (no silent fall-through) |
-| 2 | `~/.local/share/assay/config.toml` | used when it exists (**the local-share default since W13-deploy**; `$XDG_DATA_HOME/assay/config.toml` when `XDG_DATA_HOME` is set to an **absolute** path — the same root the data dir uses) |
-| 3 | `~/.config/assay/config.toml` | **DEPRECATED legacy location** — still honored as a one-release-cycle courtesy: the file loads and every command carries a loud `warning: legacy config location detected: … — move it to ~/.local/share/assay/config.toml (…deprecated…)`. The warning also fires when a canonical file wins and the legacy one is being ignored |
-| 4 | `./config.toml` | used when it exists (keeps the repo/owner operational workflow working) |
-| 5 | nothing found | **configless run** — built-in defaults (`data_dir = $XDG_DATA_HOME/assay` when the env var is set to an **absolute** path — a set-but-relative value violates the XDG spec, is treated as unset, and prints a loud warning naming the violation; else `~/.local/share/assay`; every other knob at its documented default; the plugins dir defaults under `data_dir`, so the embedded Lua sources materialize there on first run) |
+| `timeout` / `retries` / `concurrency` | `30s` / `3` / `4` | plugin transport defaults |
+| `github_token` | *(empty)* | raises api.github.com rate limits |
+| `api_base` / `raw_base` | GitHub defaults | mirror hosts for the `github_files` helper |
 
-Every command prints the resolved source as a `config:` line (`explicit -c <path>` / `local-share default <path>` / `legacy home default <path>` / `cwd default <path>` / `configless (built-in defaults)`), and `status` carries the same line.
+**`[probe]` — the real-xray wave**
 
-> **Migration (one line):** `mkdir -p ~/.local/share/assay && mv ~/.config/assay/config.toml ~/.local/share/assay/config.toml` — see [Migration notes](#migration-notes-w13-deploy).
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `threads` | `32` | parallel temp-instance workers |
+| `batch_size` | `1000` | nodes per batch-mode xray process; batch deaths halve recursively to 20 |
+| `attempts` | `3` | liveness GETs per node through `[probe].url` (default: the Cloudflare trace endpoint) |
+| `tcp_prefilter` | `true` | plain TCP dial per endpoint before any boot (UDP transports bypass) |
+| `tcp_prefilter_workers` / `_timeout` | `256` / `1s` | pre-filter dial concurrency and per-dial cap |
+| `speedtest` | `false` | per-wave speedtest off by default; the weekly wave carries it |
 
-**What works without any config file** (pure defaults, out of the box): `fetch`, `parse`, `filter`, `probe`, `select`, `check`, `list`, `status`, and the `watch` daemon's data stages. Stage commands that find no pipeline data yet fail with their normal loud "run the previous stage first" messages — that is data flow, not configuration.
+**`[geo]` — classification**
 
-**What REQUIRES a config (loud stage boundaries):**
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `timeout` | `8s` | the FLOOR of the adaptive per-request timeout |
+| `unlock_probes` | `true` | the full battery runs on every probe-alive node; `false` = probe-only waves |
+| `doh_url` | `https://dns.google/resolve` | through-tunnel DoH fallback endpoint |
+| `https_url` | `https://ipinfo.io/json` | rung-2 HTTPS self-geo (any https endpoint accepted) |
+| `exit_ip_echo_url` | `https://icanhazip.com` | HTTPS echo recovery when both self-report rungs fail entirely |
+| `ttl` | `24h` | alive-data freshness for selection |
 
-- **`render`** needs a configured `[render].template`; **`activate`** needs a configured `[activate].target`. A configless run fails at the stage boundary — `configless mode cannot render — provide -c or a config at ~/.local/share/assay/config.toml` (same wording for activate) — instead of silently defaulting those paths at the live client's config. Inside `maintain`/`watch` waves the boundary ends the wave loud while every earlier stage stays flushed and usable. (The materialized default config carries the same loud boundaries for its commented-out `template`/`target` — fill them to activate; see [Migration notes](#migration-notes-w13-deploy).)
-- **`install`** (and `uninstall --purge`) resolve install-style: explicit `-c` wins and must exist (the unit embeds the absolute path); else the **local-share default** when present; else the **deprecated legacy location** when present (the unit embeds its exact path so a tuned config keeps working, plus the loud move warning); else the canonical **configless + materialize** flow — a fresh default config is materialized at the local-share path and the daemon unit runs plain `watch` with **no `-c`** (the daemon reads the default location). The **cwd default is deliberately never consulted** here: a unit must reference a stable location, never the directory the operator happened to stand in.
-- **`stats` accounting** (inside waves) degrades to INFO in configless mode (`no activate.target — stats accounting unavailable`) and the wave continues — accounting is never correctness.
+The adaptive timeout formula: each classification request gets `clamp(10 × the node's measured probe RTT, [geo].timeout, 30s)` — the knob is the floor, 30 seconds is the hard ceiling, and the ceiling wins when a configured floor sits above it. A node without a usable RTT measurement fails safe to the floor. The whole battery is bounded by a 20-minute per-node budget.
 
-## ✅ Testing
+**`[select]` — unbounded selection**
+
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `per_country_cap` / `soft_cap` / `ceiling` | unbounded | absent or `0` = ALL alive nodes go active; explicit positives keep cap semantics |
+| `tie_band_rtt_tolerance` | `1.2` | city tie-break band: rtt ≤ head·tolerance joins the band |
+| `only_clean` | off | keep only nodes whose ip-quality evidence says hosting=false and proxy=false |
+
+**`[render]` — the client config**
+
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `template` | *(placeholder)* | your xray client config as read-only structure reference |
+| `pool_inbound_tags` | `socks-in, http-in` | must exist among template inbounds or the render fails loud |
+| `observatory_interval` | adaptive | absent = `max(60s, ceil(active × 200ms))` — observatory load stays ≤ 5 probes/s at any pool size |
+| `tcp_max_seg` | `1440` | emitted mandatorily on every pool outbound (anti-TSPU MSS clamp) |
+| `tls_fingerprint` | `firefox` | uTLS fingerprint on tls/reality outbounds |
+| `stats_port` | `15490` | the api/stats inbound bound to 127.0.0.1 only |
+| `pool_routes` | *(none)* | the ONLY destinations that reach the pool — no routes, pool carries nothing |
+
+The renderer emits one leastLoad balancer per location: `pool_<cc>` per country, `pool_<cc>_<city>` when a city has ≥ 2 live nodes (single-node cities render a direct `pool-<cc>-NN` tag), `pool_unknown` for the unknown-geo group, and `pool_all` spanning the whole pool. Balancers select only observatory-covered outbounds, and a route target that is neither a rendered balancer nor a direct pool tag fails the render loud.
+
+**`[activate]` — gated activation**
+
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `target` | *(placeholder)* | the live client config to replace atomically |
+| `xray_bin` | `/usr/bin/xray` | the core binary behind the `-test` gate, the probe, and `xray-update` |
+| `test_timeout` | `30s` | bounds the `xray run -test` child; `0s` = no deadline |
+| `backup_keep` | `0` | retain only the N newest config backups (`0` = unlimited) |
+| `service_name` | `xray-client.service` | names the printed manual-restart hint; the auto path is pinned to `xray-raw.service` |
+
+**`[maintain]` — the daemon schedule**
+
+| Knob | Default | Meaning |
+| :-- | :-- | :-- |
+| `refresh_interval` | `1h` | refresh wave cadence (5m floor) |
+| `speedtest_interval` | `168h` | weekly speedtest wave; `"0s"` disables the wave entirely |
+| `auto_restart` | `true` | the daemon restarts the live client after every gated activation and health-checks it |
+| `stats_timeout` | `10s` | bounds one `xray api statsquery` exec |
+| `prune_dead_after` | `48h` | dead records older than this are pruned (with a backup) |
+
+## 🔒 Security
+
+- **The Lua sandbox is a hard callable surface.** gopher-lua opens only `base`, `string`, `table`, `math` — no `os`, no `io`, no `package`, no `debug`; `dofile`/`loadfile`/`print`/`require`/`module`/`newproxy` are stripped from `_G`. A plugin can only call the documented host API, every failure is loud and plugin-attributed, and runs exceeding `[plugins].run_timeout` are abandoned while the wave continues.
+- **Every pool balancer fails closed.** All of them carry `fallbackTag: "block"` — a location with no healthy candidate blackholes instead of falling back to direct, and the pool reaches only the destinations listed under `[[render.pool_routes]]`.
+- **TLS-intercept hijacking is detected and excluded.** The battery's hijack detector validates certificates (always on — the seam defaults to the system pool) and contracts the plain-HTTP ip-api body against the known fake-answer signature; a node with hijack evidence on its OWN geo record is excluded from selection after the probe gate — positive evidence only, never a sibling's record, and excluded nodes consume no selection slots.
+- **The `-test` gate is unconditional.** A config that fails `xray run -test` never replaces the live file; every replace is preceded by a date-stamped backup, and every write (config materialization, cold base, rendered configs, backups) is atomic.
+- **The daemon's systemd surface is byte-pinned.** Install may run exactly its allowlisted invocations — `daemon-reload` and `enable`/`disable --now`, always `--user` and always on assay units; the restart executor may run exactly `systemctl --user restart xray-raw.service` plus a read-only `is-active`. Guard tests pin the command sets; config knobs cannot widen the surface (`[activate].service_name` names the manual hint only).
+- **Ingest hygiene is a hard filter.** Links outside the `[filter].protocols` allowlist, without `reality`/`tls` security, or carrying `allowInsecure` never reach the cold base; every wave re-filters and re-probes — trust extends only to the most recent evidence.
+- **Evidence discipline is per-node and through its own tunnel.** Exit geo is keyed on the exit IP observed through the node's connection (never the advertised host), each candidate's verdict rides its own battery record, and provenance markers (`self-report`, `self-report-https`, `doh-fallback`) stay next to the fields they describe.
+- **Byte-stability is pinned, not promised.** Color-off output, legacy verdict chips, and the machine-readable JSON twins are golden-pinned; probe-classification changes that must not alter output are proven byte-identical by tests.
+
+## 📊 Observability
+
+**The status dashboard** (`assay status`) renders per-source verdicts — **GOOD / FAIR / WEAK / POOR / DEAD** — computed from a pool-relative percentile composite (liveness, alive rate, geo breadth, classification cleanliness, unique yield) with a trend modifier; cold-start sources get an honest NEW/NONE state instead of a fabricated band. It also prints the wave funnel (links → filtered → probe-alive → classified → selected), quality columns, media-unlock counts, and the per-source sparkline history.
+
+**The journal carries rollout evidence.** Every classification decision logs its tokens, so a wave can be audited without re-running it:
+
+| Token | Meaning |
+| :-- | :-- |
+| `battery=vN alive=…` | battery schema version and the tunnel-alive gate result |
+| `tmo=<duration>` | the node's effective adaptive per-request timeout for this run |
+| `gate_rescue=cftrace ip=<exit>` | both gate endpoints failed but the cftrace echo answered — the node was rescued and the evidence recorded |
+| `consensus=N` | how many exit-IP echo sources agreed (cftrace / ipify / ip.sb) |
+| `exit-ip churn` | the node's exit IP changed between the probe wave and its self-report — the fresher tunnel truth wins |
+
+**Machine-readable twins.** `assay list --json` and `assay status --json` print exactly one JSON document each — no banners, no ANSI — pinned byte-for-byte by golden tests. The `list` twin's schema:
+
+| Field | Type | Meaning |
+| :-- | :-- | :-- |
+| `generated_at` | string | the selection's generation timestamp |
+| `config` | object | resolved config source (`path` omitted when configless) |
+| `selection` | object | the selection file read and its node count |
+| `countries[]` | array | the active core grouped by country; unknown-geo nodes form their own `🏳` entry |
+| `balancers[]` | array | the routing targets the current selection produces, with node counts |
+| `cold_base` | object, `--all` | the cold base grouped the same way |
+
+`status --json` carries its `schema_version`, the verdict/funnel/quality blocks with explicit nulls for absent evidence, and per-source rows. Color follows `--color auto/always/never` and `NO_COLOR`, and color-off output is byte-stable.
+
+## 🧪 Testing
 
 ```bash
-go test ./... -count=1        # full suite
-go test -race -count=1 ./...  # race detector
-golangci-lint run             # strict gate: 0 issues, caps disabled
+go test -race -count=1 ./...    # the full suite, race detector on
+go build ./... && go vet ./...  # build + vet clean
+golangci-lint run               # strict gate: zero issues
 ```
 
-The suite covers every stage with hermetic fixtures: the **W10 plugin matrix** — node-class contract (constructor/collector loudness with plugin + index attribution), the host network API over httptest (GET/POST/headers/redirect-caps/timeout/body-cap, a dynamic ambient-proxy-env test pinning **L5**), the `github_files` helper (include filters, manifest mode, truncated-tree loudness), the sandbox (os/io/require/dofile fail loud, at load-check AND at run time), defaults materialization (first-run-only; owner edits persist), watchdog hot-reload (add/modify/remove/broken-keeps-last-good, `-race`-pinned concurrent reload vs wave snapshots), the daemon scheduler (injected clock: tick order, speedtest-covers-refresh, failure survival, signal-driven clean shutdown), the StintikVPN fixture (nested fetches, per-subscription isolation) plus `live`-tagged real-source runs —: mocked-stage maintain orchestration (order, no-op-when-unchanged, failed `-test` gate), real-shaped `statsquery` responses (missing-counter tolerance included), prune boundaries and backup semantics, render golden regression (per-transport goldens **xray-validated against the real binary in the default suite**), the full W5 install matrix — unit files rendered from config intervals under a fake HOME, an injected systemctl executor (tests never execute systemd), an allowlist guard pinning the exact permitted commands, and idempotent re-install/purge semantics — and the W8 check matrix: URL normalization, blockpage classifier, aggregation/ranking math, a golden report (`--no-color`), an in-process SOCKS5 server pinning the **remote-DNS (`socks5h`) contract** behaviorally, engine integration (filters, limits, throttling, verdict classes, staleness hint), and a `live`-tagged real-xray temp-instance lifecycle test (`go test -tags live ./internal/checker/`) — plus the round-7 pins: the plugin circuit-breaker state machine (4 failures + success reset, 5 → disable, reload re-enable, unlimited mode, wave-level exclusion and loud lines), the `list --json` golden schema, the relative-`XDG_DATA_HOME` validation, watchdog `Close` idempotence and the post-close reload gate, and the gate's start-failure classification seam.
+The full suite passes under `-race`. It is hermetic: temp xray instances boot through a real `StartTempXray` scan, the plugin matrix runs the host API over `httptest`, and the render goldens are **validated against the real xray binary in the default suite** (`xray run -test` on every golden transport).
 
-## 🗺️ Roadmap
+- **Dynamic repro probes are the acceptance discipline.** Lifecycle, networking, seam, and CLI changes are accepted only with a dynamic reproduction: the defect is reproduced against real behavior first (RED), then the fix is proven against the same probe (GREEN) — review findings are verified live against the code, not accepted from a report.
+- **The boot-smoke flake protocol is documented, not folk wisdom.** Temp instances boot into a test port band disjoint from production (`28500–28799`, pinned by `TestMain` via `SetTestPortBand`), because the live watch daemon churns the production `18xxx` band hourly — full `-race` runs historically flaked against that live churn, and the band pin is the fix. A residual cross-process contention flake in the boot smoke clears with a single isolated rerun.
+- **`live`-tagged tests exist but never run by default.** Real-source plugin sweeps and real-xray lifecycle checks run behind `-tags live`, so the default suite stays hermetic.
 
-- **VPS probe mode (D10)** — run the probe stage on a rented server and sync results back, trading home-IP footprint for infrastructure.
-- **Panel-side integration** — explicitly out of scope; this pipeline is a local single-binary tool and stays one.
+## 📄 License
+
+[MIT](LICENSE) © 2026 4q4r
