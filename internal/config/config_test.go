@@ -157,8 +157,8 @@ func TestValidationRejectsBadConfig(t *testing.T) {
 		content := `
 data_dir = "/tmp/x"
 
-[sources.matin]
-repo = "MatinGhanbari/v2ray-configs"
+[sources.legacy]
+repo = "example-owner/example-lists"
 discovery = "github-contents"
 `
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
@@ -166,7 +166,7 @@ discovery = "github-contents"
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "[sources.*] section was removed")
 		assert.Contains(t, err.Error(), "[plugins]")
-		assert.Contains(t, err.Error(), "matin, radikal, stintikvpn, etc.")
+		assert.Contains(t, err.Error(), "sample plugin (sample.lua)")
 	})
 
 	t.Run("unknown key still fails loud", func(t *testing.T) {

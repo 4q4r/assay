@@ -23,16 +23,22 @@ func TestEmbeddedDefaultsCompile(t *testing.T) {
 			}
 		})
 	}
-	if len(defaultSources()) != 12 {
-		t.Fatalf("expected 12 embedded defaults (matin, radikal, stintikvpn, "+
-			"hidashimora, kort0881, au1rxx, barryfar, mehdirzfx, "+
-			"flat447, luxxuria, igareck, nodesradar), got %d",
-			len(defaultSources()))
+	// Fresh-clone contract: the embed glob is compile-load-bearing (a
+	// zero-match glob is a build error) and the tracked sample template is
+	// the ONE default a fresh clone receives. The set may be larger on a
+	// tree that carries additional untracked plugins in the same dir (embed
+	// reads disk) — the contract pins only what ships: non-empty + sample.
+	if len(defaultSources()) == 0 {
+		t.Fatal("embedded defaults are empty — the go:embed glob is compile-load-bearing")
+	}
+	if _, ok := defaultSources()["sample.lua"]; !ok {
+		t.Fatal("tracked sample.lua missing from the embedded defaults — " +
+			"fresh clones would get no default source")
 	}
 }
 
 func TestEnsureDefaults(t *testing.T) {
-	t.Run("first run materializes everything", func(t *testing.T) {
+	t.Run("first run materializes everything embedded", func(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "plugins")
 		if err := EnsureDefaults(dir); err != nil {
 			t.Fatalf("EnsureDefaults: %v", err)
@@ -41,8 +47,12 @@ func TestEnsureDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(entries) != 12 {
-			t.Fatalf("expected 12 materialized defaults, got %d", len(entries))
+		if len(entries) != len(defaultSources()) {
+			t.Fatalf("expected %d materialized defaults (one per embedded source), got %d",
+				len(defaultSources()), len(entries))
+		}
+		if _, err := os.Stat(filepath.Join(dir, "sample.lua")); err != nil {
+			t.Fatalf("tracked sample.lua did not materialize: %v", err)
 		}
 		for _, entry := range entries {
 			info, err := entry.Info()
@@ -59,11 +69,10 @@ func TestEnsureDefaults(t *testing.T) {
 		if err := EnsureDefaults(dir); err != nil {
 			t.Fatal(err)
 		}
-		ownerEdited := filepath.Join(dir, "matin.lua")
+		// sample.lua is the one default guaranteed to be embedded on every
+		// tree (tracked in-repo) — owner-edit semantics are pinned on it.
+		ownerEdited := filepath.Join(dir, "sample.lua")
 		if err := os.WriteFile(ownerEdited, []byte("-- owner edit\nreturn function() end"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Remove(filepath.Join(dir, "radikal.lua")); err != nil {
 			t.Fatal(err)
 		}
 		if err := EnsureDefaults(dir); err != nil {
@@ -76,7 +85,13 @@ func TestEnsureDefaults(t *testing.T) {
 		if string(b) != "-- owner edit\nreturn function() end" {
 			t.Fatalf("owner edit was overwritten: %q", b)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "radikal.lua")); !os.IsNotExist(err) {
+		if err := os.Remove(ownerEdited); err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureDefaults(dir); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(ownerEdited); !os.IsNotExist(err) {
 			t.Fatal("removed default was re-materialized — removal must persist")
 		}
 	})
