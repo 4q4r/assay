@@ -155,8 +155,8 @@ func TestFetchRetriesOnServerError(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load(), "second attempt must succeed after 502")
 }
 
-func TestManifestDiscoveryRadikalShape(t *testing.T) {
-	// Manifest mirrors the real 0xRadikal index.json: protocol_files map,
+func TestManifestDiscoveryIndexShape(t *testing.T) {
+	// Manifest mirrors the index-discovery format (index.json): protocol_files map,
 	// categories/cascade maps with files dicts, raw + mirror twins of the same
 	// path (mirror must not duplicate the fetch).
 	manifest := `{
@@ -379,7 +379,7 @@ func TestBase64SubscriptionBodyIsCarriedVerbatim(t *testing.T) {
 	files := map[string]string{"/subscriptions/v2ray/super-sub.txt": enc}
 	cl := newTestServer(t, files)
 	src := config.Source{Repo: "owner/repo", Discovery: "github-contents", Include: []string{"super-sub.txt"}}
-	got, err := cl.Source(context.Background(), "matin", src)
+	got, err := cl.Source(context.Background(), "prov-a", src)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, enc, string(got[0].Body), "fetch carries bytes verbatim; base64 decoding is parse's job")

@@ -78,7 +78,7 @@ fetch → parse → filter → probe → select → render → activate
 - Link hygiene at ingest: drop `allowInsecure=1`, drop PSK-only protocols, prefer forward-secrecy transports (reality/tls) — the standard curated-list SECURE criterion.
 - Trust extends into the future: feeds can swap endpoints any hour → every wave re-filters and re-probes; nodes failing twice get pruned.
 - Footprint: bulk probing = a fan-out of foreign-IP TLS dials from the home RU IP. Default = local but throttled (concurrency + probes/min caps); VPS mode (run probe stage on an own server, sync results) as an optional flag.
-- Source fetches over HTTPS (raw.githubusercontent / gitverse mirror): the registry stores repo ids + a discovery method, and fetch resolves the current raw paths at every wave (D9 dynamic discovery — no pinned URLs).
+- Source fetches over HTTPS (raw.githubusercontent / gitverse mirror): the plugin stores repo ids + a discovery method, and fetch resolves the current raw paths at every wave (D9 dynamic discovery — no pinned URLs).
 
 ## 8. Landmines
 

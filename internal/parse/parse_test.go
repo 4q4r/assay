@@ -12,7 +12,7 @@ import (
 
 func TestParseVLESSRealityXHTTP(t *testing.T) {
 	link := "vless://1918fb45-3312-4893-b3f9-77b7c3e647b6@109.122.197.79:443?type=xhttp&security=reality&sni=www.kit.edu&host=www.kit.edu&path=%2F&pbk=I-reZxJUuER7atFvxyYlI_OxoDdV0rQev16Hewhjcz4&sid=616f0ee48093b218&fp=chrome&mode=packet-up#Germans%20Primary"
-	n, err := parse.Link("matin", link)
+	n, err := parse.Link("prov-a", link)
 	require.NoError(t, err)
 	assert.Equal(t, "vless", n.Scheme)
 	assert.Equal(t, "1918fb45-3312-4893-b3f9-77b7c3e647b6", n.UUID)
