@@ -539,7 +539,7 @@ speedtest_interval = "168h"
 		"fetched_at": "2026-11-04T12:00:00Z",
 		"sources":    map[string]any{},
 		"plugin_stats": []map[string]any{
-			{"PluginID": "barryfar", "TotalNodes": 18110, "LiveNodes": 0,
+			{"PluginID": "example-provider", "TotalNodes": 18110, "LiveNodes": 0,
 				"DuplicateCount": 394, "HostingCount": 0, "ProxyCount": 0, "CleanCount": 0},
 		},
 	}
