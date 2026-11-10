@@ -21,22 +21,22 @@ func idSet(keys ...string) map[string]bool {
 // (a plugin trivially contains itself); empty sets never divide by zero.
 func TestComputeOverlapMatrix(t *testing.T) {
 	identities := map[string]map[string]bool{
-		"matin": idSet("vless|a.com|443", "vless|b.com|443", "vless|c.com|443", "vless|d.com|443", "vless|e.com|443"),
-		"mhd":   idSet("vless|a.com|443"),
-		"solo":  idSet("vless|z.com|443"),
-		"void":  idSet(),
+		"prov-a": idSet("vless|a.com|443", "vless|b.com|443", "vless|c.com|443", "vless|d.com|443", "vless|e.com|443"),
+		"prov-b": idSet("vless|a.com|443"),
+		"solo":   idSet("vless|z.com|443"),
+		"void":   idSet(),
 	}
 
 	m := ComputeOverlapMatrix(identities)
 
-	assert.Equal(t, map[string]int{"matin": 5, "mhd": 1, "solo": 1, "void": 0}, m.Sets,
+	assert.Equal(t, map[string]int{"prov-a": 5, "prov-b": 1, "solo": 1, "void": 0}, m.Sets,
 		"sets count DISTINCT identities (dedupe within plugin)")
-	assert.InDelta(t, 20.0, m.Cells["matin"]["mhd"], 1e-9, "1/5 of matin's identities live in mhd")
-	assert.InDelta(t, 100.0, m.Cells["mhd"]["matin"], 1e-9, "mhd's only identity is shared → 100%")
-	assert.InDelta(t, 0.0, m.Cells["matin"]["solo"], 1e-9, "disjoint pairs overlap zero")
-	assert.InDelta(t, 0.0, m.Cells["solo"]["matin"], 1e-9)
-	assert.InDelta(t, 100.0, m.Cells["matin"]["matin"], 1e-9, "diagonal is trivially 100")
-	assert.InDelta(t, 0.0, m.Cells["void"]["matin"], 1e-9, "empty set never divides by zero")
+	assert.InDelta(t, 20.0, m.Cells["prov-a"]["prov-b"], 1e-9, "1/5 of prov-a's identities live in prov-b")
+	assert.InDelta(t, 100.0, m.Cells["prov-b"]["prov-a"], 1e-9, "prov-b's only identity is shared → 100%")
+	assert.InDelta(t, 0.0, m.Cells["prov-a"]["solo"], 1e-9, "disjoint pairs overlap zero")
+	assert.InDelta(t, 0.0, m.Cells["solo"]["prov-a"], 1e-9)
+	assert.InDelta(t, 100.0, m.Cells["prov-a"]["prov-a"], 1e-9, "diagonal is trivially 100")
+	assert.InDelta(t, 0.0, m.Cells["void"]["prov-a"], 1e-9, "empty set never divides by zero")
 	assert.Len(t, m.Cells, 4, "every plugin gets a row")
 }
 
@@ -55,17 +55,17 @@ func TestComputeOverlapMatrixAsymmetric(t *testing.T) {
 // overlap-partner selection with deterministic tie-breaking.
 func TestApplyOverlapUniqueYieldAndTopPartners(t *testing.T) {
 	collector := NewPluginStatsCollector(nil)
-	collector.Stats["matin"] = &PluginStats{PluginID: "matin"}
-	collector.Stats["mhd"] = &PluginStats{PluginID: "mhd"}
+	collector.Stats["prov-a"] = &PluginStats{PluginID: "prov-a"}
+	collector.Stats["prov-b"] = &PluginStats{PluginID: "prov-b"}
 	collector.Stats["solo"] = &PluginStats{PluginID: "solo"}
 	collector.Stats["twin"] = &PluginStats{PluginID: "twin"}
 
 	identities := map[string]map[string]bool{
-		// matin: 4 unique + 1 shared with mhd + 1 shared with twin → 2/6 unique.
-		"matin": idSet("m1", "m2", "m3", "m4", "shared-mhd", "shared-twin"),
-		// mhd: 1 unique + the shared one → 1/2 unique.
-		"mhd": idSet("h1", "shared-mhd"),
-		// twin: shares everything with matin → 0 unique of 1.
+		// prov-a: 4 unique + 1 shared with prov-b + 1 shared with twin → 2/6 unique.
+		"prov-a": idSet("m1", "m2", "m3", "m4", "shared-prov-b", "shared-twin"),
+		// prov-b: 1 unique + the shared one → 1/2 unique.
+		"prov-b": idSet("h1", "shared-prov-b"),
+		// twin: shares everything with prov-a → 0 unique of 1.
 		"twin": idSet("shared-twin"),
 		// solo: fully unique → 100%.
 		"solo": idSet("s1", "s2"),
@@ -73,19 +73,19 @@ func TestApplyOverlapUniqueYieldAndTopPartners(t *testing.T) {
 	m := ComputeOverlapMatrix(identities)
 	collector.ApplyOverlap(m, identities)
 
-	matin := collector.Stats["matin"]
-	require.NotNil(t, matin)
-	assert.InDelta(t, 66.667, matin.UniqueYield, 0.01, "4/6 identities are unique")
-	require.Len(t, matin.TopOverlaps, 2, "top-2 partners surface")
-	// Overlaps: mhd 1/6≈16.7%, twin 1/6≈16.7% — tie broken by plugin id asc.
-	assert.Equal(t, "mhd", matin.TopOverlaps[0].PluginID)
-	assert.Equal(t, "twin", matin.TopOverlaps[1].PluginID)
+	provA := collector.Stats["prov-a"]
+	require.NotNil(t, provA)
+	assert.InDelta(t, 66.667, provA.UniqueYield, 0.01, "4/6 identities are unique")
+	require.Len(t, provA.TopOverlaps, 2, "top-2 partners surface")
+	// Overlaps: prov-b 1/6≈16.7%, twin 1/6≈16.7% — tie broken by plugin id asc.
+	assert.Equal(t, "prov-b", provA.TopOverlaps[0].PluginID)
+	assert.Equal(t, "twin", provA.TopOverlaps[1].PluginID)
 
-	mhd := collector.Stats["mhd"]
-	assert.InDelta(t, 50.0, mhd.UniqueYield, 1e-9, "1/2 unique")
-	require.Len(t, mhd.TopOverlaps, 1)
-	assert.Equal(t, "matin", mhd.TopOverlaps[0].PluginID)
-	assert.InDelta(t, 50.0, mhd.TopOverlaps[0].Percent, 1e-9)
+	provB := collector.Stats["prov-b"]
+	assert.InDelta(t, 50.0, provB.UniqueYield, 1e-9, "1/2 unique")
+	require.Len(t, provB.TopOverlaps, 1)
+	assert.Equal(t, "prov-a", provB.TopOverlaps[0].PluginID)
+	assert.InDelta(t, 50.0, provB.TopOverlaps[0].Percent, 1e-9)
 
 	twin := collector.Stats["twin"]
 	assert.InDelta(t, 0.0, twin.UniqueYield, 1e-9, "twin adds nothing unique")

@@ -1270,7 +1270,7 @@ func printProviderIntelTable(out io.Writer, si *statusIntel, color bool) {
 	outf(out, "%s", ui.Table(cols, rows, color))
 }
 
-// overlapCell renders the top-2 overlap partners "matin 61%, mhd 18%".
+// overlapCell renders the top-2 overlap partners "prov-a 61%, prov-b 18%".
 func overlapCell(pairs []plugins.OverlapPair) string {
 	if len(pairs) == 0 {
 		return "—"

@@ -381,3 +381,32 @@ func TestSampleDefaultEmptyBodies(t *testing.T) {
 	assert.Empty(t, nodes)
 	assert.Contains(t, log.String(), "empty")
 }
+
+// TestSampleDefaultHarvestsRealBody is the ingest-path sibling of the
+// empty-body test: the SAME tracked sample template and the SAME hermetic
+// URL rewrite, but the stub answers a real subscription body — the harvest
+// path (body → lines → scheme gate → assay.node records) must record the
+// ingestible links and drop the non-URI line.
+func TestSampleDefaultHarvestsRealBody(t *testing.T) {
+	code, ok := defaultSources()["sample.lua"]
+	require.True(t, ok, "tracked sample.lua missing from the embedded defaults")
+	body := "vless://a@h1.example.com:443?security=tls#n1\n" +
+		"trojan://c@h3.example.com:443#n3\n" +
+		"this line carries no share link\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	code = []byte(strings.ReplaceAll(string(code), "https://example.invalid/assay-sample-subscription.txt", srv.URL))
+
+	var log strings.Builder
+	eng := newEngine(engineOptions{Log: &log})
+	nodes, err := eng.Run(context.Background(), &Plugin{
+		ID: "sample", Path: "sample.lua", Code: code,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"trojan://c@h3.example.com:443#n3",
+		"vless://a@h1.example.com:443?security=tls#n1",
+	}, sortedRaws(nodes))
+}

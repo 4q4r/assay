@@ -20,10 +20,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLiveDiscoverRadikalManifest(t *testing.T) {
+func TestLiveDiscoverExampleManifest(t *testing.T) {
 	cl := fetch.NewClient(fetch.ClientConfig{Timeout: 30 * time.Second, Retries: 2})
+	// Placeholder repo: swap in your own manifest-discovery source to smoke
+	// the live path against a real upstream.
 	src := config.Source{
-		Repo:      "0xRadikal/Free-v2ray-Configs",
+		Repo:      "your-name/your-lists",
 		Discovery: "manifest",
 		Manifest:  "index.json",
 		Include:   []string{"secure/configs.txt"},

@@ -45,7 +45,7 @@ func TestGeoRecordSchemaMatchesDesign(t *testing.T) {
 	// The cold-base record schema is fixed by DESIGN.md §5; the JSON keys are a
 	// regression contract with the on-disk geo-base.jsonl store.
 	rec := model.GeoRecord{
-		Tag: "pool-nl-01", Source: "matin", Scheme: "vless", Host: "h", Port: 443,
+		Tag: "pool-nl-01", Source: "prov-a", Scheme: "vless", Host: "h", Port: 443,
 		IP: "5.6.7.8", Country: "nl", City: "Amsterdam", ASN: "AS60781", ASName: "LeaseWeb",
 		ISP: "LeaseWeb", ProxyFlag: true, HostingFlag: true,
 		FirstSeen: "2026-10-28T00:00:00Z", LastSeen: "2026-10-28T00:00:00Z", LastProbe: "2026-10-28T00:00:00Z",
