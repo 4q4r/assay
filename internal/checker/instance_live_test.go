@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/checker"
+	"assay/internal/checker"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

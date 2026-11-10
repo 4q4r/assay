@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/fetch"
-	"public_vpn/internal/model"
-	"public_vpn/internal/plugins"
-	"public_vpn/internal/stats"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/fetch"
+	"assay/internal/model"
+	"assay/internal/plugins"
+	"assay/internal/stats"
+	"assay/internal/store"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -120,7 +120,7 @@ func TestPluginRunTimeoutAbandonsHangingPlugin(t *testing.T) {
 	reg := plugins.NewRegistry()
 	reg.Set(&plugins.Plugin{ID: "healthy", Path: "healthy.lua", Code: []byte(`
 		return function()
-			return { publicvpn.node{ raw = "vless://a@h:1?s=1" }, publicvpn.node{ raw = "vless://b@h:2?s=1" } }
+			return { assay.node{ raw = "vless://a@h:1?s=1" }, assay.node{ raw = "vless://b@h:2?s=1" } }
 		end`)})
 	reg.Set(&plugins.Plugin{ID: "hung", Path: "hung.lua", Code: []byte(`
 		return function() repeat until false end`)})
@@ -185,54 +185,54 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	reg.Set(&plugins.Plugin{ID: "highdup", Path: "highdup.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://a@h:1?s=1" },
-				publicvpn.node{ raw = "vless://b@h:2?s=1" },
-				publicvpn.node{ raw = "vless://c@h:3?s=1" },
-				publicvpn.node{ raw = "vless://d@h:4?s=1" },
-				publicvpn.node{ raw = "vless://e@h:5?s=1" },
-				publicvpn.node{ raw = "vless://f@h:6?s=1" },
-				publicvpn.node{ raw = "vless://g@h:7?s=1" },
-				publicvpn.node{ raw = "vless://h@h:8?s=1" },
-				publicvpn.node{ raw = "vless://i@h:9?s=1" },
-				publicvpn.node{ raw = "vless://j@h:10?s=1" },
-				publicvpn.node{ raw = "vless://k@h:11?s=1" },
-				publicvpn.node{ raw = "vless://l@h:12?s=1" },
+				assay.node{ raw = "vless://a@h:1?s=1" },
+				assay.node{ raw = "vless://b@h:2?s=1" },
+				assay.node{ raw = "vless://c@h:3?s=1" },
+				assay.node{ raw = "vless://d@h:4?s=1" },
+				assay.node{ raw = "vless://e@h:5?s=1" },
+				assay.node{ raw = "vless://f@h:6?s=1" },
+				assay.node{ raw = "vless://g@h:7?s=1" },
+				assay.node{ raw = "vless://h@h:8?s=1" },
+				assay.node{ raw = "vless://i@h:9?s=1" },
+				assay.node{ raw = "vless://j@h:10?s=1" },
+				assay.node{ raw = "vless://k@h:11?s=1" },
+				assay.node{ raw = "vless://l@h:12?s=1" },
 			}
 		end`)})
 	// Plugin "other" - 6 nodes that duplicate 6 of highdup's nodes
 	reg.Set(&plugins.Plugin{ID: "other", Path: "other.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://a@h:1?s=1" },
-				publicvpn.node{ raw = "vless://b@h:2?s=1" },
-				publicvpn.node{ raw = "vless://c@h:3?s=1" },
-				publicvpn.node{ raw = "vless://d@h:4?s=1" },
-				publicvpn.node{ raw = "vless://e@h:5?s=1" },
-				publicvpn.node{ raw = "vless://f@h:6?s=1" },
+				assay.node{ raw = "vless://a@h:1?s=1" },
+				assay.node{ raw = "vless://b@h:2?s=1" },
+				assay.node{ raw = "vless://c@h:3?s=1" },
+				assay.node{ raw = "vless://d@h:4?s=1" },
+				assay.node{ raw = "vless://e@h:5?s=1" },
+				assay.node{ raw = "vless://f@h:6?s=1" },
 			}
 		end`)})
 	// Plugin "lowdup" - 10 nodes, 2 duplicates (20% <= 50%)
 	reg.Set(&plugins.Plugin{ID: "lowdup", Path: "lowdup.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://k@h:11?s=1" },
-				publicvpn.node{ raw = "vless://l@h:12?s=1" },
-				publicvpn.node{ raw = "vless://m@h:13?s=1" },
-				publicvpn.node{ raw = "vless://n@h:14?s=1" },
-				publicvpn.node{ raw = "vless://o@h:15?s=1" },
-				publicvpn.node{ raw = "vless://p@h:16?s=1" },
-				publicvpn.node{ raw = "vless://q@h:17?s=1" },
-				publicvpn.node{ raw = "vless://r@h:18?s=1" },
-				publicvpn.node{ raw = "vless://s@h:19?s=1" },
-				publicvpn.node{ raw = "vless://t@h:20?s=1" },
+				assay.node{ raw = "vless://k@h:11?s=1" },
+				assay.node{ raw = "vless://l@h:12?s=1" },
+				assay.node{ raw = "vless://m@h:13?s=1" },
+				assay.node{ raw = "vless://n@h:14?s=1" },
+				assay.node{ raw = "vless://o@h:15?s=1" },
+				assay.node{ raw = "vless://p@h:16?s=1" },
+				assay.node{ raw = "vless://q@h:17?s=1" },
+				assay.node{ raw = "vless://r@h:18?s=1" },
+				assay.node{ raw = "vless://s@h:19?s=1" },
+				assay.node{ raw = "vless://t@h:20?s=1" },
 			}
 		end`)})
 	// Plugin "other2" - 2 nodes that duplicate 2 of lowdup's nodes
 	reg.Set(&plugins.Plugin{ID: "other2", Path: "other2.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://k@h:11?s=1" },
-				publicvpn.node{ raw = "vless://l@h:12?s=1" },
+				assay.node{ raw = "vless://k@h:11?s=1" },
+				assay.node{ raw = "vless://l@h:12?s=1" },
 			}
 		end`)})
 
@@ -261,32 +261,32 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	reg.Set(&plugins.Plugin{ID: "lowlive", Path: "lowlive.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://a@h:1?s=1" },
-				publicvpn.node{ raw = "vless://b@h:2?s=1" },
-				publicvpn.node{ raw = "vless://c@h:3?s=1" },
-				publicvpn.node{ raw = "vless://d@h:4?s=1" },
-				publicvpn.node{ raw = "vless://e@h:5?s=1" },
-				publicvpn.node{ raw = "vless://f@h:6?s=1" },
-				publicvpn.node{ raw = "vless://g@h:7?s=1" },
-				publicvpn.node{ raw = "vless://h@h:8?s=1" },
-				publicvpn.node{ raw = "vless://i@h:9?s=1" },
-				publicvpn.node{ raw = "vless://j@h:10?s=1" },
+				assay.node{ raw = "vless://a@h:1?s=1" },
+				assay.node{ raw = "vless://b@h:2?s=1" },
+				assay.node{ raw = "vless://c@h:3?s=1" },
+				assay.node{ raw = "vless://d@h:4?s=1" },
+				assay.node{ raw = "vless://e@h:5?s=1" },
+				assay.node{ raw = "vless://f@h:6?s=1" },
+				assay.node{ raw = "vless://g@h:7?s=1" },
+				assay.node{ raw = "vless://h@h:8?s=1" },
+				assay.node{ raw = "vless://i@h:9?s=1" },
+				assay.node{ raw = "vless://j@h:10?s=1" },
 			}
 		end`)})
 	// Plugin "highlive" - will have 8/10 live (80% >= 60%)
 	reg.Set(&plugins.Plugin{ID: "highlive", Path: "highlive.lua", Code: []byte(`
 		return function()
 			return {
-				publicvpn.node{ raw = "vless://k@h:11?s=1" },
-				publicvpn.node{ raw = "vless://l@h:12?s=1" },
-				publicvpn.node{ raw = "vless://m@h:13?s=1" },
-				publicvpn.node{ raw = "vless://n@h:14?s=1" },
-				publicvpn.node{ raw = "vless://o@h:15?s=1" },
-				publicvpn.node{ raw = "vless://p@h:16?s=1" },
-				publicvpn.node{ raw = "vless://q@h:17?s=1" },
-				publicvpn.node{ raw = "vless://r@h:18?s=1" },
-				publicvpn.node{ raw = "vless://s@h:19?s=1" },
-				publicvpn.node{ raw = "vless://t@h:20?s=1" },
+				assay.node{ raw = "vless://k@h:11?s=1" },
+				assay.node{ raw = "vless://l@h:12?s=1" },
+				assay.node{ raw = "vless://m@h:13?s=1" },
+				assay.node{ raw = "vless://n@h:14?s=1" },
+				assay.node{ raw = "vless://o@h:15?s=1" },
+				assay.node{ raw = "vless://p@h:16?s=1" },
+				assay.node{ raw = "vless://q@h:17?s=1" },
+				assay.node{ raw = "vless://r@h:18?s=1" },
+				assay.node{ raw = "vless://s@h:19?s=1" },
+				assay.node{ raw = "vless://t@h:20?s=1" },
 			}
 		end`)})
 
@@ -692,7 +692,7 @@ func TestRunPluginStatsEnrichmentHistoryFailureNonFatal(t *testing.T) {
 // contract. The enrichment tail (runPluginStatsEnrichment) rewrites the
 // manifest once per full wave cycle, ~2h after fetch; the NEXT wave's fetch
 // must PRESERVE those enrichment-layer fields instead of clobbering them
-// with fresh basic stats (production incident: `publicvpn status` showed
+// with fresh basic stats (production incident: `assay status` showed
 // live=0 / n-a / NONE for the entire cycle except the seconds between the
 // enrichment tail and the next fetch). Table-driven:
 //
@@ -732,7 +732,7 @@ func TestRunFetchWithCarriesOverEnrichedStats(t *testing.T) {
 		reg := plugins.NewRegistry()
 		for _, id := range ids {
 			code := fmt.Sprintf(
-				`return function() return { publicvpn.node{ raw = "vless://n@%s.example:443?s=1" } } end`, id)
+				`return function() return { assay.node{ raw = "vless://n@%s.example:443?s=1" } } end`, id)
 			reg.Set(&plugins.Plugin{ID: id, Path: id + ".lua", Code: []byte(code)})
 		}
 		return reg

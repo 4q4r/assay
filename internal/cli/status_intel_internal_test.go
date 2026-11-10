@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/plugins"
-	"public_vpn/internal/stats"
-	"public_vpn/internal/ui"
+	"assay/internal/plugins"
+	"assay/internal/stats"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/install"
+	"assay/internal/config"
+	"assay/internal/install"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -74,8 +74,8 @@ func TestRunInstallEndToEnd(t *testing.T) {
 		embedsConfig: true,
 	}))
 	out := buf.String()
-	assert.Contains(t, out, "daemon active:    publicvpn watch (Restart=always)")
-	assert.Contains(t, out, "journalctl --user -u public_vpn-watch.service -f")
+	assert.Contains(t, out, "daemon active:    assay watch (Restart=always)")
+	assert.Contains(t, out, "journalctl --user -u assay-watch.service -f")
 
 	// Exact allowed command set, in order.
 	require.Len(t, ex.calls, 2)
@@ -296,7 +296,7 @@ func TestStatusFlagsStaleInstalledBinary(t *testing.T) {
 
 	// The on-disk binary changed under the running process (the post-pull
 	// rebuild scenario): the drift must be flagged with the recovery.
-	installed := filepath.Join(binDir, "publicvpn")
+	installed := filepath.Join(binDir, "assay")
 	current, err := os.ReadFile(installed)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(installed,
@@ -306,8 +306,8 @@ func TestStatusFlagsStaleInstalledBinary(t *testing.T) {
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	out := status.String()
 	assert.Contains(t, out, "STALE", "a content-drifted installed binary must be flagged")
-	assert.Contains(t, out, "re-run `publicvpn install`", "the recovery names the self-copy command")
-	assert.Contains(t, out, "restart public_vpn-watch.service",
+	assert.Contains(t, out, "re-run `assay install`", "the recovery names the self-copy command")
+	assert.Contains(t, out, "restart assay-watch.service",
 		"the recovery names the daemon restart (the unit keeps running the old code otherwise)")
 }
 
@@ -338,7 +338,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	out := status.String()
 	assert.Contains(t, out, "install:")
-	assert.Contains(t, out, "binary:    "+filepath.Join(binDir, "publicvpn"))
+	assert.Contains(t, out, "binary:    "+filepath.Join(binDir, "assay"))
 	assert.Contains(t, out, install.WatchService+" present")
 	assert.Contains(t, out, "service:   enabled (wants symlink)")
 	assert.Contains(t, out, "waves: refresh 6h, speedtest 168h (read live from the config)",
@@ -350,7 +350,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	status.Reset()
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 	assert.Contains(t, status.String(), "LEGACY:", "old timer units must be flagged for migration")
-	assert.Contains(t, status.String(), "re-run `publicvpn install")
+	assert.Contains(t, status.String(), "re-run `assay install")
 }
 
 // TestStatusHelpDocumentsDirFlags supersedes the old "DEFAULT directories

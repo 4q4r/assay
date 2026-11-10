@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/filter"
-	"public_vpn/internal/model"
-	"public_vpn/internal/parse"
+	"assay/internal/filter"
+	"assay/internal/model"
+	"assay/internal/parse"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

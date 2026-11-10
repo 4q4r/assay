@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/render"
+	"assay/internal/model"
+	"assay/internal/render"
 )
 
 // benchTemplate builds a template with the live-config structure at scale:

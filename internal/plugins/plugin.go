@@ -1,7 +1,7 @@
 // Package plugins implements the W10 source-ingest plugin layer: every .lua
 // file in the plugins dir is a sandboxed gopher-lua (pure-Go Lua 5.1, no
 // cgo) program that discovers raw proxy links and hands them to the pipeline
-// as publicvpn.node records. Go keeps owning URI normalization, parsing, and
+// as assay.node records. Go keeps owning URI normalization, parsing, and
 // dedupe (internal/model, internal/parse); a plugin only fetches and
 // iterates.
 //
@@ -10,7 +10,7 @@
 //   - The chunk itself must stay side-effect-free; it returns the plugin's
 //     discover function.
 //   - The discover function runs the actual discovery (network fetches live
-//     here) and returns a Lua array of publicvpn.node records (possibly
+//     here) and returns a Lua array of assay.node records (possibly
 //     empty). Returning anything else fails the plugin loud.
 //   - The sandbox exposes ONLY the documented host API (see host.go): the
 //     Lua state opens no os/io/package modules and the base library is

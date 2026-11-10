@@ -27,7 +27,7 @@ func (f *fakeExecutor) Systemctl(args ...string) error {
 // stubBinary writes a tiny stand-in for the running executable.
 func stubBinary(t *testing.T) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "running-publicvpn")
+	p := filepath.Join(t.TempDir(), "running-assay")
 	require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 	return p
 }
@@ -57,7 +57,7 @@ func TestInstallCopiesBinaryAtomicallyAndExecutable(t *testing.T) {
 	res, err := Install(opts)
 	require.NoError(t, err)
 
-	assert.Equal(t, filepath.Join(binDir, "publicvpn"), res.BinaryPath)
+	assert.Equal(t, filepath.Join(binDir, "assay"), res.BinaryPath)
 	st, err := os.Stat(res.BinaryPath)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o755), st.Mode().Perm(), "installed binary must be 0755")
@@ -101,7 +101,7 @@ func TestInstallRendersWatchUnit(t *testing.T) {
 	service, err := os.ReadFile(filepath.Join(unitDir, WatchService))
 	require.NoError(t, err)
 	s := string(service)
-	assert.Contains(t, s, "ExecStart="+filepath.Join(binDir, "publicvpn")+" watch -c "+opts.ConfigPath)
+	assert.Contains(t, s, "ExecStart="+filepath.Join(binDir, "assay")+" watch -c "+opts.ConfigPath)
 	assert.Contains(t, s, "Type=notify")
 	assert.Contains(t, s, "WatchdogSec=300")
 	assert.Contains(t, s, "TimeoutStopSec=1800",
@@ -186,8 +186,8 @@ func TestInstallNoSystemdDefaultLocationMaterializes(t *testing.T) {
 	opts, home, _ := installOpts(t, ex)
 	opts.NoSystemd = true
 	opts.ConfigPath = ""
-	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "publicvpn", "config.toml")
-	opts.DataDir = filepath.Join(home, ".local", "share", "publicvpn")
+	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "assay", "config.toml")
+	opts.DataDir = filepath.Join(home, ".local", "share", "assay")
 	res, err := Install(opts)
 	require.NoError(t, err)
 	assert.True(t, res.SkippedUnits)
@@ -218,8 +218,8 @@ func TestInstallDefaultLocationRendersPlainWatch(t *testing.T) {
 	ex := &fakeExecutor{}
 	opts, home, unitDir := installOpts(t, ex)
 	opts.ConfigPath = ""
-	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "publicvpn", "config.toml")
-	opts.DataDir = filepath.Join(home, ".local", "share", "publicvpn")
+	opts.DefaultConfigPath = filepath.Join(home, ".local", "share", "assay", "config.toml")
+	opts.DataDir = filepath.Join(home, ".local", "share", "assay")
 	res, err := Install(opts)
 	require.NoError(t, err)
 	assert.Empty(t, res.ConfigKept)

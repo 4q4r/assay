@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/install"
+	"assay/internal/config"
+	"assay/internal/install"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,7 +52,7 @@ func TestStatusHonorsBinAndUnitDirs(t *testing.T) {
 
 	// Fake a custom-dir install: the binary and the unit file in place.
 	require.NoError(t, os.MkdirAll(binDir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "publicvpn"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "assay"), []byte("#!/bin/sh\n"), 0o755))
 	require.NoError(t, os.MkdirAll(unitDir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.WatchService), []byte("[Unit]\n"), 0o644))
 
@@ -64,7 +64,7 @@ func TestStatusHonorsBinAndUnitDirs(t *testing.T) {
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
 
 	text := out.String()
-	assert.Contains(t, text, "binary:    "+filepath.Join(binDir, "publicvpn"),
+	assert.Contains(t, text, "binary:    "+filepath.Join(binDir, "assay"),
 		"status must look in the --bin-dir it was given:\n%s", text)
 	assert.Contains(t, text, install.WatchService+" present in "+unitDir,
 		"status must look in the --unit-dir it was given:\n%s", text)
@@ -83,14 +83,14 @@ func TestStatusDefaultDirsUnchanged(t *testing.T) {
 	defBin := filepath.Join(home, ".local", "bin")
 	defUnit := filepath.Join(home, ".config", "systemd", "user")
 	require.NoError(t, os.MkdirAll(defBin, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(defBin, "publicvpn"), []byte("#!/bin/sh\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(defBin, "assay"), []byte("#!/bin/sh\n"), 0o755))
 	require.NoError(t, os.MkdirAll(defUnit, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(defUnit, install.WatchService), []byte("[Unit]\n"), 0o644))
 
 	out := &bytes.Buffer{}
 	cmd.SetOut(out)
 	require.NoError(t, runStatus(cmd, explicitResolved(t, cfgPath)))
-	assert.Contains(t, out.String(), "binary:    "+filepath.Join(defBin, "publicvpn"),
+	assert.Contains(t, out.String(), "binary:    "+filepath.Join(defBin, "assay"),
 		"defaults must stay the install defaults")
 }
 
@@ -104,7 +104,7 @@ func TestStatusWaveLineSpeedtestDisabled(t *testing.T) {
 		binDir := filepath.Join(home, ".local", "bin")
 		unitDir := filepath.Join(home, ".config", "systemd", "user")
 		require.NoError(t, os.MkdirAll(binDir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(binDir, "publicvpn"), []byte("#!/bin/sh\n"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "assay"), []byte("#!/bin/sh\n"), 0o755))
 		require.NoError(t, os.MkdirAll(unitDir, 0o755))
 		require.NoError(t, os.MkdirAll(filepath.Join(unitDir, "default.target.wants"), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(unitDir, install.WatchService), []byte("[Unit]\n"), 0o644))

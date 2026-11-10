@@ -12,7 +12,7 @@ import (
 
 // W10 hard-scope guard, migrated through W13: the install package's ENTIRE
 // systemctl surface stays the four-command allowlist — --user only, only
-// public_vpn-* units, daemon-reload / enable --now (watch) / disable --now
+// assay-* units, daemon-reload / enable --now (watch) / disable --now
 // (watch) / disable --now (the legacy W5 timers, solely for the one-time
 // migration). UNCHANGED by W13: install still never restarts anything —
 // the owner-ruled xray restart lives in internal/restart's own byte-pinned
@@ -52,7 +52,7 @@ func TestCommandConstructorsMatchAllowlist(t *testing.T) {
 
 func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 	for _, bad := range [][]string{
-		{"--user", "restart", "public_vpn-watch.service"},           // never restart anything
+		{"--user", "restart", "assay-watch.service"},                // never restart anything
 		{"--user", "restart", "xray-raw.service"},                   // never touch the live client
 		{"--user", "start", WatchService},                           // start is not in the set
 		{"--user", "stop", WatchService},                            // stop is not in the set

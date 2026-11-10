@@ -18,8 +18,8 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/model"
+	"assay/internal/checker"
+	"assay/internal/model"
 )
 
 // Phase-1 IP quality & media unlock battery: runs for EVERY node the probe

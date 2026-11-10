@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/fetch"
+	"assay/internal/config"
+	"assay/internal/fetch"
 
 	lua "github.com/yuin/gopher-lua"
 )
 
-// Default host-API limits for publicvpn.http (documented in README; the
+// Default host-API limits for assay.http (documented in README; the
 // pipeline's own fetch limits are separate knobs).
 const (
 	DefaultHTTPTimeout      = 30 * time.Second
@@ -27,27 +27,27 @@ const (
 )
 
 // nodeMTKey is the registry slot of the per-state node-class metatable. The
-// marker exists for plugin authors (getmetatable(node) == "publicvpn.node");
+// marker exists for plugin authors (getmetatable(node) == "assay.node");
 // Go-side validation reads the fields uniformly (the collector accepts the
 // marker table OR a plain table with valid fields — one canonical shape).
-const nodeMTKey = "__publicvpn_node_mt"
+const nodeMTKey = "__assay_node_mt"
 
 // engineOptions configures an Engine. Production engines carry live network
 // clients; the load check builds one with noNetwork=true.
 type engineOptions struct {
-	// GitHub drives the publicvpn.github_files helper (D9 contents API +
+	// GitHub drives the assay.github_files helper (D9 contents API +
 	// manifest discovery + raw downloads, mirrors and token supported).
 	GitHub *fetch.Client
-	// HTTPTransport is the shared generic transport for publicvpn.http. It
+	// HTTPTransport is the shared generic transport for assay.http. It
 	// MUST carry Proxy=nil (landmine L5 — plugin traffic never rides the
 	// owner's VPN); NewEngine builds it that way and a white-box test pins it.
 	HTTPTransport *http.Transport
-	// Timeout / MaxRedirects / MaxBodyBytes are the publicvpn.http defaults.
+	// Timeout / MaxRedirects / MaxBodyBytes are the assay.http defaults.
 	Timeout      time.Duration
 	MaxRedirects int
 	MaxBodyBytes int64
 	UserAgent    string
-	Log          io.Writer // publicvpn.log sink; nil = io.Discard
+	Log          io.Writer // assay.log sink; nil = io.Discard
 	noNetwork    bool      // load-check mode: network host fns raise loud
 }
 
@@ -147,10 +147,10 @@ func (e *Engine) newState(ctx context.Context, pluginID string) *lua.LState {
 		l.SetField(l.Get(lua.GlobalsIndex), name, lua.LNil)
 	}
 	mt := l.NewTable()
-	mt.RawSetString("__metatable", lua.LString("publicvpn.node"))
+	mt.RawSetString("__metatable", lua.LString("assay.node"))
 	l.SetField(l.Get(lua.RegistryIndex), nodeMTKey, mt)
 
-	l.RegisterModule("publicvpn", map[string]lua.LGFunction{
+	l.RegisterModule("assay", map[string]lua.LGFunction{
 		"node": func(ls *lua.LState) int { return e.hostNode(ls, mt) },
 		"http": func(ls *lua.LState) int { return e.hostHTTP(ctx, ls, pluginID) },
 		"github_files": func(ls *lua.LState) int {
@@ -158,7 +158,7 @@ func (e *Engine) newState(ctx context.Context, pluginID string) *lua.LState {
 		},
 		"log": func(ls *lua.LState) int { return e.hostLog(ls, pluginID) },
 	})
-	pub := l.GetField(l.Get(lua.GlobalsIndex), "publicvpn").(*lua.LTable)
+	pub := l.GetField(l.Get(lua.GlobalsIndex), "assay").(*lua.LTable)
 	base64Tbl := l.NewTable()
 	base64Tbl.RawSetString("encode", l.NewFunction(e.hostBase64Encode))
 	base64Tbl.RawSetString("decode", l.NewFunction(e.hostBase64Decode))
@@ -216,7 +216,7 @@ func (e *Engine) Run(ctx context.Context, p *Plugin) (nodes []Node, err error) {
 	l.Pop(1)
 	tbl, ok := ret.(*lua.LTable)
 	if !ok {
-		return nil, pluginErrf(p.ID, "discover returned %s, expected a table of publicvpn.node",
+		return nil, pluginErrf(p.ID, "discover returned %s, expected a table of assay.node",
 			ret.Type().String())
 	}
 	return collectNodes(p.ID, tbl)
@@ -246,7 +246,7 @@ func collectNodes(id string, tbl *lua.LTable) ([]Node, error) {
 func nodeFromValue(id string, idx int, v lua.LValue) (Node, error) {
 	tbl, ok := v.(*lua.LTable)
 	if !ok {
-		return Node{}, pluginIdxErrf(id, idx, "not a publicvpn.node (got %s)", v.Type().String())
+		return Node{}, pluginIdxErrf(id, idx, "not an assay.node (got %s)", v.Type().String())
 	}
 	str := func(field string) string {
 		if s, ok := tbl.RawGetString(field).(lua.LString); ok {
@@ -278,19 +278,19 @@ func nodeFromValue(id string, idx int, v lua.LValue) (Node, error) {
 	return n, nil
 }
 
-// hostNode is the publicvpn.node constructor: validates the record at
+// hostNode is the assay.node constructor: validates the record at
 // construction time (loud, before it ever reaches the pipeline) and returns
 // the table marked with the node-class metatable.
 func (e *Engine) hostNode(l *lua.LState, mt *lua.LTable) int {
 	v := l.Get(1)
 	tbl, ok := v.(*lua.LTable)
 	if !ok {
-		l.RaiseError("publicvpn.node: expected a table argument, got %s", v.Type().String())
+		l.RaiseError("assay.node: expected a table argument, got %s", v.Type().String())
 		return 0
 	}
 	raw, _ := tbl.RawGetString("raw").(lua.LString)
 	if strings.TrimSpace(string(raw)) == "" {
-		l.RaiseError("publicvpn.node: raw (non-empty string) is required")
+		l.RaiseError("assay.node: raw (non-empty string) is required")
 		return 0
 	}
 	tbl.Metatable = mt
@@ -300,18 +300,18 @@ func (e *Engine) hostNode(l *lua.LState, mt *lua.LTable) int {
 
 func (e *Engine) hostHTTP(ctx context.Context, l *lua.LState, _ string) int {
 	if e.opt.noNetwork {
-		l.RaiseError("publicvpn.http: network is not available while the plugin is being " +
+		l.RaiseError("assay.http: network is not available while the plugin is being " +
 			"loaded — perform fetches inside the returned discover function")
 		return 0
 	}
 	tbl, ok := l.Get(1).(*lua.LTable)
 	if !ok {
-		l.RaiseError("publicvpn.http: expected a table argument, got %s", l.Get(1).Type().String())
+		l.RaiseError("assay.http: expected a table argument, got %s", l.Get(1).Type().String())
 		return 0
 	}
 	url, _ := tbl.RawGetString("url").(lua.LString)
 	if url == "" {
-		l.RaiseError("publicvpn.http: url (non-empty string) is required")
+		l.RaiseError("assay.http: url (non-empty string) is required")
 		return 0
 	}
 	method, _ := tbl.RawGetString("method").(lua.LString)
@@ -326,7 +326,7 @@ func (e *Engine) hostHTTP(ctx context.Context, l *lua.LState, _ string) int {
 	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(string(method)),
 		string(url), strings.NewReader(string(body)))
 	if err != nil {
-		l.RaiseError("publicvpn.http: %v", err)
+		l.RaiseError("assay.http: %v", err)
 		return 0
 	}
 	req.Header.Set("User-Agent", e.opt.UserAgent)
@@ -350,17 +350,17 @@ func (e *Engine) hostHTTP(ctx context.Context, l *lua.LState, _ string) int {
 	defer cancel()
 	resp, err := client.Do(req.WithContext(callCtx))
 	if err != nil {
-		l.RaiseError("publicvpn.http: %v", err)
+		l.RaiseError("assay.http: %v", err)
 		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
-		l.RaiseError("publicvpn.http: read body: %v", err)
+		l.RaiseError("assay.http: read body: %v", err)
 		return 0
 	}
 	if int64(len(payload)) > maxBody {
-		l.RaiseError("publicvpn.http: response body exceeds max_body_bytes (%d)", maxBody)
+		l.RaiseError("assay.http: response body exceeds max_body_bytes (%d)", maxBody)
 		return 0
 	}
 	headers := l.NewTable()
@@ -377,23 +377,23 @@ func (e *Engine) hostHTTP(ctx context.Context, l *lua.LState, _ string) int {
 
 func (e *Engine) hostGitHubFiles(ctx context.Context, l *lua.LState, pluginID string) int {
 	if e.opt.noNetwork {
-		l.RaiseError("publicvpn.github_files: network is not available while the plugin is " +
+		l.RaiseError("assay.github_files: network is not available while the plugin is " +
 			"being loaded — perform fetches inside the returned discover function")
 		return 0
 	}
 	if e.opt.GitHub == nil {
-		l.RaiseError("publicvpn.github_files: no GitHub client configured")
+		l.RaiseError("assay.github_files: no GitHub client configured")
 		return 0
 	}
 	tbl, ok := l.Get(1).(*lua.LTable)
 	if !ok {
-		l.RaiseError("publicvpn.github_files: expected a table argument, got %s",
+		l.RaiseError("assay.github_files: expected a table argument, got %s",
 			l.Get(1).Type().String())
 		return 0
 	}
 	repo, _ := tbl.RawGetString("repo").(lua.LString)
 	if repo == "" {
-		l.RaiseError("publicvpn.github_files: repo (non-empty string) is required")
+		l.RaiseError("assay.github_files: repo (non-empty string) is required")
 		return 0
 	}
 	manifest, _ := tbl.RawGetString("manifest").(lua.LString)
@@ -410,7 +410,7 @@ func (e *Engine) hostGitHubFiles(ctx context.Context, l *lua.LState, pluginID st
 	}
 	files, err := e.opt.GitHub.Source(ctx, pluginID, src)
 	if err != nil {
-		l.RaiseError("publicvpn.github_files: %v", err)
+		l.RaiseError("assay.github_files: %v", err)
 		return 0
 	}
 	out := l.NewTable()
@@ -453,7 +453,7 @@ func (e *Engine) hostBase64Decode(l *lua.LState) int {
 			return 1
 		}
 	}
-	l.RaiseError("publicvpn.base64.decode: input is not valid base64 (std/url, padding optional)")
+	l.RaiseError("assay.base64.decode: input is not valid base64 (std/url, padding optional)")
 	return 0
 }
 
@@ -461,7 +461,7 @@ func (e *Engine) hostJSONDecode(l *lua.LState) int {
 	s := l.CheckString(1)
 	var v any
 	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		l.RaiseError("publicvpn.json.decode: %v", err)
+		l.RaiseError("assay.json.decode: %v", err)
 		return 0
 	}
 	l.Push(toLuaValue(l, v))
@@ -471,12 +471,12 @@ func (e *Engine) hostJSONDecode(l *lua.LState) int {
 func (e *Engine) hostJSONEncode(l *lua.LState) int {
 	v, err := toJSONValue(l.Get(1))
 	if err != nil {
-		l.RaiseError("publicvpn.json.encode: %v", err)
+		l.RaiseError("assay.json.encode: %v", err)
 		return 0
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		l.RaiseError("publicvpn.json.encode: %v", err)
+		l.RaiseError("assay.json.encode: %v", err)
 		return 0
 	}
 	l.Push(lua.LString(b))

@@ -53,7 +53,7 @@ local function body_lines(body)
   -- Whitespace-flattened retry: line-wrapped base64 subscriptions must not
   -- be misclassified as junk just for interior newlines.
   local flat = trimmed:gsub("%s+", "")
-  local ok, decoded = pcall(publicvpn.base64.decode, flat)
+  local ok, decoded = pcall(assay.base64.decode, flat)
   if ok and decoded:find("://", 1, true) then
     return decoded
   end
@@ -63,7 +63,7 @@ end
 local function harvest(nodes, file)
   local src = body_lines(file.content)
   if src == nil then
-    publicvpn.log("skip ", file.path, ": not URI/base64 content")
+    assay.log("skip ", file.path, ": not URI/base64 content")
     return
   end
   -- Plain-local call in the for-in header: the gopher-lua v1.1.2 VM panics
@@ -76,18 +76,18 @@ local function harvest(nodes, file)
       -- scheme gate below is the hard boundary, this branch documents the
       -- known upstream header shape. (No goto: gopher-lua is Lua 5.1.)
     elseif ingestible(line) then
-      nodes[#nodes + 1] = publicvpn.node{ raw = line }
+      nodes[#nodes + 1] = assay.node{ raw = line }
       kept = kept + 1
     end
   end
   if kept == 0 then
-    publicvpn.log("skip ", file.path, ": no ingestible links")
+    assay.log("skip ", file.path, ": no ingestible links")
   end
 end
 
 local function collect()
   local nodes = {}
-  local files = publicvpn.github_files{ repo = REPO, include = INCLUDE }
+  local files = assay.github_files{ repo = REPO, include = INCLUDE }
   for _, file in ipairs(files) do
     harvest(nodes, file)
   end

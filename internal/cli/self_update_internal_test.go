@@ -13,11 +13,11 @@ import (
 
 func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "publicvpn")
+	bin := filepath.Join(dir, "assay")
 	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F', 1, 2, 3, 4}, 0o755))
 
 	var pending, armed atomic.Bool
-	bw, err := startBinarySelfWatcherWith(dir, "publicvpn", &pending, &armed, io.Discard, 0, bin)
+	bw, err := startBinarySelfWatcherWith(dir, "assay", &pending, &armed, io.Discard, 0, bin)
 	require.NoError(t, err)
 	defer bw.close()
 
@@ -37,7 +37,7 @@ func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 
 func TestSelfUpdateStatStabilityPartialWrite(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "publicvpn")
+	bin := filepath.Join(dir, "assay")
 	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F'}, 0o755))
 
 	old := binaryStabilityDelay
@@ -77,7 +77,7 @@ func TestSelfUpdateEscalation(t *testing.T) {
 
 func TestSelfUpdateBadMagic(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "publicvpn")
+	bin := filepath.Join(dir, "assay")
 	require.NoError(t, os.WriteFile(bin, []byte("not-elf"), 0o755))
 
 	old := binaryStabilityDelay

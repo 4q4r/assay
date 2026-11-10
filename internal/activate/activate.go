@@ -17,8 +17,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/store"
 )
 
 // Input bundles the activation dependencies.

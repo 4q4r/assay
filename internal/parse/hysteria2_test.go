@@ -3,7 +3,7 @@ package parse_test
 import (
 	"testing"
 
-	"public_vpn/internal/parse"
+	"assay/internal/parse"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

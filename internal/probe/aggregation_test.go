@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/store"
+	"assay/internal/store"
 )
 
 func TestAggregateObservedRTTMs(t *testing.T) {

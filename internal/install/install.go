@@ -1,6 +1,6 @@
 // install.go carries the systemctl executor seam of package install (see
 // units.go for the package doc and the install/uninstall flows): the EXACT
-// allowlist of sanctioned invocations (--user, public_vpn-* units only),
+// allowlist of sanctioned invocations (--user, assay-* units only),
 // the command constructors, and the production executor.
 
 package install
@@ -36,7 +36,7 @@ type Executor interface {
 
 // allowedCommands is the EXACT set of systemctl invocations the installer
 // may execute. Hard scope (W5 mandate, W10 surface): every invocation
-// carries --user and references ONLY public_vpn-* units; there is no
+// carries --user and references ONLY assay-* units; there is no
 // restart of anything else, no --system, nothing else. The legacy-timer
 // disable exists solely for the one-time W5→W10 migration (stale timers
 // must not fire waves concurrently with the daemon). Both the code

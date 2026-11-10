@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/checker"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/store"
 )
 
 // DefaultClassifyTimeout is the per-node FLOOR (minimum effective timeout)

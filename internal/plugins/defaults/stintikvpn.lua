@@ -24,7 +24,7 @@ local function body_lines(body)
   if trimmed:find("://", 1, true) then
     return body
   end
-  local ok, decoded = pcall(publicvpn.base64.decode, trimmed)
+  local ok, decoded = pcall(assay.base64.decode, trimmed)
   if ok and decoded:find("://", 1, true) then
     return decoded
   end
@@ -38,27 +38,27 @@ local function add_links(nodes, body, sub_id)
   for line in text:gmatch("([^\r\n]*)\n") do
     line = line:gsub("^%s+", ""):gsub("%s+$", "")
     if line ~= "" and not line:find("^#") and not line:find("^//") then
-      nodes[#nodes + 1] = publicvpn.node{ raw = line, remark = sub_id }
+      nodes[#nodes + 1] = assay.node{ raw = line, remark = sub_id }
     end
   end
 end
 
 local function collect()
   local nodes = {}
-  local resp = publicvpn.http{ url = DATA_URL, timeout = 30 }
+  local resp = assay.http{ url = DATA_URL, timeout = 30 }
   if resp.status ~= 200 then
     error("data.json fetch returned HTTP " .. tostring(resp.status))
   end
-  local ok, data = pcall(publicvpn.json.decode, resp.body)
+  local ok, data = pcall(assay.json.decode, resp.body)
   if not ok then
     error("data.json is not valid JSON: " .. tostring(data))
   end
   for _, sub in ipairs(data.subscriptions or {}) do
-    local fetched, subresp = pcall(publicvpn.http, { url = sub.url, timeout = 30 })
+    local fetched, subresp = pcall(assay.http, { url = sub.url, timeout = 30 })
     if not fetched then
-      publicvpn.log("subscription ", sub.id, " failed: ", subresp)
+      assay.log("subscription ", sub.id, " failed: ", subresp)
     elseif subresp.status ~= 200 then
-      publicvpn.log("subscription ", sub.id, " returned HTTP ", subresp.status)
+      assay.log("subscription ", sub.id, " returned HTTP ", subresp.status)
     else
       add_links(nodes, subresp.body, sub.id)
     end

@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 )
 
 // ClientConfig wires the client to (test) hosts.
