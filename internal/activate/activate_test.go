@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/activate"
+	"assay/internal/activate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

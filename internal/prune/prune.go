@@ -14,8 +14,8 @@ package prune
 import (
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/rank"
+	"assay/internal/model"
+	"assay/internal/rank"
 )
 
 // Options bundles one pruning pass's inputs.

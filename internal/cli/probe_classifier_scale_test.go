@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/geo"
-	"public_vpn/internal/model"
-	"public_vpn/internal/probe"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/geo"
+	"assay/internal/model"
+	"assay/internal/probe"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -279,7 +279,7 @@ func scaleClassifier(t *testing.T, fastURL string) (*geo.Classifier, string) {
 			HTTPSURL:      fastURL + "/json",
 			ExitIPEchoURL: fastURL + "/echo",
 		},
-		UserAgent:       "publicvpn-scale-parity/1",
+		UserAgent:       "assay-scale-parity/1",
 		SelfURL:         fastURL + "/json",
 		UnlockEndpoints: &endpoints,
 		// The production pacer spaces a node's own requests 100ms apart; the

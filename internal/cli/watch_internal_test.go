@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/plugins"
+	"assay/internal/config"
+	"assay/internal/plugins"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -358,7 +358,7 @@ func TestWatchFetchContinuesWithBrokenPlugin(t *testing.T) {
 	reg := plugins.NewRegistry()
 	reg.Set(&plugins.Plugin{ID: "healthy", Path: "healthy.lua", Code: []byte(`
 		return function()
-			return { publicvpn.node{ raw = "vless://a@h:1?s=1" }, publicvpn.node{ raw = "vless://b@h:2?s=1" } }
+			return { assay.node{ raw = "vless://a@h:1?s=1" }, assay.node{ raw = "vless://b@h:2?s=1" } }
 		end`)})
 	reg.Set(&plugins.Plugin{ID: "broken", Path: "broken.lua", Code: []byte(`
 		return function() error("discovery exploded") end`)})

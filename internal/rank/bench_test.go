@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"testing"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/rank"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/rank"
+	"assay/internal/store"
 )
 
 func buildRankCorpus(nodes, countries int) ([]*model.Node, []*model.GeoRecord, map[string]store.ProbeResult) {

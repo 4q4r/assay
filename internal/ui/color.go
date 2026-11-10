@@ -1,4 +1,4 @@
-// Package ui is the single owner of terminal styling for every publicvpn
+// Package ui is the single owner of terminal styling for every assay
 // CLI screen (W18): the lipgloss palette, the traffic-light helper, tree
 // glyphs, chips, and the ONE bordered table builder shared by all screens.
 //

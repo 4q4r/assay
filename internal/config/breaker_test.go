@@ -3,7 +3,7 @@ package config_test
 import (
 	"testing"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

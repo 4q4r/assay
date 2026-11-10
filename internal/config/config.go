@@ -233,7 +233,7 @@ type GeoConfig struct {
 	ExitIPEchoURL string `toml:"exit_ip_echo_url"`
 	// TTL is the legacy geo-freshness knob of the REMOVED geo stage's
 	// exit-IP cache (classification now refreshes every wave — the 24h
-	// freshness gates are gone). Still live for `publicvpn check` (GeoTTL).
+	// freshness gates are gone). Still live for `assay check` (GeoTTL).
 	TTL Duration `toml:"ttl"`
 	// MaxTTL was the rate-limit retry-sleep cap of the REMOVED geo-stage
 	// batch fallback (the local-machine ip-api overlay is gone with the
@@ -474,7 +474,7 @@ const IntervalFloor = 5 * time.Minute
 const (
 	DefaultAPIBase             = "https://api.github.com"
 	DefaultRawBase             = "https://raw.githubusercontent.com"
-	DefaultUserAgent           = "public_vpn (pipeline; contact: owner)"
+	DefaultUserAgent           = "assay (pipeline; contact: owner)"
 	DefaultCacheMaxAge         = 6 * time.Hour
 	DefaultTestTimeout         = 30 * time.Second
 	DefaultStatsTimeout        = 10 * time.Second
@@ -680,7 +680,7 @@ func checkRemovedSections(raw []byte) error {
 						"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
 						"delete the dead key(s); the temp instances use [activate].xray_bin (there is "+
 						"no separate prober binary or database anymore); panel grading moved to the "+
-						"`publicvpn check` command (per-site verdicts through real tunnels); early "+
+						"`assay check` command (per-site verdicts through real tunnels); early "+
 						"stop is gone — selection caps live at the select stage",
 					strings.Join(dead, ", "))
 			}

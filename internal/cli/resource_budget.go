@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 )
 
 // WaveBudgetInfo captures the wave-start resource budget: the effective

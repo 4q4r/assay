@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"public_vpn/internal/ui"
+	"assay/internal/ui"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -28,7 +28,7 @@ func RenderReport(rep *Report, opts RenderOptions) string {
 		renderTarget(b, rep, tr, opts.Color, opts.Top)
 	}
 	if rep.Stale {
-		fmt.Fprintf(b, "\nhint: probe data is %s old (geo.ttl %s) — run `publicvpn maintain` for freshness\n",
+		fmt.Fprintf(b, "\nhint: probe data is %s old (geo.ttl %s) — run `assay maintain` for freshness\n",
 			rep.StaleAge, rep.GeoTTL)
 	}
 	return b.String()
@@ -385,10 +385,10 @@ func flagEmoji(cc string) string {
 }
 
 // FlagEmoji is the exported flag renderer for the sibling display command
-// (`publicvpn list`); there is ONE emoji mapping in the repo.
+// (`assay list`); there is ONE emoji mapping in the repo.
 func FlagEmoji(cc string) string { return flagEmoji(cc) }
 
-// FormatMS is the exported millisecond cell formatter for `publicvpn list`
+// FormatMS is the exported millisecond cell formatter for `assay list`
 // (same compact spellings as the check report: —, <1ms, 45ms).
 func FormatMS(ms float64) string { return fmtMS(ms) }
 

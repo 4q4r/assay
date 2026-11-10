@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"testing"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
+	"assay/internal/config"
+	"assay/internal/model"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"

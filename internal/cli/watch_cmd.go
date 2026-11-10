@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/plugins"
-	"public_vpn/internal/sdnotify"
-	"public_vpn/internal/watchdog"
+	"assay/internal/config"
+	"assay/internal/plugins"
+	"assay/internal/sdnotify"
+	"assay/internal/watchdog"
 
 	"github.com/spf13/cobra"
 )
@@ -30,7 +30,7 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "watch",
 		Short: "Daemon: hot-reload the plugin registry and run maintain waves on schedule",
-		Long: `Long-running daemon (systemd unit: publicvpn-watch.service, Restart=always):
+		Long: `Long-running daemon (systemd unit: assay-watch.service, Restart=always):
 
   - fsnotify watchdog on [plugins].dir — add/modify of a .lua hot-swaps it
     into the registry (a broken file keeps the previous version active with
@@ -38,7 +38,7 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
   - refresh wave every [maintain].refresh_interval (default 1h) and
     speedtest wave every [maintain].speedtest_interval (default 168h; a
     speedtest-due tick covers the refresh) — the same fetch→…→activate
-    stages as ` + "`publicvpn maintain`" + `, reusing the one wave
+    stages as ` + "`assay maintain`" + `, reusing the one wave
     implementation; "0s" disables the speedtest wave entirely (round-8:
     refresh waves stay probe-only — probe.speedtest defaults off);
   - the stats poll runs inside every wave (existing stage cadence);
@@ -48,7 +48,7 @@ func newWatchCommand(cfgPath *string) *cobra.Command {
     proceeds);
   - configless boot (no -c, no home/cwd config) is supported: the daemon
     runs from the built-in defaults with the plugins dir under the XDG data
-    dir (~/.local/share/publicvpn/plugins); the render/activate stages fail
+    dir (~/.local/share/assay/plugins); the render/activate stages fail
     loud at their boundary each wave (logged once per wave) while every
     other stage keeps working — the same wave-continues semantics as a
     broken plugin;

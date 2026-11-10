@@ -17,24 +17,24 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/activate"
-	"public_vpn/internal/checker"
-	"public_vpn/internal/config"
-	"public_vpn/internal/fetch"
-	"public_vpn/internal/filter"
-	"public_vpn/internal/geo"
-	"public_vpn/internal/model"
-	"public_vpn/internal/parse"
-	"public_vpn/internal/plugins"
-	"public_vpn/internal/probe"
-	"public_vpn/internal/prune"
-	"public_vpn/internal/rank"
-	"public_vpn/internal/render"
-	"public_vpn/internal/restart"
-	"public_vpn/internal/stats"
-	"public_vpn/internal/store"
-	"public_vpn/internal/timeoutcal"
-	"public_vpn/internal/ui"
+	"assay/internal/activate"
+	"assay/internal/checker"
+	"assay/internal/config"
+	"assay/internal/fetch"
+	"assay/internal/filter"
+	"assay/internal/geo"
+	"assay/internal/model"
+	"assay/internal/parse"
+	"assay/internal/plugins"
+	"assay/internal/probe"
+	"assay/internal/prune"
+	"assay/internal/rank"
+	"assay/internal/render"
+	"assay/internal/restart"
+	"assay/internal/stats"
+	"assay/internal/store"
+	"assay/internal/timeoutcal"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 )
@@ -332,7 +332,7 @@ func pluginMaxFailures(cfg *config.Config) int {
 // Plugins are pure fetch (no temp side effects), so abandonment loses
 // nothing but the nodes. The leak is the detection-first mitigation; the
 // honest backstop for the hang class itself is the daemon's systemd
-// watchdog (public_vpn-watch.service: Type=notify + WatchdogSec) and the
+// watchdog (assay-watch.service: Type=notify + WatchdogSec) and the
 // operator removing the offending .lua. runTimeout <= 0 = unbounded (owner
 // ruling: an explicit "0s" is legitimate).
 //
@@ -504,7 +504,7 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 	p := newPaths(cfg)
 	b, err := os.ReadFile(p.manifest)
 	if err != nil {
-		return fmt.Errorf("no fetch manifest (%s) — run `publicvpn fetch` first", p.manifest)
+		return fmt.Errorf("no fetch manifest (%s) — run `assay fetch` first", p.manifest)
 	}
 	var manifest fetchManifest
 	//nolint:musttag // fetchManifest has JSON tags; musttag false positive
@@ -582,7 +582,7 @@ func runFilter(cmd *cobra.Command, cfg *config.Config, sourceCapFlag int) error 
 		return err
 	}
 	if len(nodes) == 0 {
-		return fmt.Errorf("no parsed nodes (%s) — run `publicvpn parse` first", p.nodes)
+		return fmt.Errorf("no parsed nodes (%s) — run `assay parse` first", p.nodes)
 	}
 	// Precedence: an explicit --source-cap flag overrides [filter].source_cap;
 	// 0 on both means unlimited.
@@ -777,7 +777,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 		return err
 	}
 	if len(nodes) == 0 {
-		return fmt.Errorf("no filtered nodes (%s) — run `publicvpn filter` first", p.filtered)
+		return fmt.Errorf("no filtered nodes (%s) — run `assay filter` first", p.filtered)
 	}
 	if limit > 0 && limit < len(nodes) {
 		nodes = nodes[:limit]
@@ -939,7 +939,7 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 		return err
 	}
 	if len(nodes) == 0 {
-		return fmt.Errorf("no filtered nodes (%s) — run `publicvpn filter` first", p.filtered)
+		return fmt.Errorf("no filtered nodes (%s) — run `assay filter` first", p.filtered)
 	}
 	geoRecs, err := store.ReadGeo(p.geoBase)
 	if err != nil {
@@ -947,7 +947,7 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 	}
 	if len(geoRecs) == 0 {
 		return fmt.Errorf(
-			"geo base empty (%s) — run `publicvpn probe` first — classification is "+
+			"geo base empty (%s) — run `assay probe` first — classification is "+
 				"merged into the probe pass and writes the cold base", p.geoBase)
 	}
 	probeByKey, err := store.LatestProbeByKey(p.probeResults)
@@ -1001,7 +1001,7 @@ func newRenderCommand(cfgPath *string) *cobra.Command {
 plus the selected pool. The template is a REQUIRED configured value: a
 configless run (no -c, no home/cwd config) fails loud at this boundary —
 "configless mode cannot render — provide -c or a config at
-~/.config/publicvpn/config.toml" — instead of silently defaulting the
+~/.config/assay/config.toml" — instead of silently defaulting the
 template to the live client's config.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
@@ -1028,7 +1028,7 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 		return err
 	}
 	if sel == nil {
-		return fmt.Errorf("no selection (%s) — run `publicvpn select` first", p.selection)
+		return fmt.Errorf("no selection (%s) — run `assay select` first", p.selection)
 	}
 	filtered, err := store.ReadNodes(p.filtered)
 	if err != nil {
@@ -1121,7 +1121,7 @@ func newActivateCommand(cfgPath *string) *cobra.Command {
 the configured live target (activate.target). The target is a REQUIRED
 configured value: a configless run fails loud at this boundary —
 "configless mode cannot activate — provide -c or a config at
-~/.config/publicvpn/config.toml" — instead of silently defaulting the target
+~/.config/assay/config.toml" — instead of silently defaulting the target
 to the live client's config.
 
 After a real replacement the live client is restarted through the
@@ -1183,7 +1183,7 @@ func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup b
 		target = config.ExpandHome(cfg.Activate.Target)
 	}
 	if _, err := os.Stat(p.rendered); err != nil {
-		return fmt.Errorf("no rendered config (%s) — run `publicvpn render` first", p.rendered)
+		return fmt.Errorf("no rendered config (%s) — run `assay render` first", p.rendered)
 	}
 	res, err := activate.Run(activate.Input{
 		RenderedPath: p.rendered,
@@ -1300,7 +1300,7 @@ live one and passes the -test gate (L10). An unchanged render is a clear
 
 Configless runs (no -c, no home/cwd config) work for the data stages; the
 render/activate stages fail loud at their boundary and end the wave — the
-daemon keeps the schedule (see ` + "`publicvpn watch`" + `).
+daemon keeps the schedule (see ` + "`assay watch`" + `).
 
 Flags:
   --no-activate  render and diff only; never touch the live config
@@ -2255,7 +2255,7 @@ compose — the overlap matrix is always part of the JSON.
 Install detection reads the directories given via --bin-dir / --unit-dir
 (defaults identical to ` + "`install`" + `: ~/.local/bin and
 ~/.config/systemd/user). An install made with custom paths is tracked by
-passing the same values here — publicvpn keeps no state file by design.`,
+passing the same values here — assay keeps no state file by design.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
@@ -2265,7 +2265,7 @@ passing the same values here — publicvpn keeps no state file by design.`,
 		},
 	}
 	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin",
-		"directory to inspect for the installed publicvpn binary (same default as install)")
+		"directory to inspect for the installed assay binary (same default as install)")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
 		"systemd user unit directory to inspect (same default as install)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false,
@@ -2311,7 +2311,7 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 		return emitStatusJSON(out, si)
 	}
 
-	outln(out, ui.Header("publicvpn pipeline status", color))
+	outln(out, ui.Header("assay pipeline status", color))
 	reportConfigSourceStyled(out, res, color)
 	outln(out, ui.Chip("data dir:", p.dataDir, color))
 	printFetchStatus(out, p, color)

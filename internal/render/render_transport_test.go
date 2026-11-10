@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"testing"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/render"
+	"assay/internal/model"
+	"assay/internal/render"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

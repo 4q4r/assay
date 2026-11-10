@@ -1,5 +1,5 @@
 [Unit]
-Description=publicvpn watch daemon (plugin hot-reload watchdog + scheduled maintain waves)
+Description=assay watch daemon (plugin hot-reload watchdog + scheduled maintain waves)
 
 [Service]
 # sd_notify(3) contract: the daemon sends READY=1 once wired and pings
@@ -26,12 +26,12 @@ WatchdogSec=300
 # live client is never left running the old config with the new one on disk.
 TimeoutStopSec=1800
 # The wave reuses the pipeline config file (single source of truth, no env
-# vars). Rendered by `publicvpn install` from this template — do not edit the
+# vars). Rendered by `assay install` from this template — do not edit the
 # installed copy by hand. The daemon reads [maintain].refresh_interval and
 # [plugins].dir live: a config change needs only a restart, never a re-install.
 # An explicit-config install embeds `-c <path>`; the W13-deploy default-
 # location install renders a plain `watch` — the daemon then reads the
-# default config (~/.local/share/publicvpn/config.toml, which install
+# default config (~/.local/share/assay/config.toml, which install
 # materializes when absent).
 ExecStart={{ .BinaryPath }} watch{{ if .ConfigPath }} -c {{ .ConfigPath }}{{ end }}
 # A daemon crash restarts automatically; waves themselves are serialized by

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/restart"
+	"assay/internal/config"
+	"assay/internal/restart"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,7 +124,7 @@ func TestCommandConstructorsMatchAllowlist(t *testing.T) {
 // process is spawned.
 func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 	for _, bad := range [][]string{
-		{"--user", "restart", "public_vpn-watch.service"},  // other unit: the daemon itself
+		{"--user", "restart", "assay-watch.service"},       // other unit: the daemon itself
 		{"--user", "restart", "custom-client.service"},     // other unit: a configured name
 		{"--user", "restart", "xray-raw"},                  // unit without .service suffix
 		{"--user", "restart", "xray-raw.service", "--now"}, // flag appended

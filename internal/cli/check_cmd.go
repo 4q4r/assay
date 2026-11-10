@@ -9,15 +9,15 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/checker"
-	"public_vpn/internal/config"
-	"public_vpn/internal/render"
-	"public_vpn/internal/ui"
+	"assay/internal/checker"
+	"assay/internal/config"
+	"assay/internal/render"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 )
 
-// checkFlags is the CLI surface of `publicvpn check` (W8). All knobs are
+// checkFlags is the CLI surface of `assay check` (W8). All knobs are
 // CLI-side; no config-schema keys were added (flags carry sensible defaults,
 // structural validation only — owner ruling).
 type checkFlags struct {
@@ -46,8 +46,8 @@ serve the site (blockpage answers are classified, never counted as success).
 
 READ-ONLY by construction: the cold base and the live client are never
 touched, nothing is rendered or activated, all dialing is out-of-band.
-Liveness and exit classification come from the LAST probe wave — re-run ` + "`publicvpn probe`" + `
-(classification is merged into the probe pass, or ` + "`publicvpn maintain`" + ` for a
+Liveness and exit classification come from the LAST probe wave — re-run ` + "`assay probe`" + `
+(classification is merged into the probe pass, or ` + "`assay maintain`" + ` for a
 full wave) for freshness; a staleness hint prints when data is older than
 geo.ttl.`,
 		Args: cobra.MinimumNArgs(1),

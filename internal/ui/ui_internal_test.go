@@ -89,8 +89,8 @@ func TestTreeGlyphsColored(t *testing.T) {
 }
 
 func TestChipPlain(t *testing.T) {
-	out := Chip("config:", "share ~/.local/share/publicvpn/config.toml", false)
-	require.Equal(t, "config: share ~/.local/share/publicvpn/config.toml", out,
+	out := Chip("config:", "share ~/.local/share/assay/config.toml", false)
+	require.Equal(t, "config: share ~/.local/share/assay/config.toml", out,
 		"color-off chips are exactly label + space + value")
 	require.NotContains(t, out, "\x1b[")
 }

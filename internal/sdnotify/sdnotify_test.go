@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/sdnotify"
+	"assay/internal/sdnotify"
 
 	"github.com/stretchr/testify/require"
 )
@@ -49,7 +49,7 @@ func TestReadySendsDatagram(t *testing.T) {
 }
 
 // TestReadyWithoutNotifySocketIsNoOp pins the non-systemd contract: no
-// NOTIFY_SOCKET → no-op success (a plain `publicvpn watch` run must be
+// NOTIFY_SOCKET → no-op success (a plain `assay watch` run must be
 // unaffected; the socket's absence is expected, not an error).
 func TestReadyWithoutNotifySocketIsNoOp(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")
@@ -84,7 +84,7 @@ func TestWatchdogPingsAtHalfInterval(t *testing.T) {
 // TestWatchdogPingsOverAbstractSocket pins the '@' namespace form of
 // NOTIFY_SOCKET (systemd hands out both spellings).
 func TestWatchdogPingsOverAbstractSocket(t *testing.T) {
-	sock := fmt.Sprintf("@publicvpn-sdnotify-test-%d", time.Now().UnixNano())
+	sock := fmt.Sprintf("@assay-sdnotify-test-%d", time.Now().UnixNano())
 	ln := startFakeNotifyListener(t, sock)
 	t.Setenv("NOTIFY_SOCKET", sock)
 	t.Setenv("WATCHDOG_USEC", "2000000")

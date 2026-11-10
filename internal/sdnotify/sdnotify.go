@@ -9,7 +9,7 @@
 // unit's WatchdogSec in microseconds; the pinger fires at half the deadline,
 // the cadence systemd recommends. Without those variables the daemon is not
 // running under systemd supervision and everything here is a documented
-// no-op — a plain `publicvpn watch` run is unaffected.
+// no-op — a plain `assay watch` run is unaffected.
 //
 // The hang contract this serves: a wedged daemon stops pinging, systemd
 // kills it at WatchdogSec and Restart=always brings it back — the honest

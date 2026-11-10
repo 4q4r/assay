@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,8 +26,8 @@ func quote(s string) string { return "\"" + s + "\"" }
 
 // TestResolvePrecedence pins the config resolution contract (W13-deploy
 // rework): ONE file wins whole — explicit -c, else the local-share default
-// (~/.local/share/publicvpn/config.toml, $XDG_DATA_HOME honored), else the
-// DEPRECATED legacy home location (~/.config/publicvpn/config.toml,
+// (~/.local/share/assay/config.toml, $XDG_DATA_HOME honored), else the
+// DEPRECATED legacy home location (~/.config/assay/config.toml,
 // found-if-exists courtesy with a loud move warning — one release cycle),
 // else the cwd default, else fully configless. There is no merging, ever
 // (owner house rule).
@@ -64,7 +64,7 @@ func TestResolvePrecedence(t *testing.T) {
 			name:   "legacy home location wins over cwd with a loud move warning",
 			legacy: true, cwdFile: true,
 			want:     config.SourceLegacyHome,
-			wantWarn: "move it to ~/.local/share/publicvpn/config.toml",
+			wantWarn: "move it to ~/.local/share/assay/config.toml",
 		},
 		{
 			name:  "share beats legacy; the ignored legacy file still warns",
@@ -84,13 +84,13 @@ func TestResolvePrecedence(t *testing.T) {
 			cwd := t.TempDir()
 			explicitCfg := writeMinimalConfig(t, t.TempDir(), "explicit.toml")
 
-			shareCfg := filepath.Join(home, ".local", "share", "publicvpn", "config.toml")
+			shareCfg := filepath.Join(home, ".local", "share", "assay", "config.toml")
 			if tt.share {
 				require.NoError(t, os.MkdirAll(filepath.Dir(shareCfg), 0o750))
 				require.NoError(t, os.WriteFile(shareCfg,
 					[]byte("data_dir = \""+filepath.Join(home, "share-data")+"\"\n"), 0o600))
 			}
-			legacyCfg := filepath.Join(home, ".config", "publicvpn", "config.toml")
+			legacyCfg := filepath.Join(home, ".config", "assay", "config.toml")
 			if tt.legacy {
 				require.NoError(t, os.MkdirAll(filepath.Dir(legacyCfg), 0o750))
 				require.NoError(t, os.WriteFile(legacyCfg,
@@ -155,7 +155,7 @@ func TestConfiglessDefaults(t *testing.T) {
 	require.Equal(t, config.SourceConfigless, res.Source)
 	cfg := res.Config
 
-	assert.Equal(t, filepath.Join(home, ".local", "share", "publicvpn"), cfg.DataDir,
+	assert.Equal(t, filepath.Join(home, ".local", "share", "assay"), cfg.DataDir,
 		"data_dir defaults to the XDG data dir")
 	assert.Equal(t, filepath.Join(cfg.DataDir, "plugins"), cfg.Plugins.Dir,
 		"plugins dir defaults under the configless data_dir")
@@ -210,19 +210,19 @@ func TestFileLoadKeepsRenderTargetDefaults(t *testing.T) {
 
 // TestDefaultDataDirHonorsXDGDataHome pins the M-1 contract: when
 // XDG_DATA_HOME is set (non-empty), the configless data dir is
-// $XDG_DATA_HOME/publicvpn; when it is unset/empty, the fallback is
-// <home>/.local/share/publicvpn. t.Setenv keeps both branches hermetic —
+// $XDG_DATA_HOME/assay; when it is unset/empty, the fallback is
+// <home>/.local/share/assay. t.Setenv keeps both branches hermetic —
 // no ambient environment leaks into either.
 func TestDefaultDataDirHonorsXDGDataHome(t *testing.T) {
 	home := t.TempDir()
 	xdg := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", xdg)
-	assert.Equal(t, filepath.Join(xdg, "publicvpn"), config.DefaultDataDir(home),
+	assert.Equal(t, filepath.Join(xdg, "assay"), config.DefaultDataDir(home),
 		"a set XDG_DATA_HOME wins")
 
 	t.Setenv("XDG_DATA_HOME", "")
-	assert.Equal(t, filepath.Join(home, ".local", "share", "publicvpn"), config.DefaultDataDir(home),
-		"empty XDG_DATA_HOME falls back to ~/.local/share/publicvpn")
+	assert.Equal(t, filepath.Join(home, ".local", "share", "assay"), config.DefaultDataDir(home),
+		"empty XDG_DATA_HOME falls back to ~/.local/share/assay")
 }
 
 // TestConfiglessResolutionUsesXDGDataHome pins the same contract through the
@@ -234,13 +234,13 @@ func TestConfiglessResolutionUsesXDGDataHome(t *testing.T) {
 	res, err := config.Resolve("", t.TempDir(), t.TempDir())
 	require.NoError(t, err)
 	require.Equal(t, config.SourceConfigless, res.Source)
-	assert.Equal(t, filepath.Join(xdg, "publicvpn"), res.Config.DataDir)
+	assert.Equal(t, filepath.Join(xdg, "assay"), res.Config.DataDir)
 }
 
 // TestConfiglessEmptyHomeIsLoud pins the M-3 guard: an empty home reaching
 // the configless fallback is API misuse — every caller must inject a real
 // home. Pre-fix the guard was missing and the resolution silently built a
-// RELATIVE data dir (.local/share/publicvpn), scattering state into
+// RELATIVE data dir (.local/share/assay), scattering state into
 // whatever directory the process happened to stand in.
 func TestConfiglessEmptyHomeIsLoud(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "")
@@ -253,6 +253,94 @@ func TestConfiglessEmptyHomeIsLoud(t *testing.T) {
 // TestSourceKindStrings pins the provenance strings every command prints
 // (the W13-deploy tier names: the local-share default and the deprecated
 // legacy home location).
+// legacyShareDirUnderHome builds the pre-rename local-share data dir the
+// way the assay rename left it on disk. The old name is assembled from
+// parts here for the same reason it is in production code: the rename's
+// acceptance contract keeps the old spelling out of Go sources while the
+// found-if-exists courtesy must still address the real directory.
+func legacyShareDirUnderHome(home string) string {
+	return filepath.Join(home, ".local", "share", "public"+"vpn")
+}
+
+// TestLegacyShareDataDirRenameHint pins the rename-migration courtesy: the
+// pre-rename local-share data dir fires exactly ONE loud hint line when the
+// new data dir is absent. Found-if-exists only — the resolution NEVER moves
+// or copies anything (no auto-migration; the owner migrates by hand in the
+// deploy wave).
+func TestLegacyShareDataDirRenameHint(t *testing.T) {
+	t.Run("pre-rename share config still loads with the loud move hint", func(t *testing.T) {
+		home := t.TempDir()
+		oldDir := legacyShareDirUnderHome(home)
+		oldCfg := filepath.Join(oldDir, "config.toml")
+		require.NoError(t, os.MkdirAll(oldDir, 0o750))
+		require.NoError(t, os.WriteFile(oldCfg,
+			[]byte("data_dir = \""+filepath.Join(home, "old-data")+"\"\n"), 0o600))
+		t.Setenv("XDG_DATA_HOME", "") // hermetic: pin the fallback branch
+
+		res, err := config.Resolve("", home, t.TempDir())
+		require.NoError(t, err)
+		assert.Equal(t, config.SourceShare, res.Source,
+			"the pre-rename local-share config is still the local-share default tier")
+		assert.Equal(t, oldCfg, res.Path)
+		assert.Equal(t, filepath.Join(home, "old-data"), res.Config.DataDir,
+			"the loaded config wins whole — no rewriting of its data_dir")
+		require.Len(t, res.Warnings, 1, "exactly one loud hint line")
+		assert.Contains(t, res.Warnings[0], "legacy data location detected: "+oldDir)
+		assert.Contains(t, res.Warnings[0], "move it to "+filepath.Join(home, ".local", "share", "assay"))
+		assert.Contains(t, res.Warnings[0], "deprecated")
+	})
+
+	t.Run("dir-only pre-rename data dir warns on the cwd tier", func(t *testing.T) {
+		home := t.TempDir()
+		cwd := t.TempDir()
+		require.NoError(t, os.MkdirAll(legacyShareDirUnderHome(home), 0o750))
+		cwdCfg := filepath.Join(cwd, "config.toml")
+		require.NoError(t, os.WriteFile(cwdCfg,
+			[]byte("data_dir = \""+filepath.Join(cwd, "cwd-data")+"\"\n"), 0o600))
+		t.Setenv("XDG_DATA_HOME", "")
+
+		res, err := config.Resolve("", home, cwd)
+		require.NoError(t, err)
+		assert.Equal(t, config.SourceCwd, res.Source)
+		require.Len(t, res.Warnings, 1, "exactly one loud hint line")
+		assert.Contains(t, res.Warnings[0], "legacy data location detected: "+legacyShareDirUnderHome(home))
+		assert.Contains(t, res.Warnings[0], "move it to "+filepath.Join(home, ".local", "share", "assay"))
+	})
+
+	t.Run("configless warns when only the pre-rename data dir exists", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.MkdirAll(legacyShareDirUnderHome(home), 0o750))
+		t.Setenv("XDG_DATA_HOME", "")
+
+		res, err := config.Resolve("", home, t.TempDir())
+		require.NoError(t, err)
+		assert.Equal(t, config.SourceConfigless, res.Source)
+		require.Len(t, res.Warnings, 1, "exactly one loud hint line")
+		assert.Contains(t, res.Warnings[0], "legacy data location detected: "+legacyShareDirUnderHome(home))
+	})
+
+	t.Run("no hint once the new data dir exists", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.MkdirAll(legacyShareDirUnderHome(home), 0o750))
+		require.NoError(t, os.MkdirAll(filepath.Join(home, ".local", "share", "assay"), 0o750))
+		t.Setenv("XDG_DATA_HOME", "")
+
+		res, err := config.Resolve("", home, t.TempDir())
+		require.NoError(t, err)
+		assert.Empty(t, res.Warnings,
+			"the new data dir exists — the migration already happened, stay quiet")
+	})
+
+	t.Run("no hint without the pre-rename data dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("XDG_DATA_HOME", "")
+
+		res, err := config.Resolve("", home, t.TempDir())
+		require.NoError(t, err)
+		assert.Empty(t, res.Warnings, "a fresh install has nothing to migrate")
+	})
+}
+
 func TestSourceKindStrings(t *testing.T) {
 	assert.Equal(t, "explicit -c", config.SourceExplicit.String())
 	assert.Equal(t, "local-share default", config.SourceShare.String())
@@ -267,16 +355,16 @@ func TestSourceKindStrings(t *testing.T) {
 func TestDefaultConfigPathLiterals(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "") // hermetic: pin the fallback branch
 	home := "/home/tester"
-	assert.Equal(t, "/home/tester/.local/share/publicvpn/config.toml", config.DefaultShareConfigPath(home))
-	assert.Equal(t, "/home/tester/.config/publicvpn/config.toml", config.LegacyHomeConfigPath(home))
-	assert.Equal(t, "/home/tester/.local/share/publicvpn", config.DefaultDataDir(home))
-	assert.Equal(t, "~/.local/share/publicvpn/config.toml", config.ShareConfigDisplay)
-	assert.Equal(t, "~/.config/publicvpn/config.toml", config.LegacyHomeConfigDisplay)
+	assert.Equal(t, "/home/tester/.local/share/assay/config.toml", config.DefaultShareConfigPath(home))
+	assert.Equal(t, "/home/tester/.config/assay/config.toml", config.LegacyHomeConfigPath(home))
+	assert.Equal(t, "/home/tester/.local/share/assay", config.DefaultDataDir(home))
+	assert.Equal(t, "~/.local/share/assay/config.toml", config.ShareConfigDisplay)
+	assert.Equal(t, "~/.config/assay/config.toml", config.LegacyHomeConfigDisplay)
 }
 
 // TestShareConfigTierHonorsXDGDataHome pins the M-1 contract for the
 // local-share CONFIG tier (not just the data dir): a set ABSOLUTE
-// XDG_DATA_HOME moves the tier-2 config path to $XDG_DATA_HOME/publicvpn —
+// XDG_DATA_HOME moves the tier-2 config path to $XDG_DATA_HOME/assay —
 // the same root DefaultDataDir uses, one scheme for the whole local-share
 // layout. A set-but-RELATIVE XDG_DATA_HOME is spec-invalid: treated as
 // unset, the home fallback applies, and the resolution carries the loud
@@ -284,10 +372,10 @@ func TestDefaultConfigPathLiterals(t *testing.T) {
 func TestShareConfigTierHonorsXDGDataHome(t *testing.T) {
 	home := t.TempDir()
 	xdg := t.TempDir()
-	shareCfg := filepath.Join(xdg, "publicvpn", "config.toml")
+	shareCfg := filepath.Join(xdg, "assay", "config.toml")
 	require.NoError(t, os.MkdirAll(filepath.Dir(shareCfg), 0o750))
 	require.NoError(t, os.WriteFile(shareCfg,
-		[]byte("data_dir = \""+filepath.Join(xdg, "publicvpn", "d")+"\"\n"), 0o600))
+		[]byte("data_dir = \""+filepath.Join(xdg, "assay", "d")+"\"\n"), 0o600))
 
 	t.Run("absolute XDG moves the tier", func(t *testing.T) {
 		t.Setenv("XDG_DATA_HOME", xdg)

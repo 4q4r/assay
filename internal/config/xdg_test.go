@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,7 +18,7 @@ import (
 func TestDefaultDataDirTreatsRelativeXDGAsUnset(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "relative/path")
 	got := config.DefaultDataDir("/home/tester")
-	assert.Equal(t, filepath.Join("/home/tester", ".local", "share", "publicvpn"), got,
+	assert.Equal(t, filepath.Join("/home/tester", ".local", "share", "assay"), got,
 		"a relative XDG_DATA_HOME must fall back to the home default, never produce a relative data dir")
 }
 
@@ -58,5 +58,5 @@ func TestXDGDataDirViolationClassifies(t *testing.T) {
 // contract kept green alongside the new validation).
 func TestDefaultDataDirUnsetFallsBack(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "")
-	assert.Equal(t, filepath.Join("/home/tester", ".local", "share", "publicvpn"), config.DefaultDataDir("/home/tester"))
+	assert.Equal(t, filepath.Join("/home/tester", ".local", "share", "assay"), config.DefaultDataDir("/home/tester"))
 }

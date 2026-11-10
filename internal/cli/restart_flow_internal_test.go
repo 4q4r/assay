@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/restart"
+	"assay/internal/config"
+	"assay/internal/restart"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"

@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"public_vpn/internal/filter"
-	"public_vpn/internal/model"
+	"assay/internal/filter"
+	"assay/internal/model"
 )
 
 // buildNodes makes n distinct nodes (plus n/4 exact duplicates for the dedupe

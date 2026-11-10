@@ -9,15 +9,15 @@ import (
 	"path/filepath"
 	"strings"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/install"
-	"public_vpn/internal/ui"
+	"assay/internal/config"
+	"assay/internal/install"
+	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
 )
 
 // W5 self-install surface. The systemctl scope is pinned inside
-// internal/install (allowlist: --user, the two public_vpn-* timers only,
+// internal/install (allowlist: --user, the two assay-* timers only,
 // daemon-reload + enable/disable --now — never restart, never other units).
 
 // resolveExecutable returns the running binary's absolute path.
@@ -50,17 +50,17 @@ the XDG local-share layout.
 
 WITHOUT -c (the canonical flow):
   1. copies the RUNNING binary (os.Executable) to --bin-dir as
-     ` + "`publicvpn`" + ` (atomic write, mode 0755; re-running after a rebuild =
+     ` + "`assay`" + ` (atomic write, mode 0755; re-running after a rebuild =
      self-upgrade);
   2. materializes the default config at
-     ~/.local/share/publicvpn/config.toml — the same values a configless
+     ~/.local/share/assay/config.toml — the same values a configless
      run uses, written as TOML with full comments. An EXISTING file is
      never overwritten (reported as "kept");
   3. renders the watch-daemon unit with a plain ` + "`watch`" + ` ExecStart — NO -c:
      the daemon reads the default config location;
   4. enables it:
        systemctl --user daemon-reload
-       systemctl --user enable --now public_vpn-watch.service
+       systemctl --user enable --now assay-watch.service
   5. prints a loud summary — including what YOU still must fill:
      [render].template and [activate].target in the materialized config.
      Until those exist the render/activate stages fail loud at their
@@ -72,13 +72,13 @@ resolved absolute path (a relative -c resolves against the current
 directory), the config is untouched where it is, and the daemon reads THAT
 file.
 
-The daemon (publicvpn watch) runs the plugin watchdog and the maintain-wave
+The daemon (assay watch) runs the plugin watchdog and the maintain-wave
 scheduler; [maintain].refresh_interval / [maintain].speedtest_interval and
 [plugins].dir are read from the config LIVE — changing them needs only a
 restart of the unit, never a re-install. Legacy W5 timer units
-(public_vpn-refresh/speedtest.*) still on disk are disabled and removed by
+(assay-refresh/speedtest.*) still on disk are disabled and removed by
 this install: waves fire from exactly ONE scheduler. The deprecated legacy
-config location (~/.config/publicvpn/config.toml) still wins when present —
+config location (~/.config/assay/config.toml) still wins when present —
 with a loud deprecation warning naming the move.
 
 --no-systemd installs the binary (and, without -c, materializes the default
@@ -105,7 +105,7 @@ session.`,
 		},
 	}
 	attachColorFlags(cmd)
-	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin", "directory for the installed publicvpn binary")
+	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin", "directory for the installed assay binary")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user", "systemd user unit directory")
 	cmd.Flags().BoolVar(&noSystemd, "no-systemd", false,
 		"install the binary only (no unit files, no timers) — for hosts without a user systemd session")
@@ -228,7 +228,7 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 		return nil
 	}
 	printInstallSummary(w, cfg, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
-	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u public_vpn-watch.service -f", opts.color))
+	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u assay-watch.service -f", opts.color))
 	return nil
 }
 
@@ -253,7 +253,7 @@ func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs string,
 		outf(w, "%s\n", ui.ChipKV("unit written:     ", p, color))
 	}
 	outf(w, "%s\n", ui.ChipKV("daemon active:    ",
-		"publicvpn watch (Restart=always) — wave intervals and the plugins dir", color))
+		"assay watch (Restart=always) — wave intervals and the plugins dir", color))
 	outf(w, "%s\n", ui.ChipKV("                  ",
 		"are read from the config live (a change needs a restart, not a re-install)", color))
 	for _, name := range res.LegacyCleaned {
@@ -284,8 +284,8 @@ func newUninstallCommand(cfgPath *string) *cobra.Command {
 		Use:   "uninstall",
 		Short: "Disable the watch daemon and remove the rendered unit files (default: user data kept)",
 		Long: `Symmetric teardown: disables the watch daemon and any legacy timer units
-still present, removes every known unit file (public_vpn-watch.service plus
-the W5-era public_vpn-refresh/speedtest units), daemon-reloads the user
+still present, removes every known unit file (assay-watch.service plus
+the W5-era assay-refresh/speedtest units), daemon-reloads the user
 manager (so it drops its not-found entries for the removed units), and
 reports. The installed binary and all user data are KEPT by default.
 
@@ -294,7 +294,7 @@ config file and the pipeline data dir ([data_dir]). It never touches
 anything outside those two paths — in particular nothing xray-raw. The
 config resolves the same way install does: explicit -c wins; the
 default-location layout (no -c) purges the canonical
-~/.local/share/publicvpn/config.toml plus the data dir under it; the
+~/.local/share/assay/config.toml plus the data dir under it; the
 deprecated legacy location still wins when present. The cwd default
 (./config.toml) is never consulted — a purge must never depend on the
 caller's working directory.`,
@@ -450,7 +450,7 @@ func binariesDiffer(a, b string) (bool, error) {
 // unlike the W5 timers — there is no configured-vs-installed mismatch class.
 func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unitDir string, color bool) {
 	outln(out, ui.Header("install:", color))
-	binPath := filepath.Join(binDir, "publicvpn")
+	binPath := filepath.Join(binDir, "assay")
 	if st, err := os.Stat(binPath); err == nil {
 		outf(out, "%s\n", ui.ChipKV("  binary:    ",
 			fmt.Sprintf("%s (mode %s)", binPath, st.Mode()), color))
@@ -463,13 +463,13 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 		if running, e := os.Executable(); e == nil && running != binPath {
 			if differ, shaErr := binariesDiffer(running, binPath); shaErr == nil && differ {
 				outf(out, "%s\n", ui.Warn("  STALE:     running binary differs from the installed one — "+
-					"the installed binary does not self-update; re-run `publicvpn install` "+
-					"(self-copy) and restart public_vpn-watch.service to load the new code", ui.Red, color))
+					"the installed binary does not self-update; re-run `assay install` "+
+					"(self-copy) and restart assay-watch.service to load the new code", ui.Red, color))
 			}
 		}
 	} else {
 		outf(out, "%s\n", ui.ChipKV("  binary:    ",
-			"not installed ("+binPath+" missing) — run `publicvpn install`", color))
+			"not installed ("+binPath+" missing) — run `assay install`", color))
 	}
 	// unitDir arrives already expanded (status flags → ExpandHome at the
 	// caller); the rest of this function only joins names onto it.
@@ -496,7 +496,7 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 					install.Span(cfg.Maintain.RefreshInterval.Duration), speedtest), color))
 		} else {
 			outf(out, "%s\n", ui.ChipKV("  service:   ",
-				"not enabled — run `publicvpn install`", color))
+				"not enabled — run `assay install`", color))
 		}
 	}
 	legacy := install.LegacyUnitNames()
@@ -509,10 +509,10 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 	if present > 0 {
 		if cfgPath != "" {
 			outf(out, "%s\n", ui.Warn(fmt.Sprintf(
-				"  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install -c %s` to migrate",
+				"  LEGACY:    %d W5 timer units still on disk — re-run `assay install -c %s` to migrate",
 				present, cfgPath), ui.Amber, color))
 		} else {
-			outf(out, "%s\n", ui.Warn(fmt.Sprintf("  LEGACY:    %d W5 timer units still on disk — re-run `publicvpn install` "+
+			outf(out, "%s\n", ui.Warn(fmt.Sprintf("  LEGACY:    %d W5 timer units still on disk — re-run `assay install` "+
 				"with a config (-c or %s) to migrate", present, config.ShareConfigDisplay), ui.Amber, color))
 		}
 	}

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/model"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
