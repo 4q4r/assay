@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/plugins"
+	"assay/internal/plugins"
 
 	"github.com/fsnotify/fsnotify"
 )

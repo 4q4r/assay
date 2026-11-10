@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"public_vpn/internal/model"
+	"assay/internal/model"
 )
 
 // ProbeResult is one node's outcome from a probe wave (the W14 real-xray

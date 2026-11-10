@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/xrayupdate"
+	"assay/internal/config"
+	"assay/internal/xrayupdate"
 
 	"github.com/spf13/cobra"
 )
 
-// newXrayUpdateCommand wires `publicvpn xray-update` (W14): fetch the latest
+// newXrayUpdateCommand wires `assay xray-update` (W14): fetch the latest
 // Xray-core release, verify its published sha256, validate the new binary
 // with `xray run -test`, and atomically replace [activate].xray_bin with a
 // date-stamped backup. A root-owned target prints the EXACT privileged

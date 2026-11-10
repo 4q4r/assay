@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/parse"
+	"assay/internal/model"
+	"assay/internal/parse"
 )
 
 // Dropped records why a node was excluded, so the pipeline report can count

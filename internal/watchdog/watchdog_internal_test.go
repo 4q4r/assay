@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/plugins"
+	"assay/internal/plugins"
 )
 
 const debounce = 30 * time.Millisecond
@@ -70,7 +70,7 @@ func TestWatchdogHotAdd(t *testing.T) {
 	dir, reg := startTest(t)
 	path := filepath.Join(dir, "new.lua")
 	if err := os.WriteFile(path, []byte(`return function()
-		return { publicvpn.node{ raw = "vless://a@h:1" } }
+		return { assay.node{ raw = "vless://a@h:1" } }
 	end`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestWatchdogHotModifySwap(t *testing.T) {
 		_, ok := reg.Get("swap")
 		return ok
 	})
-	body = `return function() return { publicvpn.node{ raw = "vless://b@h:2" } } end`
+	body = `return function() return { assay.node{ raw = "vless://b@h:2" } } end`
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestWatchdogBrokenKeepsLastGood(t *testing.T) {
 	log := &syncBuffer{}
 	reg, _ := startAt(t, dir, log)
 	path := filepath.Join(dir, "good.lua")
-	good := `return function() return { publicvpn.node{ raw = "vless://g@h:1" } } end`
+	good := `return function() return { assay.node{ raw = "vless://g@h:1" } } end`
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestWatchdogNoReloadAfterClose(t *testing.T) {
 	log := &syncBuffer{}
 	reg, w := startAt(t, dir, log)
 	path := filepath.Join(dir, "late.lua")
-	body := `return function() return { publicvpn.node{ raw = "vless://l@h:1" } } end`
+	body := `return function() return { assay.node{ raw = "vless://l@h:1" } } end`
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestWatchdogConcurrentReloadAndSnapshot(t *testing.T) {
 		for i := range 30 {
 			code := `return function() return {} end`
 			if i%2 == 0 {
-				code = `return function() return { publicvpn.node{ raw = "vless://c@h:9" } } end`
+				code = `return function() return { assay.node{ raw = "vless://c@h:9" } } end`
 			}
 			if err := os.WriteFile(path, []byte(code), 0o600); err != nil {
 				return

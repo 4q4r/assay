@@ -20,8 +20,8 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
+	"assay/internal/config"
+	"assay/internal/model"
 )
 
 // PoolRoute is one owner-configured routing rule into the pool (D2: the pool

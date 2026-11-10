@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Round-7 item 12a — `publicvpn list --json`: the machine-readable twin of
+// Round-7 item 12a — `assay list --json`: the machine-readable twin of
 // the table, same aggregation code path, color-independent by construction.
 // The schema structs live in list_cmd.go; the golden pin below fixes field
 // names, order, and values against the shared fixture. The schema is

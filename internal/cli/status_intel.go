@@ -1,6 +1,6 @@
 package cli
 
-// Phase 4 — the `publicvpn status` intelligence dashboard: pipeline funnel,
+// Phase 4 — the `assay status` intelligence dashboard: pipeline funnel,
 // global pool quality, provider intelligence table, pairwise overlap view,
 // media/unlock summary, and the machine-readable --json payload.
 //
@@ -51,12 +51,12 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/plugins"
-	"public_vpn/internal/stats"
-	"public_vpn/internal/store"
-	"public_vpn/internal/ui"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/plugins"
+	"assay/internal/stats"
+	"assay/internal/store"
+	"assay/internal/ui"
 )
 
 // statusSchemaVersion is the --json document version. 1.1 (owner ruling

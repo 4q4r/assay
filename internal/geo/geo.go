@@ -61,8 +61,8 @@ import (
 	"sync"
 	"time"
 
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/model"
+	"assay/internal/store"
 
 	"golang.org/x/net/proxy"
 )

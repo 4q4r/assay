@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"public_vpn/internal/config"
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,7 +17,7 @@ func TestLoadFullConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	content := `
-data_dir = "/tmp/publicvpn-test-data"
+data_dir = "/tmp/assay-test-data"
 
 
 
@@ -62,8 +62,8 @@ xray_bin = "/usr/bin/xray"
 	cfg, err := config.Load(path)
 	require.NoError(t, err)
 
-	assert.Equal(t, "/tmp/publicvpn-test-data", cfg.DataDir)
-	assert.Equal(t, "/tmp/publicvpn-test-data/plugins", cfg.Plugins.Dir, "plugins dir defaults under data_dir")
+	assert.Equal(t, "/tmp/assay-test-data", cfg.DataDir)
+	assert.Equal(t, "/tmp/assay-test-data/plugins", cfg.Plugins.Dir, "plugins dir defaults under data_dir")
 
 	assert.Equal(t, 20*time.Second, cfg.Fetch.Timeout.Duration)
 	assert.Equal(t, 2, cfg.Fetch.Retries)
@@ -98,7 +98,7 @@ func TestDefaultsAreApplied(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	minimal := `
-data_dir = "/tmp/publicvpn-defaults"
+data_dir = "/tmp/assay-defaults"
 
 `
 	require.NoError(t, os.WriteFile(path, []byte(minimal), 0o644))
@@ -299,7 +299,7 @@ func TestMaintainSectionParsesAndDefaults(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 		return path
 	}
-	base := `data_dir = "/tmp/publicvpn-maintain"
+	base := `data_dir = "/tmp/assay-maintain"
 `
 
 	t.Run("absent section defaults to 48h", func(t *testing.T) {
@@ -339,7 +339,7 @@ func TestAutoRestartKnobDefaultsToTrue(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 		return path
 	}
-	base := `data_dir = "/tmp/publicvpn-autorestart"
+	base := `data_dir = "/tmp/assay-autorestart"
 `
 
 	t.Run("unset defaults to true (hands-off)", func(t *testing.T) {
@@ -380,7 +380,7 @@ func TestUnlockProbesKnobDefaultsTrue(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 		return path
 	}
-	base := `data_dir = "/tmp/publicvpn-unlockprobes"
+	base := `data_dir = "/tmp/assay-unlockprobes"
 `
 
 	t.Run("absent defaults to true (owner flip)", func(t *testing.T) {
@@ -428,7 +428,7 @@ func TestTCPPrefilterKnobDefaultsOn(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 		return path
 	}
-	base := `data_dir = "/tmp/publicvpn-tcpprefilter"
+	base := `data_dir = "/tmp/assay-tcpprefilter"
 `
 
 	t.Run("absent defaults to true (owner default)", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestTCPPrefilterKnobNegativeValuesFailLoud(t *testing.T) {
 func TestFilterSourceCapConfigParsesAndValidates(t *testing.T) {
 	base := func(caps string) string {
 		return fmt.Sprintf(`
-data_dir = "/tmp/publicvpn-test"
+data_dir = "/tmp/assay-test"
 [filter]
 source_cap = %s
 `, caps)
@@ -641,7 +641,7 @@ func TestW6KnobDefaults(t *testing.T) {
 	assert.InDelta(t, 0.2, cfg.Render.BalancerTolerance, 1e-9)
 	assert.Equal(t, "https://api.github.com", cfg.Fetch.APIBase)
 	assert.Equal(t, "https://raw.githubusercontent.com", cfg.Fetch.RawBase)
-	assert.Equal(t, "public_vpn (pipeline; contact: owner)", cfg.HTTP.UserAgent)
+	assert.Equal(t, "assay (pipeline; contact: owner)", cfg.HTTP.UserAgent)
 	assert.Equal(t, "xray-raw.service", cfg.Activate.ServiceName)
 	assert.Equal(t, 10*time.Second, cfg.Maintain.StatsTimeout.Duration)
 	assert.InDelta(t, 1.2, cfg.Select.TieBandRTTTolerance, 1e-9)
@@ -715,7 +715,7 @@ api_base = "https://ghmirror.example.net"
 raw_base = "https://raw-mirror.example.net"
 
 [http]
-user_agent = "publicvpn/6 (custom)"
+user_agent = "assay/6 (custom)"
 
 [probe]
 skip_fresh_within = "15m"
@@ -742,7 +742,7 @@ prune_backup_keep = 5
 	assert.Equal(t, 90*time.Minute, cfg.Fetch.CacheMaxAge.Duration)
 	assert.Equal(t, "https://ghmirror.example.net", cfg.Fetch.APIBase)
 	assert.Equal(t, "https://raw-mirror.example.net", cfg.Fetch.RawBase)
-	assert.Equal(t, "publicvpn/6 (custom)", cfg.HTTP.UserAgent)
+	assert.Equal(t, "assay/6 (custom)", cfg.HTTP.UserAgent)
 	assert.Equal(t, 15*time.Minute, cfg.Probe.SkipFreshWithin.Duration)
 	assert.InDelta(t, 2.5, cfg.Select.TieBandRTTTolerance, 1e-9)
 	assert.Equal(t, []string{"socks-in", "http-in", "tun-in"}, cfg.Render.PoolInboundTags)

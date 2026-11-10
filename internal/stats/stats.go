@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
+	"assay/internal/config"
+	"assay/internal/model"
 )
 
 // poolOutboundPrefix is the D5/D6 namespace wall: only counters for pool-*

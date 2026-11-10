@@ -41,4 +41,4 @@ cities:
   🇺🇸 Dallas — 67% ok (2/3) — median 610ms
 
 
-hint: probe data is 31h old (geo.ttl 24h) — run `publicvpn maintain` for freshness
+hint: probe data is 31h old (geo.ttl 24h) — run `assay maintain` for freshness

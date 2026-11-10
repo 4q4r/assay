@@ -12,7 +12,7 @@ import (
 
 // W10 hard-scope guard, migrated through W13: the install package's ENTIRE
 // systemctl surface stays the four-command allowlist — --user only, only
-// public_vpn-* units, daemon-reload / enable --now (watch) / disable --now
+// assay-* units, daemon-reload / enable --now (watch) / disable --now
 // (watch) / disable --now (the legacy W5 timers, solely for the one-time
 // migration). UNCHANGED by W13: install still never restarts anything —
 // the owner-ruled xray restart lives in internal/restart's own byte-pinned
@@ -50,9 +50,37 @@ func TestCommandConstructorsMatchAllowlist(t *testing.T) {
 	}
 }
 
+// TestUnitNameLiteralsArePinned closes the M-2 rider gap: the unit-name
+// constants are otherwise compared only against themselves (the allowlist
+// rows reference the same constants), so a constant revert would be
+// invisible to the suite. The NEW names are spelled here as literals; the
+// PRE-RENAME spellings are assembled from parts (same grep reason as the
+// config package's fixture pin) and must be REFUSED — the allowlist carries
+// assay-* names only, and a constant revert to the old names would re-add
+// them and fail the refusal matrix below.
+func TestUnitNameLiteralsArePinned(t *testing.T) {
+	assert.Equal(t, "assay-watch.service", WatchService)
+	assert.Equal(t, "assay-refresh.service", RefreshService)
+	assert.Equal(t, "assay-refresh.timer", RefreshTimer)
+	assert.Equal(t, "assay-speedtest.service", SpeedtestService)
+	assert.Equal(t, "assay-speedtest.timer", SpeedtestTimer)
+
+	old := "public" + "vpn"
+	for _, bad := range [][]string{
+		{"--user", "disable", "--now", old + "-refresh.timer", old + "-speedtest.timer"},
+		{"--user", "disable", "--now", old + "-watch.service"},
+		{"--user", "enable", "--now", old + "-watch.service"},
+		{"--user", "restart", old + "-watch.service"},
+	} {
+		err := validateArgs(bad)
+		require.Error(t, err, "invocation %v must be refused — the allowlist carries assay-* names only", bad)
+		assert.Contains(t, err.Error(), "allowlist")
+	}
+}
+
 func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 	for _, bad := range [][]string{
-		{"--user", "restart", "public_vpn-watch.service"},           // never restart anything
+		{"--user", "restart", "assay-watch.service"},                // never restart anything
 		{"--user", "restart", "xray-raw.service"},                   // never touch the live client
 		{"--user", "start", WatchService},                           // start is not in the set
 		{"--user", "stop", WatchService},                            // stop is not in the set

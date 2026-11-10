@@ -1,10 +1,10 @@
-// Command publicvpn is the public_vpn pipeline CLI (D11: Go single binary).
+// Command assay is the assay pipeline CLI (D11: Go single binary).
 package main
 
 import (
 	"os"
 
-	"public_vpn/internal/cli"
+	"assay/internal/cli"
 )
 
 func main() {

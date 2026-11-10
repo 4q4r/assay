@@ -12,9 +12,9 @@ import (
 	"sort"
 	"time"
 
-	"public_vpn/internal/config"
-	"public_vpn/internal/model"
-	"public_vpn/internal/store"
+	"assay/internal/config"
+	"assay/internal/model"
+	"assay/internal/store"
 )
 
 // Select builds the active selection. probeByKey (optional) supplies the

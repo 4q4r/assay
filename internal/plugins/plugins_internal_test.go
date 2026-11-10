@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"public_vpn/internal/fetch"
+	"assay/internal/fetch"
 )
 
 // runSource executes a plugin source directly (bypassing compile) — the
@@ -37,7 +37,7 @@ func runMustNodes(t *testing.T, code string) []Node {
 func TestNodeClassContract(t *testing.T) {
 	t.Run("constructor output is collected", func(t *testing.T) {
 		nodes := runMustNodes(t, `return function()
-			return { publicvpn.node{ raw = "vless://a@h:1?s=1#m" } }
+			return { assay.node{ raw = "vless://a@h:1?s=1#m" } }
 		end`)
 		if len(nodes) != 1 || nodes[0].Raw != "vless://a@h:1?s=1#m" {
 			t.Fatalf("unexpected nodes: %+v", nodes)
@@ -45,7 +45,7 @@ func TestNodeClassContract(t *testing.T) {
 	})
 	t.Run("plain table with raw is accepted", func(t *testing.T) {
 		nodes := runMustNodes(t, `return function()
-			return { { raw = "vless://a@h:1" }, publicvpn.node{ raw = "vless://b@h:2" } }
+			return { { raw = "vless://a@h:1" }, assay.node{ raw = "vless://b@h:2" } }
 		end`)
 		if len(nodes) != 2 {
 			t.Fatalf("expected 2 nodes, got %d", len(nodes))
@@ -53,7 +53,7 @@ func TestNodeClassContract(t *testing.T) {
 	})
 	t.Run("optional hints and source carried", func(t *testing.T) {
 		nodes := runMustNodes(t, `return function()
-			return { publicvpn.node{
+			return { assay.node{
 				raw = "vless://a@h:1", source = "other", remark = "r",
 				scheme = "VLESS", host = "h", port = 1 } }
 		end`)
@@ -65,7 +65,7 @@ func TestNodeClassContract(t *testing.T) {
 	})
 	t.Run("constructor rejects missing raw loud", func(t *testing.T) {
 		_, err := runSource(t, `return function()
-			return { publicvpn.node{ remark = "no raw" } }
+			return { assay.node{ remark = "no raw" } }
 		end`)
 		if err == nil || !strings.Contains(err.Error(), "raw (non-empty string) is required") {
 			t.Fatalf("expected loud raw-required error, got: %v", err)
@@ -73,21 +73,21 @@ func TestNodeClassContract(t *testing.T) {
 	})
 	t.Run("non-node element fails loud with plugin and index", func(t *testing.T) {
 		_, err := runSource(t, `return function()
-			return { publicvpn.node{ raw = "vless://a@h:1" }, "oops" }
+			return { assay.node{ raw = "vless://a@h:1" }, "oops" }
 		end`)
 		var le *LoadError
 		if !errors.As(err, &le) || le.Plugin != "test" || le.Index != 2 {
 			t.Fatalf("expected LoadError plugin=test index=2, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), "not a publicvpn.node (got string)") {
+		if !strings.Contains(err.Error(), "not an assay.node (got string)") {
 			t.Fatalf("error must name the offending type: %v", err)
 		}
 	})
 	t.Run("nil hole in result array fails loud with index", func(t *testing.T) {
 		_, err := runSource(t, `return function()
 			local t = {}
-			t[1] = publicvpn.node{ raw = "vless://a@h:1" }
-			t[3] = publicvpn.node{ raw = "vless://b@h:2" }
+			t[1] = assay.node{ raw = "vless://a@h:1" }
+			t[3] = assay.node{ raw = "vless://b@h:2" }
 			return t
 		end`)
 		var le *LoadError
@@ -106,7 +106,7 @@ func TestNodeClassContract(t *testing.T) {
 	})
 	t.Run("port hint out of range fails loud", func(t *testing.T) {
 		_, err := runSource(t, `return function()
-			return { publicvpn.node{ raw = "vless://a@h:1", port = 99999 } }
+			return { assay.node{ raw = "vless://a@h:1", port = 99999 } }
 		end`)
 		if err == nil || !strings.Contains(err.Error(), "port hint 99999") {
 			t.Fatalf("expected loud port-range error, got: %v", err)
@@ -134,7 +134,7 @@ func TestNodeClassContract(t *testing.T) {
 		eng := newEngine(engineOptions{Log: io.Discard})
 		l := eng.newState(context.Background(), "test")
 		defer l.Close()
-		if err := l.DoString(`assert(getmetatable(publicvpn.node{raw="x"}) == "publicvpn.node")`); err != nil {
+		if err := l.DoString(`assert(getmetatable(assay.node{raw="x"}) == "assay.node")`); err != nil {
 			t.Fatalf("node class marker broken: %v", err)
 		}
 	})
@@ -145,7 +145,7 @@ func TestNodeClassContract(t *testing.T) {
 // nobody intended. The rejection is loud and names the param and the value.
 func TestNonIntegerPortHintFailsLoud(t *testing.T) {
 	_, err := runSource(t, `return function()
-		return { publicvpn.node{ raw = "vless://a@h:1", port = 443.7 } }
+		return { assay.node{ raw = "vless://a@h:1", port = 443.7 } }
 	end`)
 	if err == nil || !strings.Contains(err.Error(), "port") || !strings.Contains(err.Error(), "443.7") {
 		t.Fatalf("expected loud non-integer port error naming port and 443.7, got: %v", err)
@@ -191,7 +191,7 @@ func TestHostHTTP(t *testing.T) {
 
 	t.Run("GET with headers", func(t *testing.T) {
 		nodes := runMustNodes(t, fmt.Sprintf(`return function()
-			local r = publicvpn.http{ url = "%s/get", headers = { ["X-Probe"] = "1" } }
+			local r = assay.http{ url = "%s/get", headers = { ["X-Probe"] = "1" } }
 			assert(r.status == 200, "status " .. r.status)
 			assert(r.body == "hello", "body " .. r.body)
 			assert(r.headers["X-Reply"] == nil, "unexpected header")
@@ -204,7 +204,7 @@ func TestHostHTTP(t *testing.T) {
 		_, err := eng.Run(context.Background(), &Plugin{
 			ID: "t", Path: "t.lua",
 			Code: []byte(fmt.Sprintf(`return function()
-				local r = publicvpn.http{ url = "%s/get", headers = { ["X-Probe"] = "1" } }
+				local r = assay.http{ url = "%s/get", headers = { ["X-Probe"] = "1" } }
 				assert(r.status == 200)
 				return {}
 			end`, srv.URL)),
@@ -215,7 +215,7 @@ func TestHostHTTP(t *testing.T) {
 	})
 	t.Run("POST with body", func(t *testing.T) {
 		runMustNodes(t, fmt.Sprintf(`return function()
-			local r = publicvpn.http{ url = "%s/post", method = "POST", body = "payload" }
+			local r = assay.http{ url = "%s/post", method = "POST", body = "payload" }
 			assert(r.status == 200, "status " .. r.status)
 			assert(r.body == "posted:payload", "body " .. r.body)
 			assert(r.headers["X-Reply"] == "yes", "missing response header")
@@ -224,16 +224,16 @@ func TestHostHTTP(t *testing.T) {
 	})
 	t.Run("redirects followed and capped", func(t *testing.T) {
 		runMustNodes(t, fmt.Sprintf(`return function()
-			local r = publicvpn.http{ url = "%s/redirect" }
+			local r = assay.http{ url = "%s/redirect" }
 			assert(r.status == 200 and r.body == "landed", "default follow broken")
-			local capped = publicvpn.http{ url = "%s/redirect", max_redirects = 0 }
+			local capped = assay.http{ url = "%s/redirect", max_redirects = 0 }
 			assert(capped.status == 302, "cap not honored: " .. capped.status)
 			return {}
 		end`, srv.URL, srv.URL))
 	})
 	t.Run("timeout is loud", func(t *testing.T) {
 		_, err := runSource(t, fmt.Sprintf(`return function()
-			return { publicvpn.http{ url = "%s/slow", timeout = 0.2 } }
+			return { assay.http{ url = "%s/slow", timeout = 0.2 } }
 		end`, srv.URL))
 		deadline := strings.Contains(err.Error(), "context deadline exceeded")
 		timeout := strings.Contains(err.Error(), "Timeout")
@@ -243,7 +243,7 @@ func TestHostHTTP(t *testing.T) {
 	})
 	t.Run("max_body_bytes exceeded is loud", func(t *testing.T) {
 		_, err := runSource(t, fmt.Sprintf(`return function()
-			return { publicvpn.http{ url = "%s/big", max_body_bytes = 1024 } }
+			return { assay.http{ url = "%s/big", max_body_bytes = 1024 } }
 		end`, srv.URL))
 		if err == nil || !strings.Contains(err.Error(), "exceeds max_body_bytes") {
 			t.Fatalf("expected loud body-limit error, got: %v", err)
@@ -251,7 +251,7 @@ func TestHostHTTP(t *testing.T) {
 	})
 	t.Run("non-2xx is a value, not an error", func(t *testing.T) {
 		runMustNodes(t, fmt.Sprintf(`return function()
-			local r = publicvpn.http{ url = "%s/missing" }
+			local r = assay.http{ url = "%s/missing" }
 			assert(r.status == 404, "expected 404, got " .. r.status)
 			return {}
 		end`, srv.URL))
@@ -260,7 +260,7 @@ func TestHostHTTP(t *testing.T) {
 		t.Setenv("http_proxy", "127.0.0.1:1")
 		t.Setenv("https_proxy", "127.0.0.1:1")
 		runMustNodes(t, fmt.Sprintf(`return function()
-			local r = publicvpn.http{ url = "%s/plain" }
+			local r = assay.http{ url = "%s/plain" }
 			assert(r.status == 200, "proxied? status " .. r.status)
 			return {}
 		end`, srv.URL))
@@ -272,7 +272,7 @@ func TestHostHTTP(t *testing.T) {
 		}
 	})
 	t.Run("missing url is loud", func(t *testing.T) {
-		_, err := runSource(t, `return function() return { publicvpn.http{} } end`)
+		_, err := runSource(t, `return function() return { assay.http{} } end`)
 		if err == nil || !strings.Contains(err.Error(), "url (non-empty string) is required") {
 			t.Fatalf("expected loud url error, got: %v", err)
 		}
@@ -318,7 +318,7 @@ func TestHostGitHubFiles(t *testing.T) {
 	t.Run("contents discovery honors include", func(t *testing.T) {
 		_, err := engine().Run(context.Background(), &Plugin{ID: "t", Path: "t.lua", Code: []byte(`
 			return function()
-				local files = publicvpn.github_files{ repo = "owner/repo", include = { "sub/" } }
+				local files = assay.github_files{ repo = "owner/repo", include = { "sub/" } }
 				assert(#files == 2, "expected 2 files, got " .. #files)
 				assert(files[1].path == "sub/a.txt", files[1].path)
 				assert(files[1].content == "vless://a@h:1#a\n", files[1].content)
@@ -331,7 +331,7 @@ func TestHostGitHubFiles(t *testing.T) {
 	t.Run("manifest discovery", func(t *testing.T) {
 		_, err := engine().Run(context.Background(), &Plugin{ID: "t", Path: "t.lua", Code: []byte(`
 			return function()
-				local files = publicvpn.github_files{ repo = "owner/repo", manifest = "index.json" }
+				local files = assay.github_files{ repo = "owner/repo", manifest = "index.json" }
 				assert(#files == 1, "expected 1 file, got " .. #files)
 				assert(files[1].path == "sub/a.txt", files[1].path)
 				return {}
@@ -351,7 +351,7 @@ func TestHostGitHubFiles(t *testing.T) {
 		}, io.Discard)
 		_, err := eng.Run(context.Background(), &Plugin{ID: "t", Path: "t.lua", Code: []byte(`
 			return function()
-				return { publicvpn.github_files{ repo = "owner/repo" } }
+				return { assay.github_files{ repo = "owner/repo" } }
 			end`)})
 		if err == nil || !strings.Contains(err.Error(), "truncated") {
 			t.Fatalf("expected loud truncated-tree error, got: %v", err)
@@ -360,7 +360,7 @@ func TestHostGitHubFiles(t *testing.T) {
 	t.Run("no matches fails loud", func(t *testing.T) {
 		_, err := engine().Run(context.Background(), &Plugin{ID: "t", Path: "t.lua", Code: []byte(`
 			return function()
-				return { publicvpn.github_files{ repo = "owner/repo", include = { "nomatch/" } } }
+				return { assay.github_files{ repo = "owner/repo", include = { "nomatch/" } } }
 			end`)})
 		if err == nil || !strings.Contains(err.Error(), "no files matched") {
 			t.Fatalf("expected loud no-match error, got: %v", err)
@@ -371,17 +371,17 @@ func TestHostGitHubFiles(t *testing.T) {
 func TestHostBase64AndJSON(t *testing.T) {
 	t.Run("base64 round-trip + flexible decode", func(t *testing.T) {
 		runMustNodes(t, `return function()
-			local enc = publicvpn.base64.encode("hello")
+			local enc = assay.base64.encode("hello")
 			assert(enc == "aGVsbG8=", "encode: " .. enc)
-			assert(publicvpn.base64.decode(enc) == "hello")
-			assert(publicvpn.base64.decode("aGVsbG8") == "hello", "raw std decode")
-			assert(publicvpn.base64.decode("-8") == "\251", "url-safe decode")
+			assert(assay.base64.decode(enc) == "hello")
+			assert(assay.base64.decode("aGVsbG8") == "hello", "raw std decode")
+			assert(assay.base64.decode("-8") == "\251", "url-safe decode")
 			return {}
 		end`)
 	})
 	t.Run("base64 decode invalid is loud", func(t *testing.T) {
 		_, err := runSource(t, `return function()
-			return { publicvpn.base64.decode("!!!") }
+			return { assay.base64.decode("!!!") }
 		end`)
 		if err == nil || !strings.Contains(err.Error(), "not valid base64") {
 			t.Fatalf("expected loud base64 error, got: %v", err)
@@ -389,7 +389,7 @@ func TestHostBase64AndJSON(t *testing.T) {
 	})
 	t.Run("json decode shape", func(t *testing.T) {
 		runMustNodes(t, `return function()
-			local d = publicvpn.json.decode('{"subscriptions":[{"id":"a","url":"u"}],"n":2,"ok":true,"x":null}')
+			local d = assay.json.decode('{"subscriptions":[{"id":"a","url":"u"}],"n":2,"ok":true,"x":null}')
 			assert(d.subscriptions[1].id == "a", "nested decode")
 			assert(d.n == 2 and d.ok == true and d.x == nil)
 			return {}
@@ -398,17 +398,17 @@ func TestHostBase64AndJSON(t *testing.T) {
 	t.Run("json round-trip", func(t *testing.T) {
 		runMustNodes(t, `return function()
 			local t = { a = { 1, 2, 3 }, b = "s", c = false }
-			local enc = publicvpn.json.encode(t)
-			local back = publicvpn.json.decode(enc)
+			local enc = assay.json.encode(t)
+			local back = assay.json.decode(enc)
 			assert(back.a[2] == 2 and back.b == "s" and back.c == false)
 			return {}
 		end`)
 	})
 	t.Run("json decode invalid is loud", func(t *testing.T) {
 		_, err := runSource(t, `return function()
-			return { publicvpn.json.decode("{oops") }
+			return { assay.json.decode("{oops") }
 		end`)
-		if err == nil || !strings.Contains(err.Error(), "publicvpn.json.decode") {
+		if err == nil || !strings.Contains(err.Error(), "assay.json.decode") {
 			t.Fatalf("expected loud json error, got: %v", err)
 		}
 	})
@@ -455,7 +455,7 @@ func TestSandbox(t *testing.T) {
 		eng := newEngine(engineOptions{Log: &out})
 		_, err := eng.Run(context.Background(), &Plugin{ID: "t", Path: "t.lua", Code: []byte(`
 			return function()
-				publicvpn.log("count", 3, false)
+				assay.log("count", 3, false)
 				return {}
 			end`)})
 		if err != nil {
@@ -473,11 +473,11 @@ func TestSandbox(t *testing.T) {
 			t.Fatal("print must be absent from the sandbox")
 		}
 	})
-	t.Run("host functions are the whole publicvpn table", func(t *testing.T) {
+	t.Run("host functions are the whole assay table", func(t *testing.T) {
 		runMustNodes(t, `return function()
 			local expect = { node=true, http=true, github_files=true, log=true,
 				base64=true, json=true }
-			for k, _ in pairs(publicvpn) do
+			for k, _ in pairs(assay) do
 				assert(expect[k], "undocumented host symbol: " .. tostring(k))
 			end
 			return {}
@@ -489,7 +489,7 @@ func TestLoadCheckBlocksNetwork(t *testing.T) {
 	// A plugin doing network work in the chunk itself fails the load check
 	// loud — fetches belong inside the returned discover function.
 	_, err := Compile("eager", "eager.lua", []byte(`
-		local r = publicvpn.http{ url = "http://127.0.0.1:1/" }
+		local r = assay.http{ url = "http://127.0.0.1:1/" }
 		return function() return {} end`), io.Discard)
 	if err == nil || !strings.Contains(err.Error(),
 		"network is not available while the plugin is being loaded") {
@@ -508,7 +508,7 @@ func TestGopherLuaInlineGmatchWorkaround(t *testing.T) {
 	l := eng.newState(context.Background(), "t")
 	defer l.Close()
 	inline := `local function bl()
-		local ok, d = pcall(publicvpn.base64.decode, "dmxlc3M6Ly9h")
+		local ok, d = pcall(assay.base64.decode, "dmxlc3M6Ly9h")
 		return d
 	end
 	local n = 0
@@ -518,7 +518,7 @@ func TestGopherLuaInlineGmatchWorkaround(t *testing.T) {
 	require.Error(t, err, "gopher-lua v1.1.2 panics on inline call-chain for-in — if this passes, upstream fixed the VM and the plugin comments can be relaxed")
 
 	assigned := `local function bl()
-		local ok, d = pcall(publicvpn.base64.decode, "dmxlc3M6Ly9h")
+		local ok, d = pcall(assay.base64.decode, "dmxlc3M6Ly9h")
 		return d
 	end
 	local n = 0
@@ -550,7 +550,7 @@ func TestRunRecoversLuaRuntimePanic(t *testing.T) {
 		// The pinned gopher-lua v1.1.2 panic: a for-in iterator fed an
 		// INLINE call-chain expression — nil dereference inside the VM.
 		Code: []byte(`local function bl()
-	local ok, d = pcall(publicvpn.base64.decode, "dmxlc3M6Ly9h")
+	local ok, d = pcall(assay.base64.decode, "dmxlc3M6Ly9h")
 	return d
 end
 return function()
