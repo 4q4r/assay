@@ -1,7 +1,7 @@
 # assay — design
 
 **Status:** DRAFT v1 (2026-10-28) — awaiting owner approval. Nothing implemented.
-**Author:** controller synthesis of 3 subagent reports (StintikVPN repo analysis; Exa/GitHub internet research; live xray-raw audit), all facts URL- or disk-verified 2026-10-28.
+**Author:** controller synthesis of 3 subagent reports (upstream source analysis; Exa/GitHub internet research; live xray-raw audit), all facts URL- or disk-verified 2026-10-28.
 **Live client today:** xray-core 26.3.27 (`cc66b68-dirty`), config validates OK (`xray run -test` → `Configuration OK`).
 
 ## 1. Intent
@@ -27,17 +27,11 @@ Extend the owner's laptop xray client (`~/projects/xray-raw`) with a curated poo
 
 ## 3. Substrate — what we ingest
 
-**StintikVPN repo verdict:** a curated *link directory*, not a node source. Zero `vless://`/`vmess://` URIs anywhere; content = 5 upstream subscription URLs + 5 Telegram MTProto links (irrelevant to xray). MIT, active (pushed 2026-10-26, 161★, 0 open issues), daily CI liveness-checking the links. **Use:** consume its upstreams directly; optionally poll its `data.json` + `dead-link` issue as a source-health signal.
+**Sources are bring-your-own.** The repository ships exactly one tracked ingest plugin — `internal/plugins/defaults/sample.lua` — a documented, working template of the host API (`assay.node` / `assay.http` / `assay.base64` / `assay.github_files` / `assay.json` / `assay.log`). It materializes into the plugins dir on FIRST RUN (missing dir → written 0600; an existing dir is never touched — owner edits and removals persist). Every other source is an owner-added `.lua` file dropped into `[plugins].dir` and hot-reloaded by the `assay watch` daemon — a new provider is a new file, no rebuild. Nothing provider-specific ships in-repo.
 
-**Source registry (all verified alive 2026-10-27/28):**
+**D9 — dynamic sources (owner, 2026-10-28):** URLs are NOT pinned — a plugin stores repo ids + a discovery method (GitHub contents API listing / upstream manifest files); fetch resolves current raw paths at every wave, so upstream reorganizations and new split files propagate automatically.
 
-| id | source | cadence | why |
-| :-- | :-- | :-- | :-- |
-| `matin` | `MatinGhanbari/v2ray-configs` — per-protocol `vless.txt`, `all_sub.txt`, `super-sub.txt` | 15 min | no-wipe 404 semantics; `super-sub` = pre-tested best |
-| `radikal` | `0xRadikal/Free-v2ray-Configs` — `secure/configs.txt` + per-protocol | 15 min | pre-filtered forward secrecy (no `allowInsecure`, no PSK-only); 404-never-empty-wipes semantics |
-| `tvc` | `xtoolkit/TVC` — per-protocol files | hourly | Telegram-channel breadth (continuation of yebekhe/TVC) |
-
-Default enabled (current, 12): `matin`, `radikal`, `stintikvpn`, `hidashimora`, `kort0881`, `au1rxx`, `barryfar`, `mehdirzfx`, `flat447`, `luxxuria`, `igareck`, `nodesradar`. `tvc` optional. **D9: URLs are NOT pinned** — the registry stores repo ids + a discovery method (GitHub contents API listing / upstream manifest files such as 0xRadikal's `index.json`); fetch resolves current raw paths at every wave, so upstream reorganizations and new split files propagate automatically. Skipping `mahdibland/V2RayAggregator` full merge (their own README warns it crashes clients). **RF reality check:** most public VLESS is `tcp+vision` — exactly the profile TSPU blocks post-handshake (net4people/bbs#546). The working subset is small; the pool is a *location* source, never a primary transport.
+**RF reality check:** most public VLESS is `tcp+vision` — exactly the profile TSPU blocks post-handshake (net4people/bbs#546). The working subset is small; the pool is a *location* source, never a primary transport.
 
 ## 4. Pipeline
 
@@ -81,7 +75,7 @@ fetch → parse → filter → probe → select → render → activate
 ## 7. Security model
 
 - The node operator is a man-in-the-middle by design: sees DNS, inner SNI, timing, volumes, the real client IP; REALITY `pbk` authenticates the operator to us — it does not protect us from the operator. Hence D2: disposable traffic only, logins/banking never (SMTP is blocked pre-pool anyway).
-- Link hygiene at ingest: drop `allowInsecure=1`, drop PSK-only protocols, prefer forward-secrecy transports (reality/tls) — mirrors 0xRadikal's SECURE criterion.
+- Link hygiene at ingest: drop `allowInsecure=1`, drop PSK-only protocols, prefer forward-secrecy transports (reality/tls) — the standard curated-list SECURE criterion.
 - Trust extends into the future: feeds can swap endpoints any hour → every wave re-filters and re-probes; nodes failing twice get pruned.
 - Footprint: bulk probing = a fan-out of foreign-IP TLS dials from the home RU IP. Default = local but throttled (concurrency + probes/min caps); VPS mode (run probe stage on an own server, sync results) as an optional flag.
 - Source fetches over HTTPS (raw.githubusercontent / gitverse mirror): the registry stores repo ids + a discovery method, and fetch resolves the current raw paths at every wave (D9 dynamic discovery — no pinned URLs).

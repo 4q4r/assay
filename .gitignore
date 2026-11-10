@@ -5,6 +5,7 @@
 # Local scratch (never committed)
 *.tmp-*
 *.log
+.superpowers/
 
 # Operational pipeline config (owner-private; sanitized template = config.example.toml)
 /config.toml
@@ -15,6 +16,10 @@
 # Editor crash snapshots (unsaved-buffer dumps like client.go.1234567890)
 *.go.[0-9]*
 
-# Lua plugins: bundled defaults + any runtime-generated plugin files
+# Lua plugins: bundled defaults + any runtime-generated plugin files.
+# The defaults dir is gitignored (sources are bring-your-own; nothing
+# provider-specific ships in-repo) — EXCEPT the tracked sample template,
+# which the go:embed glob needs and fresh clones must receive.
 internal/plugins/defaults/*.lua
 *.lua
+!internal/plugins/defaults/sample.lua

@@ -1,7 +1,7 @@
-# `publicvpn status` — Provider Intelligence Dashboard: UI/UX Design Spec
+# `assay status` — Provider Intelligence Dashboard: UI/UX Design Spec
 
 **Status:** Design Spec (Code-Verified) — 0 code modifications in this phase.
-**Target:** Transform `publicvpn status` from a plain debug log into an intelligent decision dashboard for evaluating, pruning, and optimizing node sources/plugins (Lua plugins).
+**Target:** Transform `assay status` from a plain debug log into an intelligent decision dashboard for evaluating, pruning, and optimizing node sources/plugins (Lua plugins).
 
 ---
 
@@ -9,12 +9,12 @@
 
 All screens leverage the existing single-styling owner in `internal/ui` (lipgloss v2, ANSI-256 traffic lights 46/214/196, dim tree glyphs, table borders).
 
-### 1.1 Standard View (`publicvpn status`)
+### 1.1 Standard View (`assay status`)
 
 ```
-publicvpn pipeline status
-config: local-share default ~/.local/share/publicvpn/config.toml
-data dir: /home/user/.local/share/publicvpn
+assay pipeline status
+config: local-share default ~/.local/share/assay/config.toml
+data dir: /home/<user>/.local/share/assay
 
 ┌─ Pipeline Funnel ─────────────────────────────────────────────────────────┐
 │ Fetched       14,208  [███████████████████████████ 100.0%]                │
@@ -45,11 +45,11 @@ data dir: /home/user/.local/share/publicvpn
 │ haker23378-netizen  1,800  15 (8.3%)   12 (6.7%)   ▃▃▃▄▄▅  11.8% 95.2%  │
 └───────────────────────────────────────────────────────────────────────────┘
 
-install:  installed binary: ~/.local/bin/publicvpn
+install:  installed binary: ~/.local/bin/assay
 service:  enabled active (daemon)
 ```
 
-### 1.2 Verbose / Overlap View (`publicvpn status --overlap` or `status -v`)
+### 1.2 Verbose / Overlap View (`assay status --overlap` or `status -v`)
 
 ```
 ...
@@ -123,13 +123,13 @@ Built using the existing `ui.Table` component (lipgloss NormalBorder, dim 238 bo
 
 ## 4. Machine-Readable JSON Schema (`--json`)
 
-When `publicvpn status --json` is executed, the dashboard is bypassed in favor of a structured JSON dump:
+When `assay status --json` is executed, the dashboard is bypassed in favor of a structured JSON dump:
 
 ```json
 {
   "schema_version": "1.0",
   "generated_at": "2026-11-04T14:32:15Z",
-  "config_source": "local-share default /home/user/.local/share/publicvpn/config.toml",
+  "config_source": "local-share default /home/<user>/.local/share/assay/config.toml",
   "pipeline": {
     "fetched": 14208,
     "filtered": 9412,
