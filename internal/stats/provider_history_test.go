@@ -392,15 +392,15 @@ func TestReadProviderHistoryMissingFile(t *testing.T) {
 func TestWriteReadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "provider-history.json")
 	now := mustTime("2026-11-04T10:00:00Z")
-	_, err := RecordWaveSnapshot(path, "matin", snapAt("2026-11-04T09:00:00Z", 4435, 800, 700, 100, 1234), now)
+	_, err := RecordWaveSnapshot(path, "prov-a", snapAt("2026-11-04T09:00:00Z", 4435, 800, 700, 100, 1234), now)
 	require.NoError(t, err)
-	_, err = RecordWaveSnapshot(path, "mhd", snapAt("2026-11-04T09:10:00Z", 3998, 500, 480, 10, 900), now)
+	_, err = RecordWaveSnapshot(path, "prov-b", snapAt("2026-11-04T09:10:00Z", 3998, 500, 480, 10, 900), now)
 	require.NoError(t, err)
 
 	h, err := ReadProviderHistory(path)
 	require.NoError(t, err)
 	require.Len(t, h.Providers, 2)
-	m := h.Providers["matin"]
+	m := h.Providers["prov-a"]
 	require.NotNil(t, m)
 	require.Len(t, m.Waves, 1)
 	assert.Equal(t, 4435, m.Waves[0].Total)
@@ -412,7 +412,7 @@ func TestProviderHistoryDeterministicBytes(t *testing.T) {
 	build := func(dir string) {
 		path := filepath.Join(dir, "provider-history.json")
 		now := mustTime("2026-11-04T10:00:00Z")
-		for _, id := range []string{"zz", "matin", "aa", "mhd"} {
+		for _, id := range []string{"zz", "prov-a", "aa", "prov-b"} {
 			for i := range 5 {
 				ts := now.Add(-time.Duration(5-i) * time.Hour).UTC().Format(time.RFC3339)
 				_, err := RecordWaveSnapshot(path, id, snapAt(ts, 1000+i, 500+i, 400, 50, int64(800+i)), now)
@@ -453,7 +453,7 @@ func TestProviderHistoryAtomicNoTmpLeftovers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "provider-history.json")
 	now := mustTime("2026-11-04T10:00:00Z")
-	_, err := RecordWaveSnapshot(path, "matin", snapAt("2026-11-04T09:00:00Z", 10, 5, 4, 1, 50), now)
+	_, err := RecordWaveSnapshot(path, "prov-a", snapAt("2026-11-04T09:00:00Z", 10, 5, 4, 1, 50), now)
 	require.NoError(t, err)
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -510,7 +510,7 @@ func TestProviderHistoryConcurrentAccess(t *testing.T) {
 func TestProviderHistoryVersionPinned(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "provider-history.json")
 	now := mustTime("2026-11-04T10:00:00Z")
-	_, err := RecordWaveSnapshot(path, "matin", snapAt("2026-11-04T09:00:00Z", 10, 5, 4, 1, 50), now)
+	_, err := RecordWaveSnapshot(path, "prov-a", snapAt("2026-11-04T09:00:00Z", 10, 5, 4, 1, 50), now)
 	require.NoError(t, err)
 	var raw map[string]any
 	b, err := os.ReadFile(path)

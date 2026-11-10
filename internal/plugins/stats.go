@@ -45,7 +45,7 @@ type PluginStats struct {
 	// yield is ~0 adds nothing to the pool).
 	UniqueYield float64
 	// TopOverlaps lists the strongest overlap partners (descending percent,
-	// plugin-id tie-break, max 2) — e.g. "matin (61%), mhd (18%)".
+	// plugin-id tie-break, max 2) — e.g. "prov-a (61%), prov-b (18%)".
 	TopOverlaps []OverlapPair
 }
 
