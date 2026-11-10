@@ -33,10 +33,11 @@ data_dir = "~/.local/share/assay"
 # ── Plugins (W10): the source-ingest layer is LUA PLUGINS, not config
 #    tables. Each .lua file in [plugins].dir is one source: it fetches and
 #    iterates, hands raw links to Go as assay.node records, and Go keeps
-#    owning URI parsing/dedupe. The built-in plugins (matin, radikal,
-#    stintikvpn, etc.) materialize into the dir on FIRST RUN —
-#    owner edits and removals persist; a new provider is a new .lua file, no
-#    rebuild. The `assay watch` daemon hot-reloads the dir on the fly. ──
+#    owning URI parsing/dedupe. Sources are bring-your-own: the built-in
+#    sample plugin (sample.lua — the tracked template of the host API)
+#    materializes into the dir on FIRST RUN — owner edits and removals
+#    persist; a new provider is a new .lua file, no rebuild. The
+#    `assay watch` daemon hot-reloads the dir on the fly. ──
 [plugins]
 # dir = "~/.local/share/assay/plugins"  # default: <data_dir>/plugins
 # run_timeout = "120s"  # bound on ONE plugin's whole fetch run; an explicit
