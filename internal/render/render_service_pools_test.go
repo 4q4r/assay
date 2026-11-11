@@ -39,28 +39,23 @@ func geoEvidence(nodes []*model.Node, byHost map[string]model.GeoRecord) map[str
 	return out
 }
 
-// renderGeo is the geo-aware render helper: the shared template + evidence
-// map + pool routes, returning the parsed config.
+// renderGeo is the geo-aware render helper: the own config + evidence map +
+// pool routes, returning the route warnings, the raw bytes and the parsed
+// config.
 func renderGeo(
 	t *testing.T, nodes []*model.Node, sel *model.Selection,
 	geo map[string]*model.GeoRecord, routes []render.PoolRoute,
-) (render.Result, map[string]any) {
+) ([]string, []byte, map[string]any) {
 	t.Helper()
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey:   geo,
-		Cfg:        renderCfg(routes),
-	})
+	b, warnings, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, geo, render.Config{})
 	require.NoError(t, err)
 	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
-	return res, m
+	require.NoError(t, json.Unmarshal(b, &m))
+	return warnings, b, m
 }
 
 // doRenderGeo renders and parses (the geo-aware doRender counterpart; no
@@ -70,7 +65,7 @@ func doRenderGeo(
 	geo map[string]*model.GeoRecord,
 ) map[string]any {
 	t.Helper()
-	_, m := renderGeo(t, nodes, sel, geo, nil)
+	_, _, m := renderGeo(t, nodes, sel, geo, nil)
 	return m
 }
 
@@ -299,29 +294,16 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 	}
 
 	// Determinism: identical input renders byte-identical output.
-	res1, _ := renderGeo(t, nodes, sel, geoEvidence(nodes, byHost), nil)
-	res2, _ := renderGeo(t, nodes, sel, geoEvidence(nodes, byHost), nil)
-	require.NoError(t, json.Unmarshal(res1.Config, &map[string]any{}))
-	assert.Equal(t, string(res1.Config), string(res2.Config), "service pools must render deterministically")
+	_, raw1, _ := renderGeo(t, nodes, sel, geoEvidence(nodes, byHost), nil)
+	_, raw2, _ := renderGeo(t, nodes, sel, geoEvidence(nodes, byHost), nil)
+	assert.Equal(t, string(raw1), string(raw2), "service pools must render deterministically")
 
-	// Re-render idempotency: feeding a rendered config back as the template
-	// must not duplicate the service balancers (the pool_ strip covers them).
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	second, err := render.Render(render.Input{
-		Template:   res1.Config,
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey:   geoEvidence(nodes, byHost),
-		Cfg:        renderCfg(nil),
-	})
-	require.NoError(t, err)
-	var m2 map[string]any
-	require.NoError(t, json.Unmarshal(second.Config, &m2))
+	// Single-emission: every service balancer renders EXACTLY ONCE per render
+	// (the own render regenerates from scratch each wave — the emission
+	// contract that survives the template merge).
+	m1 := m
 	serviceTags := map[string]int{}
-	for _, b := range balancersOf(t, m2) {
+	for _, b := range balancersOf(t, m1) {
 		tag, _ := b["tag"].(string)
 		for _, want := range []string{"pool_clean", "pool_chatgpt", "pool_netflix", "pool_youtube",
 			"pool_de_chatgpt", "pool_de_netflix", "pool_de_frankfurt_chatgpt", "pool_de_frankfurt_netflix",
@@ -336,7 +318,7 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 		"pool_de_chatgpt": 1, "pool_de_netflix": 1,
 		"pool_de_frankfurt_chatgpt": 1, "pool_de_frankfurt_netflix": 1,
 		"pool_de_clean": 1, "pool_unknown_clean": 1,
-	}, serviceTags, "re-render must not duplicate any service balancer")
+	}, serviceTags, "every service balancer renders exactly once per render")
 }
 
 // serviceSelector fetches one service balancer's selector list.
@@ -574,9 +556,7 @@ func TestCleanFamilyUncheckedIsByteIdentical(t *testing.T) {
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	knobOff, err := render.Render(render.Input{
-		Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: renderCfg(nil),
-	})
+	knobOff, _, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey, nil, render.Config{})
 	require.NoError(t, err)
 
 	// Evidence present but EVERY record unchecked (-1): identical bytes.
@@ -584,16 +564,11 @@ func TestCleanFamilyUncheckedIsByteIdentical(t *testing.T) {
 	for _, n := range nodes {
 		byHost[n.Host] = model.GeoRecord{RiskScore: -1}
 	}
-	allUnchecked, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey:   geoEvidence(nodes, byHost),
-		Cfg:        renderCfg(nil),
-	})
+	allUnchecked, _, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey,
+		geoEvidence(nodes, byHost), render.Config{})
 	require.NoError(t, err)
 
-	assert.Equal(t, string(knobOff.Config), string(allUnchecked.Config),
+	assert.Equal(t, string(knobOff), string(allUnchecked),
 		"all-unchecked evidence must render byte-identically to the knob-off state")
 
 	// In that state the clean family is exactly the W16 flags-only sets.
@@ -626,7 +601,7 @@ func TestPoolRoutesServicePoolTargets(t *testing.T) {
 		{Balancer: "pool_chatgptt", Domains: []string{"domain:typo.example"}},
 		{Balancer: "pool_unknown_chatgpt", Domains: []string{"domain:x.example"}},
 	}
-	res, m := renderGeo(t, nodes, sel, geo, routes)
+	res, _, m := renderGeo(t, nodes, sel, geo, routes)
 
 	for _, target := range []string{"pool_chatgpt", "pool_de_netflix", "pool_youtube"} {
 		var rule map[string]any
@@ -637,13 +612,13 @@ func TestPoolRoutesServicePoolTargets(t *testing.T) {
 			}
 		}
 		require.NotNil(t, rule, "pool route to %s must render a balancerTag rule", target)
-		assert.Equal(t, []any{"socks-in", "http-in"}, rule["inboundTag"])
+		assert.Equal(t, []any{"in", "in-http"}, rule["inboundTag"])
 	}
 
 	// Unrendered service targets degrade to block, each with a warning.
-	require.Len(t, res.BlockedRoutes, 2, "typo and absent-tier targets must be reported")
-	assert.Contains(t, res.BlockedRoutes, `pool route balancer "pool_chatgptt" not rendered -> block`)
-	assert.Contains(t, res.BlockedRoutes, `pool route balancer "pool_unknown_chatgpt" not rendered -> block`)
+	require.Len(t, res, 2, "typo and absent-tier targets must be reported")
+	assert.Contains(t, res, `pool route balancer "pool_chatgptt" not rendered -> block`)
+	assert.Contains(t, res, `pool route balancer "pool_unknown_chatgpt" not rendered -> block`)
 	// The degraded rules keep their route domains (they blackhole exactly
 	// the domains the owner routed, nothing else).
 	degradedDomains := map[string]bool{}
@@ -661,13 +636,8 @@ func TestPoolRoutesServicePoolTargets(t *testing.T) {
 
 	// D6 namespace wall: a non-pool target still fails the render loud.
 	byKey := map[string]*model.Node{n.Key: n}
-	_, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey:   geo,
-		Cfg:        renderCfg([]render.PoolRoute{{Balancer: "chatgpt", Domains: []string{"domain:x.com"}}}),
-	})
+	_, _, err := render.RenderOwnConfig(sel, ownCore(),
+		[]render.PoolRoute{{Balancer: "chatgpt", Domains: []string{"domain:x.com"}}}, byKey, geo, render.Config{})
 	require.Error(t, err, "non-pool route targets must fail loud (D6)")
 	assert.Contains(t, err.Error(), "namespace wall D6")
 }

@@ -34,11 +34,6 @@ func maintainStateFixture(t *testing.T, alive bool, lastProbeAge time.Duration) 
 		Maintain: config.MaintainConfig{
 			PruneDeadAfter: config.Duration{Duration: 48 * time.Hour},
 		},
-		Render: config.RenderConfig{Template: tmpl, OutputDir: "rendered", StatsPort: 15490},
-		Activate: config.ActivateConfig{
-			Target:  filepath.Join(dir, "live.json"),
-			XrayBin: "/usr/bin/xray",
-		},
 	}
 	p := newPaths(cfg)
 	require.NoError(t, os.MkdirAll(p.dataDir, 0o750))
@@ -91,7 +86,8 @@ func TestPruneToEmptyPoolRenderRefusesObservatory(t *testing.T) {
 	// it); rank refuses it; the selection is empty; the render is L1-safe.
 	cfg := maintainStateFixture(t, true, 72*time.Hour)
 	out := runMaintainStagesDirectly(t, cfg, runPruneStage, runSelect, runRender)
-	assert.Contains(t, out, "WARNING: empty pool — no pool observatory/balancers rendered (L1 hard gate)")
+	assert.Contains(t, out, "render bootstrap: empty pool fail-closed (catch-all → block)",
+		"the empty-pool wave renders the D7 bootstrap posture")
 
 	sel, err := storeReadSelectionForTest(t, cfg)
 	require.NoError(t, err)
@@ -99,7 +95,7 @@ func TestPruneToEmptyPoolRenderRefusesObservatory(t *testing.T) {
 	assert.Empty(t, sel.Nodes, "the stale candidate must not re-enter the selection")
 
 	p := newPaths(cfg)
-	raw, err := os.ReadFile(p.rendered)
+	raw, err := os.ReadFile(ownLivePath(p))
 	require.NoError(t, err)
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(raw, &m))

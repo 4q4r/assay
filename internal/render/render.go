@@ -1,14 +1,16 @@
-// Package render implements the W3 xray client-config renderer: template +
-// pool outbounds + per-country/city leastLoad balancers + owner pool routes +
-// Plan A observatory, under the hard gates L1 (never an observatory whose
-// selector can match zero tags) and L2 (balancers require coverage). Every
-// link auth/transport param passes through 1:1 (L9); every pool outbound gets
+// Package render implements the xray client-config renderer: pool outbounds
+// + per-country/city leastLoad balancers + owner pool routes + Plan A
+// observatory under the hard gates L1 (never an observatory whose selector
+// can match zero tags) and L2 (balancers require coverage). Every link
+// auth/transport param passes through 1:1 (L9); every pool outbound gets
 // sockopt.tcpMaxSeg 1440 and client fingerprint firefox. Phase 3 adds the
 // service-quality balancer tree (pool_clean / pool_chatgpt / pool_netflix /
 // pool_youtube with country and city variants) rendered ONLY when qualifying
 // nodes exist — membership rides the Phase-1 unlock evidence (GeoRecord
 // RiskScore/MediaUnlocks) joined through model.GeoIdentity; nodes without
-// evidence never enter an unlock pool (fail-closed).
+// evidence never enter an unlock pool (fail-closed). Since the self-held-core
+// pivot (D3) there is ONE render target: the fully generated own live config
+// (RenderOwnConfig) — the foreign template merge is gone.
 package render
 
 import (
@@ -38,29 +40,6 @@ import (
 type PoolRoute struct {
 	Balancer string   `toml:"balancer"`
 	Domains  []string `toml:"domains"`
-}
-
-// ParamWarning reports the link parameters of one outbound that the renderer
-// could not place into the config. They are surfaced, never silently dropped
-// (L9 hygiene; review finding 5).
-type ParamWarning struct {
-	Tag    string   `json:"tag"`
-	Host   string   `json:"host"`
-	Params []string `json:"params"`
-}
-
-// Result carries the rendered config and the structured drop report.
-type Result struct {
-	Config        []byte
-	DroppedParams []ParamWarning
-	// BlockedRoutes lists pool routes whose target balancer/outbound was not
-	// rendered (no live nodes). Their rules were emitted with outboundTag
-	// "block" (blackhole) instead of crashing the render; each entry is a
-	// short description of the blocked route.
-	BlockedRoutes []string
-	// Warnings is an alias of BlockedRoutes kept for callers that surface
-	// warnings under that name.
-	Warnings []string
 }
 
 // materialParams are link parameters that change transport behavior when they
@@ -158,49 +137,30 @@ func appendEarlyData(path, ed string) string {
 }
 
 // Config carries the render knobs. Zero-value fields fall back to the W6
-// defaults (config.Default*) so direct Render callers keep the W3 shape
+// defaults (config.Default*) so direct callers keep the historical shape
 // byte-for-byte; config.Load always fills them with the same values (one
 // literal per default — no layer drift).
 type Config struct {
-	StatsPort  int
-	PoolRoutes []PoolRoute
-	// PoolInboundTags: inbound tags every pool rule carries; render-time
-	// validated against the template's inbounds. Zero → DefaultPoolInboundTags.
-	PoolInboundTags []string
-	// ObservatoryInterval: Plan-A probeInterval. Empty (the W19 default) →
-	// ADAPTIVE: the render computes max(60s, ceil(active×200ms)) from the
-	// selection size so sustained observatory probes stay ≤ 5/s regardless
-	// of pool growth (render.AdaptiveObservatoryInterval). A set value is a
-	// verbatim string passthrough. NEVER validated here (no floor per
-	// owner ruling); the L1 empty-selector refusal is orthogonal and stays
-	// unconditional.
+	// ObservatoryInterval is the Plan-A pool observatory probeInterval — a
+	// STRING PASSTHROUGH rendered verbatim when set, so any duration spelling
+	// the core accepts works. ABSENT (empty, the W19 default) = ADAPTIVE: the
+	// render computes the interval from the active count (max(60s,
+	// ceil(N×200ms)) — probes/sec ≤ 5, code-owned budget, no new knob).
+	// Deliberately unbounded (owner ruling — the ≥30s recommendation is
+	// rejected); garbage values fail the xray -test gate loud.
 	ObservatoryInterval string
-	// TCPMaxSeg: mandatory sockopt value on every pool outbound.
-	// Zero → config.DefaultTCPMaxSeg.
+	// TCPMaxSeg is the sockopt.tcpMaxSeg value emitted MANDATORILY on every
+	// rendered streamSettings (the owner-calibrated anti-TSPU clamp — the
+	// emission never becomes optional, only the value is configurable).
+	// Negative values are structurally invalid; otherwise unbounded.
 	TCPMaxSeg int
-	// TLSFingerprint: client fingerprint on tls/reality settings.
-	// Zero → config.DefaultTLSFingerprint.
+	// TLSFingerprint is the uTLS client fingerprint on tls/reality settings
+	// (default firefox). NO allowlist — a bad value fails the xray -test gate
+	// loud and safe.
 	TLSFingerprint string
-	// BalancerTolerance: leastLoad tolerance on country AND city balancers.
-	// Zero → config.DefaultBalancerTolerance.
+	// BalancerTolerance is the leastLoad tolerance on country AND city pool
+	// balancers (default 0.2). Deliberately unbounded (owner ruling).
 	BalancerTolerance float64
-}
-
-// Input bundles render dependencies.
-type Input struct {
-	Template   []byte
-	Selection  *model.Selection
-	NodesByKey map[string]*model.Node
-	Cfg        Config
-	// GeoByKey carries the Phase-1 unlock evidence: model.GeoRecord values
-	// keyed by model.GeoIdentity (scheme|host|port — the same map the
-	// pipeline builds from geo-base.jsonl for stats enrichment). nil or a
-	// missing record means UNCHECKED: the unlock service pools
-	// (pool_chatgpt/pool_netflix/pool_youtube and their country/city
-	// variants) stay absent, and the clean pools (the global pool_clean and
-	// the country/city clean tiers) fall back to flags-only membership
-	// (fail-closed — the [geo].unlock_probes-off state).
-	GeoByKey map[string]*model.GeoRecord
 }
 
 const (
@@ -247,7 +207,7 @@ const (
 	serviceClean   serviceKind = "clean"
 )
 
-// blockOutboundTag is the blackhole outbound, present in every template.
+// blockOutboundTag is the blackhole outbound (present in every own config).
 //
 // SECURITY INVARIANT (owner ruling, W9): every pool_* balancer emitted by the
 // renderer is pinned to fallbackTag "block", and this is deliberately NOT a
@@ -264,106 +224,13 @@ const (
 // configurable fallback could be set to direct (or removed) and reopen the
 // naked-exit hole — traffic routed to a location silently leaving from the
 // machine's real IP — so the value is hard-coded here, never plumbed from
-// config. Template balancers (best_rtt) are passthrough content and keep
-// their own fallback semantics byte-identical.
+// config.
 const blockOutboundTag = "block"
-
-// Render produces the complete xray config JSON (one document, no merge
-// stacking — L3). Output is byte-deterministic: maps marshal with sorted keys.
-// Link parameters that cannot be rendered are reported in the result — never
-// silently dropped; material ones (early-data) fail the render.
-func Render(in Input) (Result, error) {
-	var m map[string]any
-	if err := json.Unmarshal(in.Template, &m); err != nil {
-		return Result{}, fmt.Errorf("decode template: %w", err)
-	}
-	if err := stripPoolArtifacts(m); err != nil {
-		return Result{}, err
-	}
-	ensureAPIStats(m, in.Cfg.StatsPort)
-	ensureStatsAndPolicy(m)
-
-	poolCount := len(in.Selection.Nodes)
-
-	byTag := map[string]bool{}
-	for _, o := range toAnySlice(m["outbounds"]) {
-		if om, ok := o.(map[string]any); ok {
-			if tag, _ := om["tag"].(string); tag != "" {
-				byTag[tag] = true
-			}
-		}
-	}
-
-	cfg := normalizeKnobs(in.Cfg)
-
-	var dropped []ParamWarning
-	renderedBalancers := []string{}
-	if poolCount > 0 {
-		for _, sn := range in.Selection.Nodes {
-			n, ok := in.NodesByKey[sn.Key]
-			if !ok {
-				return Result{}, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
-			}
-			ob, unparsed, err := buildOutbound(n, sn.Tag, cfg)
-			if err != nil {
-				return Result{}, err
-			}
-			if len(unparsed) > 0 {
-				dropped = append(dropped, ParamWarning{Tag: sn.Tag, Host: n.Host, Params: unparsed})
-			}
-			if byTag[sn.Tag] {
-				return Result{}, fmt.Errorf("render: outbound tag %q already exists in template (namespace collision)", sn.Tag)
-			}
-			m["outbounds"] = append(toAnySlice(m["outbounds"]), ob)
-			byTag[sn.Tag] = true
-		}
-
-		renderedBalancers = addBalancers(m, in.Selection, in.NodesByKey, in.GeoByKey, cfg.BalancerTolerance)
-
-		// Plan A: legacy observatory covering exactly the pool namespace. The
-		// burstObservatory (Germans) is untouched — verified coexistence.
-		// probeInterval: verbatim passthrough of the observatory_interval
-		// knob when set; ABSENT (the W19 default) → the adaptive interval
-		// computed from the active count (observatoryInterval below). The
-		// subjectSelector covers EVERY pool tag regardless of count, so
-		// interval scaling never breaks L2 coverage; the L1 empty-selector
-		// refusal above is untouched by it.
-		m["observatory"] = map[string]any{
-			"subjectSelector":   []any{poolOutboundPrefix},
-			"probeInterval":     observatoryInterval(cfg.ObservatoryInterval, poolCount),
-			"enableConcurrency": true,
-		}
-	}
-
-	// [render].pool_routes are validated on EVERY render regardless of pool
-	// state (W7 hoist — it used to sit behind the empty-pool early return).
-	// With an empty pool no pool balancer/outbound exists, so any configured
-	// route target fails loud right here: the owner learns about the typo
-	// immediately instead of the rule silently falling through to the
-	// template's catch-all (D2). Zero routes (default config) is a no-op, so
-	// empty-pool renders stay byte-identical.
-	blocked, err := addPoolRules(m, in.Cfg.PoolRoutes, renderedBalancers, byTag, cfg.PoolInboundTags)
-	if err != nil {
-		return Result{}, err
-	}
-
-	if poolCount == 0 {
-		// L1/L2: nothing pool-related may render; the template passes through.
-		b, err := json.MarshalIndent(m, "", "  ")
-		return Result{Config: b, BlockedRoutes: blocked, Warnings: blocked}, err
-	}
-
-	b, err := json.MarshalIndent(m, "", "  ")
-	return Result{Config: b, DroppedParams: dropped, BlockedRoutes: blocked, Warnings: blocked}, err
-}
 
 // normalizeKnobs applies the W6 default fallbacks: a zero knob value means
 // "owner-mandated default" (the same values config.Load fills in — the
 // defaults live once in config, referenced here, so they cannot drift).
 func normalizeKnobs(c Config) Config {
-	if len(c.PoolInboundTags) == 0 {
-		c.PoolInboundTags = config.DefaultPoolInboundTags()
-	}
 	// ObservatoryInterval: intentionally NOT defaulted here (W19) — an empty
 	// value means ADAPTIVE pacing, resolved at the emission site from the
 	// active count; a set value passes through verbatim.
@@ -419,124 +286,8 @@ func observatoryInterval(verbatim string, active int) string {
 	return AdaptiveObservatoryInterval(active).String()
 }
 
-// stripPoolArtifacts removes every pool-owned artifact from a (possibly
-// previously rendered) template so re-renders are idempotent.
-func stripPoolArtifacts(m map[string]any) error {
-	stripPoolOutbounds(m)
-	stripPoolRouting(m)
-	return stripForeignObservatory(m)
-}
-
-func stripPoolOutbounds(m map[string]any) {
-	raw, ok := m["outbounds"].([]any)
-	if !ok {
-		return
-	}
-	kept := make([]any, 0, len(raw))
-	for _, o := range raw {
-		if om, isMap := o.(map[string]any); isMap {
-			if tag, _ := om["tag"].(string); strings.HasPrefix(tag, poolOutboundPrefix) {
-				continue
-			}
-		}
-		kept = append(kept, o)
-	}
-	m["outbounds"] = kept
-}
-
-func stripPoolRouting(m map[string]any) {
-	routing, _ := m["routing"].(map[string]any)
-	if routing == nil {
-		return
-	}
-	if raw, ok := routing["balancers"].([]any); ok {
-		kept := make([]any, 0, len(raw))
-		for _, b := range raw {
-			if bm, isMap := b.(map[string]any); isMap {
-				if tag, _ := bm["tag"].(string); strings.HasPrefix(tag, poolBalancerPrefix) {
-					continue
-				}
-			}
-			kept = append(kept, b)
-		}
-		routing["balancers"] = kept
-	}
-	if raw, ok := routing["rules"].([]any); ok {
-		kept := make([]any, 0, len(raw))
-		for _, r := range raw {
-			if rm, isMap := r.(map[string]any); isMap {
-				if bt, _ := rm["balancerTag"].(string); strings.HasPrefix(bt, poolBalancerPrefix) {
-					continue
-				}
-				// Direct-tag pool routes emit outboundTag=pool-<cc>-NN; in a
-				// previously rendered template only pool routes can carry a
-				// pool- outboundTag, so the same prefix rule keeps re-renders
-				// idempotent for them too.
-				if ot, _ := rm["outboundTag"].(string); strings.HasPrefix(ot, poolOutboundPrefix) {
-					continue
-				}
-				// Graceful-degradation pool routes (missing balancer) emit
-				// outboundTag=block with a non-empty domain list. Template
-				// block rules carry an EMPTY domain (catch-all), so the
-				// domain-presence check keeps re-renders idempotent without
-				// stripping legitimate catch-all block rules.
-				if isGracefulPoolRouteRule(rm) {
-					continue
-				}
-			}
-			kept = append(kept, r)
-		}
-		routing["rules"] = kept
-	}
-}
-
-// isGracefulPoolRouteRule reports whether rm is a pool route that was
-// degraded to the block outbound (missing balancer): outboundTag == "block"
-// with a non-empty domain list. Template catch-all block rules carry an
-// empty domain and are NOT matched.
-func isGracefulPoolRouteRule(rm map[string]any) bool {
-	ot, _ := rm["outboundTag"].(string)
-	if ot != blockOutboundTag {
-		return false
-	}
-	doms, _ := rm["domain"].([]any)
-	return len(doms) > 0
-}
-
-// stripForeignObservatory removes OUR legacy observatory (re-added fresh on
-// re-render) and refuses every other legacy observatory. L1 defense-in-depth:
-// one whose subjectSelector can match zero tags (empty array or missing
-// field) busy-loops the 26.3.27 core at ~100% CPU — that refusal is
-// unconditional, on any pool state; with a pool rendered, the Plan A
-// observatory would simply overwrite it, but a refusal here leaves no path
-// where the deadly shape reaches a rendered config.
-func stripForeignObservatory(m map[string]any) error {
-	obs, ok := m["observatory"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	selectors := stringSlice(obs["subjectSelector"])
-	if len(selectors) == 0 {
-		return errors.New("render: template carries a legacy observatory with an empty subjectSelector — " +
-			"it matches zero tags and busy-loops the core (L1, 26.3.27); remove it from the template " +
-			"or give it a non-empty selector")
-	}
-	ours := true
-	for _, s := range selectors {
-		if !strings.HasPrefix(s, poolOutboundPrefix) {
-			ours = false
-			break
-		}
-	}
-	if ours {
-		delete(m, "observatory")
-		return nil
-	}
-	return fmt.Errorf("render: template already carries a non-pool legacy observatory %v — "+
-		"Plan A cannot coexist; switch to Plan B", selectors)
-}
-
-// ensureAPIStats renders the api/stats service block bound to 127.0.0.1 only.
+// ensureAPIStats renders the api/stats service block bound to 127.0.0.1 only
+// (the own render is the only caller; the port is [core].api_port).
 func ensureAPIStats(m map[string]any, statsPort int) {
 	if _, ok := m["api"]; !ok {
 		m["api"] = map[string]any{
@@ -546,7 +297,7 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 	}
 	// dokodemo-door inbound for the API, loopback only.
 	apiIn := map[string]any{
-		"tag":      "api-in",
+		"tag":      APIInboundTag,
 		"listen":   "127.0.0.1",
 		keyPort:    statsPort,
 		"protocol": "dokodemo-door",
@@ -556,7 +307,7 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 	inbounds := toAnySlice(m["inbounds"])
 	for i, inb := range inbounds {
 		im, ok := inb.(map[string]any)
-		if ok && im["tag"] == "api-in" {
+		if ok && im["tag"] == APIInboundTag {
 			inbounds[i] = apiIn
 			replaced = true
 		}
@@ -581,7 +332,7 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 	}
 	apiRule := map[string]any{
 		"type":        "field",
-		"inboundTag":  []any{"api-in"},
+		"inboundTag":  []any{APIInboundTag},
 		"outboundTag": "api",
 	}
 	routing["rules"] = append([]any{apiRule}, rules...)
@@ -594,9 +345,8 @@ func ensureAPIStats(m map[string]any, statsPort int) {
 //   - without policy.system.statsOutboundUplink/Downlink the outbound
 //     handler's getStatCounter never registers the per-tag counters.
 //
-// The owner's live template carries neither, so the emission is additive and
-// unconditional (the api/stats block it feeds is unconditional since W3),
-// preserving any policy fields the template already carries.
+// The emission is unconditional (the api/stats block it feeds is
+// unconditional since W3).
 func ensureStatsAndPolicy(m map[string]any) {
 	if _, ok := m["stats"]; !ok {
 		m["stats"] = map[string]any{}
@@ -1128,24 +878,15 @@ func globalServiceTag(kind serviceKind) string {
 // is either a rendered pool_* balancer (emitted as balancerTag) or a rendered
 // pool-<cc>-NN outbound tag (emitted as outboundTag — D5 single-node city);
 // anything else fails loud (D6 namespace wall, unknown target). Every rule
-// carries inboundTag: inboundTags (the [render].pool_inbound_tags knob) —
-// and every listed tag is validated against the template's inbounds FIRST:
-// a missing tag fails the render loud, naming it (a silent fall-through to
-// the template's catch-all is exactly the D2 violation this closes).
+// carries inboundTag: inboundTags — the caller's GENERATED inbound tags (the
+// own config's in/in-http pair and its per-country in-<cc> set; the tags are
+// render-owned truth).
 func addPoolRules(
 	m map[string]any, routes []PoolRoute, renderedBalancers []string, renderedOutbounds map[string]bool,
 	inboundTags []string,
 ) ([]string, error) {
 	if len(routes) == 0 {
 		return nil, nil
-	}
-	missing := templateInboundTags(m).complement(inboundTags)
-	if len(missing) > 0 {
-		return nil, fmt.Errorf(
-			"render: pool_inbound_tags %v reference inbound tags missing from the template: %v — "+
-				"pool rules routed from nonexistent inbounds would silently fall through to the catch-all (D2); "+
-				"fix the template inbounds or pool_inbound_tags",
-			inboundTags, missing)
 	}
 	validBalancer := map[string]bool{}
 	for _, b := range renderedBalancers {
@@ -1197,7 +938,7 @@ func addPoolRules(
 	}
 
 	// Insert before the catch-all class: every rule of the trailing balancerTag
-	// run (the template's catch-all block may be several rules deep) sits AFTER
+	// run (the trailing catch-all block may be several rules deep) sits AFTER
 	// the pool rules, so pool domain rules are never shadowed by them.
 	insertAt := len(rules)
 	for insertAt > 0 {
@@ -1216,35 +957,6 @@ func addPoolRules(
 	updated = append(updated, rules[insertAt:]...)
 	routing["rules"] = updated
 	return blocked, nil
-}
-
-// tagSet is a set of inbound tags harvested from the template.
-type tagSet map[string]bool
-
-// complement returns every wanted tag not present in the set, sorted (the
-// error names them deterministically).
-func (s tagSet) complement(wanted []string) []string {
-	var missing []string
-	for _, w := range wanted {
-		if !s[w] {
-			missing = append(missing, w)
-		}
-	}
-	sort.Strings(missing)
-	return missing
-}
-
-// templateInboundTags collects the inbound tags defined by the template.
-func templateInboundTags(m map[string]any) tagSet {
-	set := tagSet{}
-	for _, inb := range toAnySlice(m["inbounds"]) {
-		if im, ok := inb.(map[string]any); ok {
-			if tag, _ := im["tag"].(string); tag != "" {
-				set[tag] = true
-			}
-		}
-	}
-	return set
 }
 
 // Repeated dial-block vocabulary as constants (goconst): the xray outbound
@@ -1799,17 +1511,286 @@ func toAnySlice(v any) []any {
 	return []any{}
 }
 
-// stringSlice coerces a stored interface value into []string.
-func stringSlice(v any) []string {
-	raw, ok := v.([]any)
-	if !ok {
-		return nil
+// ---- Own-target generation (self-held core pivot) ----
+
+// RouteRule is the S6 pool-route rule type of the own-target generation —
+// the re-homed [render].pool_routes entries (the design's name; the same
+// shape and semantics as the pre-pivot PoolRoute).
+type RouteRule = PoolRoute
+
+// Own inbound tag grammar (D2): the base socks/http pair plus per-country
+// socks ports tagged in-<cc> (cc = the ISO code, or the xx pseudo-location),
+// and the reserved stats/API dokodemo-door inbound. Exported: the status
+// core block (internal/cli) classifies the live config's inbounds against
+// this exact grammar — one definition of the tag contract.
+const (
+	SocksInboundTag     = "in"
+	HTTPInboundTag      = "in-http"
+	PerCountryTagPrefix = "in-"
+	APIInboundTag       = "api-in"
+)
+
+// IsPerCountryInboundTag reports the D2 per-country socks inbound shape:
+// in-<cc> with a two-letter lowercase suffix — the exact tags
+// addPerCountryInbounds generates.
+func IsPerCountryInboundTag(tag string) bool {
+	if !strings.HasPrefix(tag, PerCountryTagPrefix) || len(tag) != len(PerCountryTagPrefix)+2 {
+		return false
 	}
-	out := make([]string, 0, len(raw))
-	for _, r := range raw {
-		if s, ok := r.(string); ok {
-			out = append(out, s)
+	for i := len(PerCountryTagPrefix); i < len(tag); i++ {
+		if c := tag[i]; c < 'a' || c > 'z' {
+			return false
 		}
 	}
-	return out
+	return true
+}
+
+// Repeated object-key vocabulary of the own-target generation (goconst).
+const (
+	keyProtocol = "protocol"
+	keyRuleType = "type"
+)
+
+// normalizeCore applies the [core] defaults to a directly-constructed
+// CoreConfig — the same constants applyCoreDefaults materializes (one
+// default, one literal, no layer drift). Pipeline callers arrive
+// pre-normalized from config.Load; direct callers get the same shape.
+func normalizeCore(c config.CoreConfig) config.CoreConfig {
+	if c.SocksPort == 0 {
+		c.SocksPort = config.DefaultCoreSocksPort
+	}
+	if c.HTTPPort == 0 {
+		c.HTTPPort = config.DefaultCoreHTTPPort
+	}
+	if c.APIPort == 0 {
+		c.APIPort = config.DefaultCoreAPIPort
+	}
+	if c.Loglevel == "" {
+		c.Loglevel = config.DefaultCoreLoglevel
+	}
+	return c
+}
+
+// ownSocksInbound renders one socks5 inbound on the loopback bind (D2/N1)
+// with the canonical inbound shape (auth noauth, udp on, sniffing
+// route-only — domain rules need sniffing, routeOnly keeps it out of the
+// destination resolution).
+func ownSocksInbound(tag string, port int) map[string]any {
+	return map[string]any{
+		keyTag:      tag,
+		"listen":    config.CoreBindAddress,
+		keyPort:     port,
+		keyProtocol: "socks",
+		"settings":  map[string]any{"auth": "noauth", "udp": true},
+		"sniffing":  map[string]any{"enabled": true, "routeOnly": true},
+	}
+}
+
+// ownHTTPInbound is the http twin of ownSocksInbound.
+func ownHTTPInbound(tag string, port int) map[string]any {
+	return map[string]any{
+		keyTag:      tag,
+		"listen":    config.CoreBindAddress,
+		keyPort:     port,
+		keyProtocol: "http",
+		"settings":  map[string]any{},
+		"sniffing":  map[string]any{"enabled": true, "routeOnly": true},
+	}
+}
+
+// addPerCountryInbounds renders the D2 option layer: one socks inbound per
+// alive-country balancer (the xx pseudo-location included — its balancer is
+// pool_unknown) plus the routing rule that sends that inbound's traffic
+// wholesale to its balancer. Ports walk up from the socks port and skip the
+// reserved ports (the generated http inbound and the api dokodemo-door) so
+// generated inbounds can never collide. Returns the extended
+// rule and inbound lists (deterministic: countries sorted).
+func addPerCountryInbounds(
+	m map[string]any, sel *model.Selection, core config.CoreConfig, rules []any,
+) ([]any, []any) {
+	ccSet := map[string]bool{}
+	for _, sn := range sel.Nodes {
+		cc := sn.Country
+		if cc == "" {
+			cc = model.UnknownCountryCode
+		}
+		ccSet[cc] = true
+	}
+	ccs := make([]string, 0, len(ccSet))
+	for cc := range ccSet {
+		ccs = append(ccs, cc)
+	}
+	sort.Strings(ccs)
+
+	inbounds := toAnySlice(m["inbounds"])
+	port := core.SocksPort
+	for _, cc := range ccs {
+		port++
+		// Skip every reserved port: the generated http inbound AND the api
+		// dokodemo-door (a bind collision passes -test and only surfaces as
+		// a core crash-loop — review M2).
+		for port == core.HTTPPort || port == core.APIPort {
+			port++
+		}
+		tag := PerCountryTagPrefix + cc
+		inbounds = append(inbounds, ownSocksInbound(tag, port))
+		balancer := model.CountryBalancerTag(cc)
+		if cc == model.UnknownCountryCode {
+			balancer = model.UnknownBalancerTag
+		}
+		rules = append(rules, map[string]any{
+			keyRuleType:   "field",
+			"inboundTag":  []any{tag},
+			"balancerTag": balancer,
+		})
+	}
+	return rules, inbounds
+}
+
+// RenderOwnConfig generates assay's OWN live config (the self-held core
+// pivot: 2026-11-10 design D2/D7/S6/S7) — the artifact the core manager
+// spawns (`<data>/rendered/live.json`). Structure: the S7 log block
+// (loglevel from [core].loglevel, access: none), own proxy inbounds (socks
+// + http on the loopback bind; per-country socks ports when the D2 option is
+// on and a pool exists), outbounds (direct/block + pool), the shared
+// balancer tree (as today), the Plan A observatory (only with a pool — the
+// 26.3.27 empty-coverage busy-loop landmine, L1, is respected structurally),
+// the stats/policy blocks (build facts: the counters need both), the api
+// service on [core].api_port, and routing: the S6 owner domain rules between
+// the api rule and the catch-all; catch-all → pool_all leastLoad when a
+// selection exists, → block in the bootstrap/empty posture per D7 (an empty
+// pool NEVER routes to direct, A4).
+//
+// An EMPTY (or nil — normalized to empty at the entry) SELECTION is the
+// bootstrap posture — the render-level layer of the two-layer D7 empty-pool
+// contract. Whether the artifact gets written (bootstrap on first run,
+// keep-last-good otherwise) is the PIPELINE layer.
+//
+// The nodes/geo maps are the same unchanged inputs the template merge
+// consumes (SelectedNode carries no link params — the outbounds and the
+// evidence join runs through them); knobs carries the surviving [render]
+// knobs (tcp_max_seg, tls_fingerprint, balancer_tolerance,
+// observatory_interval). A pool route whose target balancer/outbound was not
+// rendered (no live nodes there) degrades to the block outbound — the same
+// graceful fail-closed semantics of the pool-route layer — and is REPORTED
+// through the returned warnings slice (the T4 report-channel widening of
+// the T3 review's M1: fail-closed stays, the loudness is back); a target
+// outside the pool_/pool- namespace still fails loud (D6).
+//
+//nolint:revive // the plan's binding name (RenderOwnConfig sel,core,poolRoutes) — the stutter is the contract.
+func RenderOwnConfig(
+	sel *model.Selection, core config.CoreConfig, poolRoutes []RouteRule,
+	nodes map[string]*model.Node, geoByKey map[string]*model.GeoRecord, knobs Config,
+) ([]byte, []string, error) {
+	core = normalizeCore(core)
+	cfg := normalizeKnobs(knobs)
+	if sel == nil {
+		// Nil-tolerance promise: a nil selection IS the bootstrap posture —
+		// normalized once here so every downstream consumer (the pool loop,
+		// addBalancers, addPerCountryInbounds) sees a real selection and the
+		// function never panics on its exported seam (review I-1).
+		sel = &model.Selection{}
+	}
+	poolCount := len(sel.Nodes)
+
+	outbounds := []any{
+		map[string]any{keyTag: "direct", "protocol": "freedom"},
+		map[string]any{keyTag: blockOutboundTag, "protocol": "blackhole"},
+	}
+	renderedOutbounds := map[string]bool{}
+	// droppedWarnings accumulates the non-material param drop report (T7
+	// disposition C1 — SURFACE chosen): the renderer's contract comment
+	// (buildTLSSettings) and config.example's [filter] block both promise
+	// a loud drop-report entry, and the warnings channel is the same loud
+	// grammar the pool-route degradations use. Material params keep
+	// failing the render loud (L9) — this carries only the remainder.
+	droppedWarnings := make([]string, 0)
+	for _, sn := range sel.Nodes {
+		n, ok := nodes[sn.Key]
+		if !ok {
+			return nil, nil, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
+		}
+		ob, dropped, err := buildOutbound(n, sn.Tag, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(dropped) > 0 {
+			droppedWarnings = append(droppedWarnings, fmt.Sprintf(
+				"render: outbound %s (%s): non-material link params not renderable and dropped: %s "+
+					"(capability limitation; material params fail the render loud)",
+				sn.Tag, n.Host, strings.Join(dropped, ", ")))
+		}
+		if renderedOutbounds[sn.Tag] {
+			return nil, nil, fmt.Errorf("render: outbound tag %q rendered twice (selection collision)", sn.Tag)
+		}
+		outbounds = append(outbounds, ob)
+		renderedOutbounds[sn.Tag] = true
+	}
+
+	m := map[string]any{
+		"log": map[string]any{
+			"loglevel": core.Loglevel,
+			"access":   "none", // S7: the 272k-lines/8h journald-flood lesson
+		},
+		"inbounds": []any{
+			ownSocksInbound(SocksInboundTag, core.SocksPort),
+			ownHTTPInbound(HTTPInboundTag, core.HTTPPort),
+		},
+		"outbounds": outbounds,
+		"routing":   map[string]any{"rules": []any{}},
+	}
+
+	var renderedBalancers []string
+	if poolCount > 0 {
+		// The shared balancer tree renders exactly as the pool layer always did
+		// (country/city/all/clean/service tiers) — balancers as today.
+		renderedBalancers = addBalancers(m, sel, nodes, geoByKey, cfg.BalancerTolerance)
+		m["observatory"] = map[string]any{
+			"subjectSelector":   []any{poolOutboundPrefix},
+			"probeInterval":     observatoryInterval(cfg.ObservatoryInterval, poolCount),
+			"enableConcurrency": true,
+		}
+	}
+
+	// The stats/API service block: dokodemo-door inbound on api_port, the api
+	// routing rule FIRST (it only matches its own inbound), and the
+	// stats/policy blocks the per-tag counters require (build facts).
+	ensureAPIStats(m, core.APIPort)
+	ensureStatsAndPolicy(m)
+
+	// S6: owner domain rules matched against the GENERATED inbound tags,
+	// inserted after the api rule. Unrendered targets degrade to block (the
+	// graceful fail-closed semantics of the pool-route layer) and surface
+	// through the returned warnings (the T4 report-channel widening — the
+	// same strings the pool-route layer reports).
+	blocked, err := addPoolRules(m, poolRoutes, renderedBalancers, renderedOutbounds,
+		[]string{SocksInboundTag, HTTPInboundTag})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	routing, _ := m["routing"].(map[string]any)
+	rules := toAnySlice(routing["rules"])
+	if core.PerCountryInbounds && poolCount > 0 {
+		var inbounds []any
+		rules, inbounds = addPerCountryInbounds(m, sel, core, rules)
+		m["inbounds"] = inbounds
+	}
+
+	// The catch-all closes the rule list: pool_all leastLoad with a pool,
+	// the block blackhole in the bootstrap/empty posture (D7/A4).
+	catchAll := map[string]any{keyRuleType: "field", "network": "tcp,udp"}
+	if poolCount > 0 {
+		catchAll["balancerTag"] = model.PoolAllBalancerTag
+	} else {
+		catchAll["outboundTag"] = blockOutboundTag
+	}
+	rules = append(rules, catchAll)
+	routing["rules"] = rules
+
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+	return b, append(droppedWarnings, blocked...), nil
 }

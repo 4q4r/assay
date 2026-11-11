@@ -39,6 +39,8 @@ package cli
 // mode; NONE renders n/a.
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,11 +54,14 @@ import (
 	"time"
 
 	"assay/internal/config"
+	"assay/internal/core"
 	"assay/internal/model"
 	"assay/internal/plugins"
+	"assay/internal/render"
 	"assay/internal/stats"
 	"assay/internal/store"
 	"assay/internal/ui"
+	"assay/internal/xrayupdate"
 )
 
 // statusSchemaVersion is the --json document version. 1.1 (owner ruling
@@ -1190,11 +1195,13 @@ func printSelectionStatus(out io.Writer, p paths, color bool) {
 		fmt.Sprintf("%s · %d active %v", bound, len(sel.Nodes), byCountry), color))
 }
 
-// printRenderStatus renders the render chip with the config mtime in the
-// viewer's local time (same cosmetic ruling as the fetch stamp).
-// Moved from pipeline.go.
+// printRenderStatus renders the render chip with the own live config's
+// mtime in the viewer's local time (same cosmetic ruling as the fetch
+// stamp). Moved from pipeline.go; the artifact is <data>/rendered/live.json
+// since the external mode died.
 func printRenderStatus(out io.Writer, p paths, color bool) {
-	st, err := os.Stat(p.rendered)
+	live := ownLivePath(p)
+	st, err := os.Stat(live)
 	if err != nil {
 		outln(out, ui.ChipKV("render:   ", "none", color))
 		return
@@ -1202,7 +1209,296 @@ func printRenderStatus(out io.Writer, p paths, color bool) {
 	// Same local-time cosmetic as the fetch stamp (owner ruling 2026-11-05).
 	stamp := st.ModTime().Local().Format(time.RFC3339) //nolint:gosmopolitan // owner ruling 2026-11-05
 	outf(out, "%s\n", ui.ChipKV("render:   ",
-		fmt.Sprintf("%s (%d bytes, %s)", p.rendered, st.Size(), stamp), color))
+		fmt.Sprintf("%s (%d bytes, %s)", live, st.Size(), stamp), color))
+}
+
+// ---------------------------------------------------------------------------
+// Own-core section (the self-held pivot, T7)
+// ---------------------------------------------------------------------------
+
+// coreInbound is one inbound of the rendered live config — the core's
+// actual proxy surface (D2), observed from the artifact the running core
+// was started on, never from the config knobs' intent.
+type coreInbound struct {
+	Tag      string
+	Protocol string
+	Addr     string
+	Port     int
+}
+
+// coreState is the own-core section's collected view. `assay status` runs
+// as a separate process from the watch daemon (the manager's singleton
+// lock belongs to the daemon), so every field is observed from the data
+// dir's files and one bounded `xray version` exec — the same
+// pidfile+liveness contract core.Manager.Alive() consumes. Degraded fields
+// carry their reason; nothing is fabricated.
+type coreState struct {
+	running    bool
+	pid        int
+	stalePID   bool
+	uptime     time.Duration
+	uptimeOK   bool
+	version    string
+	binPath    string
+	binMissing bool
+	versionErr error
+	inbounds   []coreInbound
+	liveErr    error
+	health     *core.HealthState
+	healthErr  error
+	strikeK    int
+}
+
+// collectCoreState observes the own core from the data dir: the manager's
+// pidfile (PID + liveness), /proc for the uptime, the managed binary for
+// the version banner (xrayupdate.CurrentVersion — the same banner contract
+// the auto-update path parses), live.json for the inbounds, and the
+// persisted D8 health-state mirror (core.ReadHealthState) for strikes.
+func collectCoreState(p paths, cfg *config.Config) *coreState {
+	cs := &coreState{binPath: cfg.CoreXrayBin()}
+	cs.strikeK = cfg.Core.RollbackStrikes
+	if cs.strikeK <= 0 {
+		cs.strikeK = config.DefaultCoreRollbackStrikes
+	}
+
+	if pid := readCorePID(p.dataDir); pid > 0 {
+		cs.pid = pid
+		if core.PIDAlive(pid) {
+			cs.running = true
+			cs.uptime, cs.uptimeOK = procUptime(pid)
+		} else {
+			cs.stalePID = true
+		}
+	}
+
+	if _, err := os.Stat(cs.binPath); err != nil {
+		cs.binMissing = true
+	} else {
+		// The exec is bounded inside CurrentVersion (10s); a hung or
+		// broken binary degrades the version line, never the command.
+		v, err := xrayupdate.CurrentVersion(context.Background(), cs.binPath)
+		if err != nil {
+			cs.versionErr = err
+		} else {
+			cs.version = v
+		}
+	}
+
+	cs.inbounds, cs.liveErr = readCoreInbounds(ownLivePath(p))
+
+	cs.health, cs.healthErr = core.ReadHealthState(p.dataDir)
+	return cs
+}
+
+// readCorePID reads the manager's pidfile (core.PIDFileName — the same
+// file Alive() consumes; the file-name contract has one definition).
+func readCorePID(dataDir string) int {
+	raw, err := os.ReadFile(filepath.Join(dataDir, core.PIDFileName))
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+// procUptime derives a process's uptime from /proc/<pid>/stat: field 22
+// (starttime in clock ticks since boot) against the kernel's btime
+// (/proc/stat). Linux-only by spec (N4: Linux + systemd user units); an
+// unreadable /proc degrades the uptime display, never the block. CLK_TCK
+// is the userspace-stable 100 (the value `getconf CLK_TCK` reports on
+// every supported kernel this product targets).
+func procUptime(pid int) (time.Duration, bool) {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	// The comm field may contain spaces and parens — split after its
+	// last ')'; starttime is the 20th field from there (overall field 22).
+	idx := bytes.LastIndexByte(raw, ')')
+	fields := strings.Fields(string(raw[idx+1:]))
+	if len(fields) < 20 {
+		return 0, false
+	}
+	startTicks, err := strconv.ParseFloat(fields[19], 64)
+	if err != nil {
+		return 0, false
+	}
+	btime, ok := procBootTime()
+	if !ok {
+		return 0, false
+	}
+	started := time.Unix(btime, 0).Add(time.Duration(startTicks / 100 * float64(time.Second)))
+	return time.Since(started).Round(time.Second), true
+}
+
+// procBootTime reads the kernel btime (boot epoch seconds) from /proc/stat.
+func procBootTime() (int64, bool) {
+	raw, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, false
+	}
+	for line := range strings.SplitSeq(string(raw), "\n") {
+		if after, ok := strings.CutPrefix(line, "btime "); ok {
+			v, err := strconv.ParseInt(strings.TrimSpace(after), 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// readCoreInbounds parses the live config's inbounds (tag/listen/port/
+// protocol). A missing file is the not-rendered state (nil, nil — the
+// section degrades); a corrupt file degrades with the reason (the core
+// could not have started on one).
+func readCoreInbounds(path string) ([]coreInbound, error) {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Inbounds []struct {
+			Tag      string `json:"tag"`
+			Listen   string `json:"listen"`
+			Port     int    `json:"port"`
+			Protocol string `json:"protocol"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	out := make([]coreInbound, 0, len(doc.Inbounds))
+	for _, in := range doc.Inbounds {
+		addr := in.Listen
+		if addr == "" {
+			addr = config.CoreBindAddress
+		}
+		out = append(out, coreInbound{Tag: in.Tag, Protocol: in.Protocol, Addr: addr, Port: in.Port})
+	}
+	return out, nil
+}
+
+// printCoreStatus renders the own-core section — one honest observable per
+// line, degraded states named (not running / stale pidfile / missing
+// binary / unreadable live config), never a fabricated value (the
+// dashboard's honesty discipline).
+func printCoreStatus(out io.Writer, cs *coreState, color bool) {
+	outln(out, ui.Header("own core", color))
+	state := "not running (no pidfile — the daemon has not started the core; " +
+		"its supervisor retries the spawn — see the journal)"
+	switch {
+	case cs.running:
+		state = fmt.Sprintf("running (pid %d", cs.pid)
+		if cs.uptimeOK {
+			state += fmt.Sprintf(", up %s", cs.uptime)
+		}
+		state += ")"
+		if cs.version != "" {
+			state += " — Xray " + cs.version
+		}
+	case cs.stalePID:
+		state = fmt.Sprintf(
+			"not running (pid %d from the pidfile is dead — stale after an unclean stop)", cs.pid)
+	}
+	outf(out, "%s\n", ui.ChipKV("core:     ", state, color))
+
+	switch {
+	case cs.binMissing:
+		outf(out, "%s\n", ui.ChipKV("  version: ",
+			fmt.Sprintf("managed binary missing (%s) — install downloads it; assay xray-update re-fetches it",
+				cs.binPath), color))
+	case cs.versionErr != nil:
+		outf(out, "%s\n", ui.ChipKV("  version: ",
+			fmt.Sprintf("unknown (%v)", cs.versionErr), color))
+	}
+
+	switch {
+	case cs.liveErr != nil:
+		outf(out, "%s\n", ui.ChipKV("  inbound: ",
+			fmt.Sprintf("live config unreadable: %v", cs.liveErr), color))
+	case len(cs.inbounds) == 0:
+		outf(out, "%s\n", ui.ChipKV("  inbound: ", "no rendered live config yet", color))
+	default:
+		outf(out, "%s\n", ui.ChipKV("  inbound: ", formatCoreInbounds(cs.inbounds), color))
+	}
+
+	printCoreHealth(out, cs.health, cs.healthErr, cs.strikeK, cs.running, color)
+}
+
+// formatCoreInbounds renders the D2 surface: the two base inbounds first
+// (socks in / http in-http), the reserved stats/API inbound as its own
+// explicit entry, then the per-country socks set as a count with its tags.
+// The classification runs against render's exported tag grammar — the api
+// inbound is NOT a per-country inbound, and anything unrecognized lands in
+// an explicit "other" tail so no rendered inbound vanishes from the line.
+func formatCoreInbounds(inbounds []coreInbound) string {
+	base := make([]string, 0, 2)
+	var perCountry, other []string
+	api := ""
+	for _, in := range inbounds {
+		switch {
+		case in.Tag == render.SocksInboundTag || in.Tag == render.HTTPInboundTag:
+			base = append(base, fmt.Sprintf("%s %s:%d", in.Protocol, in.Addr, in.Port))
+		case in.Tag == render.APIInboundTag:
+			api = fmt.Sprintf("api %s:%d", in.Addr, in.Port)
+		case in.Protocol == "socks" && render.IsPerCountryInboundTag(in.Tag):
+			perCountry = append(perCountry, in.Tag)
+		default:
+			other = append(other, in.Tag)
+		}
+	}
+	line := strings.Join(base, " · ")
+	if api != "" {
+		line += " · " + api
+	}
+	sort.Strings(perCountry)
+	if len(perCountry) > 0 {
+		line += fmt.Sprintf(" (+%d per-country: %s)", len(perCountry), strings.Join(perCountry, ", "))
+	}
+	if len(other) > 0 {
+		line += fmt.Sprintf(" (+%d other: %s)", len(other), strings.Join(other, ", "))
+	}
+	return line
+}
+
+// printCoreHealth renders the D8 line from the persisted mirror: the
+// current strike count under its K cap, the last failure, or the rollback
+// record. No mirror = no post-activation health check has ever run (the
+// honest cold state).
+func printCoreHealth(out io.Writer, h *core.HealthState, healthErr error, strikeK int, running bool, color bool) {
+	label := "  health:  "
+	if healthErr != nil {
+		outf(out, "%s\n", ui.ChipKV(label,
+			fmt.Sprintf("strike state unreadable: %v", healthErr), color))
+		return
+	}
+	if h == nil {
+		note := "no post-activation health check recorded yet"
+		if !running {
+			note += " (core not running)"
+		}
+		outf(out, "%s\n", ui.ChipKV(label, note, color))
+		return
+	}
+	line := fmt.Sprintf("strikes %d/%d", h.Strikes, strikeK)
+	switch {
+	case h.LastRollbackAt != (time.Time{}):
+		line += fmt.Sprintf(" · rollback restored %s at %s",
+			h.LastRollbackBackup, h.LastRollbackAt.Local().Format(time.RFC3339)) //nolint:gosmopolitan // owner ruling 2026-11-05
+	case h.LastError != "":
+		line += " — last check failed: " + h.LastError
+	case h.LastHealthy:
+		line += " — healthy"
+	}
+	outf(out, "%s\n", ui.ChipKV(label, line, color))
 }
 
 // printProviderIntelTable renders the spec §2.3 table: provider, total,

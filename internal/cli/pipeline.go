@@ -20,6 +20,7 @@ import (
 	"assay/internal/activate"
 	"assay/internal/checker"
 	"assay/internal/config"
+	"assay/internal/core"
 	"assay/internal/fetch"
 	"assay/internal/filter"
 	"assay/internal/geo"
@@ -30,7 +31,6 @@ import (
 	"assay/internal/prune"
 	"assay/internal/rank"
 	"assay/internal/render"
-	"assay/internal/restart"
 	"assay/internal/stats"
 	"assay/internal/store"
 	"assay/internal/timeoutcal"
@@ -697,8 +697,31 @@ func newProbeBatchFactory(cfg *config.Config, p paths) probe.BatchFactory {
 			}
 			outbounds[i] = ob
 		}
-		return checker.StartTempXrayBatch(ctx, config.ExpandHome(cfg.Activate.XrayBin), p.workDir, outbounds)
+		return checker.StartTempXrayBatch(ctx, coreXrayBin(cfg), p.workDir, outbounds)
 	})
+}
+
+// newProbeFactory is the probe stage's single-node temp-instance fleet (the
+// checker factory the W14 probe uses). S1: the binary resolves from the
+// SINGLE core knob ([core].xray_bin / CoreXrayBin) — the legacy
+// [activate].xray_bin is dead for every fleet (the 2026-11-10 pivot).
+func newProbeFactory(cfg *config.Config, p paths) probe.Factory {
+	xrayFactory := checker.NewXrayFactory(coreXrayBin(cfg), p.workDir, render.Config{
+		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+		TLSFingerprint: cfg.Render.TLSFingerprint,
+	})
+	return probe.Factory(func(ctx context.Context, n *model.Node) (probe.SocksInstance, error) {
+		return xrayFactory(ctx, n)
+	})
+}
+
+// coreXrayBin resolves the SINGLE core binary knob (S1): the explicit
+// [core].xray_bin override (~-expanded), else the managed default
+// <data>/bin/xray. Every consumer in this package — the probe/check
+// temp-instance fleets, the activation -test gate, the core manager — goes
+// through this one resolver; [activate].xray_bin is retired for all of them.
+func coreXrayBin(cfg *config.Config) string {
+	return config.ExpandHome(cfg.CoreXrayBin())
 }
 
 func loadKnownAliveForProbe(p paths, opts probe.Options) (map[string]store.KnownAliveRecord, probe.Options, error) {
@@ -787,13 +810,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	}
 	// The SAME temp-instance infrastructure the check stage uses — one
 	// factory, one render.BuildOutbound outbound builder, zero drift (W14).
-	xrayFactory := checker.NewXrayFactory(config.ExpandHome(cfg.Activate.XrayBin), p.workDir, render.Config{
-		TCPMaxSeg:      cfg.Render.TCPMaxSeg,
-		TLSFingerprint: cfg.Render.TLSFingerprint,
-	})
-	factory := probe.Factory(func(ctx context.Context, n *model.Node) (probe.SocksInstance, error) {
-		return xrayFactory(ctx, n)
-	})
+	factory := newProbeFactory(cfg, p)
 	batchFactory := newProbeBatchFactory(cfg, p)
 	opts := probeOptions(cfg, speedtest)
 	// Apply the wave-start resource budget (CPU/RAM/ports) to probe
@@ -996,13 +1013,12 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 func newRenderCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "render",
-		Short: "Render the full xray client config (template + pool + balancers + Plan A observatory)",
-		Long: `Renders the full client config from the configured template (render.template)
-plus the selected pool. The template is a REQUIRED configured value: a
-configless run (no -c, no home/cwd config) fails loud at this boundary —
-"configless mode cannot render — provide -c or a config at
-~/.config/assay/config.toml" — instead of silently defaulting the
-template to the live client's config.`,
+		Short: "Render the own core config (pool outbounds + balancers + observatory + own inbounds)",
+		Long: `Renders the own live/candidate core config from the selected pool (the
+self-held core's single render target, D3). A configless run (no -c, no
+home/cwd config) fails loud at the stage boundary — "configless mode cannot
+render — provide -c or a config at ` + "`" + `~/.config/assay/config.toml` + "`" + `" — the
+core lifecycle belongs to a configured deployment.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
@@ -1015,11 +1031,10 @@ template to the live client's config.`,
 }
 
 func runRender(cmd *cobra.Command, cfg *config.Config) error {
-	// Loud stage boundary (W12): render needs a CONFIGURED template. A
-	// configless run leaves render.template deliberately empty (the old
-	// default pointed at the live client's config — silently rendering
-	// against it from pure defaults is exactly the accident this refuses).
-	if cfg.Render.Template == "" {
+	// Loud stage boundary (W12, keyed on the Configless marker since the
+	// external mode died): the core lifecycle belongs to a configured
+	// deployment — a configless run refuses before touching any artifact.
+	if cfg.Configless {
 		return config.ConfiglessBoundaryError("render")
 	}
 	p := newPaths(cfg)
@@ -1038,11 +1053,6 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	for _, n := range filtered {
 		byKey[n.Key] = n
 	}
-	templatePath := config.ExpandHome(cfg.Render.Template)
-	template, err := os.ReadFile(templatePath)
-	if err != nil {
-		return fmt.Errorf("read template %s: %w", templatePath, err)
-	}
 	// Phase-3 service pools ride the Phase-1 unlock evidence: one geo read,
 	// keyed by the shared identity — the same join the stats enrichment uses
 	// (model.GeoIdentity). A missing geo base is the documented empty state
@@ -1056,48 +1066,102 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	for _, gr := range geoRecords {
 		geoByKey[model.GeoIdentity(gr)] = gr
 	}
-	res, err := render.Render(render.Input{
-		Template:   template,
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey:   geoByKey,
-		Cfg: render.Config{
-			StatsPort:           cfg.Render.StatsPort,
-			PoolRoutes:          toRenderRoutes(cfg.Render.PoolRoutes),
-			PoolInboundTags:     cfg.Render.PoolInboundTags,
-			ObservatoryInterval: cfg.Render.ObservatoryInterval,
-			TCPMaxSeg:           cfg.Render.TCPMaxSeg,
-			TLSFingerprint:      cfg.Render.TLSFingerprint,
-			BalancerTolerance:   cfg.Render.BalancerTolerance,
-		},
-	})
+	return runRenderOwnTarget(cmd, cfg, p, sel, byKey, geoByKey)
+}
+
+// ownLivePath is the core's live config artifact (S4: the fixed
+// <data>/rendered/live.json — the file the core manager spawns, restarts
+// and rolls back).
+func ownLivePath(p paths) string {
+	return filepath.Join(p.dataDir, "rendered", "live.json")
+}
+
+// ownCandidatePath is the activation candidate the render leg writes for a
+// NON-empty selection: the activate stage diffs it against live.json, gates
+// it, backs the live config up (C1) and replaces live.json from it. The
+// candidate exists only while it reflects the freshest render intent — the
+// empty-selection legs remove any stale one so an old pool can never be
+// re-activated over the last-good config.
+func ownCandidatePath(p paths) string {
+	return filepath.Join(p.dataDir, "rendered", "candidate.json")
+}
+
+// ownRenderKnobs is the surviving [render] knob set the own config consumes
+// (the C-1 lesson: every consumer names its knobs explicitly — no silent
+// default drift).
+func ownRenderKnobs(cfg *config.Config) render.Config {
+	return render.Config{
+		ObservatoryInterval: cfg.Render.ObservatoryInterval,
+		TCPMaxSeg:           cfg.Render.TCPMaxSeg,
+		TLSFingerprint:      cfg.Render.TLSFingerprint,
+		BalancerTolerance:   cfg.Render.BalancerTolerance,
+	}
+}
+
+// runRenderOwnTarget is the own-config leg of the render stage (self-held
+// core pivot, D7/S2). The stage's product is the ACTIVATION CANDIDATE:
+// <data>/rendered/candidate.json for a non-empty selection — the activate
+// stage owns the live.json gate/backup/replace (the T4 wiring: the live
+// artifact must hold the PRE-activation state until the activate stage
+// backs it up). Empty-pool posture, D7's two layers:
+//   - no prior live.json → write the bootstrap artifact (empty pool =
+//     fail-closed catch-all → block) straight to live.json so the core
+//     manager can spawn (S2);
+//   - prior live.json + empty selection → SKIP the write, loud line: the
+//     core keeps running on the last-good config, never regressing to
+//     block once a pool has been activated (A4: empty never routes to
+//     direct — keep-last-good is the other half of that guarantee).
+func runRenderOwnTarget(
+	cmd *cobra.Command, cfg *config.Config, p paths,
+	sel *model.Selection, byKey map[string]*model.Node, geoByKey map[string]*model.GeoRecord,
+) error {
+	out := cmd.OutOrStdout()
+	// D7 empty-pool layer: no candidate may outlive its wave — a stale one
+	// would let the activate stage re-activate an OLD pool over the
+	// last-good config.
+	if len(sel.Nodes) == 0 {
+		if err := os.Remove(ownCandidatePath(p)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale activation candidate: %w", err)
+		}
+		if _, statErr := os.Stat(ownLivePath(p)); statErr == nil {
+			outf(out, "render: empty selection — keeping last-good core config\n")
+			return nil
+		}
+	}
+	own, warnings, err := render.RenderOwnConfig(sel, cfg.Core, toRenderRoutes(cfg.Render.PoolRoutes), byKey,
+		geoByKey, ownRenderKnobs(cfg))
 	if err != nil {
 		return err
 	}
-	if len(sel.Nodes) == 0 {
-		outf(cmd.OutOrStdout(), "WARNING: empty pool — no pool observatory/balancers rendered (L1 hard gate)\n")
+	// S6 (the T3 M1 widening, folded into this task): a domain route whose
+	// target balancer did not render degrades to block — fail-closed AND
+	// loud, the same WARNING grammar the template path uses.
+	for _, b := range warnings {
+		outf(out, "WARNING: %s\n", b)
 	}
-	for _, w := range res.DroppedParams {
-		outf(cmd.OutOrStdout(), "WARNING: %s (%s): link params not renderable, left out of the outbound: %v\n",
-			w.Tag, w.Host, w.Params)
-	}
-	for _, b := range res.BlockedRoutes {
-		outf(cmd.OutOrStdout(), "WARNING: %s\n", b)
-	}
-	if err := os.MkdirAll(p.renderedDir, 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Join(p.dataDir, "rendered"), 0o750); err != nil {
 		return err
 	}
-	// 0600 deliberate: the rendered config carries pool node credentials
-	// (UUIDs/passwords). The live target keeps ITS OWN mode — atomicReplace
-	// preserves it (review finding 11). Atomic+synced write: a crash during
-	// write must never leave a truncated rendered config.
-	if err := store.WriteFileAtomic(p.rendered, func(f *os.File) error {
-		_, err := f.Write(res.Config)
+	target := ownCandidatePath(p)
+	if len(sel.Nodes) == 0 {
+		// Bootstrap: no prior live config — the D7 artifact goes straight to
+		// the live path so the core manager can spawn (S2, daemon start).
+		target = ownLivePath(p)
+	}
+	// Same atomic 0600 write as the template artifact: the own config carries
+	// the same pool node credentials.
+	if err := store.WriteFileAtomic(target, func(f *os.File) error {
+		_, err := f.Write(own)
 		return err
 	}); err != nil {
 		return err
 	}
-	outf(cmd.OutOrStdout(), "render complete: %d pool outbounds → %s\n", len(sel.Nodes), p.rendered)
+	if len(sel.Nodes) == 0 {
+		outf(out, "render bootstrap: empty pool fail-closed (catch-all → block) → %s\n", target)
+	} else {
+		outf(out, "render own config: %d pool outbounds → %s (the activate stage replaces the live core config on change)\n",
+			len(sel.Nodes), target)
+	}
 	return nil
 }
 
@@ -1110,25 +1174,23 @@ func toRenderRoutes(rs []config.PoolRoute) []render.PoolRoute {
 }
 
 func newActivateCommand(cfgPath *string) *cobra.Command {
-	var (
-		target string
-		backup bool
-	)
 	cmd := &cobra.Command{
 		Use:   "activate",
-		Short: "-test gate, date-stamped backup, atomic replace, then the gated auto-restart",
-		Long: `Runs the -test gate, takes a date-stamped backup, and atomically replaces
-the configured live target (activate.target). The target is a REQUIRED
-configured value: a configless run fails loud at this boundary —
-"configless mode cannot activate — provide -c or a config at
-~/.config/assay/config.toml" — instead of silently defaulting the target
-to the live client's config.
+		Short: "Own-core activation: -test gate, dated backup, replace live.json, core restart, health",
+		Long: `Activates the own rendered core config (the self-held core lifecycle, D3):
+the -test gate runs on the activation candidate through the SINGLE core
+binary ([core].xray_bin, S1), the current live config is backed up as
+backups/config.json.bak-<ts> (the D8 rollback source), live.json is
+replaced atomically, the core manager restarts the core on it, and the
+post-activation health check feeds the strike counter (K consecutive
+failures roll back to the newest backup — D8).
 
-After a real replacement the live client is restarted through the
-byte-pinned allowlist executor (internal/restart) when
-[maintain].auto_restart is enabled (the default — hands-off, W13); with
-auto_restart = false the manual restart command is printed instead. A
-byte-identical render is a no-op: nothing is replaced, nothing restarts.`,
+This is the one-shot path: under a running daemon it refuses loud —
+"the daemon owns the core — restart the unit or use watch" (S3) — and
+when no daemon holds the core it manages the core transiently (the core
+keeps running after the command exits; the next daemon adopts it). A
+byte-identical candidate is a no-op: nothing is replaced, nothing
+restarts. The wave path (maintain/watch) runs the exact same stage.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
 			if err != nil {
@@ -1139,128 +1201,11 @@ byte-identical render is a no-op: nothing is replaced, nothing restarts.`,
 				return err
 			}
 			reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
-			return runActivate(cmd, res.Config, target, backup, productionRestartWiring())
+			return runActivateStage(cmd, res.Config)
 		},
 	}
 	attachColorFlags(cmd)
-	cmd.Flags().StringVar(&target, "target", "", "override the activation target path (default from config)")
-	cmd.Flags().BoolVar(&backup, "backup", true, "date-stamped backup of the target before replace")
 	return cmd
-}
-
-// restartWiring bundles the W13 auto-restart seam: the byte-pinned allowlist
-// executor (package restart — the daemon's only systemd surface besides
-// install) and the health check's port-probe dialer. Sleep carries the W17
-// health ladder's clock (tests inject a no-op; production leaves nil for the
-// real time.Sleep). The maintainStages seam injects fakes in tests;
-// production is SystemctlExecutor + the real dialer.
-type restartWiring struct {
-	Executor restart.Executor
-	Dialer   restart.Dialer
-	Sleep    func(time.Duration)
-}
-
-// productionRestartWiring wires the real allowlist executor (the restart
-// package's production type); the dialer is left nil (the restart package's
-// default net dialer).
-func productionRestartWiring() *restartWiring {
-	return &restartWiring{Executor: restart.SystemctlExecutor{}}
-}
-
-func runActivate(cmd *cobra.Command, cfg *config.Config, target string, backup bool, wiring *restartWiring) error {
-	p := newPaths(cfg)
-	// Loud stage boundary (W12): activate needs a CONFIGURED target, and the
-	// boundary fires AT STAGE ENTRY on the configured value alone — the
-	// --target flag cannot bypass it (I-1). A configless run has no
-	// configured template either, so there is nothing legitimate to activate
-	// against; keying on the flag let a configless --target run fall into the
-	// misleading "no rendered config — run render first" loop, while
-	// configless render refuses with the same boundary.
-	if cfg.Activate.Target == "" {
-		return config.ConfiglessBoundaryError("activate")
-	}
-	if target == "" {
-		target = config.ExpandHome(cfg.Activate.Target)
-	}
-	if _, err := os.Stat(p.rendered); err != nil {
-		return fmt.Errorf("no rendered config (%s) — run `assay render` first", p.rendered)
-	}
-	res, err := activate.Run(activate.Input{
-		RenderedPath: p.rendered,
-		TargetPath:   target,
-		XrayBin:      cfg.Activate.XrayBin,
-		AssetDir:     config.ExpandHome(cfg.Activate.AssetDir),
-		BackupDir:    p.backupDir,
-		Backup:       backup,
-		NoRestart:    true,
-		TestTimeout:  activateTestTimeout(cfg),
-		ServiceName:  cfg.Activate.ServiceName,
-		BackupKeep:   cfg.Activate.BackupKeep,
-	})
-	if err != nil {
-		return err
-	}
-
-	// W13 auto-restart ruling: a REAL replacement restarts the live client
-	// through the byte-pinned executor, then verifies health. A nil wiring
-	// with auto_restart enabled is a programming error — never a silent
-	// skip.
-	//
-	// W17 non-interruptibility: the replace→restart→health sequence below
-	// is ONE non-interruptible step. The daemon's shutdown checkpoint is
-	// consulted only BETWEEN wave stages (runMaintainGraceful), never here
-	// — a SIGTERM landing between the atomic replace and the xray restart
-	// must not pause the stage, or the live client would be orphaned (new
-	// config on disk, old config running, no restart issued). The
-	// guard pin is TestW17MidActivateShutdownCannotInterruptRestart; the
-	// unit's TimeoutStopSec gives systemd the matching patience to wait for
-	// the step (and the stage around it) instead of SIGKILLing mid-activate.
-	auto := cfg.Maintain.AutoRestartEnabled()
-	if auto && wiring == nil {
-		return errors.New(
-			"activation: [maintain].auto_restart is enabled but no restart executor is wired (programming error)")
-	}
-	if !auto {
-		// Manual semantics (auto_restart = false): print the operator hint.
-		outf(cmd.OutOrStdout(), "%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
-			ui.Chip("activation hint:", res.RestartHint, stageColor(cmd)),
-			orNone(res.BackupPath), selectionSize(p.selection))
-		return nil
-	}
-	outf(cmd.OutOrStdout(),
-		"%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
-		ui.Chip("activation complete:", fmt.Sprintf("%s replaced from %s", target, p.rendered), stageColor(cmd)),
-		orNone(res.BackupPath), selectionSize(p.selection))
-	rres, rerr := restart.Run(restart.Input{
-		Executor:   wiring.Executor,
-		Dialer:     wiring.Dialer,
-		Sleep:      wiring.Sleep,
-		SocksPort:  extractSocksPort(p.rendered),
-		BackupPath: res.BackupPath,
-	})
-	var restartFailed *restart.Error
-	switch {
-	case rerr == nil:
-		outf(cmd.OutOrStdout(), "%s\n",
-			ui.Chip("restart:", ui.Colorize(ui.Green, rres.Verdict, stageColor(cmd)), stageColor(cmd)))
-	case errors.As(rerr, &restartFailed):
-		outf(cmd.OutOrStdout(),
-			"ERROR: restart FAILED: %v\n"+
-				"  the config on disk IS the gated new one; the live client still runs the previous config\n"+
-				"%s\n",
-			rerr,
-			ui.Chip("  wave verdict:", ui.Colorize(ui.Amber,
-				"DONE_WITH restart-failure (backup: "+orNone(res.BackupPath)+"; no auto-restore in this generation)",
-				stageColor(cmd)), stageColor(cmd)))
-	default:
-		outf(cmd.OutOrStdout(),
-			"WARNING: the restart completed but the post-restart health check FAILED: %v\n"+
-				"%s\n",
-			rerr,
-			ui.Chip("  wave verdict:", ui.Colorize(ui.Amber,
-				"DONE_WITH health-failure (report-only; no auto-restore)", stageColor(cmd)), stageColor(cmd)))
-	}
-	return nil
 }
 
 func orNone(s string) string {
@@ -1320,7 +1265,7 @@ Flags:
 			}
 			opts.color = color
 			reportConfigSourceStyled(cmd.OutOrStdout(), res, color)
-			return runMaintain(cmd.OutOrStdout(), res.Config, opts, defaultMaintainStages(opts))
+			return runOneShotMaintainWave(cmd.OutOrStdout(), res.Config, opts)
 		},
 	}
 	cmd.Flags().BoolVar(&opts.noActivate, "no-activate", false,
@@ -1357,17 +1302,23 @@ type maintainStages struct {
 	selectS           func(*cobra.Command, *config.Config) error
 	render            func(*cobra.Command, *config.Config) error
 	activate          func(*cobra.Command, *config.Config) error
+	// coreAutoUpdate is the managed-core auto-update check (T5, D4/S5):
+	// optional (nil = the wave skips it — injected stage sets may omit it).
+	coreAutoUpdate func(*cobra.Command, *config.Config) error
 }
 
 // defaultMaintainStages wires the real runners. filter runs with the config
 // cap (no CLI override inside the wave); probe runs full-set with speedtest
-// only when the wave carries it. The activate stage carries the production
-// restart wiring — the W13 byte-pinned allowlist executor (package restart):
-// every gated activation restarts the live client unless
-// [maintain].auto_restart is disabled. The one-shot wave threads the fetch
+// only when the wave carries it. The one-shot wave threads the fetch
 // stage's registry into the enrichment seam (F1): threshold enforcement
-// never reloads a throwaway copy.
-func defaultMaintainStages(opts maintainOptions) *maintainStages {
+// never reloads a throwaway copy. Every core-touching stage (activate,
+// core-auto-update) receives the SAME manager (fix I-1) — under the daemon
+// it is the daemon's long-lived one (the strike counter and the S5 inert
+// flag persist across waves); in the one-shot wave it is the wave's shared
+// transient, created once by runOneShotMaintainWave and released after the
+// wave. A nil mgr keeps the per-stage transient semantics (each stage then
+// creates its own — the single-stage one-shot entries and tests).
+func defaultMaintainStages(opts maintainOptions, mgr *core.Manager) *maintainStages {
 	var waveReg *plugins.Registry
 	return &maintainStages{
 		fetch: func(c *cobra.Command, cc *config.Config) error {
@@ -1385,16 +1336,44 @@ func defaultMaintainStages(opts maintainOptions) *maintainStages {
 		prune:   runPruneStage,
 		selectS: runSelect,
 		render:  runRender,
-		activate: func(c *cobra.Command, cfg *config.Config) error {
-			return runActivateStage(c, cfg, productionRestartWiring())
+		// The core lifecycle stages share the ONE manager (fix I-1 — two
+		// nil-managed stages each took the singleton flock; the second
+		// refused on the first's unreleased lock and aborted the wave).
+		activate: func(c *cobra.Command, cc *config.Config) error {
+			return runActivateStageWithManager(c, cc, mgr)
+		},
+		coreAutoUpdate: func(c *cobra.Command, cc *config.Config) error {
+			return runCoreAutoUpdateStageWithManager(c, cc, mgr)
 		},
 	}
 }
 
-// runMaintain executes one maintenance wave (the one-shot entry — no
-// shutdown checkpoints).
+// runMaintain executes one maintenance wave (no shutdown checkpoints) over
+// the given stage set.
 func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages) error {
 	return runMaintainGraceful(w, cfg, opts, stages, nil)
+}
+
+// runOneShotMaintainWave is the one-shot maintain entry (fix I-1): ONE
+// shared transient manager is created BEFORE the stages run and every
+// core-touching stage receives it — the previous per-stage nil-managed
+// composition made the core-auto-update stage's own manager refuse on the
+// activate stage's unreleased flock and abort the wave after a fully
+// successful activation. The flock-refusal check lands HERE, once, at wave
+// start: a daemon-held core fails the wave loud before any stage runs,
+// never mid-wave. After the wave the flock is released WITHOUT stopping any
+// core the wave spawned or adopted (A2 — the pidfile is left for the
+// daemon to adopt).
+func runOneShotMaintainWave(w io.Writer, cfg *config.Config, opts maintainOptions) error {
+	mgr, err := core.NewManager(cfg.Core, newPaths(cfg).dataDir, w)
+	if err != nil {
+		if errors.Is(err, core.ErrDaemonHoldsCore) {
+			return fmt.Errorf("maintain: %s", daemonOwnsCoreMessage)
+		}
+		return fmt.Errorf("maintain: core manager: %w", err)
+	}
+	defer mgr.Release()
+	return runMaintain(w, cfg, opts, defaultMaintainStages(opts, mgr))
 }
 
 // errWavePaused is internal: between() fired — the wave stops after the
@@ -1610,6 +1589,15 @@ func (s *waveRunState) runTail(opts maintainOptions) error {
 	}); err != nil {
 		outf(s.w, "ERROR: stage-stats write failed: %v\n", err)
 	}
+	// The managed-core auto-update check (T5, D4) runs last — an updated
+	// binary swaps+restarts AFTER the wave's own activation restart, never
+	// racing it. The stage swallows its failures into loud WARNINGs (D4:
+	// failures never break the wave), so runStage sees only success.
+	if s.stages.coreAutoUpdate != nil {
+		if !s.runStage("core-auto-update", s.stages.coreAutoUpdate) {
+			return s.pauseOrErr()
+		}
+	}
 	return nil
 }
 
@@ -1723,10 +1711,11 @@ func reportStatsFailure(w io.Writer, err error) error {
 // runStatsStage polls the live client's StatsService and folds the per-tag
 // deltas into the geo-base (W4 accounting; package stats owns the contract).
 // W7 item 9: every failure leaves this function CLASSIFIED —
-//   - INFO: the activate target lacks the rendered api/stats shape (we render
-//     it, so we read it back), or the loopback endpoint refuses connections
-//     (the service was not restarted since activation). The poll is skipped
-//     without exec'ing xray; the wave continues, exit status unaffected.
+//   - INFO: the live core config lacks the rendered api/stats shape (we
+//     render it, so we read it back), or the loopback endpoint refuses
+//     connections (the core is not running the activated config). The poll
+//     is skipped without exec'ing xray; the wave continues, exit status
+//     unaffected.
 //   - WARNING: the endpoint is reachable but the poll fails at the protocol
 //     level (or the store/target cannot be read) — today's accounting-only
 //     behavior.
@@ -1746,35 +1735,34 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 		return stats.NewClassified(stats.ClassWarning,
 			fmt.Errorf("read geo-base for stats folding: %w", err))
 	}
-	server := fmt.Sprintf("127.0.0.1:%d", cfg.Render.StatsPort)
-
-	target := config.ExpandHome(cfg.Activate.Target)
-	if target == "" {
-		// Configless boundary (W12): without activate.target there is no
-		// live config to inspect and nothing to poll against. Accounting
-		// skips the wave — INFO (expected shape), never LOUD: no data is
-		// lost, the working stages keep running.
+	server := fmt.Sprintf("127.0.0.1:%d", cfg.Core.APIPort)
+	target := ownLivePath(p)
+	if cfg.Configless {
+		// Configless boundary (W12, keyed on the marker since the external
+		// mode died): a configless run has no configured deployment to poll
+		// against. Accounting skips the wave — INFO (expected shape), never
+		// LOUD: no data is lost, the working stages keep running.
 		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
-			"configless mode: no activate.target — stats accounting unavailable "+
+			"configless mode: no configured deployment — stats accounting unavailable "+
 				"(provide -c or a config at %s to enable the poll)", config.ShareConfigDisplay))
 	}
-	hasAPI, err := stats.TargetHasAPI(target, cfg.Render.StatsPort)
+	hasAPI, err := stats.TargetHasAPI(target, cfg.Core.APIPort)
 	if err != nil {
 		return stats.NewClassified(stats.ClassWarning, err)
 	}
 	if !hasAPI {
 		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
-			"stats will be available after the first activation + service restart; "+
+			"stats will be available after the first activation + the daemon's core restart; "+
 				"skipping accounting this wave (target %s lacks the rendered api/stats shape)", target))
 	}
 	if !stats.EndpointReachable(context.Background(), server) {
 		return stats.NewClassified(stats.ClassInfo, fmt.Errorf(
-			"stats will be available after the first activation + service restart; "+
-				"skipping accounting this wave (%s connection refused — the service is not running the activated config)", server))
+			"stats will be available after the first activation + the daemon's core restart; "+
+				"skipping accounting this wave (%s connection refused — the own core is not running the activated config)", server))
 	}
 
 	res, err := stats.Run(context.Background(), stats.Options{
-		BinPath: config.ExpandHome(cfg.Activate.XrayBin),
+		BinPath: coreXrayBin(cfg),
 		Server:  server,
 		Pattern: "outbound>>>pool-",
 		Timeout: cfg.Maintain.StatsTimeout.Duration,
@@ -2207,28 +2195,195 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
 	return nil
 }
 
-// runActivateStage is the activate-if-changed gate: an unchanged render is a
-// no-op with a clear line (the live config is never rewritten without a
-// diff — and nothing restarts); a differing render goes through the W3
-// activate path (-test gate → backup → atomic replace) and, since W13, the
-// gated auto-restart + health check via the injected wiring.
-func runActivateStage(cmd *cobra.Command, cfg *config.Config, wiring *restartWiring) error {
+// runCoreAutoUpdateStage is the wave's managed-core auto-update check (D4:
+// checked each maintenance wave; S5: inert with a one-time INFO for an
+// overridden [core].xray_bin). Failures NEVER break the wave — they land in
+// the journal as loud WARNINGs and the wave completes (the next wave
+// retries: a failed check does not advance the interval state).
+func runCoreAutoUpdateStage(cmd *cobra.Command, cfg *config.Config) error {
+	// The one-shot entry: a transient manager (S3 — refuses loud under the
+	// daemon's flock, transient only when daemon-less).
+	return runCoreAutoUpdateStageWithManager(cmd, cfg, nil)
+}
+
+// runCoreAutoUpdateStageWithManager is the stage with the manager injected:
+// the watch daemon passes ITS long-lived manager (the S5 inert flag lives
+// once per manager lifetime); nil creates a transient one (one-shot
+// semantics, mirroring the activate stage).
+func runCoreAutoUpdateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *core.Manager) error {
+	out := cmd.OutOrStdout()
 	p := newPaths(cfg)
-	rendered, err := os.ReadFile(p.rendered)
-	if err != nil {
-		return fmt.Errorf("no rendered config (%s) — the render stage must run before activation", p.rendered)
+	if mgr == nil {
+		var err error
+		mgr, err = core.NewManager(cfg.Core, p.dataDir, out)
+		if err != nil {
+			if errors.Is(err, core.ErrDaemonHoldsCore) {
+				return fmt.Errorf("core auto-update: %s", daemonOwnsCoreMessage)
+			}
+			return fmt.Errorf("core auto-update: core manager: %w", err)
+		}
+		// The transient manager's lifecycle is the one-shot's: a spawned
+		// core survives the process by design (A2 — the pidfile is left for
+		// the daemon to adopt), exactly like the activate stage.
 	}
-	// Configless boundary (W12): no configured target — refuse before any
-	// diff/replace consideration (runActivate enforces the same contract).
-	if cfg.Activate.Target == "" {
+	if err := mgr.AutoUpdate(context.Background(), cfg.Core); err != nil {
+		outf(out, "WARNING: core auto-update: %v (the wave continues)\n", err)
+	}
+	return nil
+}
+
+// daemonOwnsCoreMessage is the S3 one-shot refusal: the daemon's manager
+// holds the singleton flock, so a one-shot core lifecycle is refused loud.
+// The exact text is test-pinned (TestOneShotActivateRefusesUnderFlock).
+const daemonOwnsCoreMessage = "the daemon owns the core — restart the unit or use watch"
+
+// runActivateStage is the own-core activate-if-changed gate (the T4
+// activation contract): the stage owns the ONE core lifecycle —
+//
+//	-test gate via [core].xray_bin (S1) → dated backup under the C1 name
+//	(backups/config.json.bak-<ts>) → atomic replace of live.json →
+//	manager.Restart → Healthy → RecordHealth (D8 strikes, post-activation
+//	ONLY per C3).
+//
+// No-op shapes stay loud and touch nothing: a byte-identical candidate is
+// "no changes" (and revives a dead core — the minimal crash-recovery seam
+// between waves); a missing candidate means the render leg skipped the wave
+// (empty pool / not run). The replace→restart→health sequence is ONE
+// non-interruptible step (the W17 contract — the shutdown checkpoint fires
+// only between wave stages).
+func runActivateStage(cmd *cobra.Command, cfg *config.Config) error {
+	// The one-shot entry: a transient manager (S3 — refuses loud under the
+	// daemon's flock, spawns transiently when daemon-less).
+	return runActivateStageWithManager(cmd, cfg, nil)
+}
+
+// runActivateStageWithManager is the stage with the manager injected: the
+// watch daemon passes ITS long-lived manager (the strike counter's home
+// across waves — D8); nil creates a transient one (one-shot semantics).
+func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *core.Manager) error {
+	out := cmd.OutOrStdout()
+	p := newPaths(cfg)
+	// Loud stage boundary (W12, keyed on the Configless marker since the
+	// external mode died): activation drives the core lifecycle, which
+	// belongs to a configured deployment.
+	if cfg.Configless {
 		return config.ConfiglessBoundaryError("activate")
 	}
-	live, err := os.ReadFile(config.ExpandHome(cfg.Activate.Target))
-	if err == nil && bytes.Equal(rendered, live) {
-		outln(cmd.OutOrStdout(), "no changes — the live config already matches the rendered pool; nothing activated")
+	if mgr == nil {
+		var err error
+		mgr, err = core.NewManager(cfg.Core, p.dataDir, out)
+		if err != nil {
+			if errors.Is(err, core.ErrDaemonHoldsCore) {
+				return fmt.Errorf("activate: %s", daemonOwnsCoreMessage)
+			}
+			return fmt.Errorf("activate: core manager: %w", err)
+		}
+	}
+
+	candidate, err := os.ReadFile(ownCandidatePath(p))
+	if os.IsNotExist(err) {
+		return activateMissingCandidate(out, mgr, ownLivePath(p))
+	}
+	if err != nil {
+		return fmt.Errorf("activate: read candidate %s: %w", ownCandidatePath(p), err)
+	}
+	live, liveErr := os.ReadFile(ownLivePath(p))
+	if liveErr == nil && bytes.Equal(candidate, live) {
+		// Activate-if-changed: byte-identical steady state — no restart, no
+		// backup, no strike. The core is revived if it died between waves
+		// (the minimal crash-recovery seam; full supervision is Task 5).
+		if rerr := mgr.EnsureRunning(context.Background()); rerr != nil {
+			return fmt.Errorf("activate: core revive: %w", rerr)
+		}
+		outln(out, "no changes — the live core config already matches the rendered pool; nothing activated")
 		return nil
 	}
-	return runActivate(cmd, cfg, "", true, wiring)
+
+	// L10: the -test gate runs on the CANDIDATE (never the live config)
+	// through the SINGLE core binary knob (S1) — a bad config never reaches
+	// the live path. The managed binary resolves its assets from the managed
+	// asset dir (S6); a system override resolves its own.
+	res, err := activate.Run(activate.Input{
+		RenderedPath: ownCandidatePath(p),
+		TargetPath:   ownLivePath(p),
+		XrayBin:      coreXrayBin(cfg),
+		AssetDir:     coreAssetDir(cfg, p),
+		BackupDir:    p.backupDir,
+		// No prior live config on the very first activation — nothing to
+		// back up yet (the backup exists from the second activation on).
+		Backup:      liveErr == nil,
+		BackupBase:  "config.json",
+		TestTimeout: activateTestTimeout(cfg),
+		BackupKeep:  cfg.Activate.BackupKeep,
+	})
+	if err != nil {
+		return err
+	}
+
+	// The core restarts ON the replaced live config. The ctx is deliberately
+	// NON-canceling (C4): the exec path kills the child on ctx cancellation,
+	// and the core must outlive this stage (and a one-shot process entirely —
+	// A2 reparenting + pidfile adoption); shutdown goes through Stop.
+	if rerr := mgr.Restart(context.Background()); rerr != nil {
+		return fmt.Errorf("activate: core restart failed (the replaced config %s is on disk): %w",
+			ownLivePath(p), rerr)
+	}
+
+	outf(out, "%s\nbackup: %s\ndiff summary: %d pool nodes in the active set\n",
+		ui.Chip("activation complete:", fmt.Sprintf("%s replaced from %s",
+			ownLivePath(p), ownCandidatePath(p)), stageColor(cmd)),
+		orNone(res.BackupPath), selectionSize(p.selection))
+
+	// D8: the strike counter eats ONLY post-activation health checks (C3) —
+	// K consecutive failures roll back to the newest dated backup through
+	// the manager. A failed health is report-only: the wave completes (the
+	// rollback, not the wave, is the remedy).
+	herr := mgr.Healthy(context.Background())
+	rolled := mgr.RecordHealth(herr)
+	if herr != nil {
+		outf(out, "WARNING: the post-activation health check FAILED: %v\n", herr)
+	}
+	if rolled {
+		outf(out, "%s\n", ui.Chip("wave verdict:", ui.Colorize(ui.Amber,
+			"activation ROLLED BACK — the newest pre-activate backup was restored and the core restarted on it",
+			stageColor(cmd)), stageColor(cmd)))
+	}
+	return nil
+}
+
+// activateMissingCandidate is the candidate-missing activate (T4-I-1): the
+// render leg writes a candidate only for a non-empty selection — no
+// candidate = the wave skipped activation by design (empty pool / render
+// not run). The core lifecycle still applies: with a last-good live config
+// on disk the core is ensured RUNNING on it (D7 keep-last-good — the
+// waves-retry contract holds for the empty-pool shape too, e.g. a daemon
+// restarted after a manual kill); without any live config there is nothing
+// to run — the clean loud no-op stands (a spawn attempt would fail on the
+// missing artifact). Neither shape feeds a strike (C3: no post-activation
+// health check runs for a no-op activation).
+func activateMissingCandidate(out io.Writer, mgr *core.Manager, livePath string) error {
+	if _, lerr := os.Stat(livePath); lerr == nil {
+		if rerr := mgr.EnsureRunning(context.Background()); rerr != nil {
+			return fmt.Errorf("activate: core revive on the last-good live config: %w", rerr)
+		}
+		outf(out, "activate: no rendered own config candidate — nothing to activate; "+
+			"the core stays/revives on the last-good live config (D7 keep-last-good)\n")
+		return nil
+	}
+	outf(out, "activate: no rendered own config candidate — nothing to activate "+
+		"(empty selection or render not run); live core config untouched\n")
+	return nil
+}
+
+// coreAssetDir resolves the XRAY_LOCATION_ASSET for the activation gate:
+// the managed asset dir (S6) for the managed binary, nothing for a system
+// override (it resolves its own assets) — the same split the core manager
+// applies to the spawned child.
+func coreAssetDir(cfg *config.Config, p paths) string {
+	if cfg.Core.XrayBin == "" {
+		return filepath.Join(p.dataDir, "share", "xray")
+	}
+	return ""
 }
 
 func newStatusCommand(cfgPath *string) *cobra.Command {
@@ -2243,13 +2398,16 @@ func newStatusCommand(cfgPath *string) *cobra.Command {
 		Short: "Pipeline state summary (read-only)",
 		Long: `Read-only summary of the pipeline (fetch, parse, filter, probe, geo,
 selection, render) plus the intelligence dashboard: the pipeline funnel,
-global pool quality, the provider intelligence table, and the media/unlock
-summary. The resolved config source is printed as the config line (explicit
--c, home default, cwd default, or configless built-in defaults).
+global pool quality, the provider intelligence table, the media/unlock
+summary, and the own-core block (PID, ` + "`xray version`" + ` banner, uptime, the
+live config's inbounds, and the D8 strike/rollback state — honest degraded
+states when the core is not running). The resolved config source is printed
+as the config line (explicit -c, home default, cwd default, or configless
+built-in defaults).
 
 --overlap (-v) appends the pairwise provider-overlap matrix view with
 pruning recommendations. --json bypasses the dashboard entirely and emits
-one machine-readable JSON document (schema_version 1.0); both flags
+one machine-readable JSON document (schema_version 1.1); both flags
 compose — the overlap matrix is always part of the JSON.
 
 Install detection reads the directories given via --bin-dir / --unit-dir
@@ -2328,6 +2486,7 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 	}
 	printSelectionStatus(out, p, color)
 	printRenderStatus(out, p, color)
+	printCoreStatus(out, collectCoreState(p, res.Config), color)
 	binDir, unitDir := statusInstallDirs(cmd)
 	printInstallStatus(out, res.Config, res.Path, binDir, unitDir, color)
 	return nil

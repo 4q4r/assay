@@ -13,75 +13,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// knobFixture is a small selection + template with the socks-in/http-in
-// inbounds (the default pool_inbound_tags) and two reality nodes in DE
-// (so the pool_de country balancer renders per the >=2 threshold).
-func knobFixture(t *testing.T, inbounds string) (render.Input, func(t *testing.T) map[string]any) {
+// knobFixture is a small selection (two reality nodes in DE, so the pool_de
+// country balancer renders per the >=2 threshold) rendered through the own
+// config with the given knobs — the consumption contract for every surviving
+// [render] knob.
+func knobFixture(t *testing.T, knobs render.Config) func(t *testing.T) map[string]any {
 	t.Helper()
-	tmpl := `{
-  "log": {"loglevel": "warning"},
-  "inbounds": ` + inbounds + `,
-  "outbounds": [
-    {"tag": "direct", "protocol": "freedom"},
-    {"tag": "block", "protocol": "blackhole"}
-  ],
-  "routing": {
-    "rules": [
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
-      {"type": "field", "network": "tcp,udp", "balancerTag": "best_rtt"}
-    ]
-  }
-}`
 	node1 := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000009", "knob1.example.com", 443,
 		map[string]string{"security": "reality", "type": "xhttp", "pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": "AA"})
 	node2 := model.NewNode("s", "vless", "00000000-0000-0000-0000-000000000010", "knob2.example.com", 443,
 		map[string]string{"security": "reality", "type": "xhttp", "pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": "BB"})
 	sel := &model.Selection{Nodes: []model.SelectedNode{
-		{Tag: "pool-de-01", Key: node1.Key, Country: "de"},
-		{Tag: "pool-de-02", Key: node2.Key, Country: "de"},
+		{Tag: "pool-de-01", Key: node1.Key, Country: "de", City: "Frankfurt"},
+		{Tag: "pool-de-02", Key: node2.Key, Country: "de", City: "Frankfurt"},
 	}}
-	in := render.Input{
-		Template:   []byte(tmpl),
-		Selection:  sel,
-		NodesByKey: map[string]*model.Node{node1.Key: node1, node2.Key: node2},
-		Cfg: render.Config{
-			StatsPort: 15490,
-			PoolRoutes: []render.PoolRoute{{
-				Balancer: "pool_de",
-				Domains:  []string{"geosite:netflix"},
-			}},
-		},
-	}
-	return in, func(t *testing.T) map[string]any {
+	byKey := map[string]*model.Node{node1.Key: node1, node2.Key: node2}
+	routes := []render.PoolRoute{{
+		Balancer: "pool_de",
+		Domains:  []string{"geosite:netflix"},
+	}}
+	return func(t *testing.T) map[string]any {
 		t.Helper()
-		res, err := render.Render(in)
+		b, _, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, nil, knobs)
 		require.NoError(t, err)
 		var m map[string]any
-		require.NoError(t, json.Unmarshal(res.Config, &m))
+		require.NoError(t, json.Unmarshal(b, &m))
 		return m
 	}
 }
 
-const twoInbounds = `[
-    {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks"},
-    {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"}
-  ]`
-
-// TestKnobDefaultsPreserveW3Shape pins the default-preservation contract: an
-// empty knob surface (zero-value Config fields beyond StatsPort/PoolRoutes)
-// renders byte-identical pool artifacts to the W3 baseline — inboundTag
-// [socks-in http-in], tcpMaxSeg 1440, fingerprint firefox, tolerance 0.2 —
-// with one W19 divergence: an ABSENT observatory_interval is now ADAPTIVE
-// (render-time computation from the active count), whose 60s floor for this
-// 1-node selection spells as Go duration "1m0s" (same value the core parsed
-// from the old fixed "60s" default).
-func TestKnobDefaultsPreserveW3Shape(t *testing.T) {
-	in, renderFn := knobFixture(t, twoInbounds)
-	in.Cfg = render.Config{ // zero values everywhere except the W3-era fields
-		StatsPort:  15490,
-		PoolRoutes: in.Cfg.PoolRoutes,
-	}
-	m := renderFn(t)
+// TestKnobDefaultsPreserveShape pins the default-preservation contract: an
+// empty knob surface renders the same pool artifacts the renderer has always
+// emitted — tcpMaxSeg 1440, fingerprint firefox, tolerance 0.2 — with the
+// W19 adaptive observatory interval spelling as Go duration "1m0s" at this
+// pool size (same value the core parsed from the old fixed "60s" default),
+// and the pool rules carrying the GENERATED own inbound tags.
+func TestKnobDefaultsPreserveShape(t *testing.T) {
+	m := knobFixture(t, render.Config{})(t)
 
 	rules := m["routing"].(map[string]any)["rules"].([]any)
 	var poolRule map[string]any
@@ -93,7 +61,7 @@ func TestKnobDefaultsPreserveW3Shape(t *testing.T) {
 		}
 	}
 	require.NotNil(t, poolRule)
-	assert.Equal(t, []any{"socks-in", "http-in"}, poolRule["inboundTag"])
+	assert.Equal(t, []any{"in", "in-http"}, poolRule["inboundTag"])
 
 	obs := m["observatory"].(map[string]any)
 	assert.Equal(t, "1m0s", obs["probeInterval"], "W19: absent knob → adaptive interval (60s floor at this pool size)")
@@ -125,56 +93,15 @@ func TestKnobDefaultsPreserveW3Shape(t *testing.T) {
 	assert.InDelta(t, 0.2, tol, 1e-9)
 }
 
-// TestPoolInboundTagsRenamedFailsLoud pins the exact error shape: a template
-// whose inbound was renamed must fail with the missing tag named.
-func TestPoolInboundTagsRenamedFailsLoud(t *testing.T) {
-	in, _ := knobFixture(t, `[
-		{"tag": "socks-in2", "listen": "127.0.0.1", "port": 10808, "protocol": "socks"},
-		{"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"}
-	]`)
-	in.Cfg.PoolInboundTags = nil // nil → the render package default tags apply
-	_, err := render.Render(in)
-	require.Error(t, err, "a renamed template inbound must fail the render loud (D2 silent fall-through)")
-	assert.Contains(t, err.Error(), "socks-in", "the missing tag must be named")
-}
-
-// TestPoolInboundTagsExtraValidTagIsCarried pins the consumption contract:
-// an added, existing inbound tag appears in every rendered pool rule.
-func TestPoolInboundTagsExtraValidTagIsCarried(t *testing.T) {
-	in, _ := knobFixture(t, `[
-		{"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks"},
-		{"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"},
-		{"tag": "tun-in", "listen": "127.0.0.1", "port": 10910, "protocol": "socks"}
-	]`)
-	in.Cfg.PoolInboundTags = []string{"socks-in", "http-in", "tun-in"}
-	res, err := render.Render(in)
-	require.NoError(t, err)
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
-	rules := m["routing"].(map[string]any)["rules"].([]any)
-	found := 0
-	for _, r := range rules {
-		rm, ok := r.(map[string]any)
-		if ok && rm["domain"] != nil && strings.Contains(rm["domain"].([]any)[0].(string), "netflix") {
-			assert.Equal(t, []any{"socks-in", "http-in", "tun-in"}, rm["inboundTag"])
-			found++
-		}
-	}
-	assert.Equal(t, 1, found, "the single pool rule must carry all three tags")
-}
-
 // TestRenderKnobValuesRenderVerbatim pins the consumption contract for the
 // value knobs: each configured value lands in the rendered config exactly.
 func TestRenderKnobValuesRenderVerbatim(t *testing.T) {
-	in, _ := knobFixture(t, twoInbounds)
-	in.Cfg.ObservatoryInterval = "45s"
-	in.Cfg.TCPMaxSeg = 1380
-	in.Cfg.TLSFingerprint = "chrome"
-	in.Cfg.BalancerTolerance = 0.55
-	res, err := render.Render(in)
-	require.NoError(t, err)
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	m := knobFixture(t, render.Config{
+		ObservatoryInterval: "45s",
+		TCPMaxSeg:           1380,
+		TLSFingerprint:      "chrome",
+		BalancerTolerance:   0.55,
+	})(t)
 
 	assert.Equal(t, "45s", m["observatory"].(map[string]any)["probeInterval"],
 		"observatory_interval is a verbatim string passthrough")
@@ -209,17 +136,6 @@ func TestRenderKnobValuesRenderVerbatim(t *testing.T) {
 // subjectSelector is untouched by the scaling — ["pool-"] covers EVERY pool
 // outbound regardless of count (L2).
 func TestObservatoryIntervalAdaptive(t *testing.T) {
-	tmpl := `{
-	  "log": {"loglevel": "warning"},
-	  "inbounds": ` + twoInbounds + `,
-	  "outbounds": [
-	    {"tag": "direct", "protocol": "freedom"},
-	    {"tag": "block", "protocol": "blackhole"}
-	  ],
-	  "routing": {"rules": [
-	    {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}
-	  ]}
-	}`
 	build := func(t *testing.T, n int) map[string]any {
 		t.Helper()
 		sel := &model.Selection{}
@@ -233,13 +149,10 @@ func TestObservatoryIntervalAdaptive(t *testing.T) {
 				Tag: fmt.Sprintf("pool-de-%02d", i+1), Key: node.Key, Country: "de",
 			})
 		}
-		res, err := render.Render(render.Input{
-			Template: []byte(tmpl), Selection: sel, NodesByKey: byKey,
-			Cfg: render.Config{StatsPort: 15490},
-		})
+		b, _, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey, nil, render.Config{})
 		require.NoError(t, err)
 		var m map[string]any
-		require.NoError(t, json.Unmarshal(res.Config, &m))
+		require.NoError(t, json.Unmarshal(b, &m))
 		return m
 	}
 
@@ -265,16 +178,7 @@ func TestObservatoryIntervalAdaptive(t *testing.T) {
 // site of [render].balancer_tolerance: city balancers carry the same
 // configured tolerance as country ones.
 func TestBalancerToleranceAppliesToCityBalancersToo(t *testing.T) {
-	in, _ := knobFixture(t, twoInbounds)
-	in.Cfg.BalancerTolerance = 0.7
-	// The fixture now has 2 DE nodes; set both to same city → city balancer renders (D5).
-	in.Selection.Nodes[0].City = "Frankfurt"
-	in.Selection.Nodes[1].City = "Frankfurt"
-
-	res, err := render.Render(in)
-	require.NoError(t, err)
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	m := knobFixture(t, render.Config{BalancerTolerance: 0.7})(t)
 	cityTolerance := map[string]float64{}
 	for _, b := range m["routing"].(map[string]any)["balancers"].([]any) {
 		bm := b.(map[string]any)

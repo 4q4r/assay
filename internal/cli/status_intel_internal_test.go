@@ -824,8 +824,8 @@ func TestStatusTimestampsLocalTime(t *testing.T) {
 	// A rendered-config artifact with a fixed UTC mtime: 10:00Z → 12:00+02:00.
 	stamp := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
 	require.NoError(t, os.MkdirAll(p.renderedDir, 0o750))
-	require.NoError(t, os.WriteFile(p.rendered, []byte("config"), 0o600))
-	require.NoError(t, os.Chtimes(p.rendered, stamp, stamp))
+	require.NoError(t, os.WriteFile(ownLivePath(p), []byte("config"), 0o600))
+	require.NoError(t, os.Chtimes(ownLivePath(p), stamp, stamp))
 
 	s := runStatusCaptured(t, cfgPath, nil)
 	assert.Contains(t, s, "at 2026-11-04T14:00:00+02:00",

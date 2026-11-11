@@ -306,11 +306,31 @@ func TestRunWatchGracefulShutdown(t *testing.T) {
 		},
 	}
 	out := &syncWriter{}
-	cfg := &config.Config{DataDir: dir, Plugins: config.PluginsConfig{Dir: filepath.Join(dir, "plugins")}}
+	// The daemon owns a core manager (T4/S2): the fake core binary and a
+	// test-band port so the bootstrap spawn succeeds hermetically, and the
+	// SIGTERM shutdown's explicit core stop (C4) has something to stop.
+	corePort := nextCoreTestPort()
+	cfg := &config.Config{
+		DataDir: dir,
+		Plugins: config.PluginsConfig{Dir: filepath.Join(dir, "plugins")},
+		Core: config.CoreConfig{
+			XrayBin:   cliFakeBinary(t),
+			SocksPort: corePort,
+			HTTPPort:  corePort + 1,
+			Loglevel:  "warning",
+		},
+	}
 	done := make(chan error, 1)
 	go func() { done <- runWatch(out, cfg, dep) }()
 	<-watchdogStarted
-	<-sdStarted // the sd_notify handshake must start with the daemon
+	// The sd_notify handshake starts after the core manager's bootstrap
+	// spawn (T4/S2 ordering) — bounded so a wedged spawn fails the test
+	// instead of hanging it.
+	select {
+	case <-sdStarted:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("daemon never reached READY: %s", out.String())
+	}
 	sigs <- os.Interrupt
 	select {
 	case err := <-done:

@@ -1,10 +1,8 @@
 // Package activate implements the activation step: xray run -test gate
 // (L10 — a bad config must never reach the live path), date-stamped backup,
-// and an atomic replace. Since W13 the restart of the live client after a
-// gated activation is the wave's concern, executed exclusively through
-// internal/restart's byte-pinned allowlist executor — the orchestration
-// lives in the cli layer (runActivate), and this package itself still never
-// executes anything but the xray -test child.
+// and an atomic replace. The post-replace restart belongs to the caller's
+// lifecycle layer (the core manager, since the self-held-core pivot) — this
+// package never executes anything but the xray -test child.
 package activate
 
 import (
@@ -17,7 +15,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"assay/internal/config"
 	"assay/internal/store"
 )
 
@@ -29,27 +26,28 @@ type Input struct {
 	AssetDir     string // XRAY_LOCATION_ASSET for -test (geosite/geoip resolution)
 	BackupDir    string // when Backup is set, date-stamped copies land here
 	Backup       bool
-	NoRestart    bool // documentation-only; this package never restarts regardless
 	// TestTimeout bounds the `xray run -test` child ([activate].test_timeout).
 	// >0 = context.WithTimeout; 0 = NO deadline (current behavior).
 	// The config layer resolves nil → DefaultTestTimeout.
 	TestTimeout time.Duration
-	// ServiceName is the unit named in the printed restart hint
-	// ([activate].service_name); zero falls back to config.DefaultServiceName.
-	ServiceName string
 	// BackupKeep caps backup retention after a successful new backup write
 	// ([activate].backup_keep): only the N newest .bak-<ts> files remain.
 	// 0 = unlimited. Deletion failures are loud and abort BEFORE the live
 	// target is replaced.
 	BackupKeep int
+	// BackupBase overrides the backup basename. Empty = filepath.Base of the
+	// target (the legacy foreign-target naming). The own-core activate
+	// stamps config.json.bak-<ts> regardless of the live artifact's name
+	// (the C1 cross-task contract: the core manager's D8 rollback restores
+	// the newest <data>/backups/config.json.bak-<ts>).
+	BackupBase string
 }
 
 // Result reports what happened.
 type Result struct {
-	TestPassed  bool
-	Replaced    bool
-	BackupPath  string
-	RestartHint string
+	TestPassed bool
+	Replaced   bool
+	BackupPath string
 }
 
 // Run executes -test → (optional) backup → retention → atomic replace.
@@ -64,12 +62,16 @@ func Run(in Input) (Result, error) {
 
 	// 2. Date-stamped backup of the CURRENT target.
 	if in.Backup {
-		bp, err := backupTarget(in.TargetPath, in.BackupDir)
+		base := in.BackupBase
+		if base == "" {
+			base = filepath.Base(in.TargetPath)
+		}
+		bp, err := backupTarget(in.TargetPath, in.BackupDir, base)
 		if err != nil {
 			return res, fmt.Errorf("backup before replace: %w", err)
 		}
 		res.BackupPath = bp
-		if err := store.KeepNewestBackups(in.BackupDir, filepath.Base(in.TargetPath), in.BackupKeep); err != nil {
+		if err := store.KeepNewestBackups(in.BackupDir, base, in.BackupKeep); err != nil {
 			return res, fmt.Errorf("backup retention (backup_keep=%d): %w", in.BackupKeep, err)
 		}
 	}
@@ -80,13 +82,6 @@ func Run(in Input) (Result, error) {
 		return res, fmt.Errorf("atomic replace: %w", err)
 	}
 	res.Replaced = true
-	service := in.ServiceName
-	if service == "" {
-		service = config.DefaultServiceName
-	}
-	res.RestartHint = fmt.Sprintf(
-		"activation complete: %s replaced from %s — restart manually when ready:\n	systemctl --user restart %s",
-		in.TargetPath, in.RenderedPath, service)
 	return res, nil
 }
 
@@ -160,12 +155,12 @@ func xrayTest(in Input) error {
 // deterministically (no process, genuinely expired deadline).
 var runGate = func(cmd *exec.Cmd) error { return cmd.Run() }
 
-func backupTarget(target, backupDir string) (string, error) {
+func backupTarget(target, backupDir, base string) (string, error) {
 	if err := os.MkdirAll(backupDir, 0o750); err != nil {
 		return "", err
 	}
 	stamp := time.Now().UTC().Format("20060102-150405")
-	dst := filepath.Join(backupDir, filepath.Base(target)+".bak-"+stamp)
+	dst := filepath.Join(backupDir, base+".bak-"+stamp)
 	data, err := os.ReadFile(target)
 	if err != nil {
 		return "", err
@@ -176,9 +171,12 @@ func backupTarget(target, backupDir string) (string, error) {
 // atomicReplace copies the rendered file into the target's directory under a
 // temp name (same filesystem → rename is atomic), preserves the original
 // mode, and renames over the target. Paths come from the owner's config.
+// The FIRST activation (no existing target to stat) defaults to 0600 — the
+// config carries pool node credentials (T4-M-1 hardening), matching the
+// render leg's deliberate 0600 write mode.
 func atomicReplace(src, dst string) error {
 	dir := filepath.Dir(dst)
-	mode := os.FileMode(0o644)
+	mode := os.FileMode(0o600)
 	if st, err := os.Stat(dst); err == nil {
 		mode = st.Mode().Perm()
 	}

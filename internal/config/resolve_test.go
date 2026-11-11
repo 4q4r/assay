@@ -145,8 +145,8 @@ func TestResolveExplicitMissingFailsLoud(t *testing.T) {
 
 // TestConfiglessDefaults pins the configless shape: data_dir is the XDG
 // default under the injected home; every previously-required knob carries
-// its default; render.template and activate.target are deliberately EMPTY —
-// they are the loud stage boundaries (configless mode cannot render/activate).
+// its default; the Configless boundary marker is SET — it is the loud stage
+// boundary's key (configless mode cannot render/activate).
 func TestConfiglessDefaults(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", "") // hermetic: pin the fallback branch
@@ -171,8 +171,20 @@ func TestConfiglessDefaults(t *testing.T) {
 	assert.Equal(t, 1440, cfg.Render.TCPMaxSeg)
 	assert.Equal(t, config.DefaultRefreshInterval, cfg.Maintain.RefreshInterval.Duration)
 	assert.Equal(t, config.DefaultUserAgent, cfg.HTTP.UserAgent)
-	assert.Empty(t, cfg.Render.Template, "render.template stays empty: the configless render boundary")
-	assert.Empty(t, cfg.Activate.Target, "activate.target stays empty: the configless activate boundary")
+	assert.True(t, cfg.Configless, "the configless marker is set: the stage boundaries key on it")
+}
+
+// TestFileLoadCarriesNoConfiglessMarker pins the marker's polarity: a
+// file-loaded config (any tier) never carries the configless boundary marker
+// — render/activate run for it.
+func TestFileLoadCarriesNoConfiglessMarker(t *testing.T) {
+	dir := t.TempDir()
+	path := writeMinimalConfig(t, dir, "config.toml")
+	res, err := config.Resolve(path, t.TempDir(), t.TempDir())
+	require.NoError(t, err)
+	require.Equal(t, config.SourceExplicit, res.Source)
+	assert.False(t, res.Config.Configless,
+		"a file-loaded config renders/activates — the boundary is configless-only")
 }
 
 // TestResolveRelativeExplicitUsesInjectedCWD pins the M-2 contract: a
@@ -193,19 +205,6 @@ func TestResolveRelativeExplicitUsesInjectedCWD(t *testing.T) {
 	assert.Equal(t, injectedCfg, res.Path,
 		"relative -c resolves against the injected cwd, not the process cwd")
 	assert.NotEqual(t, otherCfg, res.Path)
-}
-
-// TestFileLoadKeepsRenderTargetDefaults pins the unchanged file-loaded
-// behavior: a real config file still receives the template/target defaults
-// (strict decode and defaults are untouched by the configless wave).
-func TestFileLoadKeepsRenderTargetDefaults(t *testing.T) {
-	dir := t.TempDir()
-	path := writeMinimalConfig(t, dir, "config.toml")
-	res, err := config.Resolve(path, t.TempDir(), t.TempDir())
-	require.NoError(t, err)
-	require.Equal(t, config.SourceExplicit, res.Source)
-	assert.Equal(t, "~/projects/xray-raw/config.json", res.Config.Render.Template)
-	assert.Equal(t, "~/projects/xray-raw/config.json", res.Config.Activate.Target)
 }
 
 // TestDefaultDataDirHonorsXDGDataHome pins the M-1 contract: when

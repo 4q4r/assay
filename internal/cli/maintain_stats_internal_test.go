@@ -41,18 +41,18 @@ import (
 // execMarker, so the INFO arms can prove xray was never launched.
 func statsStageCfg(t *testing.T, dir string, port int) (*config.Config, string) {
 	t.Helper()
-	target := filepath.Join(dir, "live-config.json")
 	bin := filepath.Join(dir, "sentinel-xray.sh")
 	body := "#!/bin/sh\necho executed >> " + filepath.Join(dir, "xray-executed.marker") + "\nexit 0\n"
 	require.NoError(t, os.WriteFile(bin, []byte(body), 0o755))
 	cfg := &config.Config{
 		DataDir: dir,
-		Activate: config.ActivateConfig{
-			Target:  target,
-			XrayBin: bin,
+		Core: config.CoreConfig{
+			XrayBin:   bin,
+			APIPort:   port,
+			SocksPort: port + 1,
+			HTTPPort:  port + 2,
 		},
 	}
-	cfg.Render.StatsPort = port
 	return cfg, filepath.Join(dir, "xray-executed.marker")
 }
 
@@ -60,6 +60,7 @@ func statsStageCfg(t *testing.T, dir string, port int) (*config.Config, string) 
 // api/stats block the renderer emits.
 func writeTarget(t *testing.T, path string, shaped bool, port int) {
 	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750), "the rendered dir must exist for the own live path")
 	var body string
 	if shaped {
 		body = fmt.Sprintf(`{
@@ -114,7 +115,7 @@ func TestStatsFirstRunTargetLacksAPIShapeIsINFO(t *testing.T) {
 	dir := t.TempDir()
 	port := 15491
 	cfg, marker := statsStageCfg(t, dir, port)
-	writeTarget(t, cfg.Activate.Target, false, port) // plain config: never activated
+	writeTarget(t, ownLivePath(newPaths(cfg)), false, port) // plain config: never activated
 
 	order := []string{}
 	buf := &bytes.Buffer{}
@@ -123,7 +124,7 @@ func TestStatsFirstRunTargetLacksAPIShapeIsINFO(t *testing.T) {
 
 	out := buf.String()
 	assert.Contains(t, out, "INFO:", "the first-run shape must be an INFO line, not a warning")
-	assert.Contains(t, out, "stats will be available after the first activation + service restart; skipping accounting this wave")
+	assert.Contains(t, out, "stats will be available after the first activation + the daemon's core restart; skipping accounting this wave")
 	assert.NotContains(t, out, "WARNING:", "an expected first run is never a warning")
 	_, err := os.Stat(marker)
 	assert.True(t, os.IsNotExist(err), "the poll must not exec xray when the target lacks the api shape")
@@ -140,8 +141,8 @@ func TestStatsEndpointRefusedIsINFO(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(addr)
 	port, convErr := strconv.Atoi(portStr)
 	require.NoError(t, convErr)
-	cfg.Render.StatsPort = port
-	writeTarget(t, cfg.Activate.Target, true, port) // shape present...
+	cfg.Core.APIPort = port
+	writeTarget(t, ownLivePath(newPaths(cfg)), true, port) // shape present...
 
 	order := []string{}
 	buf := &bytes.Buffer{}
@@ -150,7 +151,7 @@ func TestStatsEndpointRefusedIsINFO(t *testing.T) {
 
 	out := buf.String()
 	assert.Contains(t, out, "INFO:")
-	assert.Contains(t, out, "stats will be available after the first activation + service restart; skipping accounting this wave")
+	assert.Contains(t, out, "stats will be available after the first activation + the daemon's core restart; skipping accounting this wave")
 	assert.NotContains(t, out, "WARNING:")
 	_, err := os.Stat(marker)
 	assert.True(t, os.IsNotExist(err), "a refused endpoint must not reach the xray exec")
@@ -168,12 +169,12 @@ func TestStatsEndpointUnexpectedResponseIsWARNING(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	port, convErr := strconv.Atoi(portStr)
 	require.NoError(t, convErr)
-	cfg.Render.StatsPort = port
-	writeTarget(t, cfg.Activate.Target, true, port)
+	cfg.Core.APIPort = port
+	writeTarget(t, ownLivePath(newPaths(cfg)), true, port)
 	failing := filepath.Join(dir, "failing-xray.sh")
 	require.NoError(t, os.WriteFile(failing,
 		[]byte("#!/bin/sh\necho 'rpc error: unavailable' >&2\nexit 1\n"), 0o755))
-	cfg.Activate.XrayBin = failing
+	cfg.Core.XrayBin = failing
 
 	order := []string{}
 	buf := &bytes.Buffer{}
@@ -197,8 +198,8 @@ func TestStatsWriteFailureFailsTheWaveLoud(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	port, convErr := strconv.Atoi(portStr)
 	require.NoError(t, convErr)
-	cfg.Render.StatsPort = port
-	writeTarget(t, cfg.Activate.Target, true, port)
+	cfg.Core.APIPort = port
+	writeTarget(t, ownLivePath(newPaths(cfg)), true, port)
 
 	// The poll succeeds (real-shaped counters for pool-de-01) and the geo-base
 	// carries the matching record — the fold updates it, so the stage MUST
@@ -210,7 +211,7 @@ cat <<'EOF'
 EOF
 exit 0
 `), 0o755))
-	cfg.Activate.XrayBin = polling
+	cfg.Core.XrayBin = polling
 	geoBase := filepath.Join(dir, "geo-base.jsonl")
 	rec := &model.GeoRecord{Tag: "pool-de-01", Scheme: "vless", Host: "de1.example.com", Port: 443}
 	require.NoError(t, storeAppendGeoBase(t, geoBase, rec))

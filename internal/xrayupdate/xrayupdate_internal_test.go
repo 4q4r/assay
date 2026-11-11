@@ -308,9 +308,10 @@ func TestPostReplaceValidationFailureRollsBackToBackup(t *testing.T) {
 	assert.FileExists(t, res.StagedBinary, "the staged binary survives for inspection")
 }
 
-// --- unwritable target: exact privileged commands, never half-applied ---
+// --- unwritable target: loud refusal, never half-applied (S5 managed-only —
+// the sudo stage-and-instruct path died with the external mode) ---
 
-func TestUnwritableTargetPrintsExactPrivilegedCommands(t *testing.T) {
+func TestUnwritableTargetRefusesLoudWithoutPrivilegedCommands(t *testing.T) {
 	asset := fakeXrayZip(t, "26.10.21")
 	srv := releaseServer(t, "v26.10.21", asset, "")
 	rootDir := t.TempDir()
@@ -323,27 +324,19 @@ func TestUnwritableTargetPrintsExactPrivilegedCommands(t *testing.T) {
 	opts.AssumeYes = true
 	res, err := Run(opts)
 	require.Error(t, err, "an unwritable target must fail loud, exit-path material for the owner")
-	require.ErrorIs(t, err, ErrPrivilegedTarget)
-
-	require.Len(t, res.PrivilegedCommands, 2, "backup line + install line")
-	backupLine, installLine := res.PrivilegedCommands[0], res.PrivilegedCommands[1]
-	assert.Contains(t, backupLine, "sudo cp", "the OLD binary is backed up by the SAME privileged step")
-	assert.Contains(t, backupLine, target+".bak-20261029-120000", "the backup line is date-stamped")
-	assert.Contains(t, installLine, "sudo install -m 0755", "the exact install command")
-	assert.Contains(t, installLine, res.StagedBinary, "the STAGED file path appears verbatim")
-	assert.Contains(t, installLine, target, "the target path appears verbatim")
-
+	assert.Contains(t, err.Error(), "not writable", "the refusal names the directory")
+	assert.Contains(t, err.Error(), "[core].xray_bin", "the refusal names the knob")
 	_, err = os.Stat(res.StagedBinary)
-	require.NoError(t, err, "the staged binary SURVIVES for the owner to install manually")
+	require.NoError(t, err, "the staged binary SURVIVES for the owner to re-point and retry")
 	_, err = os.Stat(target)
 	require.True(t, os.IsNotExist(err), "nothing was half-applied to the unwritable target")
 }
 
-// I-1 pin (fix round): an unwritable target with an EXISTING binary must
-// land on the privileged path too. Pre-fix the backup copy ran BEFORE the
-// writability probe, so this case died with a generic "backup … permission
-// denied" and no sudo lines — the owner got nothing actionable.
-func TestUnwritableTargetWithExistingBinaryPrintsExactPrivilegedCommands(t *testing.T) {
+// I-1 pin (fix round), re-pointed to the loud refusal: an unwritable target
+// with an EXISTING binary must still refuse at the writability probe BEFORE
+// the backup — pre-fix the backup copy ran first and died with a generic
+// "backup … permission denied" naming nothing actionable.
+func TestUnwritableTargetWithExistingBinaryRefusesBeforeBackup(t *testing.T) {
 	asset := fakeXrayZip(t, "26.10.21")
 	srv := releaseServer(t, "v26.10.21", asset, "")
 	rootDir := t.TempDir()
@@ -359,14 +352,8 @@ func TestUnwritableTargetWithExistingBinaryPrintsExactPrivilegedCommands(t *test
 	opts.AssumeYes = true
 	res, err := Run(opts)
 	require.Error(t, err, "an unwritable target must fail loud, exit-path material for the owner")
-	require.ErrorIs(t, err, ErrPrivilegedTarget)
-
-	require.Len(t, res.PrivilegedCommands, 2, "backup line + install line — the sudo block covers the backup too")
-	backupLine, installLine := res.PrivilegedCommands[0], res.PrivilegedCommands[1]
-	assert.Contains(t, backupLine, "sudo cp", "the OLD binary is backed up by the SAME privileged step")
-	assert.Contains(t, backupLine, target+".bak-20261029-120000", "the backup line is date-stamped")
-	assert.Contains(t, installLine, "sudo install -m 0755", "the exact install command")
-	assert.Contains(t, installLine, res.StagedBinary, "the STAGED file path appears verbatim")
+	assert.Contains(t, err.Error(), "not writable", "the refusal names the directory")
+	assert.FileExists(t, res.StagedBinary, "the staged binary survives for inspection")
 
 	after, rerr := os.ReadFile(target)
 	require.NoError(t, rerr)

@@ -3,8 +3,9 @@
 # OPTIONAL — the CLI works without it: with no -c and no config at the
 # local-share default (~/.local/share/assay/config.toml) every data
 # stage runs configless on the built-in defaults (data_dir =
-# ~/.local/share/assay). A config file is required for
-# render/activate ([render].template / [activate].target).
+# ~/.local/share/assay). render/activate drive the OWN core lifecycle,
+# which belongs to a configured deployment — a configless run refuses
+# loud at their stage boundary.
 #
 # W13-deploy: `assay install` WITHOUT -c is the canonical deploy — it
 # materializes a fully commented default config at
@@ -17,12 +18,11 @@
 # `config.toml` (gitignored — operational values never belong in git) and fill
 # in your real paths. NOTHING here identifies a specific deployment.
 #
-# INTENTIONAL PLACEHOLDERS (documented): [render].template and [activate].target
-# use ~/path/to/... placeholders. `status`, `fetch`, `parse`, `filter` and
-# `probe` load this file as-is (the probe pass merges exit classification in
-# and writes the geo-base cold base itself); `render`/`activate` fail LOUD
-# until those two paths point at a real xray client template/config. There are
-# no active [[render.pool_routes]] entries — routes are per-deployment
+# `status`, `fetch`, `parse`, `filter` and `probe` load this file as-is (the
+# probe pass merges exit classification in and writes the geo-base cold base
+# itself); `render`/`activate` drive the own core (the self-held pivot: the
+# generated live config at <data>/rendered/live.json, one lifecycle). There
+# are no active [[render.pool_routes]] entries — routes are per-deployment
 # operator policy (see the commented example in [render] below).
 #
 # Stages: fetch → parse → filter → probe (classification merged) → select →
@@ -89,7 +89,7 @@ allow_insecure = false
 
 [probe]
 # W14 real-xray engine: every probed node gets a temporary single-node xray
-# (the SAME factory the check stage uses — [activate].xray_bin, no
+# (the SAME factory the check stage uses — [core].xray_bin, no
 # separate prober binary or database), so liveness and the speedtest cover
 # EVERY rendered protocol uniformly, hysteria2 included. The removed
 # xray-knife keys (path/db_path/check_preset/url_success_threshold/max_passed)
@@ -201,14 +201,61 @@ tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance join
                            # when enabled, all selected nodes are clean, so render skips the
                            # redundant clean-* balancers and renders only the common (all) ones
 
+[core]
+# The self-held core (the 2026-11-10 pivot, D1/D2): the daemon supervises
+# its OWN xray process with its own proxy inbounds — this section is that
+# process's knob surface.
+# xray_bin = ""              # the SINGLE binary knob (S1): path to the xray binary
+                            # every consumer resolves (probe/check fleets, the -test
+                            # gate, the core manager). Empty = the managed default
+                            # <data>/bin/xray (installed by `assay install`); a system
+                            # xray may be pointed at instead — core auto-update goes
+                            # inert there with a one-time loud INFO (S5).
+# auto_update = true         # managed-core auto-update, default ON (D4, managed core
+                            # only per S5); checked each maintenance wave
+# update_interval = "24h"    # auto-update check cadence
+socks_port = 10810          # own socks5 inbound, loopback-only (D2). Deliberately
+                            # distinct from the owner's hand-managed client (10808)
+http_port = 10811           # own http inbound, loopback-only (D2; distinct from 10809)
+api_port = 15491            # own stats/API inbound, loopback-only (the hand-managed
+                            # client keeps 15490)
+# per_country_inbounds = false # D2 option: one socks inbound per alive-country
+                            # balancer (tags in-<cc>), default OFF. Traffic on these
+                            # ports rides its country balancer WHOLESALE — it does not
+                            # match [[render.pool_routes]] domain rules (those bind the
+                            # base in/in-http inbounds only; the country port is the
+                            # explicit override)
+# rollback_strikes = 3       # D8 self-healing: K consecutive failed post-activation
+                            # health checks → restore the newest backup → -test gate →
+                            # core restart. No upper bound (owner ruling).
+# loglevel = "warning"       # the generated config's xray loglevel (S7; access
+                            # stays "none" — the journald-flood lesson)
+
+# ── Retired keys (S4 migration notes) ──
+# Legacy configs may carry keys the self-held-core pivot removed. The loader
+# treats every retired key as parse-and-warn (ONE loud migration line per
+# key; the daemon NEVER refuses to start on them) and applies the re-homed
+# value where one exists:
+#   activate.xray_bin        → core.xray_bin (the single binary knob above)
+#   render.stats_port        → core.api_port
+#   activate.target          → retired (the foreign-config target is gone)
+#   activate.asset_dir       → retired (the managed core owns its asset dir)
+#   activate.service_name    → retired (the foreign unit is gone; D3)
+#   activate.backup_dir      → retired (backups live at the fixed <data>/backups —
+#                              the D8 rollback restores the newest config.json.bak-<ts>
+#                              from exactly there; a movable dir would break the remedy)
+#   render.template          → retired (the own config is fully generated)
+#   render.output_dir        → retired (fixed <data>/rendered/live.json)
+#   render.pool_inbound_tags → retired (inbound tags are generated)
+#   maintain.auto_restart    → retired (core restarts are the core manager's job)
+# render.pool_routes is NOT retired — re-homed semantics unchanged ([render]
+# below). An unknown key that is NOT on this list still fails the strict
+# decode loud.
+
 [render]
-template = "~/path/to/template.json"  # PLACEHOLDER — read-only structure reference to
-                                      # your xray client config; set before render/activate
-output_dir = "rendered"
-stats_port = 15490                            # api/stats inbound, bound to 127.0.0.1 only
-pool_inbound_tags = ["socks-in", "http-in"]   # tags every pool rule carries; each MUST exist
-                                              # among the template's inbounds or the render
-                                              # fails loud (no silent D2 fall-through)
+# The render target is FIXED: the own core's generated config lives at
+# <data>/rendered/live.json; inbound tags are generated (no path/knob
+# surface). The own inbounds and their ports live in [core] above.
 observatory_interval = "60s"                  # Plan-A pool observatory probeInterval. ABSENT =
                                               # ADAPTIVE (W19 default): the render computes
                                               # max(60s, ceil(active×200ms)) so observatory probes
@@ -240,18 +287,13 @@ balancer_tolerance = 0.2                      # leastLoad tolerance on country A
 #domains = ["geosite:netflix", "domain:example.com"]
 
 [activate]
-target = "~/path/to/client-config.json"  # PLACEHOLDER — live client config; activate
-                                         # does -test gate + date-stamped backup + atomic
-                                         # replace, then the gated auto-restart (see
-                                         # [maintain].auto_restart below)
-xray_bin = "/usr/bin/xray"                  # core binary used for the -test gate
-# asset_dir = ""                            # XRAY_LOCATION_ASSET for -test; default: template dir
-backup_dir = "backups"
+# Activation drives the OWN core (the self-held pivot, D3): -test gate on
+# the candidate → date-stamped backup → atomic replace of live.json → the
+# core manager restarts the core on it. The binary knob is [core].xray_bin
+# (the SINGLE binary knob, S1) — there is no target/xray_bin/asset_dir/
+# service_name/backup_dir surface anymore (backups live at the FIXED
+# <data>/backups — the D8 rollback restores from exactly there).
 test_timeout = "30s"          # bounds the `xray run -test` child; explicit "0s" = no deadline
-service_name = "xray-client.service"  # unit named in the printed MANUAL restart hint
-                                      # (auto_restart = false only); the W13 auto-restart path
-                                      # is byte-pinned to xray-raw.service and refuses any
-                                      # other unit loud
 backup_keep = 0               # retain only the N newest config backups (0 = unlimited)
 
 [maintain]
@@ -274,16 +316,9 @@ speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly). "
                              # Positive values below the 5m floor still fail validation loud.
 stats_timeout = "10s"        # bounds one `xray api statsquery` exec
 prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)
-# auto_restart (W13, default TRUE): after a gated activation (-test gate →
-# backup → atomic replace) the daemon restarts the live client itself —
-# `systemctl --user restart xray-raw.service`, exactly once per real
-# activation — and then health-checks it (is-active + the socks port read
-# from the just-activated config). A failed restart or a failed health
-# check is LOUD (the wave completes DONE_WITH restart-failure /
-# health-failure, naming the backup to restore from — report-only, no
-# auto-restore). An explicit false restores the manual semantics: the
-# command prints the restart hint and touches nothing.
-auto_restart = true
+# Core restarts are the core manager's job (D3) — there is no auto_restart
+# knob. After a gated activation the daemon restarts the OWN core on the
+# replaced live config and health-checks it (D8 rollback strikes).
 
 [http]
 # user_agent = "assay (pipeline; contact: owner)"

@@ -5,29 +5,10 @@
     ],
     "tag": "api"
   },
-  "burstObservatory": {
-    "pingConfig": {
-      "connectivity": "http://1.0.0.1/cdn-cgi/trace",
-      "destination": "http://1.1.1.1/cdn-cgi/trace",
-      "httpMethod": "GET",
-      "interval": "10s",
-      "sampling": 5,
-      "timeout": "3s"
-    },
-    "subjectSelector": [
-      "proxy-"
-    ]
-  },
-  "dns": {
-    "queryStrategy": "UseIPv4",
-    "servers": [
-      "https://dns.google/dns-query"
-    ]
-  },
   "inbounds": [
     {
       "listen": "127.0.0.1",
-      "port": 10808,
+      "port": 10810,
       "protocol": "socks",
       "settings": {
         "auth": "noauth",
@@ -37,22 +18,22 @@
         "enabled": true,
         "routeOnly": true
       },
-      "tag": "socks-in"
+      "tag": "in"
     },
     {
       "listen": "127.0.0.1",
-      "port": 10809,
+      "port": 10811,
       "protocol": "http",
       "settings": {},
       "sniffing": {
         "enabled": true,
         "routeOnly": true
       },
-      "tag": "http-in"
+      "tag": "in-http"
     },
     {
       "listen": "127.0.0.1",
-      "port": 15490,
+      "port": 15491,
       "protocol": "dokodemo-door",
       "settings": {
         "address": "127.0.0.1"
@@ -61,7 +42,7 @@
     }
   ],
   "log": {
-    "dnsLog": false,
+    "access": "none",
     "loglevel": "warning"
   },
   "observatory": {
@@ -74,81 +55,11 @@
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "AsIs"
-      },
       "tag": "direct"
     },
     {
       "protocol": "blackhole",
-      "settings": {
-        "response": {
-          "type": "none"
-        }
-      },
       "tag": "block"
-    },
-    {
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "198.51.100.1",
-            "port": 443,
-            "users": [
-              {
-                "encryption": "none",
-                "id": "00000000-0000-0000-0000-000000000001"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "realitySettings": {
-          "fingerprint": "firefox",
-          "publicKey": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE",
-          "serverName": "donor.example",
-          "shortId": "AA"
-        },
-        "security": "reality",
-        "sockopt": {
-          "tcpMaxSeg": 1440
-        }
-      },
-      "tag": "proxy-0"
-    },
-    {
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "198.51.100.2",
-            "port": 443,
-            "users": [
-              {
-                "encryption": "none",
-                "id": "00000000-0000-0000-0000-000000000001"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "realitySettings": {
-          "fingerprint": "firefox",
-          "publicKey": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE",
-          "serverName": "donor.example",
-          "shortId": "AA"
-        },
-        "security": "reality",
-        "sockopt": {
-          "tcpMaxSeg": 1440
-        }
-      },
-      "tag": "proxy-1"
     },
     {
       "protocol": "vless",
@@ -255,21 +166,6 @@
   },
   "routing": {
     "balancers": [
-      {
-        "fallbackTag": "proxy-0",
-        "selector": [
-          "proxy-"
-        ],
-        "strategy": {
-          "settings": {
-            "expected": 1,
-            "maxRTT": "1s",
-            "tolerance": 0.2
-          },
-          "type": "leastLoad"
-        },
-        "tag": "best_rtt"
-      },
       {
         "fallbackTag": "block",
         "selector": [
@@ -428,8 +324,6 @@
         "tag": "pool_youtube"
       }
     ],
-    "domainMatcher": "hybrid",
-    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "inboundTag": [
@@ -439,75 +333,7 @@
         "type": "field"
       },
       {
-        "domain": [
-          "domain:nvidia.com"
-        ],
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "outboundTag": "fox-proxy",
-        "type": "field"
-      },
-      {
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "outboundTag": "block",
-        "port": "25,465,587,2525",
-        "type": "field"
-      },
-      {
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "outboundTag": "direct",
-        "protocol": [
-          "bittorrent"
-        ],
-        "type": "field"
-      },
-      {
-        "domain": [
-          "geosite:youtube"
-        ],
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "outboundTag": "direct",
-        "type": "field"
-      },
-      {
-        "domain": [
-          "domain:example.ru"
-        ],
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "outboundTag": "direct",
-        "type": "field"
-      },
-      {
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
-        "ip": [
-          "geoip:private"
-        ],
-        "outboundTag": "direct",
-        "type": "field"
-      },
-      {
-        "balancerTag": "best_rtt",
-        "inboundTag": [
-          "socks-in",
-          "http-in"
-        ],
+        "balancerTag": "pool_all",
         "network": "tcp,udp",
         "type": "field"
       }

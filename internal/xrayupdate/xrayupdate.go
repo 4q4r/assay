@@ -1,10 +1,12 @@
 // Package xrayupdate implements `assay xray-update` (W14): fetch the
 // latest Xray-core release for this platform, VERIFY its published sha256
 // (every release asset ships a .dgst companion), unpack, validate the NEW
-// binary with `xray run -test`, and atomically replace the configured
-// [activate].xray_bin target with a date-stamped backup of the old binary.
-// A root-owned (unwritable) target is never half-applied: the command
-// stages everything and prints the EXACT privileged commands for the owner.
+// binary with `xray run -test`, and atomically replace the target binary
+// with a date-stamped backup of the old one. Since D4/S5 the update surface
+// is MANAGED-ONLY: the target resolves through [core].xray_bin (the managed
+// default <data>/bin/xray or the explicit override). An unwritable target
+// directory is a loud misconfiguration — nothing is half-applied, and no
+// privileged commands are ever printed (the managed core never needs sudo).
 package xrayupdate
 
 import (
@@ -41,19 +43,15 @@ const (
 // Release coordinates: the XTLS/Xray-core GitHub releases. The version is
 // NEVER hardcoded — releases/latest resolves dynamically.
 const (
-	repoSlug        = "XTLS/Xray-core"
-	defaultAPIBase  = "https://api.github.com"
+	repoSlug = "XTLS/Xray-core"
+	// DefaultAPIBase is the canonical GitHub API host; the managed-core
+	// lifecycle (internal/core) reuses the same release surface through the
+	// exported helpers below.
+	DefaultAPIBase  = "https://api.github.com"
 	timeoutAPI      = 30 * time.Second
 	timeoutDownload = 5 * time.Minute
 	timeoutTest     = 30 * time.Second
 )
-
-// ErrPrivilegedTarget marks the unwritable-target outcome: the update is
-// fully staged, nothing was applied, and Result.PrivilegedCommands carries
-// the exact lines for the owner.
-var ErrPrivilegedTarget = errors.New(
-	"target directory is not writable (root-owned) — the new binary is STAGED, " +
-		"the old binary is untouched; run the commands below to apply")
 
 // ErrYesRequired marks the non-interactive refusal: without --yes a piped
 // invocation must not guess the owner's intent.
@@ -63,17 +61,21 @@ var ErrYesRequired = errors.New(
 // Options configures one xray-update run.
 type Options struct {
 	CheckOnly   bool   // --check: report latest vs current, touch nothing
-	BinOverride string // --bin: target path override ([activate].xray_bin otherwise)
-	TargetPath  string // resolved [activate].xray_bin (expanded; CLI's concern)
+	BinOverride string // --bin: target path override ([core].xray_bin otherwise)
+	TargetPath  string // resolved [core].xray_bin (expanded; CLI's concern)
 	AssumeYes   bool   // --yes: skip the confirmation prompt
 	// Color chip-styles the final VERDICT lines (W18); the stage progress
 	// lines stay plain — journald-friendly by construction.
 	Color bool
+	// Label prefixes the stage progress lines ("xray-update:" by default);
+	// the managed-core lifecycle (internal/core) passes "core:" so the wave
+	// journal reads one grammar.
+	Label string
 	// APIBase overrides the GitHub API host (test seam; empty = default).
 	APIBase string
 	// StagingDir is where the release is downloaded, verified, and unpacked
-	// (CLI passes <data_dir>/xray-staged — survives across runs for the
-	// privileged-apply path).
+	// (CLI passes <data_dir>/xray-staged — the managed-core lifecycle reads
+	// the staged binary out of the same dir within its own invocation).
 	StagingDir string
 	// Stdin/Stdout/Stderr carry the interaction (tests inject buffers).
 	Stdin  io.Reader
@@ -93,9 +95,6 @@ type Result struct {
 	Updated        bool   // the target binary was replaced
 	BackupPath     string // date-stamped backup of the OLD binary
 	StagedBinary   string // the verified, -test-passed staged binary
-	// PrivilegedCommands is set ONLY on ErrPrivilegedTarget: the exact lines
-	// (backup + install) the owner runs to apply the staged binary.
-	PrivilegedCommands []string
 }
 
 // release is the slice of the GitHub releases/latest payload this command
@@ -116,7 +115,7 @@ func Run(opts Options) (*Result, error) {
 		opts.TargetPath = opts.BinOverride
 	}
 	if opts.TargetPath == "" {
-		return nil, errors.New("no target binary path (--bin or [activate].xray_bin)")
+		return nil, errors.New("no target binary path (--bin or [core].xray_bin)")
 	}
 	if opts.StagingDir == "" {
 		return nil, errors.New("no staging directory configured")
@@ -126,13 +125,13 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	res := &Result{}
-	current, err := currentVersion(opts.TargetPath)
+	current, err := currentVersion(context.Background(), opts.TargetPath)
 	if err != nil {
 		return nil, err
 	}
 	res.CurrentVersion = current
 
-	rel, err := fetchRelease(opts.APIBase)
+	rel, err := fetchRelease(context.Background(), opts.APIBase)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +157,7 @@ func Run(opts Options) (*Result, error) {
 		return res, nil
 	}
 
-	staged, err := stageRelease(opts, rel)
+	staged, err := stageRelease(context.Background(), opts, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -243,14 +242,14 @@ func readAnswer(r io.Reader) (string, error) {
 
 // currentVersion runs `<bin> version` and parses the banner; a missing
 // binary is a valid fresh-install state ("" version), not an error.
-func currentVersion(bin string) (string, error) {
+func currentVersion(ctx context.Context, bin string) (string, error) {
 	if _, err := os.Stat(bin); err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// The binary path comes from the owner's config — the config IS the trust root.
 	out, err := exec.CommandContext(ctx, bin, "version").Output()
@@ -299,11 +298,11 @@ func printCheck(w io.Writer, res *Result, color bool) {
 // fetchRelease resolves the latest release + its asset list from the GitHub
 // API. The client's Proxy is nil by L5 discipline: a binary download must
 // never silently ride the owner's live VPN.
-func fetchRelease(apiBase string) (*release, error) {
+func fetchRelease(ctx context.Context, apiBase string) (*release, error) {
 	if apiBase == "" {
-		apiBase = defaultAPIBase
+		apiBase = DefaultAPIBase
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutAPI)
+	ctx, cancel := context.WithTimeout(ctx, timeoutAPI)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		apiBase+"/repos/"+repoSlug+"/releases/latest", nil)
@@ -311,7 +310,16 @@ func fetchRelease(apiBase string) (*release, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	client := &http.Client{Timeout: timeoutAPI, Transport: &http.Transport{Proxy: nil}} // L5: never the ambient proxy
+	// DisableKeepAlives: every client here is ONE-SHOT (a single request per
+	// invocation), so idle-connection reuse buys nothing — and a kept-alive
+	// transport leaves background goroutines that read process-global state
+	// (time.Now → time.Local) after the caller moved on, which races any
+	// later time.Local mutation in the same process (-race caught exactly
+	// that across two cli tests). No lingering transport goroutines, ever.
+	client := &http.Client{Timeout: timeoutAPI, Transport: &http.Transport{
+		Proxy:             nil, // L5: never the ambient proxy
+		DisableKeepAlives: true,
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s latest release: %w", repoSlug, err)
@@ -387,7 +395,16 @@ func findAsset(rel *release, name string) (*asset, error) {
 // release's published .dgst companion, unpacks, and validates the staged
 // binary with `xray run -test`. Any failure aborts before the target is
 // touched.
-func stageRelease(opts Options, rel *release) (string, error) {
+// logLabel is the prefix of the stage progress lines (Options.Label; the
+// default stays the command's own chip label).
+func (o Options) logLabel() string {
+	if o.Label != "" {
+		return o.Label
+	}
+	return "xray-update:"
+}
+
+func stageRelease(ctx context.Context, opts Options, rel *release) (string, error) {
 	assetName := assetForPlatform(runtime.GOOS, runtime.GOARCH, os.Getenv("GOARM"))
 	a, err := findAsset(rel, assetName)
 	if err != nil {
@@ -397,13 +414,13 @@ func stageRelease(opts Options, rel *release) (string, error) {
 		return "", err
 	}
 	zipPath := filepath.Join(opts.StagingDir, assetName)
-	_, _ = fmt.Fprintf(opts.Stdout, "xray-update: downloading %s (%s)…\n", a.Name, rel.TagName)
-	if err := download(a.URL, zipPath); err != nil {
+	_, _ = fmt.Fprintf(opts.Stdout, "%s downloading %s (%s)…\n", opts.logLabel(), a.Name, rel.TagName)
+	if err := download(ctx, a.URL, zipPath); err != nil {
 		return "", err
 	}
 	defer func() { _ = os.Remove(zipPath) }() // the zip is scratch; the unpacked binary stays
 
-	want, err := fetchExpectedSha256(a.URL + ".dgst")
+	want, err := fetchExpectedSha256(ctx, a.URL+".dgst")
 	if err != nil {
 		return "", err
 	}
@@ -418,7 +435,7 @@ func stageRelease(opts Options, rel *release) (string, error) {
 				"tampered; nothing was applied",
 			a.Name, rel.TagName, want, got)
 	}
-	_, _ = fmt.Fprintf(opts.Stdout, "xray-update: sha256 verified (%s…)\n", got[:12])
+	_, _ = fmt.Fprintf(opts.Stdout, "%s sha256 verified (%s…)\n", opts.logLabel(), got[:12])
 
 	binName := "xray"
 	if runtime.GOOS == "windows" {
@@ -435,22 +452,25 @@ func stageRelease(opts Options, rel *release) (string, error) {
 	if err := os.Chmod(staged, 0o755); err != nil {
 		return "", err
 	}
-	if err := runTestGate(staged, opts.TestFailsEnv); err != nil {
+	if err := runTestGate(ctx, staged, opts.TestFailsEnv); err != nil {
 		return "", fmt.Errorf("staged binary failed validation (staged at %s): %w", staged, err)
 	}
-	_, _ = fmt.Fprintf(opts.Stdout, "xray-update: staged binary passed `xray run -test`\n")
+	_, _ = fmt.Fprintf(opts.Stdout, "%s staged binary passed `xray run -test`\n", opts.logLabel())
 	return staged, nil
 }
 
 // download streams url into dst (no ambient proxy — L5).
-func download(url, dst string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutDownload)
+func download(ctx context.Context, url, dst string) error {
+	ctx, cancel := context.WithTimeout(ctx, timeoutDownload)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: timeoutDownload, Transport: &http.Transport{Proxy: nil}} // L5 // L5
+	client := &http.Client{Timeout: timeoutDownload, Transport: &http.Transport{
+		Proxy:             nil,  // L5: never the ambient proxy
+		DisableKeepAlives: true, // one-shot client — no lingering transport goroutines
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", url, err)
@@ -477,14 +497,17 @@ func download(url, dst string) error {
 //	SHA1= …
 //	SHA2-256= <hex>
 //	SHA2-512= …
-func fetchExpectedSha256(url string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutAPI)
+func fetchExpectedSha256(ctx context.Context, url string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeoutAPI)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: timeoutAPI, Transport: &http.Transport{Proxy: nil}} // L5 // L5
+	client := &http.Client{Timeout: timeoutAPI, Transport: &http.Transport{
+		Proxy:             nil,  // L5: never the ambient proxy
+		DisableKeepAlives: true, // one-shot client — no lingering transport goroutines
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetch checksum %s: %w", url, err)
@@ -603,7 +626,7 @@ func validateInstalled(opts Options, target string) error {
 		return fmt.Errorf("post-replace validation: %s version printed no parsable banner (%q)",
 			target, strings.TrimSpace(banner))
 	}
-	if err := runTestGate(target, opts.TestFailsEnv); err != nil {
+	if err := runTestGate(context.Background(), target, opts.TestFailsEnv); err != nil {
 		return fmt.Errorf("post-replace validation: %w", err)
 	}
 	return nil
@@ -634,7 +657,7 @@ func rollbackReplace(res *Result, target string, cause error) error {
 // binary, with the binary's directory as the asset root — the same check
 // the activate stage applies to a rendered config. extraEnv carries the
 // test seam (opts.TestFailsEnv).
-func runTestGate(bin string, extraEnv []string) error {
+func runTestGate(ctx context.Context, bin string, extraEnv []string) error {
 	cfg := `{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}`
 	cfgPath := filepath.Join(filepath.Dir(bin), "test-config.json")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
@@ -642,7 +665,7 @@ func runTestGate(bin string, extraEnv []string) error {
 	}
 	defer func() { _ = os.Remove(cfgPath) }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutTest)
+	ctx, cancel := context.WithTimeout(ctx, timeoutTest)
 	defer cancel()
 	//nolint:gosec // binary we just checksum-verified
 	cmd := exec.CommandContext(ctx, bin, "run", "-test", "-c", cfgPath)
@@ -660,27 +683,30 @@ func runTestGate(bin string, extraEnv []string) error {
 // applyStaged replaces the target atomically: a date-stamped backup of the
 // OLD binary first, then copy the staged binary to a temp file IN the
 // target's directory (same filesystem) and rename over the target. An
-// unwritable target directory is the privileged path: nothing is applied,
-// the staged binary survives, and the exact sudo commands are returned for
-// the owner.
+// unwritable target directory is a LOUD misconfiguration (S5: the update
+// surface is managed-only — a writable user-owned binary needs no
+// privileged path): nothing is applied, the staged binary survives, and the
+// error names the directory and the knob.
 func applyStaged(opts Options, res *Result) error {
 	target := opts.TargetPath
 	dir := filepath.Dir(target)
 	stamp := opts.Now().UTC().Format("20060102-150405")
 
 	// 1. Writability probe FIRST (temp-create/remove in the target's
-	// directory): an unwritable (root-owned) target must land on the
-	// stage-and-instruct path BEFORE the backup runs — the backup would hit
-	// the same EACCES and die with a generic permission error and no sudo
-	// lines (I-1). The target's directory may not exist yet (fresh install)
-	// — create it.
+	// directory): an unwritable (root-owned) target refuses before the
+	// backup runs — the backup would hit the same EACCES and die with a
+	// generic permission error naming nothing actionable (I-1). The target's
+	// directory may not exist yet (fresh install) — create it.
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create target directory %s: %w", dir, err)
 	}
 	probe := filepath.Join(dir, ".xray-update-probe-"+stamp)
 	if err := os.WriteFile(probe, nil, 0o600); err != nil {
 		_ = os.Remove(probe)
-		return stageAndInstruct(opts, res, target, stamp)
+		_, _ = fmt.Fprintf(opts.Stderr, "xray-update: target directory %s is not writable — "+
+			"nothing applied, the staged binary survives at %s\n", dir, res.StagedBinary)
+		return fmt.Errorf("target directory %s is not writable (the update surface is "+
+			"managed-only per D4/S5 — point [core].xray_bin at a user-owned path and retry)", dir)
 	}
 	_ = os.Remove(probe)
 
@@ -717,26 +743,6 @@ func applyStaged(opts Options, res *Result) error {
 		return rollbackReplace(res, target, verr)
 	}
 	return nil
-}
-
-// stageAndInstruct is the unwritable-target outcome: nothing applied, the
-// staged binary survives, and the exact sudo commands reach the owner.
-func stageAndInstruct(opts Options, res *Result, target, stamp string) error {
-	// Stage-and-instruct: the EXACT privileged commands (backup + install),
-	// never a half-apply.
-	backup := target + ".bak-" + stamp
-	res.PrivilegedCommands = []string{
-		"sudo cp -p " + target + " " + backup,
-		"sudo install -m 0755 " + res.StagedBinary + " " + target,
-	}
-	_, _ = fmt.Fprintf(opts.Stderr, "xray-update: %s\n\n", ErrPrivilegedTarget.Error())
-	_, _ = fmt.Fprintf(opts.Stderr, "  staged binary (verified, -test passed): %s\n", res.StagedBinary)
-	for _, cmdLine := range res.PrivilegedCommands {
-		_, _ = fmt.Fprintf(opts.Stderr, "  %s\n", cmdLine)
-	}
-	_, _ = fmt.Fprintf(opts.Stderr, "\n  user-level alternative: point [activate].xray_bin at ~/.local/bin/xray "+
-		"and xray-update applies freely without sudo\n")
-	return ErrPrivilegedTarget
 }
 
 // copyFile copies src → dst with the given permission (create/truncate).
@@ -778,4 +784,53 @@ func tailBytes(b []byte, n int) string {
 		return s
 	}
 	return "..." + s[len(s)-n:]
+}
+
+// CurrentVersion reads the CURRENT core version via `<bin> version` and
+// parses the banner; a missing binary is a valid fresh-install state
+// ("" version), not an error. Exported for the managed-core lifecycle
+// (internal/core) — the same banner contract the manual path uses. ctx
+// bounds the child.
+func CurrentVersion(ctx context.Context, bin string) (string, error) {
+	return currentVersion(ctx, bin)
+}
+
+// FetchLatestTag resolves the latest Xray-core release tag from the GitHub
+// API (the check leg of the managed-core auto-update; ctx bounds the call).
+// The client's Proxy is nil by L5 discipline.
+func FetchLatestTag(ctx context.Context, apiBase string) (string, error) {
+	rel, err := fetchRelease(ctx, apiBase)
+	if err != nil {
+		return "", err
+	}
+	return rel.TagName, nil
+}
+
+// StageVerifiedRelease runs the managed download leg: fetch the latest
+// release, download the platform asset, VERIFY its sha256 against the
+// release's published .dgst companion, unpack flat into stagingDir, and
+// gate the staged binary with `xray run -test`. Returns the staged binary
+// path and the release tag; the target is untouched (the caller installs).
+// label prefixes the progress lines in the caller's journal. ctx bounds
+// every leg (network + gate child).
+func StageVerifiedRelease(
+	ctx context.Context, apiBase, stagingDir, label string, stdout io.Writer, extraTestEnv []string,
+) (string, string, error) {
+	rel, err := fetchRelease(ctx, apiBase)
+	if err != nil {
+		return "", "", err
+	}
+	opts := Options{
+		StagingDir:   stagingDir,
+		Label:        label,
+		APIBase:      apiBase,
+		Stdout:       stdout,
+		Stderr:       stdout,
+		TestFailsEnv: extraTestEnv,
+	}
+	staged, err := stageRelease(ctx, opts, rel)
+	if err != nil {
+		return "", "", err
+	}
+	return staged, rel.TagName, nil
 }

@@ -14,11 +14,12 @@ import (
 // systemctl surface stays the four-command allowlist — --user only, only
 // assay-* units, daemon-reload / enable --now (watch) / disable --now
 // (watch) / disable --now (the legacy W5 timers, solely for the one-time
-// migration). UNCHANGED by W13: install still never restarts anything —
-// the owner-ruled xray restart lives in internal/restart's own byte-pinned
-// executor (the only other sanctioned exec-of-systemctl file in the tree).
+// migration). STILL TRUE after the self-held-core pivot (D3): install never
+// restarts anything — the pre-pivot foreign-restart executor that used to
+// live in internal/restart was REMOVED with the external mode, and install
+// is once again the ONLY sanctioned exec-of-systemctl file in the tree.
 // The maintain/pipeline surface keeps its separate spelling ban (cli units
-// guard); the two executor files are the complete daemon surface.
+// guard); install is the complete daemon systemd surface.
 
 func TestSystemctlAllowlistIsExactlyThePinnedSet(t *testing.T) {
 	require.Len(t, allowedCommands, 4, "the allowlist is exactly four commands")
@@ -29,7 +30,7 @@ func TestSystemctlAllowlistIsExactlyThePinnedSet(t *testing.T) {
 	for _, cmd := range allowedCommands {
 		assert.Equal(t, "--user", cmd[0], "every invocation MUST be --user")
 		for _, arg := range cmd {
-			assert.NotContains(t, arg, "xray", "no xray-raw or other foreign unit may ever appear")
+			assert.NotContains(t, arg, "xray", "no foreign proxy-client unit may ever appear")
 		}
 	}
 }
@@ -81,10 +82,10 @@ func TestUnitNameLiteralsArePinned(t *testing.T) {
 func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 	for _, bad := range [][]string{
 		{"--user", "restart", "assay-watch.service"},                // never restart anything
-		{"--user", "restart", "xray-raw.service"},                   // never touch the live client
+		{"--user", "restart", "foreign-client.service"},             // never touch the live client
 		{"--user", "start", WatchService},                           // start is not in the set
 		{"--user", "stop", WatchService},                            // stop is not in the set
-		{"--user", "enable", "xray-raw.service"},                    // foreign unit
+		{"--user", "enable", "foreign-client.service"},              // foreign unit
 		{"--user", "daemon-reload", "extra"},                        // trailing args
 		{"--system", "daemon-reload"},                               // system bus forbidden
 		{"daemon-reload"},                                           // missing --user
@@ -142,14 +143,13 @@ func TestUnitTemplatesAreTheSingleSource(t *testing.T) {
 	}
 }
 
-// TestDaemonNeverTouchesSystemd is the W10 guard, kept through the W13
-// migration with the same assertions and an updated meaning: the watch
-// DAEMON entry (internal/cli watch path) must carry no exec-of-systemctl
-// surface of its own — the restart capability lives in the byte-pinned
-// allowlist executor (internal/restart) behind the stages seam, so this
-// file stays process-spawn-free. (W4–W12 wording: "only install talks to
-// systemd"; W13 adds the restart executor as the second — and last —
-// sanctioned file.)
+// TestDaemonNeverTouchesSystemd is the W10 guard, kept with the same
+// assertions and the meaning the self-held-core pivot (D3) restored: the
+// watch DAEMON entry (internal/cli watch path) must carry no
+// exec-of-systemctl surface of its own. (W4–W12 wording: "only install
+// talks to systemd"; W13 added the then-new restart executor as the second
+// sanctioned file; D3 removed it again — install is once again the only
+// one.)
 func TestDaemonNeverTouchesSystemd(t *testing.T) {
 	cliDir := filepath.Join("..", "cli")
 	entries, err := os.ReadDir(cliDir)

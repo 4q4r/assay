@@ -1,0 +1,509 @@
+{
+  "api": {
+    "services": [
+      "StatsService"
+    ],
+    "tag": "api"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10810,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "routeOnly": true
+      },
+      "tag": "in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10811,
+      "protocol": "http",
+      "settings": {},
+      "sniffing": {
+        "enabled": true,
+        "routeOnly": true
+      },
+      "tag": "in-http"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 15491,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      },
+      "tag": "api-in"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "observatory": {
+    "enableConcurrency": true,
+    "probeInterval": "1m0s",
+    "subjectSelector": [
+      "pool-"
+    ]
+  },
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "nl1.example.com",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "pool-uuid-1"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "serverName": "donor.example",
+          "shortId": "b1"
+        },
+        "security": "reality",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        },
+        "xhttpSettings": {
+          "host": "cdn.example",
+          "mode": "packet-up",
+          "path": "/pool"
+        }
+      },
+      "tag": "pool-nl-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "nl2.example.com",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "pool-uuid-1"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "serverName": "donor.example",
+          "shortId": "b1"
+        },
+        "security": "reality",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        },
+        "xhttpSettings": {
+          "host": "cdn.example",
+          "mode": "packet-up",
+          "path": "/pool"
+        }
+      },
+      "tag": "pool-nl-02"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "de1.example.com",
+            "port": 2053,
+            "users": [
+              {
+                "encryption": "none",
+                "flow": "xtls-rprx-vision",
+                "id": "pool-uuid-1"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "serverName": "donor.example",
+          "shortId": "b1"
+        },
+        "security": "reality",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        }
+      },
+      "tag": "pool-de-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "de2.example.com",
+            "port": 2053,
+            "users": [
+              {
+                "encryption": "none",
+                "flow": "xtls-rprx-vision",
+                "id": "pool-uuid-1"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+          "serverName": "donor.example",
+          "shortId": "b1"
+        },
+        "security": "reality",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        }
+      },
+      "tag": "pool-de-02"
+    },
+    {
+      "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "us1.example.com",
+            "password": "pool-uuid-1",
+            "port": 443
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "sockopt": {
+          "tcpMaxSeg": 1440
+        },
+        "tlsSettings": {
+          "fingerprint": "firefox",
+          "serverName": "donor.example"
+        },
+        "wsSettings": {
+          "host": "ws.example",
+          "path": "/tj"
+        }
+      },
+      "tag": "pool-us-01"
+    }
+  ],
+  "policy": {
+    "system": {
+      "statsOutboundDownlink": true,
+      "statsOutboundUplink": true
+    }
+  },
+  "routing": {
+    "balancers": [
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_amsterdam"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-us-"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_us"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_all"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_frankfurt_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_amsterdam_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_amsterdam_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_chatgpt"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_netflix"
+      },
+      {
+        "fallbackTag": "block",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02",
+          "pool-de-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_youtube"
+      }
+    ],
+    "rules": [
+      {
+        "inboundTag": [
+          "api-in"
+        ],
+        "outboundTag": "api",
+        "type": "field"
+      },
+      {
+        "balancerTag": "pool_nl",
+        "domain": [
+          "geosite:netflix"
+        ],
+        "inboundTag": [
+          "in",
+          "in-http"
+        ],
+        "type": "field"
+      },
+      {
+        "balancerTag": "pool_all",
+        "network": "tcp,udp",
+        "type": "field"
+      }
+    ]
+  },
+  "stats": {}
+}

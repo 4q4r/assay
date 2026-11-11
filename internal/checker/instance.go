@@ -203,7 +203,7 @@ var bootMu sync.Mutex
 func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[string]any) (SocksInstance, error) {
 	// Single outbound: use the original xrayInstance path for backward compatibility with tests.
 	if xrayBin == "" {
-		return nil, errors.New("xray binary path is empty (activate.xray_bin)")
+		return nil, errors.New("xray binary path is empty (core.xray_bin)")
 	}
 	bootMu.Lock()
 	defer bootMu.Unlock()
@@ -274,7 +274,7 @@ func StartTempXrayBatch(
 	outbounds []map[string]any,
 ) (BatchSocksInstance, error) {
 	if xrayBin == "" {
-		return nil, errors.New("xray binary path is empty (activate.xray_bin)")
+		return nil, errors.New("xray binary path is empty (core.xray_bin)")
 	}
 	if len(outbounds) == 0 {
 		return nil, errors.New("StartTempXrayBatch: at least one outbound required")

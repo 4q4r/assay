@@ -312,35 +312,11 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 // exact gap is why the C-1 bug shipped: all five knobs rendered defaults.
 func TestRenderKnobsReachRenderedOutputEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	tmpl := filepath.Join(dir, "template.json")
-	require.NoError(t, os.WriteFile(tmpl, []byte(`{
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks"},
-    {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"},
-    {"tag": "tun-in", "listen": "127.0.0.1", "port": 10910, "protocol": "socks"}
-  ],
-  "outbounds": [
-    {"tag": "direct", "protocol": "freedom"},
-    {"tag": "block", "protocol": "blackhole"}
-  ],
-  "routing": {
-    "rules": [
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
-      {"type": "field", "network": "tcp,udp", "balancerTag": "best_rtt"}
-    ]
-  }
-}`), 0o644))
-
 	tomlPath := filepath.Join(dir, "config.toml")
 	content := `
 data_dir = "` + dir + `"
 
-
 [render]
-template = "` + tmpl + `"
-output_dir = "rendered"
-pool_inbound_tags = ["socks-in", "http-in", "tun-in"]
 observatory_interval = "45s"
 tcp_max_seg = 1380
 tls_fingerprint = "chrome"
@@ -383,8 +359,8 @@ domains = ["geosite:netflix"]
 	cmd.SetOut(buf)
 	require.NoError(t, runRender(cmd, cfg))
 
-	raw, err := os.ReadFile(p.rendered)
-	require.NoError(t, err)
+	raw, err := os.ReadFile(ownCandidatePath(p))
+	require.NoError(t, err, "the own render writes the activation candidate")
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(raw, &m))
 
@@ -432,8 +408,8 @@ domains = ["geosite:netflix"]
 		}
 	}
 	require.NotNil(t, poolRule, "the pool routing rule must render")
-	assert.Equal(t, []any{"socks-in", "http-in", "tun-in"}, poolRule["inboundTag"],
-		"pool_inbound_tags incl. the extra tun-in must surface in inboundTag (not the 2-tag default)")
+	assert.Equal(t, []any{"in", "in-http"}, poolRule["inboundTag"],
+		"pool rules carry the GENERATED own inbound tags (S4 — the knob is retired)")
 }
 
 func TestConfigReconciliationWarnsStaleBalancer(t *testing.T) {

@@ -16,12 +16,12 @@ import (
 
 // W7 item 9 seams: the stats stage classifies its failures (INFO / WARNING /
 // LOUD). The INFO arm must detect the two first-run shapes WITHOUT exec'ing
-// xray: the activate target lacking the rendered api/stats shape (we render
+// xray: a target config lacking the rendered api/stats shape (we render
 // it, so we can read it back), and a loopback endpoint that refuses
 // connections (the service was never restarted after activation).
 
 // apiShapedTarget is the shape ensureAPIStats + ensureStatsAndPolicy render
-// into the activate target; TargetHasAPI must recognize it.
+// into the target; TargetHasAPI must recognize it.
 func apiShapedTarget(t *testing.T, dir string, port int) string {
 	t.Helper()
 	body := `{

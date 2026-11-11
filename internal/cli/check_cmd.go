@@ -95,14 +95,13 @@ func resolveColor(mode string, noColor bool, out io.Writer) (bool, error) {
 // non-file writer (pipes, buffers, tests) is never a terminal.
 func writerIsTerminal(w io.Writer) bool { return ui.WriterIsTerminal(w) }
 
-func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkFlags) error {
-	p := newPaths(cfg)
-	out := cmd.OutOrStdout()
-	color, err := resolveColor(f.color, f.noColor, out)
-	if err != nil {
-		return err
-	}
-	opts := checker.Options{
+// newCheckOptions is the check fleet's option resolution (the S1 seam): the
+// temp-instance binary resolves from the SINGLE core knob
+// ([core].xray_bin / CoreXrayBin) — the legacy [activate].xray_bin is dead
+// for this fleet (the 2026-11-10 pivot). Split out so the resolution is
+// testable without running a check wave.
+func newCheckOptions(cfg *config.Config, p paths, targets []string, f checkFlags) checker.Options {
+	return checker.Options{
 		Targets:          targets,
 		Countries:        splitCountries(f.countries),
 		Limit:            f.limit,
@@ -110,7 +109,7 @@ func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkF
 		Timeout:          f.timeout,
 		Concurrency:      f.concurrency,
 		WithDead:         f.withDead,
-		XrayBin:          config.ExpandHome(cfg.Activate.XrayBin),
+		XrayBin:          coreXrayBin(cfg),
 		GeoBasePath:      p.geoBase,
 		ProbeResultsPath: p.probeResults,
 		NodesPath:        p.filtered,
@@ -120,8 +119,19 @@ func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkF
 			TCPMaxSeg:      cfg.Render.TCPMaxSeg,
 			TLSFingerprint: cfg.Render.TLSFingerprint,
 		},
-		Progress: cmd.ErrOrStderr(),
+		Progress: nil, // wired by the caller (the command's stderr)
 	}
+}
+
+func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkFlags) error {
+	p := newPaths(cfg)
+	out := cmd.OutOrStdout()
+	color, err := resolveColor(f.color, f.noColor, out)
+	if err != nil {
+		return err
+	}
+	opts := newCheckOptions(cfg, p, targets, f)
+	opts.Progress = cmd.ErrOrStderr()
 	report, err := checker.Run(cmd.Context(), opts)
 	if err != nil {
 		return err

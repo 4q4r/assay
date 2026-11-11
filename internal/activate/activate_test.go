@@ -55,7 +55,6 @@ func TestActivateReplacesTargetAndBacksUp(t *testing.T) {
 		TargetPath:   target,
 		XrayBin:      fakeXray(t, dir, "ok"),
 		BackupDir:    filepath.Join(dir, "backups"),
-		NoRestart:    true,
 	})
 	require.NoError(t, err)
 	require.True(t, res.TestPassed)
@@ -83,7 +82,6 @@ func TestActivateWithBackupKeepsOriginal(t *testing.T) {
 		XrayBin:      fakeXray(t, dir, "ok"),
 		BackupDir:    backupDir,
 		Backup:       true,
-		NoRestart:    true,
 	})
 	require.NoError(t, err)
 	assert.NotEmpty(t, res.BackupPath)
@@ -110,7 +108,6 @@ func TestActivateTestGateBlocksReplace(t *testing.T) {
 		RenderedPath: rendered,
 		TargetPath:   target,
 		XrayBin:      fakeXray(t, dir, "ok"), // fake rejects the file named bad.json
-		NoRestart:    true,
 	})
 	require.Error(t, err, "-test gate failed — activation must abort")
 	assert.Contains(t, err.Error(), "-test")
@@ -131,7 +128,6 @@ func TestActivateHardFailsOnXrayTestFailure(t *testing.T) {
 		RenderedPath: rendered,
 		TargetPath:   target,
 		XrayBin:      fakeXray(t, dir, "fail"),
-		NoRestart:    true,
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "-test")
@@ -153,7 +149,7 @@ func TestActivateIsAtomicOnReplace(t *testing.T) {
 	_, err := activate.Run(activate.Input{
 		RenderedPath: rendered, TargetPath: target,
 		XrayBin: fakeXray(t, dir, "ok"), Backup: true,
-		BackupDir: filepath.Join(dir, "backups"), NoRestart: true,
+		BackupDir: filepath.Join(dir, "backups"),
 	})
 	require.NoError(t, err)
 	entries, err := os.ReadDir(dir)
@@ -173,7 +169,7 @@ func TestActivatePreservesFileMode(t *testing.T) {
 
 	_, err := activate.Run(activate.Input{
 		RenderedPath: rendered, TargetPath: target,
-		XrayBin: fakeXray(t, dir, "ok"), NoRestart: true,
+		XrayBin: fakeXray(t, dir, "ok"),
 	})
 	require.NoError(t, err)
 	info, err := os.Stat(target)
@@ -182,8 +178,9 @@ func TestActivatePreservesFileMode(t *testing.T) {
 }
 
 func TestActivateNeverRestartsService(t *testing.T) {
-	// The result must carry the restart hint (printed for the owner) but the
-	// command itself never touches systemd — structural: no exec of systemctl.
+	// The command itself never touches systemd — structural: this package's
+	// only child process is the xray -test gate (the restart belongs to the
+	// caller's core lifecycle).
 	dir := t.TempDir()
 	target := filepath.Join(dir, "config.json")
 	rendered := filepath.Join(dir, "rendered.json")
@@ -192,11 +189,10 @@ func TestActivateNeverRestartsService(t *testing.T) {
 
 	res, err := activate.Run(activate.Input{
 		RenderedPath: rendered, TargetPath: target,
-		XrayBin: fakeXray(t, dir, "ok"), NoRestart: true,
+		XrayBin: fakeXray(t, dir, "ok"),
 	})
 	require.NoError(t, err)
-	assert.Contains(t, res.RestartHint, "systemctl --user restart xray-raw.service")
-	assert.NotContains(t, res.RestartHint, "sudo ")
+	assert.True(t, res.Replaced, "the gated replace completed")
 }
 
 func TestRenderedJSONValidity(t *testing.T) {
@@ -207,7 +203,7 @@ func TestRenderedJSONValidity(t *testing.T) {
 	require.NoError(t, os.WriteFile(rendered, []byte(`{"ok":true}`), 0o644))
 	_, err := activate.Run(activate.Input{
 		RenderedPath: rendered, TargetPath: target,
-		XrayBin: fakeXray(t, dir, "ok"), NoRestart: true,
+		XrayBin: fakeXray(t, dir, "ok"),
 	})
 	require.NoError(t, err)
 	var m map[string]any
@@ -221,14 +217,10 @@ func mustRead(t *testing.T, p string) []byte {
 	return b
 }
 
-// Guard (W13 contract, migrated from the W4-era total ban): the activate
-// package still never EXECUTES systemctl — restart after a gated activation
-// lives behind internal/restart's byte-pinned allowlist executor, wired by
-// the cli layer. The printed restart hint remains the only non-comment
-// occurrence of the word: comments may explain the rail, code may not
-// widen it. (Migration note: W4–W12 pinned "exactly one occurrence total —
-// the hint"; W13 moves the restart capability into internal/restart and
-// pins this package to the same surface it always had — the hint.)
+// Guard (the D3 contract since the self-held-core pivot): the activate
+// package never mentions OR executes systemctl — the gated replace is its
+// whole surface, the core manager owns the restart, and the foreign-unit
+// executor is gone entirely.
 func TestNoSystemdInvocationInSource(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "activate", "activate.go"))
 	require.NoError(t, err)
@@ -241,8 +233,8 @@ func TestNoSystemdInvocationInSource(t *testing.T) {
 		nonComment.WriteString(line)
 		nonComment.WriteByte('\n')
 	}
-	assert.Equal(t, 1, strings.Count(nonComment.String(), "systemctl"),
-		"outside comments, systemctl may appear exactly once: in the printed restart hint")
+	assert.NotContains(t, nonComment.String(), "systemctl",
+		"the activate package must not touch systemd at all — the core lifecycle owns the restart")
 	for line := range strings.SplitSeq(string(src), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "//") {
@@ -251,7 +243,5 @@ func TestNoSystemdInvocationInSource(t *testing.T) {
 		assert.False(t, strings.Contains(trimmed, "exec.Command") && strings.Contains(trimmed, "systemctl"),
 			"systemctl must never be executed: %s", trimmed)
 	}
-	assert.NotContains(t, nonComment.String(), "internal/restart",
-		"the activate package must not import the restart executor — the cli layer wires it")
 	_ = exec.Command // keep import used if assertions change
 }

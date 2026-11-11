@@ -81,10 +81,10 @@ func LegacyLocationWarning(path, canonical string) string {
 		" (the ~/.config/assay location is deprecated and will stop being honored in a future release)"
 }
 
-// ConfiglessBoundaryError is the loud stage boundary: render/activate need a
-// configured template/target, and a configless run has neither — the stage
-// refuses with the actionable message instead of silently defaulting to the
-// live client's config.
+// ConfiglessBoundaryError is the loud stage boundary: render/activate drive
+// the core lifecycle, which belongs to a configured deployment — a
+// configless run (no file anywhere; the marker is Config.Configless) refuses
+// with the actionable message instead of half-running on pure defaults.
 func ConfiglessBoundaryError(stage string) error {
 	return fmt.Errorf("configless mode cannot %s — provide -c or a config at %s", stage, ShareConfigDisplay)
 }
@@ -189,8 +189,10 @@ type Resolved struct {
 	Path string
 	// Warnings are loud resolution warnings (a spec-invalid relative
 	// XDG_DATA_HOME treated as unset; the deprecated legacy home location
-	// found on disk). Every command prints them next to the config-source
-	// line; they never change the resolution outcome.
+	// found on disk; S4 retired config keys found in the loaded file —
+	// exactly one line per key, with the re-homed value carried where S4
+	// says so). Every command prints them next to the config-source line;
+	// they never change the resolution outcome.
 	Warnings []string
 }
 
@@ -239,11 +241,11 @@ func resolveExplicit(explicit, cwd string) (*Resolved, error) {
 	if _, err := os.Stat(abs); err != nil {
 		return nil, fmt.Errorf("config not found at %s (explicit -c must exist — there is no fall-through)", abs)
 	}
-	cfg, err := Load(abs)
+	cfg, retired, err := loadFile(abs)
 	if err != nil {
 		return nil, err
 	}
-	return &Resolved{Config: cfg, Source: SourceExplicit, Path: abs}, nil
+	return &Resolved{Config: cfg, Source: SourceExplicit, Path: abs, Warnings: retired}, nil
 }
 
 // resolveImplicit walks the documented default tiers (local-share →
@@ -288,7 +290,7 @@ func newShareTier(home string) (*Resolved, error) {
 	if !fileExists(p) {
 		return nil, nil
 	}
-	cfg, err := Load(p)
+	cfg, retired, err := loadFile(p)
 	if err != nil {
 		return nil, err
 	}
@@ -296,6 +298,7 @@ func newShareTier(home string) (*Resolved, error) {
 	if lp := LegacyHomeConfigPath(home); fileExists(lp) {
 		res.Warnings = append(res.Warnings, LegacyLocationWarning(lp, ShareConfigDisplay))
 	}
+	res.Warnings = append(res.Warnings, retired...)
 	return res, nil
 }
 
@@ -311,7 +314,7 @@ func legacyShareTier(home string) (*Resolved, error) {
 	if !fileExists(p) {
 		return nil, nil
 	}
-	cfg, err := Load(p)
+	cfg, retired, err := loadFile(p)
 	if err != nil {
 		return nil, err
 	}
@@ -321,6 +324,7 @@ func legacyShareTier(home string) (*Resolved, error) {
 	}
 	res.Warnings = append(res.Warnings,
 		LegacyShareLocationWarning(legacyShareDataDir(home), DefaultDataDir(home)))
+	res.Warnings = append(res.Warnings, retired...)
 	return res, nil
 }
 
@@ -331,7 +335,7 @@ func legacyHomeTier(home string) (*Resolved, error) {
 	if !fileExists(p) {
 		return nil, nil
 	}
-	cfg, err := Load(p)
+	cfg, retired, err := loadFile(p)
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +346,7 @@ func legacyHomeTier(home string) (*Resolved, error) {
 	if hint := legacyShareDirHint(home); hint != "" {
 		res.Warnings = append(res.Warnings, hint)
 	}
+	res.Warnings = append(res.Warnings, retired...)
 	return res, nil
 }
 
@@ -356,7 +361,7 @@ func resolveCwdTier(cwd, home string) (*Resolved, error) {
 	if !fileExists(p) {
 		return nil, nil
 	}
-	cfg, err := Load(p)
+	cfg, retired, err := loadFile(p)
 	if err != nil {
 		return nil, err
 	}
@@ -369,15 +374,17 @@ func resolveCwdTier(cwd, home string) (*Resolved, error) {
 			res.Warnings = append(res.Warnings, hint)
 		}
 	}
+	res.Warnings = append(res.Warnings, retired...)
 	return res, nil
 }
 
 // configless builds the no-file configuration: data_dir at the XDG default,
-// every knob at its documented default — EXCEPT render.template and
-// activate.target, which stay EMPTY on purpose: they are the loud stage
-// boundaries (configless mode cannot render/activate). An empty home is API
-// misuse (M-3): callers must inject a real home — returning the config
-// would build a RELATIVE data dir, so it fails loud instead.
+// every knob at its documented default, and the Configless boundary marker
+// SET: it is the loud stage boundary's key (configless mode cannot
+// render/activate — the same W12 contract, carried by the marker since the
+// retired template/target fields died). An empty home is API misuse (M-3):
+// callers must inject a real home — returning the config would build a
+// RELATIVE data dir, so it fails loud instead.
 func configless(home string) (*Resolved, error) {
 	if home == "" {
 		return nil, errors.New("configless: empty home is API misuse — inject a real home directory")
@@ -389,6 +396,10 @@ func configless(home string) (*Resolved, error) {
 			CheckInterval: Duration{Duration: 30 * time.Second},
 		},
 		Probe: ProbeConfig{CalibrationEnabled: true},
+		// AutoUpdate default ON (D4) pre-seeded before decode-equivalent
+		// defaults, matching the Load path (an explicit false survives).
+		Core:       CoreConfig{AutoUpdate: true},
+		Configless: true,
 	}
 	applyDefaults(cfg, true)
 	syncResourceConfig(cfg)

@@ -81,7 +81,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		return nil, fmt.Errorf("check: --concurrency must be ≥ 0 (got %d)", opts.Concurrency)
 	}
 	if opts.factoryOverride == nil && opts.XrayBin == "" {
-		return nil, errors.New("check: xray binary path is empty (activate.xray_bin)")
+		return nil, errors.New("check: xray binary path is empty (core.xray_bin)")
 	}
 	targets := make([]Target, 0, len(opts.Targets))
 	for _, raw := range opts.Targets {

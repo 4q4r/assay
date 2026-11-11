@@ -41,8 +41,8 @@ const poolOutboundPrefix = "pool-"
 
 // Options bundles one stats poll's dependencies.
 type Options struct {
-	BinPath string // the xray binary (config activate.xray_bin)
-	Server  string // host:port of the api-in inbound (loopback, render.stats_port)
+	BinPath string // the xray binary ([core].xray_bin)
+	Server  string // host:port of the api-in inbound (loopback, [core].api_port)
 	Pattern string // statsquery pattern, e.g. "outbound>>>pool-"
 	Timeout time.Duration
 }
@@ -235,7 +235,7 @@ func dropProxyEnv(env []string) []string {
 	return out
 }
 
-// TargetHasAPI reports whether the activate target carries the api/stats
+// TargetHasAPI reports whether the target config carries the api/stats
 // shape this stage polls — the same shape render emits (ensureAPIStats:
 // an `api` block, an `api-in` inbound on the configured stats port, and the
 // stats/policy blocks that make the counters exist). We render the target,
@@ -250,7 +250,7 @@ func TargetHasAPI(targetPath string, statsPort int) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read activate target %s: %w", targetPath, err)
+		return false, fmt.Errorf("read target config %s: %w", targetPath, err)
 	}
 	var m struct {
 		API      *json.RawMessage `json:"api"`
@@ -268,7 +268,7 @@ func TargetHasAPI(targetPath string, statsPort int) (bool, error) {
 		} `json:"policy"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return false, fmt.Errorf("decode activate target %s: %w", targetPath, err)
+		return false, fmt.Errorf("decode target config %s: %w", targetPath, err)
 	}
 	if m.API == nil || m.Stats == nil {
 		return false, nil

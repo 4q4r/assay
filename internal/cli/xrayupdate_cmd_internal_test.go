@@ -58,7 +58,7 @@ func TestXrayUpdateCommandCheckMode(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(bin), 0o750))
 	require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\necho \"Xray 26.3.27 test-banner\"\nexit 0\n"), 0o755))
 
-	cfgBody := fmt.Sprintf("data_dir = %q\n[fetch]\napi_base = %q\n[activate]\nxray_bin = %q\n",
+	cfgBody := fmt.Sprintf("data_dir = %q\n[fetch]\napi_base = %q\n[core]\nxray_bin = %q\n",
 		filepath.Join(dir, "data"), srv.URL, bin)
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgBody), 0o600))
@@ -75,10 +75,10 @@ func TestXrayUpdateCommandCheckMode(t *testing.T) {
 	assert.Contains(t, text, "update available")
 }
 
-// TestXrayUpdateCommandUnwritableTargetExitLoud pins the CLI contract: a
-// root-owned target surfaces the staged-binary + sudo lines on stderr and
-// the command FAILS (exit 1 through the cobra error path) — never a silent
-// half-apply.
+// TestXrayUpdateCommandUnwritableTargetExitLoud pins the CLI contract (S5
+// managed-only): a root-owned target FAILS the command (exit 1 through the
+// cobra error path) with the loud refusal on stderr — never a silent
+// half-apply, never privileged commands.
 func TestXrayUpdateCommandUnwritableTargetExitLoud(t *testing.T) {
 	srv := fakeReleaseServer(t, "v26.10.21")
 	dir := t.TempDir()
@@ -87,7 +87,7 @@ func TestXrayUpdateCommandUnwritableTargetExitLoud(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(rootDir, 0o750) })
 	bin := filepath.Join(rootDir, "xray")
 
-	cfgBody := fmt.Sprintf("data_dir = %q\n[fetch]\napi_base = %q\n[activate]\nxray_bin = %q\n",
+	cfgBody := fmt.Sprintf("data_dir = %q\n[fetch]\napi_base = %q\n[core]\nxray_bin = %q\n",
 		filepath.Join(dir, "data"), srv.URL, bin)
 	cfgPath := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgBody), 0o600))
@@ -100,10 +100,9 @@ func TestXrayUpdateCommandUnwritableTargetExitLoud(t *testing.T) {
 	root.SetArgs([]string{"--config", cfgPath, "xray-update", "--yes"})
 	err := root.Execute()
 	require.Error(t, err, "unwritable target must fail the command (exit 1)")
-	text := errOut.String()
-	assert.Contains(t, text, "sudo install -m 0755", "the exact privileged line is printed")
-	assert.Contains(t, text, bin, "the target path appears verbatim")
-	assert.Contains(t, text, "xray-staged", "the staged binary path appears verbatim")
+	assert.Contains(t, err.Error(), "not writable", "the refusal names the directory")
+	assert.Contains(t, err.Error(), "[core].xray_bin", "the refusal names the knob")
+	assert.NotContains(t, errOut.String(), "sudo", "no privileged commands exist anymore (managed-only)")
 	_, statErr := os.Stat(bin)
 	assert.True(t, os.IsNotExist(statErr), "nothing was applied to the unwritable target")
 }

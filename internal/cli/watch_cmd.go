@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"assay/internal/config"
+	"assay/internal/core"
 	"assay/internal/plugins"
+	"assay/internal/render"
 	"assay/internal/sdnotify"
+	"assay/internal/store"
 	"assay/internal/watchdog"
 
 	"github.com/spf13/cobra"
@@ -22,10 +25,12 @@ import (
 // newWatchCommand is the W10 daemon entry: fsnotify watchdog on the plugins
 // dir + the wave scheduler ([maintain].refresh_interval / speedtest_interval)
 // reusing the exact maintainStages runners. SIGINT/SIGTERM finish the current
-// stage, flush, and exit 0. Since W13 the daemon's systemd surface is
-// exactly the restart executor the activate stage carries (byte-pinned
-// two-command allowlist in internal/restart) — scheduling still lives here;
-// this file itself carries no process-spawning surface of any kind.
+// stage, flush, and exit 0. The pre-pivot restart executor the activate
+// stage used to carry (byte-pinned two-command allowlist in internal/restart)
+// was REMOVED with the external mode (D3) — since the self-held-core pivot
+// the daemon's core lifecycle is its own child process, not a systemctl
+// call. Scheduling still lives here; this file itself carries no
+// process-spawning surface of any kind.
 func newWatchCommand(cfgPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "watch",
@@ -247,18 +252,94 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 	}
 }
 
-// runWatch wires the daemon: watchdog → shared registry → scheduler with a
-// between-stage shutdown checkpoint → signal-driven graceful stop (exit 0).
-// The sd_notify handshake (READY=1 + WatchdogSec pings) starts before the
-// first wave: under the Type=notify unit systemd holds the start until
-// READY=1, and the pinger must be live from the very beginning.
+// ensureBootstrapLiveConfig writes the D7 bootstrap live config when the
+// core's live artifact does not exist yet (S2: the daemon spawns a bootstrap
+// core at start, and the spawn needs the artifact). An existing live.json is
+// last-good (or a prior bootstrap) and is kept — A4/D7: never regress a
+// configured core to the fail-closed posture by overwriting it.
+func ensureBootstrapLiveConfig(out io.Writer, cfg *config.Config, p paths) error {
+	if _, err := os.Stat(ownLivePath(p)); err == nil {
+		return nil
+	}
+	own, warnings, err := render.RenderOwnConfig(nil, cfg.Core, toRenderRoutes(cfg.Render.PoolRoutes),
+		nil, nil, ownRenderKnobs(cfg))
+	if err != nil {
+		return fmt.Errorf("render bootstrap core config: %w", err)
+	}
+	for _, b := range warnings {
+		outf(out, "WARNING: %s\n", b)
+	}
+	if err := os.MkdirAll(filepath.Join(p.dataDir, "rendered"), 0o750); err != nil {
+		return err
+	}
+	if err := store.WriteFileAtomic(ownLivePath(p), func(f *os.File) error {
+		_, err := f.Write(own)
+		return err
+	}); err != nil {
+		return err
+	}
+	outf(out, "watch: bootstrap core config written (empty pool fail-closed — catch-all → block) → %s\n",
+		ownLivePath(p))
+	return nil
+}
+
+// runWatch wires the daemon: watchdog → shared registry → core manager
+// (bootstrap spawn per S2) → scheduler with a between-stage shutdown
+// checkpoint → signal-driven graceful stop (exit 0).
+//
+// S2 ordering: the core manager takes the singleton flock, the bootstrap
+// live config is ensured, and EnsureRunning has spawned/adopted the core
+// BEFORE the sd_notify handshake — READY=1 fires only once the bootstrap
+// core is reachable. The child runs under a NON-canceling ctx (C4: the exec
+// path kills the child on ctx cancellation) and is stopped explicitly on
+// the SIGTERM shutdown (A2: a daemon restart never leaves the core dead —
+// the pidfile lets the next daemon adopt it).
 func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
+	// The daemon's lifetime channel: the crash supervisor and the scheduler
+	// both watch it; SIGTERM closes it after the current stage finishes.
+	stop := make(chan struct{})
 	dir := config.ExpandHome(cfg.Plugins.Dir)
 	reg, closer, err := deps.startWatchdog(dir, out)
 	if err != nil {
 		return fmt.Errorf("watch: start watchdog on %s: %w", dir, err)
 	}
 	defer func() { _ = closer.Close() }()
+
+	// The core manager: the daemon owns the singleton flock for its whole
+	// lifetime (S3) — a second daemon fails loud here and the unit restarts.
+	// The BOOTSTRAP, by contrast, degrades loud-but-nonfatal (the same
+	// wave-continues contract as the configless stages): a missing managed
+	// binary logs its WARNING and the daemon stays up (an unwritable data
+	// dir is NOT that case — it fails NewManager HARD right above, since
+	// nothing works without the data dir; T4 review M-4). The waves retry
+	// the core through every wave's activate stage: revive on a last-good
+	// live config, Restart on a candidate (T4-I-1) — and the crash
+	// supervisor revives independently of the waves (G1).
+	p := newPaths(cfg)
+	mgr, err := core.NewManager(cfg.Core, p.dataDir, out)
+	if err != nil {
+		return fmt.Errorf("watch: core manager: %w", err)
+	}
+	if err := ensureBootstrapLiveConfig(out, cfg, p); err != nil {
+		outf(out, "WARNING: watch: bootstrap core config: %v (daemon stays up; the waves retry)\n", err)
+	}
+	// Bootstrap spawn / adoption (S2, A2), retried with a doubling backoff
+	// before degrading (bootstrap-degradation closure): a transient boot
+	// race heals; a persistent failure (e.g. the managed binary is absent)
+	// exhausts the budget and lands on the loud non-fatal WARNING — the
+	// retry outcome is loud either way. The crash supervisor below keeps
+	// retrying on its own bounded ladder, so the degraded state is not
+	// permanent even without waves. The ctx is deliberately NON-canceling
+	// (C4): only the explicit Stop below may kill this child.
+	if berr := bootstrapCoreWithRetries(out, mgr.EnsureRunning, bootstrapAttempts,
+		func(d time.Duration) { time.Sleep(d) }); berr != nil {
+		outf(out, "WARNING: watch: bootstrap core: %v (daemon stays up; the waves retry "+
+			"and the crash supervisor revives)\n", berr)
+	}
+	// G1: the between-waves crash supervision. The loop dies with the
+	// daemon's stop channel; the child itself is stopped only by the
+	// explicit Stop on the shutdown path below.
+	mgr.Supervise(stop)
 
 	stopSdNotify := deps.sdNotify(out)
 	defer stopSdNotify()
@@ -283,9 +364,14 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// pipeline logic; every other stage is the exact production runner.
 	// The enrichment seam gets the SAME registry (F1): the MinLivePercent
 	// breaker lands on the long-lived watchdog registry and actually
-	// disables plugins across waves.
+	// disables plugins across waves. The activate stage gets the daemon's
+	// manager (T4): the D8 strike counter accumulates across waves, and the
+	// one-shot flock refusal can never fire against the daemon's own lock.
 	runWave := func(cfg *config.Config, opts maintainOptions, between func() bool) error {
-		stages := defaultMaintainStages(opts)
+		// The daemon's ONE manager flows into every core-touching stage via
+		// defaultMaintainStages (fix I-1): the D8 strike counter accumulates
+		// across waves and the S5 inert INFO stays one-time.
+		stages := defaultMaintainStages(opts, mgr)
 		stages.fetch = func(c *cobra.Command, cc *config.Config) error {
 			_, err := runFetchWith(c, cc, reg)
 			return err
@@ -298,7 +384,6 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 
 	var shutdown atomic.Bool
 	between := shutdown.Load
-	stop := make(chan struct{})
 	sched := &waveScheduler{
 		cfg:             cfg,
 		refreshInterval: cfg.Maintain.RefreshInterval.Duration,
@@ -350,9 +435,46 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		shutdown.Store(true)
 		close(stop)
 		<-schedDone
+		// C4/A2: the core is stopped EXPLICITLY on the daemon shutdown (the
+		// child never dies via ctx cancellation). A stop failure is loud but
+		// must not mask the clean shutdown — the pidfile and the flock die
+		// with the process either way.
+		if serr := mgr.Stop(); serr != nil {
+			outf(out, "watch: core stop failed: %v\n", serr)
+		}
 		outln(out, "watch: clean shutdown")
 		return nil
 	}
+}
+
+// bootstrapAttempts is the daemon's bootstrap retry budget (the
+// bootstrap-degradation closure): a failing bootstrap EnsureRunning retries
+// with a doubling backoff before degrading to the loud non-fatal state.
+// Code-owned, not a knob (supervision politeness is not operator-facing
+// configuration — the owner's standing ruling).
+const bootstrapAttempts = 3
+
+// bootstrapCoreWithRetries is the daemon's bootstrap step: it calls ensure
+// up to N times with a doubling backoff (1s, 2s, … — transient boot races
+// heal; a persistent failure exhausts the budget fast), every failed
+// attempt is loud, and the LAST error surfaces to the caller (which prints
+// the non-fatal WARNING). The retry outcome is loud either way.
+func bootstrapCoreWithRetries(
+	out io.Writer, ensure func(context.Context) error, attempts int, wait func(time.Duration),
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := ensure(context.Background())
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		outf(out, "watch: bootstrap attempt %d/%d failed: %v\n", attempt, attempts, err)
+		if attempt < attempts {
+			wait(time.Duration(attempt) * time.Second)
+		}
+	}
+	return fmt.Errorf("bootstrap failed after %d attempts: %w", attempts, lastErr)
 }
 
 // checkSelfUpdate is called at every wave boundary. It promotes a pending

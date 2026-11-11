@@ -46,17 +46,13 @@ city_expand_threshold = 25
 ceiling = 40
 
 [render]
-template = "~/projects/xray-raw/config.json"
-output_dir = "rendered"
-stats_port = 15490
 
 [[render.pool_routes]]
 balancer = "pool_de"
 domains = ["geosite:netflix"]
 
 [activate]
-target = "~/projects/xray-raw/config.json"
-xray_bin = "/usr/bin/xray"
+test_timeout = "20s"
 `
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	cfg, err := config.Load(path)
@@ -86,12 +82,12 @@ xray_bin = "/usr/bin/xray"
 	assert.Equal(t, 25, cfg.Select.CityExpandThreshold)
 	assert.Equal(t, 40, cfg.Select.Ceiling)
 
-	assert.Equal(t, 15490, cfg.Render.StatsPort)
 	require.Len(t, cfg.Render.PoolRoutes, 1)
 	assert.Equal(t, "pool_de", cfg.Render.PoolRoutes[0].Balancer)
 	assert.Equal(t, []string{"geosite:netflix"}, cfg.Render.PoolRoutes[0].Domains)
 
-	assert.Equal(t, "/usr/bin/xray", cfg.Activate.XrayBin)
+	require.NotNil(t, cfg.Activate.TestTimeout)
+	assert.Equal(t, 20*time.Second, cfg.Activate.TestTimeout.Duration)
 }
 
 func TestDefaultsAreApplied(t *testing.T) {
@@ -126,10 +122,12 @@ data_dir = "/tmp/assay-defaults"
 	assert.Equal(t, 0, cfg.Select.SoftCap, "absent = unbounded global selection")
 	assert.Equal(t, 0, cfg.Select.CityExpandThreshold, "absent = expansion off (moot when unbounded)")
 	assert.Equal(t, 0, cfg.Select.Ceiling, "absent = unbounded ceiling")
-	assert.Equal(t, 15490, cfg.Render.StatsPort)
-	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Render.Template)
-	assert.Equal(t, "~/projects/xray-raw/config.json", cfg.Activate.Target)
-	assert.Equal(t, "/usr/bin/xray", cfg.Activate.XrayBin)
+	assert.Equal(t, 10810, cfg.Core.SocksPort, "own socks inbound defaults to the D2 port")
+	assert.Equal(t, 10811, cfg.Core.HTTPPort, "own http inbound defaults to the D2 port")
+	assert.Equal(t, 15491, cfg.Core.APIPort, "own stats/API port defaults to the spec port")
+	// activate.backup_dir is retired (S4): the backup dir is FIXED at
+	// <data>/backups — the D8 rollback globs exactly there — and the retired
+	// key parse-and-warns (core_config_internal_test.go pins the warning).
 	assert.True(t, cfg.Probe.CalibrationEnabled, "calibration defaults ON")
 	assert.InDelta(t, 10.0, cfg.Probe.CalibrationBase, 1e-9)
 	assert.InDelta(t, 1.0, cfg.Probe.CalibrationMargin, 1e-9)
@@ -273,18 +271,33 @@ https_url = "https://geo.self-hosted.example/internal/json"
 			"the endpoint is a passthrough string — structural https check only")
 	})
 
-	t.Run("stats port must be unprivileged", func(t *testing.T) {
+	t.Run("core ports must be valid TCP ports (the re-homed structural check)", func(t *testing.T) {
+		for _, body := range []string{
+			"\n[core]\napi_port = 70000\n",  // above the TCP port domain
+			"\n[core]\nsocks_port = -1\n",   // below the TCP port domain
+			"\n[core]\nhttp_port = 65536\n", // just above the TCP port domain
+		} {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			content := "data_dir = \"/tmp/x\"\n" + body
+			require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+			_, err := config.Load(path)
+			require.Error(t, err, "body %q must fail the [core] port validation", body)
+			assert.Contains(t, err.Error(), "valid TCP port")
+		}
+	})
+
+	t.Run("core ports 0 = unset (the default materializes, the load passes)", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.toml")
 		content := `
 data_dir = "/tmp/x"
 
-
-[render]
-stats_port = 80
+[core]
+api_port = 0
 `
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
-		_, err := config.Load(path)
-		require.Error(t, err)
+		cfg, err := config.Load(path)
+		require.NoError(t, err, "0 is the W6 unset convention, never an invalid port")
+		assert.Equal(t, 15491, cfg.Core.APIPort)
 	})
 }
 
@@ -328,51 +341,11 @@ func TestMaintainSectionParsesAndDefaults(t *testing.T) {
 	})
 }
 
-// TestAutoRestartKnobDefaultsToTrue pins [maintain].auto_restart (W13, the
-// owner's hands-off ruling): unset = TRUE — the daemon restarts the live
-// xray client after every gated activation; an explicit false restores the
-// manual-restart semantics (the hint is printed instead).
-func TestAutoRestartKnobDefaultsToTrue(t *testing.T) {
-	write := func(content string) string {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "config.toml")
-		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-		return path
-	}
-	base := `data_dir = "/tmp/assay-autorestart"
-`
-
-	t.Run("unset defaults to true (hands-off)", func(t *testing.T) {
-		cfg, err := config.Load(write(base))
-		require.NoError(t, err)
-		assert.True(t, cfg.Maintain.AutoRestartEnabled(),
-			"auto_restart must default to true — zero manual restarts is the approved premise")
-	})
-
-	t.Run("explicit false restores manual semantics", func(t *testing.T) {
-		cfg, err := config.Load(write(base + "\n[maintain]\nauto_restart = false\n"))
-		require.NoError(t, err)
-		assert.False(t, cfg.Maintain.AutoRestartEnabled())
-	})
-
-	t.Run("explicit true parses", func(t *testing.T) {
-		cfg, err := config.Load(write(base + "\n[maintain]\nauto_restart = true\n"))
-		require.NoError(t, err)
-		assert.True(t, cfg.Maintain.AutoRestartEnabled())
-	})
-
-	t.Run("unknown key still fails strict decode", func(t *testing.T) {
-		_, err := config.Load(write(base + "\n[maintain]\nauto_restartt = true\n"))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "strict mode")
-	})
-}
-
 // TestUnlockProbesKnobDefaultsTrue pins [geo].unlock_probes (owner ruling
 // 2026-11-06: unlock probes ship ON by default, like the ip quality fields
 // they carry): absent = TRUE (materialized by applyGeoDefaults), an
 // explicit false keeps the stage off, an explicit true parses. The knob is
-// tri-state (*bool) exactly like [maintain].auto_restart.
+// tri-state (*bool) exactly like the other boolean switches.
 func TestUnlockProbesKnobDefaultsTrue(t *testing.T) {
 	write := func(content string) string {
 		t.Helper()
@@ -608,17 +581,6 @@ func TestFilterProtocolsAndAllowInsecureConfig(t *testing.T) {
 // w6Base is the minimal valid config body every W6 knob test builds on.
 const w6Base = "data_dir = \"d\"\n"
 
-// TestW6PoolInboundTagsDeduplicatedAtLoad pins M-4: duplicate entries in
-// [render].pool_inbound_tags are collapsed at config load — order preserved,
-// FIRST occurrence wins (a later re-appearance must not resurrect the tag).
-func TestW6PoolInboundTagsDeduplicatedAtLoad(t *testing.T) {
-	cfg := load(t, w6Base+`[render]
-pool_inbound_tags = ["socks-in", "socks-in", "tun-in", "tun-in", "socks-in", "http-in"]
-`)
-	assert.Equal(t, []string{"socks-in", "tun-in", "http-in"}, cfg.Render.PoolInboundTags,
-		"duplicates must collapse at load: first occurrence wins, order preserved")
-}
-
 // TestW6KnobDefaults pins the owner-ruled defaults of every W6 knob: absent
 // keys must reproduce today's exact behavior (the W6 binding ruling — defaults
 // preserve current behavior, and NO artificial floor/ceiling/range validation
@@ -631,7 +593,6 @@ func TestW6KnobDefaults(t *testing.T) {
 	// P1
 	require.NotNil(t, cfg.Activate.TestTimeout, "activate.test_timeout must default (30s), not nil")
 	assert.Equal(t, 30*time.Second, cfg.Activate.TestTimeout.Duration)
-	assert.Equal(t, []string{"socks-in", "http-in"}, cfg.Render.PoolInboundTags)
 	assert.Empty(t, cfg.Render.ObservatoryInterval,
 		"W19: absent observatory_interval = ADAPTIVE (render computes max(60s, ceil(N×200ms)) from the active count); explicit stays verbatim")
 	assert.Equal(t, 1440, cfg.Render.TCPMaxSeg)
@@ -642,7 +603,6 @@ func TestW6KnobDefaults(t *testing.T) {
 	assert.Equal(t, "https://api.github.com", cfg.Fetch.APIBase)
 	assert.Equal(t, "https://raw.githubusercontent.com", cfg.Fetch.RawBase)
 	assert.Equal(t, "assay (pipeline; contact: owner)", cfg.HTTP.UserAgent)
-	assert.Equal(t, "xray-raw.service", cfg.Activate.ServiceName)
 	assert.Equal(t, 10*time.Second, cfg.Maintain.StatsTimeout.Duration)
 	assert.InDelta(t, 1.2, cfg.Select.TieBandRTTTolerance, 1e-9)
 	assert.Equal(t, 0, cfg.Activate.BackupKeep, "0 = unlimited retention")
@@ -724,7 +684,6 @@ skip_fresh_within = "15m"
 tie_band_rtt_tolerance = 2.5
 
 [render]
-pool_inbound_tags = ["socks-in", "http-in", "tun-in"]
 observatory_interval = "45s"
 tcp_max_seg = 1380
 tls_fingerprint = "chrome"
@@ -732,7 +691,6 @@ balancer_tolerance = 0.5
 
 [activate]
 test_timeout = "1m"
-service_name = "xray-custom.service"
 backup_keep = 3
 
 [maintain]
@@ -745,14 +703,12 @@ prune_backup_keep = 5
 	assert.Equal(t, "assay/6 (custom)", cfg.HTTP.UserAgent)
 	assert.Equal(t, 15*time.Minute, cfg.Probe.SkipFreshWithin.Duration)
 	assert.InDelta(t, 2.5, cfg.Select.TieBandRTTTolerance, 1e-9)
-	assert.Equal(t, []string{"socks-in", "http-in", "tun-in"}, cfg.Render.PoolInboundTags)
 	assert.Equal(t, "45s", cfg.Render.ObservatoryInterval, "string passthrough: rendered verbatim")
 	assert.Equal(t, 1380, cfg.Render.TCPMaxSeg)
 	assert.Equal(t, "chrome", cfg.Render.TLSFingerprint)
 	assert.InDelta(t, 0.5, cfg.Render.BalancerTolerance, 1e-9)
 	require.NotNil(t, cfg.Activate.TestTimeout)
 	assert.Equal(t, time.Minute, cfg.Activate.TestTimeout.Duration)
-	assert.Equal(t, "xray-custom.service", cfg.Activate.ServiceName)
 	assert.Equal(t, 3, cfg.Activate.BackupKeep)
 	assert.Equal(t, 20*time.Second, cfg.Maintain.StatsTimeout.Duration)
 	assert.Equal(t, 5, cfg.Maintain.PruneBackupKeep)

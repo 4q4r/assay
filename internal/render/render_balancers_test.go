@@ -16,13 +16,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// balancersOf extracts routing.balancers as typed objects.
+// balancersOf extracts routing.balancers as typed objects; an ABSENT
+// balancers key (the own empty-pool config) yields an empty list — absence
+// IS the empty answer, not an error.
 func balancersOf(t *testing.T, m map[string]any) []map[string]any {
 	t.Helper()
 	routing, ok := m["routing"].(map[string]any)
 	require.True(t, ok, "routing object present")
 	raw, ok := routing["balancers"].([]any)
-	require.True(t, ok, "routing.balancers array present")
+	if !ok {
+		return nil
+	}
 	out := make([]map[string]any, 0, len(raw))
 	for _, b := range raw {
 		bm, ok := b.(map[string]any)
@@ -82,7 +86,7 @@ func TestPoolUnknownBalancerRendersForUnknownGeoNodes(t *testing.T) {
 		}
 	}
 	require.NotNil(t, route, "a pool route may target pool_unknown like a country balancer")
-	assert.Equal(t, []any{"socks-in", "http-in"}, route["inboundTag"])
+	assert.Equal(t, []any{"in", "in-http"}, route["inboundTag"])
 }
 
 // TestPoolUnknownAbsentWithoutUnknownNodes pins the conditional rendering:
@@ -135,27 +139,17 @@ func TestPoolAllAbsentOnEmptyPool(t *testing.T) {
 
 // TestPoolBalancersCarryBlockFallbackOnNewBalancers pins the W9 invariant
 // extended to the W16 balancers: pool_unknown and pool_all carry
-// fallbackTag block, and re-rendering from a previous output does not
-// duplicate either (strip idempotency covers the new tags).
+// fallbackTag block, and every balancer renders EXACTLY ONCE per render
+// (the emission contract; the own render regenerates from scratch each wave).
 func TestPoolBalancersCarryBlockFallbackOnNewBalancers(t *testing.T) {
 	nodes, sel := unknownSelection(t)
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	cfg := renderCfg([]render.PoolRoute{
+	m, _ := doOwnRender(t, nodes, sel, []render.PoolRoute{
 		{Balancer: "pool_unknown", Domains: []string{"domain:x.com"}},
 		{Balancer: "pool_all", Domains: []string{"domain:y.com"}},
 	})
-	first, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: cfg})
-	require.NoError(t, err)
-	second, err := render.Render(render.Input{Template: first.Config, Selection: sel, NodesByKey: byKey, Cfg: cfg})
-	require.NoError(t, err)
-	var m2 map[string]any
-	require.NoError(t, json.Unmarshal(second.Config, &m2))
 
 	counts := map[string]int{}
-	for _, b := range balancersOf(t, m2) {
+	for _, b := range balancersOf(t, m) {
 		tag, _ := b["tag"].(string)
 		if strings.HasPrefix(tag, "pool_") {
 			counts[tag]++
@@ -163,7 +157,7 @@ func TestPoolBalancersCarryBlockFallbackOnNewBalancers(t *testing.T) {
 		}
 	}
 	assert.Equal(t, map[string]int{"pool_unknown": 1, "pool_all": 1, "pool_de": 1, "pool_de_frankfurt": 1},
-		counts, "re-render must not duplicate the new balancers")
+		counts, "every balancer renders exactly once per render")
 }
 
 // TestUnknownAndAllGoldenPassesXrayTest materializes (first run) and
@@ -180,11 +174,8 @@ func TestUnknownAndAllGoldenPassesXrayTest(t *testing.T) {
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		GeoByKey: geoEvidence(nodes, map[string]model.GeoRecord{
+	res, _, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey,
+		geoEvidence(nodes, map[string]model.GeoRecord{
 			// Phase-3 evidence: the unknown-geo exit qualifies for the GLOBAL
 			// service pools only (chatgpt + youtube; no xx country tier);
 			// de1 carries netflix-full + a checked DE region, de2 chatgpt.
@@ -197,20 +188,17 @@ func TestUnknownAndAllGoldenPassesXrayTest(t *testing.T) {
 			"de2.example.com": {RiskScore: -1, MediaUnlocks: model.MediaUnlockStatus{
 				ChatGPT: model.UnlockYes, CheckedAt: "2026-11-04T12:00:00Z",
 			}},
-		}),
-		Cfg: renderCfg(nil),
-	})
+		}), render.Config{})
 	require.NoError(t, err)
-	assert.Empty(t, res.DroppedParams)
 
 	goldenPath := filepath.Join("testdata", "golden-unknown-and-all.json")
 	golden, err := os.ReadFile(goldenPath)
 	if err == nil {
-		assert.Equal(t, string(golden), string(res.Config),
+		assert.Equal(t, string(golden), string(res),
 			"render diverged from %s — if intentional, regenerate deliberately", goldenPath)
 	} else {
-		require.NoError(t, os.WriteFile(goldenPath, res.Config, 0o644), "first run materializes the golden")
-		golden = res.Config
+		require.NoError(t, os.WriteFile(goldenPath, res, 0o644), "first run materializes the golden")
+		golden = res
 		t.Logf("materialized %s", goldenPath)
 	}
 
@@ -287,28 +275,22 @@ func TestCityVariantPairGoldenPassesXrayTest(t *testing.T) {
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		Cfg:        renderCfg(nil),
-	})
+	res, _, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey, nil, render.Config{})
 	require.NoError(t, err)
-	assert.Empty(t, res.DroppedParams)
 
 	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	require.NoError(t, json.Unmarshal(res, &m))
 	require.NotNil(t, balancerByTag(t, m, "pool_de_frankfurt_am_main"),
 		"the golden render carries the folded city balancer")
 
 	goldenPath := filepath.Join("testdata", "golden-city-variant-pair.json")
 	golden, err := os.ReadFile(goldenPath)
 	if err == nil {
-		assert.Equal(t, string(golden), string(res.Config),
+		assert.Equal(t, string(golden), string(res),
 			"render diverged from %s — if intentional, regenerate deliberately", goldenPath)
 	} else {
-		require.NoError(t, os.WriteFile(goldenPath, res.Config, 0o644), "first run materializes the golden")
-		golden = res.Config
+		require.NoError(t, os.WriteFile(goldenPath, res, 0o644), "first run materializes the golden")
+		golden = res
 		t.Logf("materialized %s", goldenPath)
 	}
 

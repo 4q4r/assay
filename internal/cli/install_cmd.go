@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strings"
 
 	"assay/internal/config"
+	"assay/internal/core"
 	"assay/internal/install"
 	"assay/internal/ui"
 
@@ -34,6 +36,12 @@ func resolveExecutable() (string, error) {
 // cobra-level install flow never executes systemd (same pattern as
 // signalChannel in watch_cmd.go).
 var installExecutor = func() install.Executor { return install.SystemctlExecutor{} }
+
+// ensureCoreBinary is the D4 install-bootstrap seam: production wires
+// core.EnsureCoreBinary (download the managed core, sha-verified, atomic —
+// inert for an overridden [core].xray_bin per S5); tests stub it so the
+// wiring pins never touch the network.
+var ensureCoreBinary = core.EnsureCoreBinary
 
 func newInstallCommand(cfgPath *string) *cobra.Command {
 	var (
@@ -61,11 +69,15 @@ WITHOUT -c (the canonical flow):
   4. enables it:
        systemctl --user daemon-reload
        systemctl --user enable --now assay-watch.service
-  5. prints a loud summary — including what YOU still must fill:
-     [render].template and [activate].target in the materialized config.
-     Until those exist the render/activate stages fail loud at their
-     boundary; every data stage (fetch → parse → filter → probe → geo →
-     select) runs meanwhile.
+  5. downloads the managed xray core into <data>/bin/xray — sha256-verified
+     against the release checksums, atomically placed (D4); skipped with a
+     loud INFO when [core].xray_bin points at a system binary (S5 —
+     auto-update stays inert there);
+  6. prints a loud summary. Every data stage (fetch → parse → filter →
+     probe → select) runs meanwhile; the daemon spawns the own core on a
+     fail-closed bootstrap config at start (empty pool → block, D7) and
+     each wave re-renders <data>/rendered/live.json — no further setup
+     required.
 
 WITH -c <path>: the previous semantics verbatim — the unit embeds the
 resolved absolute path (a relative -c resolves against the current
@@ -213,6 +225,17 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
+	// D4 core bootstrap: guarantee the managed core binary before the first
+	// wave (the spec's "install is a complete user bootstrap"). Inert with a
+	// loud INFO when [core].xray_bin is overridden (S5). A download failure
+	// is loud but NON-fatal here: install already enabled the daemon, and
+	// the waves retry through the auto-update stage.
+	if cfg != nil {
+		if berr := ensureCoreBinary(context.Background(), cfg.Core, config.ExpandHome(cfg.DataDir), w); berr != nil {
+			outf(w, "%s\n", ui.Warn("WARNING: core bootstrap: "+berr.Error()+
+				" (install completes; the daemon's waves retry through auto-update)", ui.Amber, opts.color))
+		}
+	}
 	outf(w, "%s\n", ui.ChipKV("installed binary: ", res.BinaryPath+" (copy of the running image, mode 0755)", opts.color))
 	if res.ConfigWritten != "" {
 		outf(w, "%s\n", ui.ChipKV("config created:   ", res.ConfigWritten+
@@ -227,7 +250,7 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 			"no timers installed; run the maintain wave manually or from your own scheduler", opts.color))
 		return nil
 	}
-	printInstallSummary(w, cfg, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
+	printInstallSummary(w, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
 	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u assay-watch.service -f", opts.color))
 	return nil
 }
@@ -246,7 +269,7 @@ func daemonCfg(opts installOptions, cfgPath string) string {
 // legacy cleanup, and the config guidance — explicit-path installs name the
 // referenced file, default-location installs name where the daemon reads
 // its config and what the owner must fill to activate.
-func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs string,
+func printInstallSummary(w io.Writer, cfgAbs string,
 	daemonCfgPath string, res install.Result, color bool,
 ) {
 	for _, p := range res.UnitPaths {
@@ -267,12 +290,6 @@ func printInstallSummary(w io.Writer, cfg *config.Config, cfgAbs string,
 	}
 	outf(w, "%s\n", ui.ChipKV("daemon config:    ",
 		daemonCfgPath+" (the daemon reads the default location — no -c in the unit)", color))
-	if cfg != nil && cfg.Render.Template == "" && cfg.Activate.Target == "" {
-		outf(w, "%s\n", ui.ChipKV("to activate:      ",
-			"fill [render].template and [activate].target in the config above;", color))
-		outf(w, "%s\n", ui.ChipKV("                  ",
-			"until then render/activate fail loud at their stage boundary (data stages run)", color))
-	}
 }
 
 func newUninstallCommand(cfgPath *string) *cobra.Command {
@@ -291,7 +308,8 @@ reports. The installed binary and all user data are KEPT by default.
 
 --purge is DESTRUCTIVE and must be passed explicitly: it also removes the
 config file and the pipeline data dir ([data_dir]). It never touches
-anything outside those two paths — in particular nothing xray-raw. The
+anything outside those two paths — in particular nothing outside assay's
+own deployment (the owner's hand-managed proxy client is never touched). The
 config resolves the same way install does: explicit -c wins; the
 default-location layout (no -c) purges the canonical
 ~/.local/share/assay/config.toml plus the data dir under it; the
@@ -299,29 +317,32 @@ deprecated legacy location still wins when present. The cwd default
 (./config.toml) is never consulted — a purge must never depend on the
 caller's working directory.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			var ir installResolution
-			if purge {
-				var err error
-				ir, err = resolveInstallPath(*cfgPath)
-				if err != nil {
+			// The config resolves on BOTH paths now: the managed-core
+			// teardown (D4) needs the data dir on the plain path too. A
+			// configless machine resolves to the built-in defaults; a
+			// resolution FAILURE leaves cfg nil (nothing is guessed — the
+			// core teardown is skipped; --purge still refuses: it cannot
+			// resolve what to purge).
+			ir, err := resolveInstallPath(*cfgPath)
+			if err != nil {
+				if purge {
 					return fmt.Errorf("--purge needs the config: %w", err)
 				}
+				ir = installResolution{}
+			}
+			if purge {
 				reportConfigSource(cmd.OutOrStdout(), ir.res)
 			}
 			var cfg *config.Config
 			if ir.res != nil {
 				cfg = ir.res.Config
 			}
-			// C-1: ir.res is nil on the non-purge path — only --purge resolves a
-			// config. cfgPath must stay "" there (runUninstall's purge branch
-			// is the only consumer), never a nil dereference.
+			// cfgPath is the purge's consumer (the resolved config path, or
+			// the materialized default for the W13 default-location purge).
 			var cfgPath string
 			if ir.res != nil {
 				cfgPath = ir.res.Path
 			}
-			// W13-deploy: the default-location install (--purge without -c)
-			// purges the canonical local-share config — the materialized
-			// default — plus the data dir (never the caller's cwd file).
 			if purge && cfgPath == "" {
 				cfgPath = ir.materializePath
 			}
@@ -357,6 +378,11 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 		executor = installExecutor()
 	}
 	uo := install.UninstallOptions{UnitDir: unitDir, Exec: executor}
+	if cfg != nil {
+		// The managed-core teardown (D4) rides the resolved data dir; with
+		// no resolvable config there is nothing known to remove.
+		uo.ManagedCoreDataDir = config.ExpandHome(cfg.DataDir)
+	}
 	if opts.purge {
 		uo.PurgeConfigPath = cfgPath
 		uo.PurgeDataDir = config.ExpandHome(cfg.DataDir)
@@ -376,6 +402,9 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	}
 	for _, name := range res.MissingUnits {
 		outf(w, "unit absent:      %s (already clean)\n", name)
+	}
+	for _, name := range res.CoreRemoved {
+		outf(w, "core removed:     %s\n", name)
 	}
 	for _, p := range res.Purged {
 		outf(w, "purged:           %s\n", p)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"assay/internal/config"
 	"assay/internal/model"
 	"assay/internal/render"
 
@@ -17,50 +18,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testTemplate mirrors the live xray-raw config structure (values anonymized):
-// log, burstObservatory (Germans-only), 2 inbounds, 5 outbounds, 7 routing
-// rules (last = catch-all best_rtt), 1 balancer.
-func testTemplate(t *testing.T) []byte {
-	t.Helper()
-	var m map[string]any
-	require.NoError(t, json.Unmarshal([]byte(`{
-  "log": {"loglevel": "warning", "dnsLog": false},
-  "dns": {"queryStrategy": "UseIPv4", "servers": ["https://dns.google/dns-query"]},
-  "burstObservatory": {
-    "subjectSelector": ["proxy-"],
-    "pingConfig": {"destination": "http://1.1.1.1/cdn-cgi/trace", "connectivity": "http://1.0.0.1/cdn-cgi/trace", "interval": "10s", "sampling": 5, "timeout": "3s", "httpMethod": "GET"}
-  },
-  "inbounds": [
-    {"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"auth": "noauth", "udp": true}, "sniffing": {"enabled": true, "routeOnly": true}},
-    {"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http", "settings": {}, "sniffing": {"enabled": true, "routeOnly": true}}
-  ],
-  "outbounds": [
-    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "AsIs"}},
-    {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "none"}}},
-    {"tag": "proxy-0", "protocol": "vless", "settings": {"vnext": [{"address": "198.51.100.1", "port": 443, "users": [{"id": "00000000-0000-0000-0000-000000000001", "encryption": "none"}]}]}, "streamSettings": {"network": "xhttp", "security": "reality", "sockopt": {"tcpMaxSeg": 1440}, "realitySettings": {"fingerprint": "firefox", "serverName": "donor.example", "publicKey": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "shortId": "AA"}}},
-    {"tag": "proxy-1", "protocol": "vless", "settings": {"vnext": [{"address": "198.51.100.2", "port": 443, "users": [{"id": "00000000-0000-0000-0000-000000000001", "encryption": "none"}]}]}, "streamSettings": {"network": "xhttp", "security": "reality", "sockopt": {"tcpMaxSeg": 1440}, "realitySettings": {"fingerprint": "firefox", "serverName": "donor.example", "publicKey": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "shortId": "AA"}}}
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "domainMatcher": "hybrid",
-    "rules": [
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "domain": ["domain:nvidia.com"], "outboundTag": "fox-proxy"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "port": "25,465,587,2525", "outboundTag": "block"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "protocol": ["bittorrent"], "outboundTag": "direct"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "domain": ["geosite:youtube"], "outboundTag": "direct"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "domain": ["domain:example.ru"], "outboundTag": "direct"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "ip": ["geoip:private"], "outboundTag": "direct"},
-      {"type": "field", "inboundTag": ["socks-in", "http-in"], "network": "tcp,udp", "balancerTag": "best_rtt"}
-    ],
-    "balancers": [
-      {"tag": "best_rtt", "selector": ["proxy-"], "strategy": {"type": "leastLoad", "settings": {"expected": 1, "maxRTT": "1s", "tolerance": 0.2}}, "fallbackTag": "proxy-0"}
-    ]
-  }
-}`), &m))
-	b, err := json.Marshal(m)
-	require.NoError(t, err)
-	return b
-}
+// Since the self-held-core pivot (D3) the renderer has ONE entry: the fully
+// generated own config. These tests exercise the shared pool layer (outbound
+// builders, balancer tree, pool routes, observatory, api/stats blocks)
+// through that entry; the drop-report transport pins run through
+// render.BuildOutbound — the SAME builder the own render and the site
+// checker use (one literal, no drift).
 
 type nodeOpts struct {
 	scheme  string
@@ -83,29 +46,52 @@ func mkSelected(t *testing.T, tag, cc, city, host string, port int, o nodeOpts) 
 	return n, model.SelectedNode{Tag: tag, Key: n.Key, Country: cc, City: city, RTTMs: 100, Speed: 1_000_000, Checks: 3, Total: 3}
 }
 
-func renderCfg(poolRoutes []render.PoolRoute) render.Config {
-	return render.Config{
-		StatsPort:  15490,
-		PoolRoutes: poolRoutes,
+// ownCore is the fixture [core] block: explicit spec defaults so port
+// assertions cannot drift with the constants.
+func ownCore() config.CoreConfig {
+	return config.CoreConfig{
+		SocksPort: 10810,
+		HTTPPort:  10811,
+		APIPort:   15491,
+		Loglevel:  "warning",
 	}
 }
 
-func doRender(t *testing.T, nodes []*model.Node, sel *model.Selection, routes ...render.PoolRoute) map[string]any {
+// doOwnRender is the shared own-render entry: nodes/selection/geo/routes in,
+// the parsed own config plus the route warnings out.
+func doOwnRender(
+	t *testing.T, nodes []*model.Node, sel *model.Selection, routes []render.PoolRoute,
+) (map[string]any, []string) {
 	t.Helper()
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  sel,
-		NodesByKey: byKey,
-		Cfg:        renderCfg(routes),
-	})
+	b, warnings, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, nil, render.Config{})
 	require.NoError(t, err)
 	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	require.NoError(t, json.Unmarshal(b, &m))
+	return m, warnings
+}
+
+// doRender keeps the historical helper name: every pool-layer test renders
+// through the own config (the only entry since D3).
+func doRender(t *testing.T, nodes []*model.Node, sel *model.Selection, routes ...render.PoolRoute) map[string]any {
+	t.Helper()
+	m, _ := doOwnRender(t, nodes, sel, routes)
 	return m
+}
+
+// doRenderErr is the loud variant: the render must fail and the error comes
+// back for message assertions.
+func doRenderErr(t *testing.T, nodes []*model.Node, sel *model.Selection, routes ...render.PoolRoute) error {
+	t.Helper()
+	byKey := map[string]*model.Node{}
+	for _, n := range nodes {
+		byKey[n.Key] = n
+	}
+	_, _, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, nil, render.Config{})
+	return err
 }
 
 func twoCountrySelection(t *testing.T) ([]*model.Node, *model.Selection) {
@@ -200,38 +186,36 @@ func TestPoolOutboundTrojanWS(t *testing.T) {
 	assert.InDelta(t, 1440, sockopt["tcpMaxSeg"], 0.001)
 }
 
-func TestPlanAObservatoryCoexistsWithBurstObservatory(t *testing.T) {
+// TestPlanAObservatoryShape pins the own config's pool observatory: the
+// subjectSelector covers exactly the pool namespace and concurrency is on
+// (L2 coverage); the adaptive interval is pinned in the knobs test.
+func TestPlanAObservatoryShape(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	m := doRender(t, nodes, sel)
 
 	obs, ok := m["observatory"].(map[string]any)
-	require.True(t, ok, "Plan A: legacy observatory rendered alongside burst")
+	require.True(t, ok, "Plan A: pool observatory rendered")
 	assert.Equal(t, []any{"pool-"}, obs["subjectSelector"])
 	assert.Equal(t, "1m0s", obs["probeInterval"], "W19: absent knob → adaptive (2 nodes ride the 60s floor)")
 	assert.Equal(t, true, obs["enableConcurrency"])
-
-	burst, ok := m["burstObservatory"].(map[string]any)
-	require.True(t, ok, "Germans burstObservatory must survive untouched")
-	assert.Equal(t, []any{"proxy-"}, burst["subjectSelector"])
-	assert.Equal(t, "10s", burst["pingConfig"].(map[string]any)["interval"])
 }
 
 func TestEmptyPoolRefusesObservatoryAndBalancers(t *testing.T) {
-	// L1 HARD GATE: empty pool → no pool observatory, no balancers, no rules.
+	// L1/L2 HARD GATES: empty pool → no pool observatory, no pool balancers
+	// (the balancers key is absent entirely), no pool outbounds; the
+	// bootstrap outbounds are exactly direct+block.
 	m := doRender(t, nil, &model.Selection{})
 	_, has := m["observatory"]
 	assert.False(t, has, "L1: empty pool must not render an observatory (busy-loop on 26.3.27)")
-	for _, b := range m["routing"].(map[string]any)["balancers"].([]any) {
-		tag, _ := b.(map[string]any)["tag"].(string)
-		assert.False(t, strings.HasPrefix(tag, "pool_"), "L2: no pool balancers without coverage (got %s)", tag)
-	}
-	// Template artifacts survive.
-	assert.NotNil(t, m["burstObservatory"])
+	routing, ok := m["routing"].(map[string]any)
+	require.True(t, ok)
+	_, hasBalancers := routing["balancers"]
+	assert.False(t, hasBalancers, "L2: the empty-pool config carries no balancers key at all")
+	assert.Len(t, outboundsOf(t, m), 2, "only the direct/block pair on an empty pool")
 	for _, o := range outboundsOf(t, m) {
 		tag, _ := o["tag"].(string)
 		assert.False(t, strings.HasPrefix(tag, "pool-"), "no pool outbounds on empty pool (got %s)", tag)
 	}
-	assert.Len(t, outboundsOf(t, m), 4, "template outbounds intact")
 }
 
 func TestCountryAndCityBalancers(t *testing.T) {
@@ -239,7 +223,7 @@ func TestCountryAndCityBalancers(t *testing.T) {
 	m := doRender(t, nodes, sel)
 	balancers := m["routing"].(map[string]any)["balancers"].([]any)
 
-	var nl, best map[string]any
+	var nl map[string]any
 	var cities []map[string]any
 	for _, b := range balancers {
 		bm := b.(map[string]any)
@@ -247,13 +231,10 @@ func TestCountryAndCityBalancers(t *testing.T) {
 		switch {
 		case tag == "pool_nl":
 			nl = bm
-		case tag == "best_rtt":
-			best = bm
 		case strings.HasPrefix(tag, "pool_") && strings.Count(tag, "_") >= 2:
 			cities = append(cities, bm) // pool_<cc>_<city-slug>
 		}
 	}
-	require.NotNil(t, best, "Germans balancer survives")
 	require.NotNil(t, nl, "country balancer pool_nl rendered")
 	assert.Equal(t, []any{"pool-nl-"}, nl["selector"], "prefix selector covers the country's tags")
 	strategy := nl["strategy"].(map[string]any)
@@ -270,7 +251,7 @@ func TestCountryAndCityBalancers(t *testing.T) {
 	}
 	assert.True(t, cityTags["pool_nl_amsterdam"], "Amsterdam city balancer rendered")
 	assert.True(t, cityTags["pool_de_frankfurt"], "Frankfurt city balancer rendered")
-	// Frankfurt/Seattle have 1 node each → no city balancer (direct tag override).
+	// Seattle has 1 node → no city balancer (direct tag override).
 }
 
 func TestPoolRulesInsertedBeforeCatchAll(t *testing.T) {
@@ -280,25 +261,24 @@ func TestPoolRulesInsertedBeforeCatchAll(t *testing.T) {
 		render.PoolRoute{Balancer: "pool_de", Domains: []string{"domain:example.com"}},
 	)
 	rules := m["routing"].(map[string]any)["rules"].([]any)
-	require.Greater(t, len(rules), 7)
+	require.Greater(t, len(rules), 3)
 
-	// The last rule stays the Germans catch-all.
+	// The last rule stays the own catch-all (pool_all leastLoad).
 	last := rules[len(rules)-1].(map[string]any)
-	assert.Equal(t, "best_rtt", last["balancerTag"])
+	assert.Equal(t, "pool_all", last["balancerTag"])
 
 	// Pool rules sit immediately before it, in config order.
 	poolRule1 := rules[len(rules)-3].(map[string]any)
 	poolRule2 := rules[len(rules)-2].(map[string]any)
 	assert.Equal(t, "pool_nl", poolRule1["balancerTag"])
-	assert.Equal(t, []any{"socks-in", "http-in"}, poolRule1["inboundTag"])
+	assert.Equal(t, []any{"in", "in-http"}, poolRule1["inboundTag"],
+		"pool rules carry the GENERATED own inbound tags")
 	assert.Equal(t, []any{"geosite:netflix"}, poolRule1["domain"])
 	assert.Equal(t, "pool_de", poolRule2["balancerTag"])
 
-	// Rules keep precedence (D2): api rule first, then the nvidia rule.
+	// The api rule keeps precedence (first — it only matches its inbound).
 	first := rules[0].(map[string]any)
 	assert.Equal(t, "api", first["outboundTag"])
-	second := rules[1].(map[string]any)
-	assert.Equal(t, "fox-proxy", second["outboundTag"])
 }
 
 func TestAPIStatsBlockBoundToLoopback(t *testing.T) {
@@ -321,7 +301,7 @@ func TestAPIStatsBlockBoundToLoopback(t *testing.T) {
 	}
 	require.NotNil(t, apiIn, "api dokodemo inbound rendered")
 	assert.Equal(t, "127.0.0.1", apiIn["listen"], "stats API binds loopback only")
-	assert.InDelta(t, 15490, apiIn["port"], 0.001)
+	assert.InDelta(t, 15491, apiIn["port"], 0.001, "the api inbound binds core.api_port")
 
 	rules := m["routing"].(map[string]any)["rules"].([]any)
 	first := rules[0].(map[string]any)
@@ -329,49 +309,24 @@ func TestAPIStatsBlockBoundToLoopback(t *testing.T) {
 	assert.Equal(t, "api", first["outboundTag"])
 }
 
-func TestRenderIsIdempotent(t *testing.T) {
-	nodes, sel := twoCountrySelection(t)
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	firstRes, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: renderCfg(nil)})
-	require.NoError(t, err)
-
-	// Re-render using the previous output as the template: pool artifacts must
-	// not duplicate (activate replaces the live config; next wave reads it).
-	second, err := render.Render(render.Input{Template: firstRes.Config, Selection: sel, NodesByKey: byKey, Cfg: renderCfg(nil)})
-	require.NoError(t, err)
-	var m2 map[string]any
-	require.NoError(t, json.Unmarshal(second.Config, &m2))
-	count := 0
-	for _, o := range outboundsOf(t, m2) {
-		if tag, _ := o["tag"].(string); len(tag) > 5 && tag[:5] == "pool-" {
-			count++
-		}
-	}
-	assert.Len(t, sel.Nodes, count, "re-render must not duplicate pool outbounds")
-	rules := m2["routing"].(map[string]any)["rules"].([]any)
-	apiRules := 0
-	for _, r := range rules {
-		if r.(map[string]any)["outboundTag"] == "api" {
-			apiRules++
-		}
-	}
-	assert.Equal(t, 1, apiRules, "api rule not duplicated")
-	_, hasObs := m2["observatory"]
-	assert.True(t, hasObs, "observatory still present exactly once (no stale copies)")
-}
-
+// TestRenderIsDeterministicForGoldenRegression pins the byte determinism
+// the golden regression relies on, and OWNS the golden's lifecycle (T7
+// disposition C3, documented): on a fresh clone the golden ships tracked in
+// testdata/ and this test compares against it; when the file is ABSENT
+// (a deleted or renamed golden, or a new shape's first run), the
+// write-on-first-run branch below MATERIALIZES it — an expected first-run
+// behavior, not a bug or tampering. The materialized file is committed
+// afterwards; regeneration after an intentional render change stays a
+// DELIBERATE act (the failure text names it).
 func TestRenderIsDeterministicForGoldenRegression(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
 	byKey := map[string]*model.Node{}
 	for _, n := range nodes {
 		byKey[n.Key] = n
 	}
-	cfg := renderCfg([]render.PoolRoute{
+	routes := []render.PoolRoute{
 		{Balancer: "pool_nl", Domains: []string{"geosite:netflix"}},
-	})
+	}
 	// Phase-3 unlock evidence for the fixture exits: de1 qualifies for every
 	// service pool, nl1 is netflix-full only (webonly chatgpt excluded),
 	// nl2 is chatgpt only (originals netflix), de2 is UNCHECKED (fail-closed
@@ -396,22 +351,22 @@ func TestRenderIsDeterministicForGoldenRegression(t *testing.T) {
 			CheckedAt: "2026-11-04T12:00:00Z",
 		}},
 	})
-	res1, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, GeoByKey: geo, Cfg: cfg})
+	b1, _, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, geo, render.Config{})
 	require.NoError(t, err)
-	res2, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, GeoByKey: geo, Cfg: cfg})
+	b2, _, err := render.RenderOwnConfig(sel, ownCore(), routes, byKey, geo, render.Config{})
 	require.NoError(t, err)
-	assert.Equal(t, string(res1.Config), string(res2.Config), "render must be byte-deterministic (golden regression basis)")
+	assert.Equal(t, string(b1), string(b2), "render must be byte-deterministic (golden regression basis)")
 
 	// Golden file comparison.
-	goldenPath := filepath.Join("testdata", "golden-render.json")
+	goldenPath := filepath.Join("testdata", "golden-own-render.json")
 	golden, err := os.ReadFile(goldenPath)
 	if err == nil {
-		assert.Equal(t, string(golden), string(res1.Config),
-			"rendered output diverged from the golden file — if intentional, regenerate testdata/golden-render.json deliberately")
+		assert.Equal(t, string(golden), string(b1),
+			"rendered output diverged from the golden file — if intentional, regenerate testdata/golden-own-render.json deliberately")
 	} else {
 		t.Logf("golden file not found (%v) — write it on first run", err)
 		require.NoError(t, os.MkdirAll("testdata", 0o755))
-		require.NoError(t, os.WriteFile(goldenPath, res1.Config, 0o644), "first run materializes the golden")
+		require.NoError(t, os.WriteFile(goldenPath, b1, 0o644), "first run materializes the golden")
 	}
 }
 
@@ -434,55 +389,20 @@ func TestPoolRouteDirectOutboundTagRendersOutboundTag(t *testing.T) {
 	}
 	require.NotNil(t, direct, "direct-tag pool route must render a rule with outboundTag=pool-de-01")
 	assert.Nil(t, direct["balancerTag"], "a direct-tag rule must not carry balancerTag")
-	assert.Equal(t, []any{"socks-in", "http-in"}, direct["inboundTag"])
+	assert.Equal(t, []any{"in", "in-http"}, direct["inboundTag"])
 	assert.Equal(t, []any{"geosite:netflix"}, direct["domain"])
 
 	// The outbound itself was rendered and the rule precedes the catch-all.
 	poolOutbound(t, m, "pool-de-01")
 	last := rules[len(rules)-1].(map[string]any)
-	assert.Equal(t, "best_rtt", last["balancerTag"], "catch-all stays last")
+	assert.Equal(t, "pool_all", last["balancerTag"], "catch-all stays last")
 	assert.NotEqual(t, direct, last, "the direct-tag rule sits before the catch-all")
-}
-
-// TestPoolRouteDirectOutboundTagIsIdempotent pins the strip side of the
-// direct-tag surface: re-rendering from a previous output must not duplicate
-// the outboundTag rule (re-render idempotency, same contract as balancerTag
-// rules).
-func TestPoolRouteDirectOutboundTagIsIdempotent(t *testing.T) {
-	n, sn := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053, nodeOpts{network: "tcp"})
-	byKey := map[string]*model.Node{n.Key: n}
-	sel := &model.Selection{Nodes: []model.SelectedNode{sn}}
-	cfg := renderCfg([]render.PoolRoute{{Balancer: "pool-de-01", Domains: []string{"geosite:netflix"}}})
-
-	first, err := render.Render(render.Input{Template: testTemplate(t), Selection: sel, NodesByKey: byKey, Cfg: cfg})
-	require.NoError(t, err)
-	second, err := render.Render(render.Input{Template: first.Config, Selection: sel, NodesByKey: byKey, Cfg: cfg})
-	require.NoError(t, err)
-
-	var m2 map[string]any
-	require.NoError(t, json.Unmarshal(second.Config, &m2))
-	count := 0
-	for _, r := range m2["routing"].(map[string]any)["rules"].([]any) {
-		if ot, _ := r.(map[string]any)["outboundTag"].(string); ot == "pool-de-01" {
-			count++
-		}
-	}
-	assert.Equal(t, 1, count, "re-render must not duplicate the direct-tag pool rule")
 }
 
 func TestUnknownPoolRouteBalancerGraceful(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	res, err := render.Render(render.Input{
-		Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
-		Cfg: renderCfg([]render.PoolRoute{{Balancer: "pool_fr", Domains: []string{"domain:x.com"}}}),
-	})
-	require.NoError(t, err, "render must succeed even when a pool balancer was not rendered")
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	m, warnings := doOwnRender(t, nodes, sel,
+		[]render.PoolRoute{{Balancer: "pool_fr", Domains: []string{"domain:x.com"}}})
 	rules := m["routing"].(map[string]any)["rules"].([]any)
 	found := false
 	for _, r := range rules {
@@ -493,26 +413,17 @@ func TestUnknownPoolRouteBalancerGraceful(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "blocked pool route rule must be present")
-	assert.Contains(t, res.BlockedRoutes, "pool route balancer \"pool_fr\" not rendered -> block")
+	assert.Contains(t, warnings, "pool route balancer \"pool_fr\" not rendered -> block",
+		"the graceful degradation is reported through the warnings channel")
 }
 
-// TestUnknownPoolRouteDirectTagIsLoud pins the loud failure for a direct-tag
-// target that was not rendered (no live node there): the error must name the
-// tag and the not-rendered reason (M-a), not fall through to the namespace
-// message.
+// TestUnknownPoolRouteDirectTagGraceful pins the graceful degradation for a
+// direct-tag target that was not rendered (no live node there): block
+// outbound, never a crash (M-a).
 func TestUnknownPoolRouteDirectTagGraceful(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	res, err := render.Render(render.Input{
-		Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
-		Cfg: renderCfg([]render.PoolRoute{{Balancer: "pool-de-09", Domains: []string{"domain:x.com"}}}),
-	})
-	require.NoError(t, err, "render must succeed even when a pool outbound was not rendered")
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(res.Config, &m))
+	m, _ := doOwnRender(t, nodes, sel,
+		[]render.PoolRoute{{Balancer: "pool-de-09", Domains: []string{"domain:x.com"}}})
 	rules := m["routing"].(map[string]any)["rules"].([]any)
 	found := false
 	for _, r := range rules {
@@ -527,14 +438,14 @@ func TestUnknownPoolRouteDirectTagGraceful(t *testing.T) {
 
 // TestEmptyPoolStillValidatesPoolRoutes pins the W7 hoist: [render.pool_routes]
 // target validation runs on EVERY render regardless of pool state. With an
-// empty pool NO pool-prefixed target can exist — stripPoolArtifacts removed
-// every pool- outbound and no pool_ balancer is ever rendered — so a
-// configured route there is necessarily a typo or dead reference, and every
-// pool-prefixed target must fail loud naming it (the owner learns about the
-// mistake immediately instead of a silent D2 fall-through to the catch-all).
-// There is deliberately NO "valid target with an empty pool" success arm: the
-// template's own tags (direct/block/proxy-*) are namespace-walled for pool
-// routes, so no pool-namespaced target can resolve while the pool is empty.
+// empty pool NO pool-prefixed target can exist — the own config carries no
+// pool- outbound and no pool_ balancer — so a configured route there is
+// necessarily a typo or dead reference, and every non-pool target fails loud
+// naming it (the owner learns about the mistake immediately instead of a
+// silent D2 fall-through to the catch-all). There is deliberately NO "valid
+// target with an empty pool" success arm: the own config's own tags
+// (direct/block/in/in-http) are namespace-walled for pool routes, so no
+// pool-namespaced target can resolve while the pool is empty.
 func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -546,12 +457,8 @@ func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := render.Render(render.Input{
-				Template:   testTemplate(t),
-				Selection:  &model.Selection{},
-				NodesByKey: map[string]*model.Node{},
-				Cfg:        renderCfg([]render.PoolRoute{{Balancer: tc.target, Domains: []string{"domain:x.com"}}}),
-			})
+			err := doRenderErr(t, nil, &model.Selection{},
+				render.PoolRoute{Balancer: tc.target, Domains: []string{"domain:x.com"}})
 			require.Error(t, err, "empty pool + route target %q must fail loud (namespace wall)", tc.target)
 			assert.Contains(t, err.Error(), tc.target, "the loud failure must name the offending target")
 		})
@@ -560,15 +467,8 @@ func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 	// pool-prefixed targets on an empty pool are not rendered -> graceful block.
 	for _, target := range []string{"pool_de", "pool-de-01"} {
 		t.Run("empty pool graceful "+target, func(t *testing.T) {
-			res, err := render.Render(render.Input{
-				Template:   testTemplate(t),
-				Selection:  &model.Selection{},
-				NodesByKey: map[string]*model.Node{},
-				Cfg:        renderCfg([]render.PoolRoute{{Balancer: target, Domains: []string{"domain:x.com"}}}),
-			})
-			require.NoError(t, err)
-			var m map[string]any
-			require.NoError(t, json.Unmarshal(res.Config, &m))
+			m, _ := doOwnRender(t, nil, &model.Selection{},
+				[]render.PoolRoute{{Balancer: target, Domains: []string{"domain:x.com"}}})
 			rules := m["routing"].(map[string]any)["rules"].([]any)
 			found := false
 			for _, r := range rules {
@@ -593,14 +493,8 @@ func TestEmptyPoolStillValidatesPoolRoutes(t *testing.T) {
 func TestNonPoolBalancerRouteRejected(t *testing.T) {
 	for _, target := range []string{"best_rtt", "proxy-0", "direct"} {
 		nodes, sel := twoCountrySelection(t)
-		byKey := map[string]*model.Node{}
-		for _, n := range nodes {
-			byKey[n.Key] = n
-		}
-		_, err := render.Render(render.Input{
-			Template: testTemplate(t), Selection: sel, NodesByKey: byKey,
-			Cfg: renderCfg([]render.PoolRoute{{Balancer: target, Domains: []string{"domain:x.com"}}}),
-		})
+		err := doRenderErr(t, nodes, sel,
+			render.PoolRoute{Balancer: target, Domains: []string{"domain:x.com"}})
 		require.Error(t, err, "pool routes may only target pool_ balancers or pool- outbound tags (D6 namespace wall), got target %q", target)
 		assert.Contains(t, err.Error(), target, "the offending target must be named")
 	}
@@ -608,21 +502,19 @@ func TestNonPoolBalancerRouteRejected(t *testing.T) {
 
 func TestSelectionNodeMissingIsLoud(t *testing.T) {
 	sel := &model.Selection{Nodes: []model.SelectedNode{{Tag: "pool-de-01", Key: "ghost"}}}
-	_, err := render.Render(render.Input{
-		Template: testTemplate(t), Selection: sel, NodesByKey: map[string]*model.Node{}, Cfg: renderCfg(nil),
-	})
+	err := doRenderErr(t, nil, sel)
 	require.Error(t, err, "a selected node without node data cannot be rendered — fail loud")
 }
 
-// TestGoldenRenderPassesXrayTest is the Plan A coexistence verdict: the real
-// xray binary (26.3.27) must accept the rendered config containing BOTH the
-// legacy pool observatory and the Germans burstObservatory.
-func TestGoldenRenderPassesXrayTest(t *testing.T) {
+// TestGoldenOwnRenderPassesXrayTest is the real-binary verdict: the xray core
+// must accept the generated own config (inbounds, balancers, observatory,
+// api/stats blocks, routes and the catch-all).
+func TestGoldenOwnRenderPassesXrayTest(t *testing.T) {
 	bin := "/usr/bin/xray"
 	if _, err := os.Stat(bin); err != nil {
 		t.Skipf("xray binary not present at %s", bin)
 	}
-	golden, err := os.ReadFile(filepath.Join("testdata", "golden-render.json"))
+	golden, err := os.ReadFile(filepath.Join("testdata", "golden-own-render.json"))
 	if err != nil {
 		t.Fatalf("golden render missing: run the suite once to materialize it: %v", err)
 	}
@@ -633,119 +525,59 @@ func TestGoldenRenderPassesXrayTest(t *testing.T) {
 	cmd := exec.CommandContext(context.Background(), bin, "run", "-test", "-c", cfgPath)
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+tmp)
 	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "xray run -test rejected the Plan A render:\n%s", out)
+	require.NoError(t, err, "xray run -test rejected the own render:\n%s", out)
 	assert.Contains(t, string(out), "Configuration OK")
 }
 
-// TestTemplateEmptySelectorObservatoryRefusedOnAnyPoolState pins the L1
-// defense-in-depth gate: a template-carried legacy observatory whose
-// subjectSelector can match zero tags busy-loops the 26.3.27 core (~100% CPU)
-// regardless of pool state — it must be refused at render time with the L1
-// rationale (review finding 4).
-func TestTemplateEmptySelectorObservatoryRefusedOnAnyPoolState(t *testing.T) {
-	templateWith := func(t *testing.T, observatory map[string]any) []byte {
-		t.Helper()
-		var m map[string]any
-		require.NoError(t, json.Unmarshal(testTemplate(t), &m))
-		m["observatory"] = observatory
-		b, err := json.Marshal(m)
-		require.NoError(t, err)
-		return b
-	}
+// --- drop-report transport pins (through BuildOutbound — the SAME builder
+// the own render and the site checker use) ---
 
-	for _, tc := range []struct {
-		name string
-		obs  map[string]any
-	}{
-		{"empty array", map[string]any{"subjectSelector": []any{}, "probeInterval": "60s"}},
-		{"missing field", map[string]any{"probeInterval": "60s"}},
-	} {
-		t.Run(tc.name+"/empty-pool", func(t *testing.T) {
-			_, err := render.Render(render.Input{
-				Template:   templateWith(t, tc.obs),
-				Selection:  &model.Selection{},
-				NodesByKey: map[string]*model.Node{},
-				Cfg:        renderCfg(nil),
-			})
-			require.Error(t, err, "L1: empty-selector observatory must be refused even with an empty pool")
-			assert.Contains(t, err.Error(), "subjectSelector")
-			assert.Contains(t, err.Error(), "L1", "message must carry the L1 rationale")
-		})
-		t.Run(tc.name+"/non-empty-pool", func(t *testing.T) {
-			nodes, sel := twoCountrySelection(t)
-			byKey := map[string]*model.Node{}
-			for _, n := range nodes {
-				byKey[n.Key] = n
-			}
-			_, err := render.Render(render.Input{
-				Template:   templateWith(t, tc.obs),
-				Selection:  sel,
-				NodesByKey: byKey,
-				Cfg:        renderCfg(nil),
-			})
-			require.Error(t, err, "L1: refusal is unconditional, not pool-state dependent")
-		})
-	}
+// buildOne renders a single node through the exported builder seam.
+func buildOne(t *testing.T, n *model.Node) (map[string]any, []string) {
+	t.Helper()
+	ob, dropped, err := render.BuildOutbound(n, "probe-out", render.Config{
+		TCPMaxSeg:      config.DefaultTCPMaxSeg,
+		TLSFingerprint: config.DefaultTLSFingerprint,
+	})
+	require.NoError(t, err)
+	return ob, dropped
 }
 
 // TestUnrenderedLinkParamsAreReportedNotSilentlyDropped pins the structured
-// drop report: params the chosen network/security cannot carry surface in
-// Result.DroppedParams per outbound tag (review finding 5).
+// drop report: params the chosen network/security cannot carry surface in the
+// builder's dropped list (review finding 5).
 func TestUnrenderedLinkParamsAreReportedNotSilentlyDropped(t *testing.T) {
 	// xhttp node carrying a grpc-only param and an unknown one.
-	n, sn := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443,
+	n, _ := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443,
 		nodeOpts{network: "xhttp", extra: map[string]string{
 			"mode": "packet-up", "host": "cdn.example", "path": "/pool",
 			"serviceName": "grpc-svc", "headerType": "none",
 		}})
-	var m map[string]any
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
-		NodesByKey: map[string]*model.Node{n.Key: n},
-		Cfg:        renderCfg(nil),
-	})
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(res.Config, &m))
-
-	require.Len(t, res.DroppedParams, 1)
-	w := res.DroppedParams[0]
-	assert.Equal(t, "pool-nl-01", w.Tag)
-	assert.ElementsMatch(t, []string{"serviceName", "headerType"}, w.Params,
+	_, dropped := buildOne(t, n)
+	assert.ElementsMatch(t, []string{"serviceName", "headerType"}, dropped,
 		"grpc-only and unknown params are reported for the xhttp outbound")
 }
 
 // TestFullyConsumedParamsProduceNoDropReport guards the whitelist against
 // over-reporting: a node whose every param is consumed renders clean.
 func TestFullyConsumedParamsProduceNoDropReport(t *testing.T) {
-	n, sn := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053,
+	n, _ := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053,
 		nodeOpts{network: "tcp", extra: map[string]string{
 			"flow": "xtls-rprx-vision", "fp": "chrome", "spx": "/", "pqv": "AAAA",
 		}})
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
-		NodesByKey: map[string]*model.Node{n.Key: n},
-		Cfg:        renderCfg(nil),
-	})
-	require.NoError(t, err)
-	assert.Empty(t, res.DroppedParams,
+	_, dropped := buildOne(t, n)
+	assert.Empty(t, dropped,
 		"flow/fp/spx/pqv are consumed (fp by mandated override) — no report")
 }
 
 // TestMaterialEarlyDataParamFailsLoud pins the hard gate: an early-data param
 // that cannot be rendered for the chosen network materially changes transport
-// behavior — the render must fail, naming the param (review finding 5).
+// behavior — the build must fail, naming the param (review finding 5).
 func TestMaterialEarlyDataParamFailsLoud(t *testing.T) {
 	for _, network := range []string{"tcp", "grpc", "xhttp"} {
-		n, sn := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443,
+		n, _ := mkSelected(t, "pool-nl-01", "nl", "Amsterdam", "nl1.example.com", 443,
 			nodeOpts{network: network, extra: map[string]string{"ed": "2048"}})
-		_, err := render.Render(render.Input{
-			Template:   testTemplate(t),
-			Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
-			NodesByKey: map[string]*model.Node{n.Key: n},
-			Cfg:        renderCfg(nil),
-		})
+		_, _, err := render.BuildOutbound(n, "probe-out", render.Config{})
 		require.Error(t, err, "ed on %s must fail the render, not vanish", network)
 		assert.Contains(t, err.Error(), `"ed"`, "the offending param must be named")
 		assert.Contains(t, err.Error(), network)
@@ -758,12 +590,9 @@ func TestMaterialEarlyDataParamFailsLoud(t *testing.T) {
 func TestVMESSUnparseableAidFailsLoud(t *testing.T) {
 	n := model.NewNode("s", "vmess", "vmess-uuid-1", "de1.example.com", 2053,
 		map[string]string{"type": "tcp", "security": "tls", "sni": "donor.example", "aid": "abc"})
-	sn := model.SelectedNode{Tag: "pool-de-01", Key: n.Key, Country: "de", City: "Frankfurt"}
-	_, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
-		NodesByKey: map[string]*model.Node{n.Key: n},
-		Cfg:        renderCfg(nil),
+	_, _, err := render.BuildOutbound(n, "probe-out", render.Config{
+		TCPMaxSeg:      config.DefaultTCPMaxSeg,
+		TLSFingerprint: config.DefaultTLSFingerprint,
 	})
 	require.Error(t, err, "unparseable aid must fail the render, not silently become alterId 0")
 	assert.Contains(t, err.Error(), `"aid"`, "the offending param must be named")
@@ -772,80 +601,14 @@ func TestVMESSUnparseableAidFailsLoud(t *testing.T) {
 
 // TestVMESSParsedAidRendersAndConsumes guards the success path: a numeric aid
 // renders as alterId verbatim and is consumed — it must not leak into the
-// DroppedParams report (M-f: consumed only on successful placement).
+// drop report (M-f: consumed only on successful placement).
 func TestVMESSParsedAidRendersAndConsumes(t *testing.T) {
 	n := model.NewNode("s", "vmess", "vmess-uuid-1", "de1.example.com", 2053,
 		map[string]string{"type": "tcp", "security": "tls", "sni": "donor.example", "aid": "64"})
-	sn := model.SelectedNode{Tag: "pool-de-01", Key: n.Key, Country: "de", City: "Frankfurt"}
-	res, err := render.Render(render.Input{
-		Template:   testTemplate(t),
-		Selection:  &model.Selection{Nodes: []model.SelectedNode{sn}},
-		NodesByKey: map[string]*model.Node{n.Key: n},
-		Cfg:        renderCfg(nil),
-	})
-	require.NoError(t, err)
-	assert.Empty(t, res.DroppedParams, "a parsed aid is consumed — no drop report")
-	ob := poolOutbound(t, func() map[string]any {
-		t.Helper()
-		var m map[string]any
-		require.NoError(t, json.Unmarshal(res.Config, &m))
-		return m
-	}(), "pool-de-01")
+	ob, dropped := buildOne(t, n)
+	assert.Empty(t, dropped, "a parsed aid is consumed — no drop report")
 	user := ob["settings"].(map[string]any)["vnext"].([]any)[0].(map[string]any)["users"].([]any)[0].(map[string]any)
 	assert.InDelta(t, 64, user["alterId"], 0.001, "aid renders as alterId verbatim (L9)")
-}
-
-// TestPoolRulesGoBeforeAllTrailingBalancerRules pins the insertion point: the
-// catch-all class (balancerTag rules) can be several rules deep; pool rules
-// must land after the last user-traffic rule and before the ENTIRE trailing
-// balancer block, not between two balancer rules (review finding 12).
-func TestPoolRulesGoBeforeAllTrailingBalancerRules(t *testing.T) {
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(testTemplate(t), &m))
-	routing := m["routing"].(map[string]any)
-	rules := routing["rules"].([]any)
-	routing["rules"] = append(rules,
-		map[string]any{"type": "field", "inboundTag": []any{"socks-in"}, "network": "tcp,udp", "balancerTag": "best_rtt"})
-
-	nodes, sel := twoCountrySelection(t)
-	byKey := map[string]*model.Node{}
-	for _, n := range nodes {
-		byKey[n.Key] = n
-	}
-	res, err := render.Render(render.Input{
-		Template:   func() []byte { b, _ := json.Marshal(m); return b }(),
-		Selection:  sel,
-		NodesByKey: byKey,
-		Cfg:        renderCfg([]render.PoolRoute{{Balancer: "pool_nl", Domains: []string{"geosite:netflix"}}}),
-	})
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(res.Config, &m))
-
-	rules = m["routing"].(map[string]any)["rules"].([]any)
-	firstPool, lastPool, firstGerman := -1, -1, -1
-	for i, r := range rules {
-		rm := r.(map[string]any)
-		bt, ok := rm["balancerTag"].(string)
-		if !ok {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(bt, "pool_"):
-			if firstPool < 0 {
-				firstPool = i
-			}
-			lastPool = i
-		default:
-			if firstGerman < 0 {
-				firstGerman = i
-			}
-		}
-	}
-	require.NotEqual(t, -1, firstPool, "pool rule rendered")
-	require.NotEqual(t, -1, firstGerman, "trailing german balancer rules present")
-	assert.Greater(t, firstGerman, lastPool,
-		"the german balancer block starts only AFTER the last pool rule — no wedging between balancerTag rules")
-	assert.Less(t, firstPool, firstGerman, "pool rules precede the entire trailing balancer block")
 }
 
 // TestCleanAndAllBalancers verifies the clean/all balancer separation:

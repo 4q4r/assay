@@ -203,25 +203,17 @@ func TestConfiglessActivateBoundaryLoud(t *testing.T) {
 	assert.Contains(t, err.Error(), config.ShareConfigDisplay)
 }
 
-// TestConfiglessActivateTargetFlagCannotBypassBoundary pins the I-1
-// contract: the configless boundary refuses AT STAGE ENTRY on the configured
-// activate.target alone — the --target flag cannot bypass it. Pre-fix, the
-// flag skipped the boundary and fell into the misleading "no rendered
-// config — run render first" loop (configless render refuses the same way).
-func TestConfiglessActivateTargetFlagCannotBypassBoundary(t *testing.T) {
-	_ = newHermeticEnv(t)
+// TestActivateHasNoForeignTargetFlag pins the T4 CLI surface (D3: activate
+// knows ONE lifecycle — the own core): the command no longer carries the
+// foreign --target override, so the pre-pivot I-1 bypass concern (a flag
+// skipping the configless boundary) is structurally moot. The configless
+// boundary itself stays pinned by TestConfiglessActivateBoundaryLoud.
+func TestActivateHasNoForeignTargetFlag(t *testing.T) {
 	root := newTestRoot()
-	buf := &bytes.Buffer{}
-	root.SetOut(buf)
-	root.SetErr(buf)
-	root.SetArgs([]string{"activate", "--target", filepath.Join(t.TempDir(), "target.json")})
-	err := root.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "configless mode cannot activate",
-		"the loud boundary message, not the render-first loop")
-	assert.Contains(t, err.Error(), config.ShareConfigDisplay)
-	assert.NotContains(t, err.Error(), "run render first",
-		"--target must not drop configless runs into the misleading render-first loop")
+	cmd, _, err := root.Find([]string{"activate"})
+	require.NoError(t, err)
+	assert.Nil(t, cmd.Flags().Lookup("target"),
+		"the foreign --target override died with the external-mode activation path")
 }
 
 // TestConfiglessWaveDataStagesWorkThenRenderLoud pins the wave matrix: the
@@ -255,8 +247,8 @@ func TestConfiglessWaveDataStagesWorkThenRenderLoud(t *testing.T) {
 }
 
 // TestConfiglessStatsSkipsINFO pins the stats stage's configless behavior:
-// without activate.target the poll is accounting-unavailable (INFO — the
-// wave continues), never a silent success and never a wave failure.
+// a configless run has no configured deployment to poll (INFO — the wave
+// continues), never a silent success and never a wave failure.
 func TestConfiglessStatsSkipsINFO(t *testing.T) {
 	_ = newHermeticEnv(t)
 	res, err := resolveCommand("")
@@ -371,7 +363,8 @@ func TestInstallDefaultLocationMaterializesConfig(t *testing.T) {
 	out := run()
 	assert.Contains(t, out, "config created:   "+cfgPath, "summary names the materialized config:\n%s", out)
 	assert.Contains(t, out, "daemon config:    "+cfgPath+" (the daemon reads the default location — no -c in the unit)")
-	assert.Contains(t, out, "to activate:      fill [render].template and [activate].target")
+	assert.NotContains(t, out, "to activate:",
+		"no activation hint — the default config activates out of the box (own core)")
 
 	// The materialized file: valid TOML that loads, data_dir = the local-share
 	// default, and the load passes strict decode (the embedded template must

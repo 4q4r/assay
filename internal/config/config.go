@@ -323,18 +323,12 @@ type PoolRoute struct {
 	Domains  []string `toml:"domains"`
 }
 
-// RenderConfig controls xray config rendering.
+// RenderConfig controls the own live-config rendering (D3: one render
+// target — <data>/rendered/live.json; the retired template/output_dir/
+// stats_port/pool_inbound_tags surface parse-and-warns per S4, see
+// retiredKeys).
 type RenderConfig struct {
-	Template   string      `toml:"template"`
-	OutputDir  string      `toml:"output_dir"`
-	StatsPort  int         `toml:"stats_port"`
 	PoolRoutes []PoolRoute `toml:"pool_routes"`
-	// PoolInboundTags lists the inbound tags every pool routing rule carries.
-	// Render-time validation: every listed tag must exist among the
-	// template's inbound tags, or the render fails loud naming the missing
-	// tag (closes the silent D2 fall-through path). Default:
-	// socks-in,http-in.
-	PoolInboundTags []string `toml:"pool_inbound_tags"`
 	// ObservatoryInterval is the Plan-A pool observatory probeInterval — a
 	// STRING PASSTHROUGH rendered verbatim when set, so any duration spelling
 	// the core accepts works. ABSENT (empty, the W19 default) = ADAPTIVE: the
@@ -357,21 +351,14 @@ type RenderConfig struct {
 	BalancerTolerance float64 `toml:"balancer_tolerance"`
 }
 
-// ActivateConfig controls the -test gate, backup, and atomic replace.
+// ActivateConfig controls the -test gate, backup, and atomic replace (the
+// own-core lifecycle; the retired target/xray_bin/asset_dir/service_name/
+// backup_dir surface parse-and-warns per S4, see retiredKeys).
 type ActivateConfig struct {
-	Target    string `toml:"target"`
-	XrayBin   string `toml:"xray_bin"`
-	AssetDir  string `toml:"asset_dir"` // XRAY_LOCATION_ASSET for -test; default = template dir
-	BackupDir string `toml:"backup_dir"`
 	// TestTimeout bounds the `xray run -test` child process. Nil = unset →
 	// DefaultTestTimeout (30s); an explicit "0s" means NO deadline (current
 	// behavior, documented). Negative values are structurally invalid.
 	TestTimeout *Duration `toml:"test_timeout"`
-	// ServiceName is the systemd unit named in the printed restart hint
-	// (the manual path — auto_restart = false only; the W13 auto path is
-	// byte-pinned to DefaultServiceName and refuses any other unit loud).
-	// Default: xray-raw.service.
-	ServiceName string `toml:"service_name"`
 	// BackupKeep caps backup retention: after a successful new backup write,
 	// only the BackupKeep newest .bak-<ts> files are kept (0 = unlimited,
 	// the default). Deletion failures are loud — rollback depth is never
@@ -405,18 +392,6 @@ type MaintainConfig struct {
 	// activate.backup_keep caps activation backups (0 = unlimited, the
 	// default; deletion failures are loud). Resolves parked item M3.
 	PruneBackupKeep int `toml:"prune_backup_keep"`
-	// AutoRestart restarts the live xray client through the byte-pinned
-	// allowlist executor (internal/restart) after every gated activation —
-	// the W13 owner ruling: hands-off, zero manual restarts ever. Nil
-	// (unset) defaults to TRUE; an explicit false restores the W4-era
-	// manual semantics (the printed restart hint instead of a restart).
-	AutoRestart *bool `toml:"auto_restart"`
-}
-
-// AutoRestartEnabled resolves the tri-state knob: unset = true (hands-off
-// is the approved premise), explicit false = manual-restart semantics.
-func (m MaintainConfig) AutoRestartEnabled() bool {
-	return m.AutoRestart == nil || *m.AutoRestart
 }
 
 // DefaultSpeedtestInterval is the speedtest-wave default: weekly (168h).
@@ -482,7 +457,6 @@ const (
 	DefaultTCPMaxSeg           = 1440
 	DefaultBalancerTolerance   = 0.2
 	DefaultTieBandRTTTolerance = 1.2
-	DefaultServiceName         = "xray-raw.service"
 	// DefaultDoHURL is the [geo].doh_url default: the DoH endpoint the geo
 	// fallback queries through the tunnel (the same endpoint the checker's
 	// doh-via-exit view uses — one DoH host across the pipeline).
@@ -548,15 +522,6 @@ const (
 	DefaultMaxTTL = DefaultGeoMaxTTL
 )
 
-// defaultPoolInboundTags is the render.pool_inbound_tags default (the tags
-// every pool routing rule has carried since W3).
-var defaultPoolInboundTags = []string{"socks-in", "http-in"}
-
-// DefaultPoolInboundTags returns a copy of the pool_inbound_tags default.
-func DefaultPoolInboundTags() []string {
-	return append([]string(nil), defaultPoolInboundTags...)
-}
-
 // ResourceConfig describes the machine resource envelope the pipeline may
 // spend on concurrent work (temp xray instances, geo self-report workers,
 // probe threads). A zero value means "auto-detect": MaxCPUCores falls back
@@ -576,11 +541,101 @@ type ResourceConfig struct {
 	HeadroomPct int `toml:"headroom_pct"`
 }
 
+// CoreConfig is the self-held core's own config surface (the 2026-11-10
+// pivot, D1–D8): the daemon supervises ITS OWN xray process with its own
+// proxy inbounds, so the knobs that describe that process live here. The
+// inbounds themselves are rendered by the core-manager wave — this task
+// carries the config surface only.
+//
+// The inbound bind address is the binding constant CoreBindAddress
+// (127.0.0.1, D2/N1: no LAN exposure without an explicit later decision) —
+// there is no bind knob on purpose.
+type CoreConfig struct {
+	// XrayBin is the SINGLE core-binary knob (S1): a path to the xray
+	// binary every consumer (probe/check temp-instance fleets, the batch
+	// pre-filter, the activation -test gate, the core manager) resolves.
+	// Empty = the managed default <data>/bin/xray (resolved by
+	// CoreXrayBin, never stored); a system xray may be pointed at instead
+	// — core auto-update goes inert there with a one-time loud INFO (S5).
+	XrayBin string `toml:"xray_bin"`
+	// AutoUpdate is the managed-core auto-update switch, default ON (D4,
+	// managed core only per S5). The default is pre-seeded by Load and
+	// configless BEFORE decode (SelfUpdate.Enabled precedent), so an
+	// explicit false survives decode and sticks.
+	AutoUpdate bool `toml:"auto_update"`
+	// UpdateInterval is the auto-update check cadence (default 24h;
+	// checked each maintenance wave). 0 = unset → the default.
+	UpdateInterval Duration `toml:"update_interval"`
+	// SocksPort is the own socks5 inbound port (default 10810 — it must
+	// NOT collide with the owner's hand-managed client on 10808/10809;
+	// config.example documents the distinction). 0 = unset → the default.
+	SocksPort int `toml:"socks_port"`
+	// HTTPPort is the own http inbound port (default 10811). 0 = unset →
+	// the default.
+	HTTPPort int `toml:"http_port"`
+	// APIPort is the own stats/API port (default 15491; the owner's
+	// hand-managed client keeps 15490). 0 = unset → the default.
+	APIPort int `toml:"api_port"`
+	// PerCountryInbounds turns the D2 option on: one socks inbound per
+	// alive-country balancer (tags in-<cc>) next to the base inbounds.
+	// Default false (the zero value — there is no default application).
+	PerCountryInbounds bool `toml:"per_country_inbounds"`
+	// RollbackStrikes is the D8 self-healing counter: K consecutive failed
+	// post-activation health checks → restore the newest pre-activate
+	// backup → -test gate → core restart. Default 3; 0 = unset → the
+	// default. No upper bound (owner ruling).
+	RollbackStrikes int `toml:"rollback_strikes"`
+	// Loglevel is the generated config's xray loglevel (default "warning",
+	// S7 — access stays "none" by default per the 272k-lines/8h journald
+	// flood history; the knob tunes the core's log level only).
+	Loglevel string `toml:"loglevel"`
+}
+
+// CoreBindAddress is the binding constant for every own inbound's bind
+// address (D2/N1): loopback only. A constant, not a knob — LAN exposure is
+// a later explicit decision.
+const CoreBindAddress = "127.0.0.1"
+
+// Core defaults — the single literal for every [core] default value,
+// referenced by applyCoreDefaults so the defaults can never drift between
+// layers (the W6 convention).
+const (
+	// DefaultCoreSocksPort is the own socks5 inbound port (D2; distinct
+	// from the owner's hand-managed client on 10808).
+	DefaultCoreSocksPort = 10810
+	// DefaultCoreHTTPPort is the own http inbound port (D2; distinct from
+	// the owner's hand-managed client on 10809).
+	DefaultCoreHTTPPort = 10811
+	// DefaultCoreAPIPort is the own stats/API port (spec Config surface;
+	// the owner's hand-managed client keeps 15490).
+	DefaultCoreAPIPort = 15491
+	// DefaultCoreUpdateInterval is the managed-core auto-update check
+	// cadence (D4).
+	DefaultCoreUpdateInterval = 24 * time.Hour
+	// DefaultCoreRollbackStrikes is the D8 strike count: K consecutive
+	// failed health checks trigger the rollback.
+	DefaultCoreRollbackStrikes = 3
+	// DefaultCoreLoglevel is the generated config's loglevel (S7).
+	DefaultCoreLoglevel = "warning"
+)
+
+// CoreXrayBin resolves the SINGLE binary knob (S1): the explicit
+// [core].xray_bin when set (a system xray override), else the managed
+// default <data>/bin/xray joined from the resolved data dir. Callers keep
+// their ExpandHome discipline for ~-prefixed overrides.
+func (c *Config) CoreXrayBin() string {
+	if c.Core.XrayBin != "" {
+		return c.Core.XrayBin
+	}
+	return filepath.Join(c.DataDir, "bin", "xray")
+}
+
 // Config is the pipeline configuration root.
 type Config struct {
 	DataDir    string           `toml:"data_dir"`
 	Resources  ResourceConfig   `toml:"resources"`
 	Resource   ResourceConfig   `toml:"resource"`
+	Core       CoreConfig       `toml:"core"`
 	Plugins    PluginsConfig    `toml:"plugins"`
 	Fetch      FetchConfig      `toml:"fetch"`
 	Filter     FilterConfig     `toml:"filter"`
@@ -592,6 +647,12 @@ type Config struct {
 	Maintain   MaintainConfig   `toml:"maintain"`
 	HTTP       HTTPConfig       `toml:"http"`
 	SelfUpdate SelfUpdateConfig `toml:"self_update"`
+	// Configless marks the built-in-defaults resolution (SourceConfigless):
+	// the W12 stage boundary's key since the external mode died (the retired
+	// template/target emptiness used to carry it). Never decoded from any
+	// file (toml:"-"); set ONLY by the configless constructor — a file-loaded
+	// or hand-built config always renders/activates.
+	Configless bool `toml:"-"`
 }
 
 // Duration wraps time.Duration for TOML string values like "30s", "24h".
@@ -615,31 +676,81 @@ func (d *Duration) MarshalText() ([]byte, error) {
 }
 
 // Load reads, migration-checks, strict-decodes, defaults, and validates the
-// config file.
+// config file. Retired S4 keys parse-and-warn: the re-homed values always
+// land on Config.Core here, but the warning LINES belong to the resolve
+// funnel — callers that must surface them use LoadWithWarnings (or
+// Resolve, whose Resolved.Warnings every command prints).
 func Load(path string) (*Config, error) {
+	cfg, _, err := loadFile(path)
+	return cfg, err
+}
+
+// LoadWithWarnings is Load plus the S4 retired-key warning lines (exactly
+// one per retired key present in the file). The CLI's install-style
+// resolution builds Resolved values directly, so it needs the lines without
+// going through config.Resolve's tiers.
+func LoadWithWarnings(path string) (*Config, []string, error) {
+	return loadFile(path)
+}
+
+// loadFile is the single decode path behind Load and LoadWithWarnings: one
+// lenient probe decode (removed-section refusal + retired-key detection and
+// pruning), one strict decode, one defaults application, one retired-key
+// application — no fallback chains.
+func loadFile(path string) (*Config, []string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, nil, fmt.Errorf("read config: %w", err)
 	}
-	if err := checkRemovedSections(raw); err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
+	// ONE lenient probe decode drives both the removed-section refusal and
+	// the S4 retired-key pruning. A probe failure means invalid TOML — the
+	// strict decode below fails loud with its own parse error, so the probe
+	// result is simply not used in that case.
+	probe := map[string]any{}
+	if perr := toml.NewDecoder(strings.NewReader(string(raw))).Decode(&probe); perr == nil {
+		if err := checkRemovedSections(probe); err != nil {
+			return nil, nil, fmt.Errorf("config %s: %w", path, err)
+		}
+	}
+	// S4: the retired keys are detected from the RAW TOML key paths and
+	// PRUNED before the strict decode — their struct fields are deleted
+	// (D3), so an unpruned key would fail the strict decode as unknown and
+	// the daemon would refuse to start on a retired key. With the keys
+	// pruned, the strict decode stays byte-identical for every clean config
+	// (no findings → no re-encode), and only a retired-key config takes the
+	// pruned re-encode path.
+	findings, coreTable := pruneRetiredKeys(probe)
+	strictSource := raw
+	if len(findings) > 0 {
+		pruned, merr := toml.Marshal(probe)
+		if merr != nil {
+			return nil, nil, fmt.Errorf("re-encode config %s: %w", path, merr)
+		}
+		strictSource = pruned
 	}
 	cfg := &Config{
 		SelfUpdate: SelfUpdateConfig{Enabled: true, CheckInterval: Duration{Duration: 30 * time.Second}},
 		Probe:      ProbeConfig{CalibrationEnabled: true},
+		// AutoUpdate default ON (D4) is pre-seeded BEFORE decode so an
+		// explicit false survives (the SelfUpdate.Enabled precedent).
+		Core: CoreConfig{AutoUpdate: true},
 	}
-	dec := toml.NewDecoder(strings.NewReader(string(raw)))
+	dec := toml.NewDecoder(strings.NewReader(string(strictSource)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	syncResourceConfig(cfg)
 	applyDefaults(cfg, false)
+	// The retired keys are applied AFTER defaults so a re-homed value lands
+	// on top of the [core] default it replaces, and BEFORE validate so the
+	// [core] validation sees the re-homed values.
+	warnings := applyRetiredFindings(cfg, coreTable, findings)
 	syncResourceConfig(cfg)
 	if err := validate(cfg); err != nil {
-		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+		return nil, nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
-	return cfg, nil
+	return cfg, warnings, nil
 }
 
 // checkRemovedSections fails LOUD on removed layouts, naming the exact
@@ -652,67 +763,64 @@ func Load(path string) (*Config, error) {
 //     dead — requests originate from thousands of distinct node IPs and the
 //     aggregate limit they clamped cannot pool. The self-report is automatic
 //     (no knob); the surviving knobs are ttl / timeout / doh_url.
-func checkRemovedSections(raw []byte) error {
-	probe := map[string]any{}
-	decodeErr := toml.NewDecoder(strings.NewReader(string(raw))).Decode(&probe)
-	if decodeErr == nil {
-		if _, ok := probe["sources"]; ok {
-			return errors.New(
-				"the [sources.*] section was removed — the source-ingest layer is now Lua plugins " +
-					"(W10). Delete every [sources.<id>] table and use the [plugins] section " +
-					"([plugins] dir = \"...\", default <data_dir>/plugins). The built-in sample " +
-					"plugin (sample.lua) materializes into the plugins " +
-					"dir on first run — edit or add .lua files there; a new provider is a new " +
-					".lua file, no Go rebuild")
-		}
-		if probeTable, ok := probe["probe"].(map[string]any); ok {
-			dead := make([]string, 0, 5)
-			for _, key := range []string{"path", "db_path", "check_preset", "url_success_threshold", "max_passed"} {
-				if _, present := probeTable[key]; present {
-					dead = append(dead, "probe."+key)
-				}
-			}
-			if len(dead) > 0 {
-				return fmt.Errorf(
-					"%s: removed — the probe wave no longer shells out to xray-knife (W14): every "+
-						"probed node now gets a temporary single-node xray instance (the SAME "+
-						"infrastructure the check stage uses), so liveness and the speedtest "+
-						"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
-						"delete the dead key(s); the temp instances use [activate].xray_bin (there is "+
-						"no separate prober binary or database anymore); panel grading moved to the "+
-						"`assay check` command (per-site verdicts through real tunnels); early "+
-						"stop is gone — selection caps live at the select stage",
-					strings.Join(dead, ", "))
+func checkRemovedSections(probe map[string]any) error {
+	if _, ok := probe["sources"]; ok {
+		return errors.New(
+			"the [sources.*] section was removed — the source-ingest layer is now Lua plugins " +
+				"(W10). Delete every [sources.<id>] table and use the [plugins] section " +
+				"([plugins] dir = \"...\", default <data_dir>/plugins). The built-in sample " +
+				"plugin (sample.lua) materializes into the plugins " +
+				"dir on first run — edit or add .lua files there; a new provider is a new " +
+				".lua file, no Go rebuild")
+	}
+	if probeTable, ok := probe["probe"].(map[string]any); ok {
+		dead := make([]string, 0, 5)
+		for _, key := range []string{"path", "db_path", "check_preset", "url_success_threshold", "max_passed"} {
+			if _, present := probeTable[key]; present {
+				dead = append(dead, "probe."+key)
 			}
 		}
-		if geoTable, ok := probe["geo"].(map[string]any); ok {
-			dead := make([]string, 0, 3)
-			for _, key := range []string{"endpoint", "batch_size", "per_minute"} {
-				if _, present := geoTable[key]; present {
-					dead = append(dead, "geo."+key)
-				}
-			}
-			if len(dead) > 0 {
-				return fmt.Errorf(
-					"%s: removed — the classification pass (merged into the probe wave) "+
-						"self-reports per node: every alive node asks "+
-						"ip-api (http://ip-api.com/json/, no ip parameter) through its own tunnel, so "+
-						"requests come from thousands of distinct node IPs and the aggregate per-source "+
-						"limit these batch knobs clamped can never pool (W11). The self-report is "+
-						"automatic — there is no replacement knob. Delete the dead key(s) from your "+
-						"[geo] table (keep ttl and timeout; the DoH fallback endpoint is [geo].doh_url, "+
-						"default %s)",
-					strings.Join(dead, ", "), DefaultDoHURL)
-			}
+		if len(dead) > 0 {
+			return fmt.Errorf(
+				"%s: removed — the probe wave no longer shells out to xray-knife (W14): every "+
+					"probed node now gets a temporary single-node xray instance (the SAME "+
+					"infrastructure the check stage uses), so liveness and the speedtest "+
+					"uniformly cover every rendered protocol, hysteria2 included. Migration: "+
+					"delete the dead key(s); the temp instances use [core].xray_bin (there is "+
+					"no separate prober binary or database anymore); panel grading moved to the "+
+					"`assay check` command (per-site verdicts through real tunnels); early "+
+					"stop is gone — selection caps live at the select stage",
+				strings.Join(dead, ", "))
 		}
 	}
-	return nil // a lenient-decode failure is the strict decode's problem below
+	if geoTable, ok := probe["geo"].(map[string]any); ok {
+		dead := make([]string, 0, 3)
+		for _, key := range []string{"endpoint", "batch_size", "per_minute"} {
+			if _, present := geoTable[key]; present {
+				dead = append(dead, "geo."+key)
+			}
+		}
+		if len(dead) > 0 {
+			return fmt.Errorf(
+				"%s: removed — the classification pass (merged into the probe wave) "+
+					"self-reports per node: every alive node asks "+
+					"ip-api (http://ip-api.com/json/, no ip parameter) through its own tunnel, so "+
+					"requests come from thousands of distinct node IPs and the aggregate per-source "+
+					"limit these batch knobs clamped can never pool (W11). The self-report is "+
+					"automatic — there is no replacement knob. Delete the dead key(s) from your "+
+					"[geo] table (keep ttl and timeout; the DoH fallback endpoint is [geo].doh_url, "+
+					"default %s)",
+				strings.Join(dead, ", "), DefaultDoHURL)
+		}
+	}
+	return nil
 }
 
 func applyDefaults(c *Config, configless bool) {
 	syncResourceConfig(c)
 	applyResourceDefaults(&c.Resources)
 	applyResourceDefaults(&c.Resource)
+	applyCoreDefaults(c)
 	applyPluginsDefaults(c)
 	applyFetchDefaults(&c.Fetch)
 	applyFilterDefaults(&c.Filter)
@@ -724,6 +832,207 @@ func applyDefaults(c *Config, configless bool) {
 	applyMaintainDefaults(&c.Maintain)
 	applyHTTPDefaults(&c.HTTP)
 	applySelfUpdateDefaults(&c.SelfUpdate)
+}
+
+// applyCoreDefaults materializes the [core] defaults: update_interval 24h,
+// socks/http/api ports 10810/10811/15491, rollback_strikes 3, loglevel
+// "warning". AutoUpdate needs NO application here — true is pre-seeded by
+// Load/configless before decode so an explicit false survives (the
+// SelfUpdate.Enabled precedent); PerCountryInbounds defaults to false as
+// the zero value. An explicit 0 on a numeric knob means unset (the W6
+// convention), never "off".
+func applyCoreDefaults(c *Config) {
+	if c.Core.UpdateInterval.Duration == 0 {
+		c.Core.UpdateInterval.Duration = DefaultCoreUpdateInterval
+	}
+	if c.Core.SocksPort == 0 {
+		c.Core.SocksPort = DefaultCoreSocksPort
+	}
+	if c.Core.HTTPPort == 0 {
+		c.Core.HTTPPort = DefaultCoreHTTPPort
+	}
+	if c.Core.APIPort == 0 {
+		c.Core.APIPort = DefaultCoreAPIPort
+	}
+	if c.Core.RollbackStrikes == 0 {
+		c.Core.RollbackStrikes = DefaultCoreRollbackStrikes
+	}
+	if c.Core.Loglevel == "" {
+		c.Core.Loglevel = DefaultCoreLoglevel
+	}
+}
+
+// retiredKey is one S4-retired knob of the external-client mode (the
+// 2026-11-10 self-held-core pivot): a key old configs may still carry that
+// must never refuse the daemon start (S4 parse-and-warn). Rehome names the
+// [core] knob receiving the value when S4 re-homes it ("" = plain retire);
+// reason is the migration note carried verbatim in the warning line.
+type retiredKey struct {
+	table  string
+	key    string
+	rehome string
+	reason string
+}
+
+// retiredKeys is the S4 enumeration, in spec order. The mechanism is
+// FIELD-INDEPENDENT since the external-mode removal (D3/T6): the keys are
+// detected from the RAW TOML key paths (pruneRetiredKeys over the lenient
+// probe decode) and PRUNED before the strict decode, whose struct no longer
+// carries the retired fields. A retired key is therefore never an unknown
+// field to the strict decode — the daemon never refuses to start on one
+// (S4) — and a retired value with a type the re-home cannot carry (say,
+// render.stats_port = "abc") warns honestly instead of failing the load,
+// exactly the parse-and-warn contract.
+var retiredKeys = []retiredKey{
+	{
+		table: "activate", key: "target",
+		reason: "the external activation target is retired (the self-held core renders its own live config)",
+	},
+	{
+		table: "activate", key: "xray_bin", rehome: "xray_bin",
+		reason: "the single binary knob is core.xray_bin (S1)",
+	},
+	{
+		table: "activate", key: "asset_dir",
+		reason: "the managed core dir owns the assets",
+	},
+	{
+		table: "activate", key: "service_name",
+		reason: "no foreign systemd unit is restarted anymore (D3)",
+	},
+	{
+		table: "render", key: "template",
+		reason: "the own live config is fully generated",
+	},
+	{
+		table: "render", key: "output_dir",
+		reason: "the live config is fixed at <data>/rendered/live.json",
+	},
+	{
+		table: "render", key: "stats_port", rehome: "api_port",
+		reason: "the own stats/API port is core.api_port",
+	},
+	{
+		table: "render", key: "pool_inbound_tags",
+		reason: "inbound tags are generated",
+	},
+	{
+		table: "maintain", key: "auto_restart",
+		reason: "core restarts are the core manager's job",
+	},
+	{
+		table: "activate", key: "backup_dir",
+		reason: "backups live at the fixed <data>/backups — the D8 rollback " +
+			"restores the newest config.json.bak-<ts> from exactly there, so a " +
+			"movable backup dir would break the remedy silently",
+	},
+}
+
+// retiredFinding is one retired key discovered in the raw TOML: the table
+// row it matched and the raw value it carried (the type the re-home must
+// carry honestly — a wrong-typed value warns instead of re-homing).
+type retiredFinding struct {
+	rk    retiredKey
+	value any
+}
+
+// pruneRetiredKeys walks the lenient probe decode's RAW key paths against
+// the S4 table: every retired key present in its section is recorded as a
+// finding and DELETED from the probe map (the pruned map is what the strict
+// decode sees, so the deleted struct fields can never surface as unknown).
+// The raw [core] table is returned alongside because the re-home precedence
+// ("the new knob wins when set explicitly") reads explicitness off the RAW
+// file, not off the decoded defaults.
+func pruneRetiredKeys(probe map[string]any) ([]retiredFinding, map[string]any) {
+	coreTable, _ := probe["core"].(map[string]any)
+	findings := make([]retiredFinding, 0, len(retiredKeys))
+	for _, rk := range retiredKeys {
+		table, ok := probe[rk.table].(map[string]any)
+		if !ok {
+			continue
+		}
+		value, present := table[rk.key]
+		if !present {
+			continue
+		}
+		delete(table, rk.key)
+		findings = append(findings, retiredFinding{rk: rk, value: value})
+	}
+	return findings, coreTable
+}
+
+// applyRetiredFindings implements the S4 parse-and-warn application over the
+// pruned findings: for every retired key PRESENT in the file it produces
+// exactly one loud warning line, and where S4 re-homes the value it lands on
+// [core] — unless the new knob is set explicitly in the raw file, in which
+// case [core] wins and the warning says so honestly (a warning claiming a
+// re-home that did not happen would be a lie). Runs AFTER defaults so a
+// re-homed value lands on top of the [core] default it replaces, and BEFORE
+// validate so the [core] validation sees the re-homed values. Warning lines
+// go to the resolve warning sink (Resolved.Warnings); the re-home itself
+// applies on every decode path so Config.Core is always correct.
+func applyRetiredFindings(c *Config, coreTable map[string]any, findings []retiredFinding) []string {
+	warnings := make([]string, 0, len(findings))
+	for _, f := range findings {
+		switch {
+		case f.rk.rehome != "" && !retiredKeySet(coreTable, f.rk.rehome) && rehomeCarries(f.rk.rehome, f.value):
+			applyRetiredValue(c, f.rk.rehome, f.value)
+			warnings = append(warnings, fmt.Sprintf(
+				"retired config key %s.%s — value re-homed to core.%s (%s); delete the old key from your config",
+				f.rk.table, f.rk.key, f.rk.rehome, f.rk.reason))
+		case f.rk.rehome != "":
+			warnings = append(warnings, fmt.Sprintf(
+				"retired config key %s.%s — ignored, core.%s keeps its own value (%s); delete the old key from your config",
+				f.rk.table, f.rk.key, f.rk.rehome, f.rk.reason))
+		default:
+			warnings = append(warnings, fmt.Sprintf(
+				"retired config key %s.%s — %s; the key is ignored, delete it from your config",
+				f.rk.table, f.rk.key, f.rk.reason))
+		}
+	}
+	return warnings
+}
+
+// rehomeCarries reports whether the raw value's type is one the re-home can
+// actually carry (the raw-path detection reads the value BEFORE any struct
+// type-checks it, so a wrong-typed retired value must not claim a re-home —
+// the warning would lie).
+func rehomeCarries(knob string, value any) bool {
+	switch knob {
+	case "api_port":
+		_, ok := value.(int64)
+		return ok
+	case "xray_bin":
+		_, ok := value.(string)
+		return ok
+	}
+	return false
+}
+
+// retiredKeySet reports whether the raw [core] table explicitly carries the
+// knob (the re-home yields to an explicit new-surface value).
+func retiredKeySet(coreTable map[string]any, knob string) bool {
+	if coreTable == nil {
+		return false
+	}
+	_, set := coreTable[knob]
+	return set
+}
+
+// applyRetiredValue carries one re-homed value onto its [core] knob. The
+// value's type was vetted by rehomeCarries, so the assertions here mirror
+// it exactly.
+func applyRetiredValue(c *Config, knob string, value any) {
+	switch knob {
+	case "api_port":
+		if port, ok := value.(int64); ok {
+			c.Core.APIPort = int(port)
+		}
+	case "xray_bin":
+		if bin, ok := value.(string); ok {
+			c.Core.XrayBin = bin
+		}
+	}
 }
 
 // applyPluginsDefaults resolves the plugins dir default: <data_dir>/plugins,
@@ -876,44 +1185,7 @@ func applySelectDefaults(s *SelectConfig) {
 	}
 }
 
-// dedupeStrings collapses duplicate entries preserving order — the first
-// occurrence wins, later duplicates are dropped.
-func dedupeStrings(in []string) []string {
-	if len(in) < 2 {
-		return in
-	}
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if _, dup := seen[s]; dup {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	return out
-}
-
-func applyRenderDefaults(r *RenderConfig, configless bool) {
-	// Normalize duplicates at the load boundary (M-4): "socks-in" twice must
-	// not render a duplicated inboundTag — first occurrence wins, order is
-	// preserved.
-	r.PoolInboundTags = dedupeStrings(r.PoolInboundTags)
-	// The template default is a FILE-LOADED default only: a configless run
-	// keeps render.template empty so the render stage fails loud at its
-	// boundary instead of silently pointing at the live client's config.
-	if !configless && r.Template == "" {
-		r.Template = "~/projects/xray-raw/config.json"
-	}
-	if r.OutputDir == "" {
-		r.OutputDir = "rendered"
-	}
-	if r.StatsPort == 0 {
-		r.StatsPort = 15490
-	}
-	if len(r.PoolInboundTags) == 0 {
-		r.PoolInboundTags = DefaultPoolInboundTags()
-	}
+func applyRenderDefaults(r *RenderConfig, _ bool) {
 	// ObservatoryInterval: NO default application (W19) — empty = ADAPTIVE:
 	// the render computes max(60s, ceil(active×200ms)) from the selection
 	// size so sustained observatory probes stay ≤ 5/s regardless of pool
@@ -930,24 +1202,9 @@ func applyRenderDefaults(r *RenderConfig, configless bool) {
 	}
 }
 
-func applyActivateDefaults(a *ActivateConfig, configless bool) {
-	// The target default is a FILE-LOADED default only: configless mode
-	// keeps activate.target empty so activation fails loud at its boundary
-	// instead of silently aiming at the live client's config.
-	if !configless && a.Target == "" {
-		a.Target = "~/projects/xray-raw/config.json"
-	}
-	if a.XrayBin == "" {
-		a.XrayBin = "/usr/bin/xray"
-	}
-	if a.BackupDir == "" {
-		a.BackupDir = "backups"
-	}
+func applyActivateDefaults(a *ActivateConfig, _ bool) {
 	if a.TestTimeout == nil {
 		a.TestTimeout = &Duration{Duration: DefaultTestTimeout}
-	}
-	if a.ServiceName == "" {
-		a.ServiceName = DefaultServiceName
 	}
 	// BackupKeep: no default application — 0 IS the default (unlimited).
 }
@@ -969,13 +1226,6 @@ func applyMaintainDefaults(m *MaintainConfig) {
 		m.StatsTimeout.Duration = DefaultStatsTimeout
 	}
 	// PruneBackupKeep: no default application — 0 IS the default (unlimited).
-	// AutoRestart: nil (unset) materializes as TRUE — hands-off is the W13
-	// owner ruling; AutoRestartEnabled() treats a nil pointer the same way,
-	// so both direct-struct (test) construction and file loading agree.
-	if m.AutoRestart == nil {
-		v := true
-		m.AutoRestart = &v
-	}
 }
 
 func applyHTTPDefaults(h *HTTPConfig) {
@@ -1050,6 +1300,9 @@ func (r ResourceConfig) UsableRAMMB() int {
 
 func validate(c *Config) error {
 	if err := validateBasics(c); err != nil {
+		return err
+	}
+	if err := validateCore(c.Core); err != nil {
 		return err
 	}
 	if err := validateResource(c.Resources); err != nil {
@@ -1272,10 +1525,29 @@ func validateGeo(g GeoConfig) error {
 	return validateNonNegative("geo.max_ttl", g.MaxTTL.Duration)
 }
 
-func validateRender(r RenderConfig) error {
-	if r.StatsPort < 1024 || r.StatsPort > 65535 {
-		return fmt.Errorf("render.stats_port must be a valid TCP port, got %d", r.StatsPort)
+// validateCore carries the [core] port checks (the re-home of the retired
+// render.stats_port validation, T6 disposition 3): every own inbound port
+// must be a VALID TCP PORT — 1..65535 is the structural definition of the
+// port domain, not a policy range (owner discipline: no artificial floors or
+// ceilings on knobs). 0 never reaches here — the default materializes first
+// — and the defaults are valid by construction.
+func validateCore(c CoreConfig) error {
+	for _, p := range []struct {
+		name string
+		port int
+	}{
+		{"core.socks_port", c.SocksPort},
+		{"core.http_port", c.HTTPPort},
+		{"core.api_port", c.APIPort},
+	} {
+		if p.port < 1 || p.port > 65535 {
+			return fmt.Errorf("%s must be a valid TCP port, got %d", p.name, p.port)
+		}
 	}
+	return nil
+}
+
+func validateRender(r RenderConfig) error {
 	if err := validateNonNegative("render.tcp_max_seg", r.TCPMaxSeg); err != nil {
 		return err
 	}

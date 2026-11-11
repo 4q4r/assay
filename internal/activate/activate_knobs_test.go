@@ -62,25 +62,6 @@ func TestTestTimeoutBoundsTheTestGate(t *testing.T) {
 	})
 }
 
-// TestServiceNameInRestartHint pins [activate].service_name: the printed
-// restart hint names the configured unit; the zero value falls back to
-// xray-raw.service (behavior preservation).
-func TestServiceNameInRestartHint(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "config.json")
-	rendered := filepath.Join(dir, "rendered.json")
-	writeConfig(t, target)
-	require.NoError(t, os.WriteFile(rendered, []byte(`{"v":3}`), 0o644))
-
-	res, err := activate.Run(activate.Input{
-		RenderedPath: rendered, TargetPath: target,
-		XrayBin: fakeXray(t, dir, "ok"), ServiceName: "xray-custom.service",
-	})
-	require.NoError(t, err)
-	assert.Contains(t, res.RestartHint, "systemctl --user restart xray-custom.service")
-	assert.NotContains(t, res.RestartHint, "xray-raw.service")
-}
-
 // TestBackupKeepRetention pins [activate].backup_keep: after a successful
 // new backup write only the N newest .bak-<ts> files remain; 0 = unlimited;
 // a deletion failure is LOUD and aborts before the live target is replaced.

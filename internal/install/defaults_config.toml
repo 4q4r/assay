@@ -19,17 +19,34 @@ refresh_interval = "1h"
 # the speedtest wave entirely (refresh waves stay probe-only).
 # speedtest_interval = "168h"
 
+[core]
+# The self-held core (the 2026-11-10 pivot, D1/D2): the daemon supervises
+# its OWN xray process with its own proxy inbounds; this section is that
+# process's knob surface. The full schema lives in config.example.toml
+# (the repository's documented example); the materialized defaults are
+# shown here.
+# xray_bin = ""              # the SINGLE binary knob (S1): empty = the managed
+                            # default <data>/bin/xray (installed by `assay install`);
+                            # a system xray may be pointed at instead — core
+                            # auto-update goes inert there with a one-time loud
+                            # INFO (S5)
+# auto_update = true         # managed-core auto-update, default ON (D4, managed
+                            # core only per S5)
+socks_port = 10810          # own socks5 inbound, loopback-only (D2)
+http_port = 10811           # own http inbound, loopback-only (D2)
+api_port = 15491            # own stats/API inbound, loopback-only
+
 [render]
-# Pool render template. Unset → the file-loaded default applies
-# (~/projects/xray-raw/config.json — the owner's live client layout); set
-# your own template path here. Until render has a readable template the
-# stage fails loud at its boundary.
-# template = "/path/to/xray-template.json"
+# The render target is FIXED: the own core's generated config lives at
+# <data>/rendered/live.json — there is no template or output-path knob
+# (S4). The surviving knobs (observatory_interval, tcp_max_seg,
+# tls_fingerprint, balancer_tolerance, pool_routes) default correctly and
+# are documented in config.example.toml.
 
 [activate]
-# Live xray config the gated render result replaces. Unset → the
-# file-loaded default applies (~/projects/xray-raw/config.json); set your
-# own live-config path here. Until activate.target exists the stage fails
-# loud at its boundary — the data stages (fetch → parse → filter → probe →
-# geo → select) keep running meanwhile.
-# target = "/path/to/live-xray-config.json"
+# Activation drives the OWN core (D3): -test gate on the candidate →
+# date-stamped backup → atomic replace of live.json → the core manager
+# restarts the core on it. The binary knob is [core].xray_bin (S1); the
+# surviving knobs (test_timeout, backup_keep) default correctly and are
+# documented in config.example.toml. Backups live at the FIXED
+# <data>/backups — the D8 rollback restores from exactly there.

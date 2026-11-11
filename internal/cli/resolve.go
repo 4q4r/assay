@@ -78,22 +78,22 @@ func resolveInstallPath(explicit string) (installResolution, error) {
 		return installResolution{res: res, embedsConfig: true}, err
 	}
 	if p := config.DefaultShareConfigPath(home); pathExists(p) {
-		cfg, err := config.Load(p)
+		cfg, retired, err := config.LoadWithWarnings(p)
 		if err != nil {
 			return installResolution{}, err
 		}
 		return installResolution{
-			res: &config.Resolved{Config: cfg, Source: config.SourceShare, Path: p},
+			res: &config.Resolved{Config: cfg, Source: config.SourceShare, Path: p, Warnings: retired},
 		}, nil
 	}
 	if p := config.LegacyHomeConfigPath(home); pathExists(p) {
-		cfg, err := config.Load(p)
+		cfg, retired, err := config.LoadWithWarnings(p)
 		if err != nil {
 			return installResolution{}, err
 		}
 		return installResolution{res: &config.Resolved{
 			Config: cfg, Source: config.SourceLegacyHome, Path: p,
-			Warnings: []string{config.LegacyLocationWarning(p, config.ShareConfigDisplay)},
+			Warnings: append([]string{config.LegacyLocationWarning(p, config.ShareConfigDisplay)}, retired...),
 		}, embedsConfig: true}, nil
 	}
 	res, err := config.Resolve("", home, "")

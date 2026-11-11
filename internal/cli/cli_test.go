@@ -188,12 +188,12 @@ template = %q
 	// store level (TestJSONLArtifactsAreExplicitly0600); this integration pins
 	// the rendered config.
 
-	// render with an empty selection passes the template through and writes
-	// the rendered config.
+	// render with an empty selection writes the bootstrap own config
+	// (D7 fail-closed posture) straight to the live path.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "filtered.jsonl"), []byte(""), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "selection.json"), []byte(`{"generated_at":"2026-10-28T00:00:00Z","cap_applied":0,"cities_alive":0,"nodes":[]}`), 0o600))
 	run("render")
-	rendered, err := os.Stat(filepath.Join(dir, "rendered", "config.json"))
+	rendered, err := os.Stat(filepath.Join(dir, "rendered", "live.json"))
 	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o600), rendered.Mode().Perm(), "rendered config.json must be 0600")
+	assert.Equal(t, fs.FileMode(0o600), rendered.Mode().Perm(), "the own live config must be 0600")
 }

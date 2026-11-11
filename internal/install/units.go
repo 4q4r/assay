@@ -262,6 +262,11 @@ type UninstallOptions struct {
 	// pipeline data dir. User data is kept unless BOTH paths are given.
 	PurgeConfigPath string
 	PurgeDataDir    string
+	// ManagedCoreDataDir is the data dir whose MANAGED core artifacts
+	// (<data>/bin/xray, <data>/share/xray) uninstall removes — the D4
+	// teardown (unit + binaries; the data dir itself stays behind --purge).
+	// Empty = skip (no known data dir — never a guess at the cwd).
+	ManagedCoreDataDir string
 }
 
 // UninstallResult reports what uninstall did.
@@ -270,15 +275,16 @@ type UninstallResult struct {
 	RemovedUnits   []string
 	MissingUnits   []string
 	Purged         []string
-	SkippedDisable bool // no user systemd session — nothing to disable
+	CoreRemoved    []string // the managed core artifacts actually removed
+	SkippedDisable bool     // no user systemd session — nothing to disable
 }
 
 // Uninstall stops the daemon and legacy timers (each only when its unit
 // file still exists), removes every known unit file (current + legacy),
-// daemon-reloads so the user manager drops its not-found entries (I-2), and
-// reports. --purge additionally removes the config file and data dir;
-// anything else on the system (the installed binary included) is left
-// untouched.
+// daemon-reloads so the user manager drops its not-found entries (I-2),
+// removes the managed core artifacts from the data dir (D4), and reports.
+// --purge additionally removes the config file and data dir; anything else
+// on the system (the installed assay binary included) is left untouched.
 func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	res := UninstallResult{}
 	if o.UnitDir == "" {
@@ -297,17 +303,12 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	} else {
 		res.SkippedDisable = true
 	}
-	for _, name := range AllKnownUnitNames() {
-		path := filepath.Join(o.UnitDir, name)
-		if err := os.Remove(path); err != nil {
-			if os.IsNotExist(err) {
-				res.MissingUnits = append(res.MissingUnits, name)
-				continue
-			}
-			return res, fmt.Errorf("uninstall: remove %s: %w", path, err)
-		}
-		res.RemovedUnits = append(res.RemovedUnits, name)
+	removed, missing, err := removeKnownUnits(o.UnitDir)
+	if err != nil {
+		return res, err
 	}
+	res.RemovedUnits = removed
+	res.MissingUnits = missing
 	// I-2 (W5 fix round): the manager must rescan after the unit files are
 	// gone — without this daemon-reload the user manager keeps ghost
 	// "not-found" entries for the removed units until the next unrelated
@@ -318,6 +319,13 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 			return res, fmt.Errorf("uninstall: unit files removed but daemon-reload failed: %w", err)
 		}
 	}
+	// The managed core teardown (D4): bin/xray + share/xray under the data
+	// dir. Absent artifacts are the clean no-op; a removal failure is loud.
+	coreRemoved, err := removeManagedCore(o.ManagedCoreDataDir)
+	if err != nil {
+		return res, err
+	}
+	res.CoreRemoved = coreRemoved
 	for _, purge := range []string{o.PurgeConfigPath, o.PurgeDataDir} {
 		if purge == "" {
 			continue
@@ -328,6 +336,24 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 		res.Purged = append(res.Purged, purge)
 	}
 	return res, nil
+}
+
+// removeKnownUnits removes every known unit file (current + legacy) from
+// the unit dir, sorting the outcomes into removed and already-absent.
+func removeKnownUnits(unitDir string) ([]string, []string, error) {
+	var removed, missing []string
+	for _, name := range AllKnownUnitNames() {
+		path := filepath.Join(unitDir, name)
+		if rmErr := os.Remove(path); rmErr != nil {
+			if os.IsNotExist(rmErr) {
+				missing = append(missing, name)
+				continue
+			}
+			return removed, missing, fmt.Errorf("uninstall: remove %s: %w", path, rmErr)
+		}
+		removed = append(removed, name)
+	}
+	return removed, missing, nil
 }
 
 // disablePresentUnits disables the watch service and the legacy timers —
@@ -473,4 +499,45 @@ func Span(d time.Duration) string {
 	default:
 		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
 	}
+}
+
+// removeManagedCore removes the managed core artifacts from the data dir:
+// exactly <data>/bin/xray and <data>/share/xray (the D4 download layout),
+// tidying the emptied parent dirs. An empty data dir means nothing to
+// remove; absent artifacts are the clean no-op — the result lists what was
+// actually removed.
+func removeManagedCore(dataDir string) ([]string, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	var removed []string
+	bin := filepath.Join(dataDir, "bin", "xray")
+	if _, err := os.Stat(bin); err == nil {
+		if err := os.Remove(bin); err != nil {
+			return removed, fmt.Errorf("uninstall: remove managed core binary %s: %w", bin, err)
+		}
+		removed = append(removed, bin)
+	}
+	// The managed asset tree goes wholesale (it holds only release assets).
+	assetDir := filepath.Join(dataDir, "share", "xray")
+	if _, err := os.Stat(assetDir); err == nil {
+		if err := os.RemoveAll(assetDir); err != nil {
+			return removed, fmt.Errorf("uninstall: remove managed assets %s: %w", assetDir, err)
+		}
+		removed = append(removed, assetDir)
+	}
+	// Tidy the emptied product dirs without touching anything foreign (a
+	// dir left non-empty by foreign files is deliberately left in place).
+	for _, dir := range []string{filepath.Join(dataDir, "bin"), filepath.Join(dataDir, "share")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // absent — nothing to tidy
+		}
+		if len(entries) == 0 {
+			if rerr := os.Remove(dir); rerr != nil && !os.IsNotExist(rerr) {
+				return removed, fmt.Errorf("uninstall: remove empty dir %s: %w", dir, rerr)
+			}
+		}
+	}
+	return removed, nil
 }

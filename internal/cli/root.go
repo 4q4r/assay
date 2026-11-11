@@ -16,8 +16,9 @@ import (
 func New() *cobra.Command {
 	var cfgPath string
 	root := &cobra.Command{
-		Use:           "assay",
-		Short:         "Third-party public-node location pool pipeline for the owner's xray client",
+		Use: "assay",
+		Short: "Self-held public-node location pool: a managed xray core + local " +
+			"proxy inbounds fed by a re-verified third-party node pool",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		CompletionOptions: cobra.CompletionOptions{
@@ -62,7 +63,6 @@ type paths struct {
 	waveState    string
 	selection    string
 	renderedDir  string
-	rendered     string
 	backupDir    string
 	workDir      string
 }
@@ -70,7 +70,9 @@ type paths struct {
 func newPaths(cfg *config.Config) paths {
 	dataDir := config.ExpandHome(cfg.DataDir)
 	cacheDir := filepath.Join(dataDir, "cache")
-	renderedDir := filepath.Join(dataDir, config.ExpandHome(cfg.Render.OutputDir))
+	// renderedDir is the fixed own-config home (S4: <data>/rendered —
+	// live.json and candidate.json live here; there is no path knob).
+	renderedDir := filepath.Join(dataDir, "rendered")
 	return paths{
 		dataDir:      dataDir,
 		cacheDir:     cacheDir,
@@ -83,8 +85,11 @@ func newPaths(cfg *config.Config) paths {
 		waveState:    filepath.Join(dataDir, "wave-state.json"),
 		selection:    filepath.Join(dataDir, "selection.json"),
 		renderedDir:  renderedDir,
-		rendered:     filepath.Join(renderedDir, "config.json"),
-		backupDir:    filepath.Join(dataDir, config.ExpandHome(cfg.Activate.BackupDir)),
-		workDir:      filepath.Join(os.TempDir(), "opencode", "probe-work"),
+		// backupDir is the FIXED D8 rollback source (S4: the backup-dir knob
+		// is retired — the core manager's rollback globs exactly
+		// <data>/backups/config.json.bak-<ts>, so the writer must use the
+		// same fixed dir; a movable one would break the remedy silently).
+		backupDir: filepath.Join(dataDir, "backups"),
+		workDir:   filepath.Join(os.TempDir(), "opencode", "probe-work"),
 	}
 }
