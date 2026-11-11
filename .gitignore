@@ -23,3 +23,4 @@
 internal/plugins/defaults/*.lua
 *.lua
 !internal/plugins/defaults/sample.lua
+DESIGN.md
