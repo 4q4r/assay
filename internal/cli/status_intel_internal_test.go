@@ -446,11 +446,15 @@ func TestComputeVerdictsNeverTrips(t *testing.T) {
 	assert.NotEmpty(t, verdictTrip, "the reserved constant is defined")
 	pools := [][]providerRow{
 		{engineRow("solo", 0, 0, 0, 0, false, 0, "", 0)},
-		{engineRow("a", 4, 4, 0, 0, false, 99, "", verdictMinHistoryWaves),
-			engineRow("b", 0, 0, 0, 0, false, 1, "", verdictMinHistoryWaves)},
-		{engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, verdictMinHistoryWaves),
+		{
+			engineRow("a", 4, 4, 0, 0, false, 99, "", verdictMinHistoryWaves),
+			engineRow("b", 0, 0, 0, 0, false, 1, "", verdictMinHistoryWaves),
+		},
+		{
+			engineRow("a", 80, 80, 1, 100, true, 88, stats.TrendUpStrong, verdictMinHistoryWaves),
 			engineRow("b", 5, 10, 1, 0, true, 8, stats.TrendDownStrong, verdictMinHistoryWaves),
-			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, verdictMinHistoryWaves)},
+			engineRow("c", 8, 10, 0, 0, false, 45, stats.TrendFlat, verdictMinHistoryWaves),
+		},
 		{{stats: plugins.PluginStats{PluginID: "cold"}}},
 	}
 	for _, rows := range pools {
@@ -539,8 +543,10 @@ speedtest_interval = "168h"
 		"fetched_at": "2026-11-04T12:00:00Z",
 		"sources":    map[string]any{},
 		"plugin_stats": []map[string]any{
-			{"PluginID": "example-provider", "TotalNodes": 18110, "LiveNodes": 0,
-				"DuplicateCount": 394, "HostingCount": 0, "ProxyCount": 0, "CleanCount": 0},
+			{
+				"PluginID": "example-provider", "TotalNodes": 18110, "LiveNodes": 0,
+				"DuplicateCount": 394, "HostingCount": 0, "ProxyCount": 0, "CleanCount": 0,
+			},
 		},
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "manifest.json"),

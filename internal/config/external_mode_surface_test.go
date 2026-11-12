@@ -226,8 +226,10 @@ func surfaceViolations(t *testing.T, root string) []string {
 	for line := range strings.SplitSeq(defaults, "\n") {
 		trimmed := strings.TrimSpace(line)
 		trimmed = strings.TrimPrefix(trimmed, "# ")
-		for _, key := range []string{"template", "target", "output_dir", "stats_port",
-			"pool_inbound_tags", "asset_dir", "service_name", "auto_restart", "backup_dir"} {
+		for _, key := range []string{
+			"template", "target", "output_dir", "stats_port",
+			"pool_inbound_tags", "asset_dir", "service_name", "auto_restart", "backup_dir",
+		} {
 			if strings.HasPrefix(trimmed, key+" =") {
 				violations = append(violations,
 					"leg6 embedded defaults config carries a retired knob row: "+trimmed)
@@ -265,8 +267,10 @@ func TestExternalModeSurfaceZero(t *testing.T) {
 		"ActivateConfig": reflect.TypeFor[ActivateConfig](),
 		"MaintainConfig": reflect.TypeFor[MaintainConfig](),
 	} {
-		for _, name := range []string{"Template", "OutputDir", "StatsPort", "PoolInboundTags",
-			"Target", "XrayBin", "AssetDir", "ServiceName", "AutoRestart", "BackupDir"} {
+		for _, name := range []string{
+			"Template", "OutputDir", "StatsPort", "PoolInboundTags",
+			"Target", "XrayBin", "AssetDir", "ServiceName", "AutoRestart", "BackupDir",
+		} {
 			if _, ok := typ.FieldByName(name); ok {
 				t.Errorf("retired struct field %s.%s still exists — the external-mode removal is incomplete",
 					section, name)

@@ -44,7 +44,8 @@ func ownByKey(nodes []*model.Node) map[string]*model.Node {
 }
 
 func ownRender(t *testing.T, sel *model.Selection, core config.CoreConfig, routes []render.RouteRule,
-	nodes map[string]*model.Node) map[string]any {
+	nodes map[string]*model.Node,
+) map[string]any {
 	t.Helper()
 	b, _, err := render.RenderOwnConfig(sel, core, routes, nodes, nil, render.Config{})
 	require.NoError(t, err)

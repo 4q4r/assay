@@ -147,7 +147,8 @@ func TestMergeGeoRecordsEmissionOrderKeySortedUnderAllFeedPermutations(t *testin
 	}
 	require.Len(t, keyed, 3, "distinct credentials → distinct node keys")
 	identity := model.GeoIdentity(&model.GeoRecord{
-		Scheme: keyed[0].Scheme, Host: keyed[0].Host, Port: keyed[0].Port})
+		Scheme: keyed[0].Scheme, Host: keyed[0].Host, Port: keyed[0].Port,
+	})
 	for i, n := range keyed {
 		for j, m := range keyed {
 			if i != j {

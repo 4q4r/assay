@@ -581,16 +581,26 @@ func buildFunnel(stages stageCounts, probed, alive, geoClean, selected int, dirt
 	}
 	return []funnelStage{
 		{Name: "Fetched", Count: stages.Nodes},
-		{Name: "Filtered", Count: stages.Filtered,
-			Note: transfer(stages.Filtered-stages.Nodes, "filter policy", "filter gain")},
-		{Name: "Probed", Count: probed,
-			Note: transfer(probed-stages.Filtered, "probe coverage", "accumulated store (latest-per-key)")},
-		{Name: "Alive", Count: alive,
-			Note: transfer(alive-probed, "dead / unreachable", "store carries more alive keys")},
-		{Name: "Geo Clean", Count: geoClean,
-			Note: transfer(geoClean-alive, geoDrop, "geo fold ahead of probe store")},
-		{Name: "Selected", Count: selected,
-			Note: transfer(selected-geoClean, "rank cut", "rank admits beyond geo fold")},
+		{
+			Name: "Filtered", Count: stages.Filtered,
+			Note: transfer(stages.Filtered-stages.Nodes, "filter policy", "filter gain"),
+		},
+		{
+			Name: "Probed", Count: probed,
+			Note: transfer(probed-stages.Filtered, "probe coverage", "accumulated store (latest-per-key)"),
+		},
+		{
+			Name: "Alive", Count: alive,
+			Note: transfer(alive-probed, "dead / unreachable", "store carries more alive keys"),
+		},
+		{
+			Name: "Geo Clean", Count: geoClean,
+			Note: transfer(geoClean-alive, geoDrop, "geo fold ahead of probe store"),
+		},
+		{
+			Name: "Selected", Count: selected,
+			Note: transfer(selected-geoClean, "rank cut", "rank admits beyond geo fold"),
+		},
 	}
 }
 

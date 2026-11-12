@@ -305,9 +305,11 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 	serviceTags := map[string]int{}
 	for _, b := range balancersOf(t, m1) {
 		tag, _ := b["tag"].(string)
-		for _, want := range []string{"pool_clean", "pool_chatgpt", "pool_netflix", "pool_youtube",
+		for _, want := range []string{
+			"pool_clean", "pool_chatgpt", "pool_netflix", "pool_youtube",
 			"pool_de_chatgpt", "pool_de_netflix", "pool_de_frankfurt_chatgpt", "pool_de_frankfurt_netflix",
-			"pool_de_clean", "pool_unknown_clean"} {
+			"pool_de_clean", "pool_unknown_clean",
+		} {
 			if tag == want {
 				serviceTags[tag]++
 			}

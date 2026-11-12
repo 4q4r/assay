@@ -721,8 +721,10 @@ func TestRunFetchWithCarriesOverEnrichedStats(t *testing.T) {
 		return fetchManifest{
 			FetchedAt: time.Now().UTC().Add(-2 * time.Hour),
 			Sources: map[string][]fetch.FetchedFile{
-				"alpha": {{Source: "alpha", Path: "alpha.txt", URL: "plugin://alpha",
-					Body: []byte("stale\n"), FetchedAt: time.Now().UTC().Add(-2 * time.Hour)}},
+				"alpha": {{
+					Source: "alpha", Path: "alpha.txt", URL: "plugin://alpha",
+					Body: []byte("stale\n"), FetchedAt: time.Now().UTC().Add(-2 * time.Hour),
+				}},
 			},
 			PluginStats: []plugins.PluginStats{
 				{

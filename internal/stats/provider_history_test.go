@@ -469,8 +469,10 @@ func TestProviderHistorySizeBudget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "provider-history.json")
 	now := mustTime("2026-11-04T10:00:00Z")
-	ids := []string{"prov-a1", "prov-b2", "prov-c3", "prov-d4", "prov-e5",
-		"prov-f6", "prov-g7", "prov-h8", "prov-i9", "prov-j0"}
+	ids := []string{
+		"prov-a1", "prov-b2", "prov-c3", "prov-d4", "prov-e5",
+		"prov-f6", "prov-g7", "prov-h8", "prov-i9", "prov-j0",
+	}
 	for _, id := range ids {
 		for i := range MaxWaves {
 			ts := now.Add(-time.Duration(MaxWaves-i) * time.Hour).UTC().Format(time.RFC3339)

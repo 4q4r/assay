@@ -227,6 +227,7 @@ func summarize(reports []NodeReport, eligible int) Summary {
 	}
 	return s
 }
+
 func mergeGeoRecords(
 	dataDir string, nodes []*model.Node, probeByKey map[string]store.ProbeResult, waveSeq uint64,
 	reports map[string]*NodeReport,

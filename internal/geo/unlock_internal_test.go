@@ -453,7 +453,8 @@ func TestEchoConsensus(t *testing.T) {
 	t.Run("failed echoes carry no vote", func(t *testing.T) {
 		res := echoConsensus([]EchoResult{
 			{Source: echoCFTrace, Class: echoErr},
-			okEcho(echoIPify, "203.0.113.7"), {Source: echoIPSB, Class: echoBad},
+			okEcho(echoIPify, "203.0.113.7"),
+			{Source: echoIPSB, Class: echoBad},
 		})
 		assert.Empty(t, res.IP)
 		assert.Zero(t, res.Agree)
