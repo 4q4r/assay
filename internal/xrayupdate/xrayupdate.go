@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"assay/internal/platform"
 	"assay/internal/ui"
 )
 
@@ -437,10 +438,7 @@ func stageRelease(ctx context.Context, opts Options, rel *release) (string, erro
 	}
 	_, _ = fmt.Fprintf(opts.Stdout, "%s sha256 verified (%s…)\n", opts.logLabel(), got[:12])
 
-	binName := "xray"
-	if runtime.GOOS == "windows" {
-		binName = "xray.exe"
-	}
+	binName := platform.CoreBinaryName(runtime.GOOS)
 	staged := filepath.Join(opts.StagingDir, binName)
 	if err := unzipFlat(zipPath, opts.StagingDir); err != nil {
 		return "", err

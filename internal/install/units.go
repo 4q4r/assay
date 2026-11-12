@@ -15,11 +15,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"text/template"
 	"time"
 
 	units "assay/systemd"
+
+	"assay/internal/platform"
 )
 
 // defaultConfigTemplate is the embedded default-config TOML (single source
@@ -502,16 +505,17 @@ func Span(d time.Duration) string {
 }
 
 // removeManagedCore removes the managed core artifacts from the data dir:
-// exactly <data>/bin/xray and <data>/share/xray (the D4 download layout),
-// tidying the emptied parent dirs. An empty data dir means nothing to
-// remove; absent artifacts are the clean no-op — the result lists what was
-// actually removed.
+// exactly <data>/bin/xray[.exe] (the binary name from the platform binname
+// table) and <data>/share/xray (the D4 download layout), tidying the
+// emptied parent dirs. An empty data dir means nothing to remove; absent
+// artifacts are the clean no-op — the result lists what was actually
+// removed.
 func removeManagedCore(dataDir string) ([]string, error) {
 	if dataDir == "" {
 		return nil, nil
 	}
 	var removed []string
-	bin := filepath.Join(dataDir, "bin", "xray")
+	bin := filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS))
 	if _, err := os.Stat(bin); err == nil {
 		if err := os.Remove(bin); err != nil {
 			return removed, fmt.Errorf("uninstall: remove managed core binary %s: %w", bin, err)

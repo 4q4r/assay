@@ -57,12 +57,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"assay/internal/config"
+	"assay/internal/platform"
 	"assay/internal/store"
 	"assay/internal/xrayupdate"
 )
@@ -369,7 +371,7 @@ func materializeAssets(dataDir string, log io.Writer) {
 	assets := 0
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || name == "xray" || name == "test-config.json" ||
+		if entry.IsDir() || name == platform.CoreBinaryName(runtime.GOOS) || name == "test-config.json" ||
 			strings.HasSuffix(name, ".zip") || strings.HasPrefix(name, ".") {
 			continue
 		}

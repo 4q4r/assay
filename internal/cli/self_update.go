@@ -1,16 +1,20 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"assay/internal/platform"
 )
 
 // binaryStabilityDelay is how long verifyBinary waits between two stat
@@ -18,13 +22,27 @@ import (
 // tests can shorten it; production uses ~2s per the brief.
 var binaryStabilityDelay = 2 * time.Second
 
-// elfMagic is the first four bytes of a valid ELF executable.
-var elfMagic = []byte{0x7f, 'E', 'L', 'F'}
+// magicRejection returns the verifier's rejection reason when buf does not
+// carry one of the platform's exec magics; "" when a magic matched.
+func magicRejection(buf []byte, magics [][]byte, format string) string {
+	for _, magic := range magics {
+		if bytes.Equal(buf[:len(magic)], magic) {
+			return ""
+		}
+	}
+	article := "a"
+	if format == "ELF" {
+		article = "an"
+	}
+	return "not " + article + " " + format + " binary (bad magic)"
+}
 
-// verifyBinary confirms that path points at a complete, valid ELF binary:
+// verifyBinary confirms that path points at a complete, valid executable
+// for the RUNNING platform (S0: the per-OS exec magic comes from
+// platform.ExecMagics — ELF on linux, Mach-O on darwin, PE on windows):
 //   - the file exists and is stat-stable across two reads (size + mtime
 //     unchanged across binaryStabilityDelay — partial-write protection);
-//   - the first four bytes are the ELF magic \x7fELF.
+//   - the first bytes match one of the platform's exec magics.
 //
 // An optional sidecar "<path>.sha256" is verified when present. Returns
 // (true, "") when armed, (false, reason) otherwise. Never panics; logs
@@ -52,13 +70,12 @@ func verifyBinary(path string) (bool, string) {
 	defer func() { _ = f.Close() }()
 	buf := make([]byte, 4)
 	n, err := f.Read(buf)
+	format := platform.ExecFormatName(runtime.GOOS)
 	if err != nil || n < 4 {
-		return false, "short read (not a complete ELF)"
+		return false, "short read (not a complete " + format + ")"
 	}
-	for i := range elfMagic {
-		if buf[i] != elfMagic[i] {
-			return false, "not an ELF binary (bad magic)"
-		}
+	if reason := magicRejection(buf, platform.ExecMagics(runtime.GOOS), format); reason != "" {
+		return false, reason
 	}
 	// Optional sha256 sidecar.
 	if side, err := os.ReadFile(path + ".sha256"); err == nil {

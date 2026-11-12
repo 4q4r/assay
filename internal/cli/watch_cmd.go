@@ -487,7 +487,7 @@ func (s *waveScheduler) checkSelfUpdate() bool {
 		return false
 	}
 	s.restartWaves++
-	// Verify (stat-stability + ELF magic) once.
+	// Verify (stat-stability + per-OS exec magic) once.
 	if !s.restartArmed.Load() && s.exePath != "" {
 		if ok, reason := verifyBinary(s.exePath); ok {
 			s.restartArmed.Store(true)
