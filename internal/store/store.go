@@ -15,9 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"assay/internal/model"
+	"assay/internal/platform"
 )
 
 // ProbeResult is one node's outcome from a probe wave (the W14 real-xray
@@ -745,15 +744,14 @@ func writeFileAtomicNoSync(path string, write func(*os.File) error) error {
 
 // fadviseDontNeed drops a just-written file from the page cache. Used for
 // large writes (probe-results, geo-base) to avoid evicting hotter pages.
+// The hint is linux-only (platform.DropFilePageCache — fadvise
+// FADV_DONTNEED; a documented no-op on darwin/windows) and best-effort by
+// contract: it never blocks or fails the write path.
 func fadviseDontNeed(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
 	defer func() { _ = f.Close() }()
-	fi, err := f.Stat()
-	if err != nil {
-		return
-	}
-	_ = unix.Fadvise(int(f.Fd()), 0, fi.Size(), unix.FADV_DONTNEED)
+	platform.DropFilePageCache(f)
 }
