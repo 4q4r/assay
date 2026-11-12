@@ -119,6 +119,6 @@ jobs:
       - uses: actions/checkout@v7
       # Reads .markdownlint-cli2.jsonc from the repo root automatically —
       # same config as the local markdownlint-cli2 gate.
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           globs: "*.md"
