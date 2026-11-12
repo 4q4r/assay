@@ -15,8 +15,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
+
+	"assay/internal/platform"
 )
 
 // SourceKind identifies where the effective configuration came from. The
@@ -113,11 +116,15 @@ const legacyShareLeaf = "public" + "vpn"
 
 // legacyShareDataDir returns the pre-rename local-share data dir under the
 // same scheme DefaultDataDir used before the rename: $XDG_DATA_HOME/<leaf>
-// when the env var is absolute, else ~/.local/share/<leaf>. Found-if-exists
-// courtesy only — the resolution never writes there.
+// when the env var is absolute, else ~/.local/share/<leaf>. The XDG tier is
+// linux-only behavior (platform.XDGHonored — §5.1); on darwin/windows only
+// the home path applies. Found-if-exists courtesy only — the resolution
+// never writes there.
 func legacyShareDataDir(home string) string {
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" && filepath.IsAbs(xdg) {
-		return filepath.Join(xdg, legacyShareLeaf)
+	if platform.XDGHonored(runtime.GOOS) {
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" && filepath.IsAbs(xdg) {
+			return filepath.Join(xdg, legacyShareLeaf)
+		}
 	}
 	return filepath.Join(home, ".local", "share", legacyShareLeaf)
 }
@@ -149,21 +156,27 @@ func legacyShareDirHint(home string) string {
 	return LegacyShareLocationWarning(oldDir, DefaultDataDir(home))
 }
 
-// DefaultDataDir returns the configless data dir: $XDG_DATA_HOME/assay
-// when XDG_DATA_HOME is set to an ABSOLUTE path, else the XDG user-data
-// fallback ~/.local/share/assay under the given home (M-1: the env var
-// is part of the resolution contract, honored wherever the configless
-// default applies — the data dir AND the local-share config tier alike).
+// DefaultDataDir returns the configless data dir per the platform §4.2
+// table: on linux $XDG_DATA_HOME/assay when XDG_DATA_HOME is set to an
+// ABSOLUTE path (the M-1 contract: the env var is part of the resolution
+// contract — the data dir AND the local-share config tier alike), else
+// ~/.local/share/assay under the given home; on darwin
+// ~/Library/Application Support/assay and on windows %LOCALAPPDATA%\assay
+// (XDG is linux-only — platform.XDGHonored guards every XDG branch).
 //
 // A set-but-RELATIVE XDG_DATA_HOME is spec-invalid (the XDG Base Directory
 // spec requires absolute paths): it is treated as UNSET — never a crash,
 // never a relative data dir — and reported by XDGDataDirViolation so callers
 // can warn loud.
 func DefaultDataDir(home string) string {
-	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" && filepath.IsAbs(xdg) {
-		return filepath.Join(xdg, "assay")
+	dir, ok := platform.DefaultDataDir(runtime.GOOS, home)
+	if !ok {
+		// Unreachable for known GOOS values with a real home; an empty home
+		// is API misuse (M-3) — the configless path refuses it loud before
+		// this can matter.
+		return ""
 	}
-	return filepath.Join(home, ".local", "share", "assay")
+	return dir
 }
 
 // XDGDataDirViolation reports a spec-invalid XDG_DATA_HOME (set but
@@ -171,7 +184,12 @@ func DefaultDataDir(home string) string {
 // loud, specific warning message; "" means the value is valid or unset.
 // Spec-invalid values are IGNORED per XDG semantics (DefaultDataDir falls
 // back to the home default) — the violation is surfaced, never fatal.
+// Linux-only behavior (§5.1): platforms without an XDG contract never
+// report XDG violations.
 func XDGDataDirViolation() string {
+	if !platform.XDGHonored(runtime.GOOS) {
+		return ""
+	}
 	xdg := os.Getenv("XDG_DATA_HOME")
 	if xdg == "" || filepath.IsAbs(xdg) {
 		return ""

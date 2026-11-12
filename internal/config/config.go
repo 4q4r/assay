@@ -13,6 +13,8 @@ import (
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
+
+	"assay/internal/platform"
 )
 
 // Source is one upstream node feed descriptor (D9): repo id + discovery
@@ -636,20 +638,23 @@ var UserLocalBinDir = func() string {
 }
 
 // UserLocalXrayBin is the user-local core binary path — ~/.local/bin/xray
-// through the injectable dir seam; "" when no home dir resolves.
+// through the injectable dir seam (the file name comes from the platform
+// binname table: xray.exe on windows); "" when no home dir resolves.
 func UserLocalXrayBin() string {
 	dir := UserLocalBinDir()
 	if dir == "" {
 		return ""
 	}
-	return filepath.Join(dir, "xray")
+	return filepath.Join(dir, platform.CoreBinaryName(runtime.GOOS))
 }
 
 // DefaultSystemXrayPaths is the standard-path scan list of the core-binary
 // resolution: an existing system xray at the FIRST of these paths binds
 // when no user-local binary exists. A var, not a const: slices are not
 // constant expressions, and the test suites inject fixture dirs through it.
-var DefaultSystemXrayPaths = []string{"/usr/local/bin/xray", "/usr/bin/xray"}
+// Initialized from the platform §4.2 table (linux pair byte-identical to
+// the pre-S0 literal; darwin adds the homebrew prefix; windows is empty).
+var DefaultSystemXrayPaths = platform.SystemXrayPaths(runtime.GOOS)
 
 // isRegularExecutable reports whether path exists as a regular file with
 // any execute bit set.
@@ -680,7 +685,7 @@ func ResolveCoreXrayBin(xrayBin, dataDir string) string {
 	if user := UserLocalXrayBin(); user != "" {
 		return user
 	}
-	return filepath.Join(dataDir, "bin", "xray")
+	return filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS))
 }
 
 // CoreXrayBin resolves the SINGLE binary knob (S1) through
