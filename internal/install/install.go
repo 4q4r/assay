@@ -82,6 +82,7 @@ func equalArgs(a, b []string) bool {
 		return false
 	}
 	for i := range a {
+		//nolint:gosec // G602 false positive: the lengths are proven equal above
 		if a[i] != b[i] {
 			return false
 		}

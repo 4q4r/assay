@@ -101,10 +101,15 @@ func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 }
 
 // TestInstallSourceUsesOnlyTheSanctionedConstructors pins the source-level
-// shape: exactly TWO exec sites (the allowlist-checked SystemctlExecutor and
-// the allowlist-checked LaunchctlExecutor — S1), and every executor call
-// goes through the command constructors — no literal args at call sites, no
-// third exec path.
+// shape: exactly SEVEN exec sites — every one inside an allowlist-checked
+// executor (systemctl + launchctl from W10/S1; sv, rc-update/rc-service,
+// rc-status probe, s6-svc/s6-svscanctl/s6-svstat, crontab from S3 — the plan
+// §3.2 surfaces, each pinned by its own allowlist guard) — and the systemd /
+// launchd flows call only via their command constructors. The literal
+// "restart" is banned EXCEPT inside runit.go, where the plan §3.2 allowlist
+// explicitly pins `sv {status,stop,restart,up,down}` (an ops-surface verb no
+// install flow ever invokes); the systemd/launchd surface stays restart-free
+// (the W13 ruling: install never restarts anything).
 func TestInstallSourceUsesOnlyTheSanctionedConstructors(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
@@ -119,10 +124,17 @@ func TestInstallSourceUsesOnlyTheSanctionedConstructors(t *testing.T) {
 		execSites += strings.Count(s, "exec.Command")
 		callSites += strings.Count(s, ".Systemctl(cmd")
 		launchctlCallSites += strings.Count(s, ".Launchctl(cmd")
+		if e.Name() == "runit.go" {
+			// The plan §3.2 verb table — pinned here and by the allowlist
+			// guard; no install flow ever sends `restart`.
+			assert.Contains(t, s, `"restart"`, "runit.go must carry the §3.2 pinned verb table")
+			continue
+		}
 		assert.NotContains(t, s, `"restart"`,
-			"%s: the string literal \"restart\" must never appear — no restart verb anywhere in the install surface", e.Name())
+			"%s: the string literal \"restart\" must never appear — no restart verb in the systemd/launchd/s6/openrc/cron surface", e.Name())
 	}
-	assert.Equal(t, 2, execSites, "exactly two exec sites: the allowlist-checked systemctl and launchctl executors")
+	assert.Equal(t, 7, execSites, "exactly seven exec sites, each inside an allowlist-checked executor "+
+		"(systemctl, launchctl, sv, rc-update/rc-service, rc-status probe, s6, crontab)")
 	// Install: legacy disable (conditional) + reload + enable = up to 3;
 	// cleanupLegacyUnits: legacy disable = 1; Uninstall: disable + post-removal
 	// reload = 2. All flow through the constructors; no new command shape.
