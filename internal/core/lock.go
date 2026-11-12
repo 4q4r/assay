@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
+
+	"assay/internal/platform"
 )
 
 // coreLockName is the singleton lock file's name inside the data dir (S3:
@@ -21,10 +22,19 @@ const coreLockName = "core.lock"
 var ErrDaemonHoldsCore = errors.New("core: the singleton core lock is already held — " +
 	"the daemon owns the core (use the unit or `assay watch`)")
 
-// acquireCoreLock takes the EXCLUSIVE non-blocking flock on
+// lockCoreFile/unlockCoreFile are the portable lock seam (S0): the per-GOOS
+// transport (flock on unix, LockFileEx on windows) lives in
+// internal/platform. Package vars so tests can record calls against the
+// seam (the recorded-actions double contract, lock_internal_test.go).
+var (
+	lockCoreFile   = platform.LockFile
+	unlockCoreFile = platform.UnlockFile
+)
+
+// acquireCoreLock takes the EXCLUSIVE non-blocking hold on
 // <data>/core.lock (S3: exactly one manager per data dir — a second one
 // fails with ErrDaemonHoldsCore instead of double-spawning the core). The
-// lock lives as long as the returned file stays open — the manager's
+// hold lives as long as the returned file stays open — the manager's
 // lifetime; a dead holder releases it by the kernel, so there is no
 // stale-lock state to recover from.
 func acquireCoreLock(dataDir string) (*os.File, error) {
@@ -38,9 +48,9 @@ func acquireCoreLock(dataDir string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("core: open %s: %w", path, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := lockCoreFile(f); err != nil {
 		_ = f.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+		if errors.Is(err, platform.ErrLockHeld) {
 			return nil, fmt.Errorf("%w (flock on %s)", ErrDaemonHoldsCore, path)
 		}
 		return nil, fmt.Errorf("core: flock %s: %w", path, err)

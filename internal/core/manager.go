@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"assay/internal/config"
+	"assay/internal/platform"
 )
 
 // Geometry constants — code-owned, NOT knobs (the owner's standing ruling:
@@ -472,7 +473,7 @@ func (m *Manager) Release() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile != nil {
-		_ = syscall.Flock(int(m.lockFile.Fd()), syscall.LOCK_UN)
+		_ = unlockCoreFile(m.lockFile)
 		_ = m.lockFile.Close()
 		m.lockFile = nil
 	}
@@ -483,7 +484,7 @@ func (m *Manager) Release() {
 func (m *Manager) release() {
 	_ = m.Stop()
 	if m.lockFile != nil {
-		_ = syscall.Flock(int(m.lockFile.Fd()), syscall.LOCK_UN)
+		_ = unlockCoreFile(m.lockFile)
 		_ = m.lockFile.Close()
 		m.lockFile = nil
 	}
@@ -596,7 +597,7 @@ func (m *Manager) stopLocked() error {
 		_, _ = fmt.Fprintf(m.log, "core: stopped pid %d\n", pid)
 	case m.adoptedPID != 0:
 		pid := m.adoptedPID
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := platform.KillProcessForce(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("core: kill adopted pid %d: %w", pid, err)
 		}
 		deadline := time.Now().Add(adoptedStopPoll)
@@ -729,13 +730,12 @@ func (m *Manager) clearPIDFile() {
 	}
 }
 
-// PIDAlive is the liveness probe for pidfile pids (signal 0): ESRCH = dead,
-// EPERM = alive but not ours (counted alive — the status contract).
-// Exported: the status core block (internal/cli) reuses the same
-// pidfile-liveness contract instead of a second signal-0 definition.
+// PIDAlive is the liveness probe for pidfile pids (signal 0 on unix via the
+// platform seam): ESRCH = dead, EPERM = alive but not ours (counted alive —
+// the status contract). Exported: the status core block (internal/cli)
+// reuses the same pidfile-liveness contract instead of a second definition.
 func PIDAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return platform.ProcessAlive(pid)
 }
 
 // fetchThroughSocks performs health leg 2 on an already-dialed socks
