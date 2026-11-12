@@ -155,6 +155,7 @@ type Manager struct {
 	waitOnce       sync.Once
 	done           chan struct{} // closed by the wait goroutine after Wait returns
 	waitErr        error         // valid after <-done (channel close = happens-before)
+	job            *childJob     // windows containment job (ADDENDUM §2); nil on unix
 	adoptedPID     int
 	strikes        int           // consecutive failed health checks (D8)
 	generation     int           // increments on every child start (supervisor token)
@@ -521,6 +522,9 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	}
 	//nolint:gosec // the binary comes from the owner's [core].xray_bin — the config file IS the trust root
 	cmd := exec.CommandContext(ctx, m.bin, "run", "-c", m.livePath)
+	// ADDENDUM §2 (windows): the child runs in its own process group so the
+	// stop ladder can CTRL_BREAK it alone. No-op on unix (byte-identical).
+	configureChildSpawn(cmd)
 	cmd.Env = m.childEnv()
 	cmd.WaitDelay = killWaitDelay
 	cmd.Stdout = m.stderrTail
@@ -536,15 +540,29 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	m.spawnedAt = time.Now()
 	m.deliberateStop = false
 	_ = m.waitDone() // start the reaper now; Stop and readiness share its signal
+	// ADDENDUM §2 (windows): assign the child to the kill-on-close Job
+	// Object — daemon death never orphans the child. A containment failure
+	// fails the spawn loud (the child is killed; nothing runs uncontained).
+	job, jerr := attachChildJob(cmd.Process)
+	if jerr != nil {
+		_ = m.cmd.Process.Kill()
+		<-m.waitDone()
+		m.cmd = nil
+		return fmt.Errorf("core: attach the core child to the containment job object: %w "+
+			"(a child outside the job could outlive the daemon — refusing to run it uncontained)", jerr)
+	}
+	m.job = job
 	if err := m.writePIDFile(cmd.Process.Pid); err != nil {
 		_ = m.cmd.Process.Kill()
 		<-m.waitDone()
+		m.releaseJobLocked()
 		m.cmd = nil
 		return fmt.Errorf("core: write pidfile after spawn: %w", err)
 	}
 	if err := m.awaitBoot(ctx); err != nil {
 		_ = m.cmd.Process.Kill()
 		<-m.waitDone()
+		m.releaseJobLocked()
 		m.cmd = nil
 		m.clearPIDFile()
 		return err
@@ -578,20 +596,31 @@ func (m *Manager) awaitBoot(ctx context.Context) error {
 	}
 }
 
-// stopLocked stops whatever core this manager owns: the session child is
-// killed by its exact captured PID and reaped; an adopted pid is SIGKILLed
-// and liveness-polled (a non-child cannot be Waited). Idempotent. Every
-// entry sets deliberateStop first — the crash supervisor reads a subsequent
-// child exit as a deliberate stop, never as a crash.
+// releaseJobLocked drops the containment job handle (ADDENDUM §2: the
+// kill-on-close limit makes this the final containment act on windows; a
+// nil/no-op job on unix). Nil-safe.
+func (m *Manager) releaseJobLocked() {
+	if m.job != nil {
+		m.job.release()
+		m.job = nil
+	}
+}
+
+// stopLocked stops whatever core this manager owns: the session child goes
+// through the per-OS stop ladder (unix: the byte-identical kill+reap
+// two-liner; windows: CTRL_BREAK → bounded wait → TerminateProcess,
+// ADDENDUM §2); an adopted pid is SIGKILLed and liveness-polled (a
+// non-child cannot be Waited — and was never in our job/process group).
+// Idempotent. Every entry sets deliberateStop first — the crash supervisor
+// reads a subsequent child exit as a deliberate stop, never as a crash.
 func (m *Manager) stopLocked() error {
 	m.deliberateStop = true
 	switch {
 	case m.cmd != nil:
 		pid := m.cmd.Process.Pid
-		if err := m.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return fmt.Errorf("core: kill child pid %d: %w", pid, err)
+		if err := m.stopSessionChildLocked(); err != nil {
+			return err
 		}
-		<-m.waitDone()
 		m.cmd = nil
 		m.clearPIDFile()
 		_, _ = fmt.Fprintf(m.log, "core: stopped pid %d\n", pid)
