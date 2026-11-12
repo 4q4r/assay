@@ -28,15 +28,20 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # qemu-user-binfmt provides binfmt registration for the qemu-aarch64 /
-      # qemu-arm / qemu-i386 user emulators for the cross-arch smoke hook in
-      # .goreleaser.yaml (amd64 smokes natively). qemu-user-static became a
-      # virtual package on ubuntu-26.04 (resolute); qemu-user-binfmt is the
-      # real provider. Direct qemu-user exec on static Go binaries; NOT
-      # docker/setup-qemu-action, whose binfmt handlers register for
-      # container exec only.
-      - name: install qemu-user-binfmt
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-binfmt
+      # qemu-user provides the user-mode emulator binaries the smoke hook
+      # invokes: /usr/bin/qemu-aarch64, /usr/bin/qemu-arm, /usr/bin/qemu-i386
+      # (file list: https://packages.ubuntu.com/resolute/qemu-user). On
+      # ubuntu-26.04 (resolute) NO package ships the legacy "-static"-suffixed
+      # names: qemu-user-static is a virtual package there (provided by
+      # qemu-user-binfmt), so the v0.1.0 run failed with exit 127
+      # "qemu-aarch64-static: not found" — the smoke script invoked a name
+      # that does not exist on this image. qemu-user is listed explicitly
+      # even though qemu-user-binfmt depends on it, so the emulator binaries
+      # cannot vanish from the job if the registration package is ever
+      # reorganized. amd64 smokes natively. NOT docker/setup-qemu-action,
+      # whose binfmt handlers register for container exec only.
+      - name: install qemu-user emulators + binfmt registration
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user qemu-user-binfmt
       - name: goreleaser release
         uses: goreleaser/goreleaser-action@v7
         with:

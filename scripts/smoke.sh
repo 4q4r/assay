@@ -4,8 +4,18 @@
 #
 # Invoked per build target as a goreleaser post-build hook
 # (.goreleaser.yaml builds.hooks.post), so any failure aborts the release
-# BEFORE publish. Cross-arch targets run under qemu-user-static
-# (installed by release.yml); amd64 runs natively on the ubuntu runner.
+# BEFORE publish.
+#
+# Execution strategy — DIRECT exec first: native targets (amd64 on the
+# amd64 runner) need no emulator at all, and foreign targets run
+# transparently once release.yml's qemu-user-binfmt has registered the
+# binfmt_misc handler for their arch. Only when direct exec fails with a
+# "never ran" signal (bash 126 exec-format/permission or 127 not-found;
+# dash ENOEXEC script-fallback = exit 2 with empty stdout) do we fall
+# back to the explicit qemu interpreter from the qemu-user package. A
+# probe that actually RAN and exited nonzero is a genuine failure: it is
+# never retried under the emulator and aborts the smoke (and the release)
+# with that exit code.
 #
 # Usage: smoke.sh <target> <binary-path>
 #   e.g. smoke.sh linux_arm_7 dist/assay_linux_arm_7/assay
@@ -29,22 +39,75 @@ case "$target" in
 # linux_arm64_v8.0, linux_386_sse2), so those branches match by prefix —
 # the qemu runner choice is invariant across those levels; arm keeps an
 # exact match because the goarm suffix comes from our own config.
+# Interpreter names = the qemu-user package's binary names on
+# ubuntu-26.04 (resolute): /usr/bin/qemu-aarch64, /usr/bin/qemu-arm,
+# /usr/bin/qemu-i386. The legacy "-static" names of the old
+# qemu-user-static package do not exist on resolute (qemu-user-static is
+# a virtual package there) — invoking them was the v0.1.0 exit-127
+# failure.
 linux_amd64*) runner="" ;;
-linux_arm64*) runner="qemu-aarch64-static" ;;
-linux_arm_7) runner="qemu-arm-static" ;;
-linux_386*) runner="qemu-i386-static" ;;
+linux_arm64*) runner="qemu-aarch64" ;;
+linux_arm_7) runner="qemu-arm" ;;
+linux_386*) runner="qemu-i386" ;;
 *)
 	echo "smoke: unexpected target '$target'" >&2
 	exit 1
 	;;
 esac
 
-# set -eu makes a nonzero probe exit (missing qemu, broken ELF, bad flag)
-# abort here; the case below additionally rejects an empty/garbled
-# version line so a silent-print binary cannot pass.
-# $runner is UNQUOTED on purpose: empty = native exec, otherwise exactly
-# one word (the qemu interpreter name); POSIX word-splitting is safe here.
-out=$($runner "$bin" -v)
+# Attempt 1: DIRECT exec. stderr stays attached so the CI log keeps the
+# exact kernel/shell diagnosis for any failure. set -eu makes a nonzero
+# FINAL probe exit (missing qemu, broken ELF, bad flag) abort here; the
+# case below additionally rejects an empty/garbled version line so a
+# silent-print binary cannot pass.
+set +e
+out=$("$bin" -v)
+direct_rc=$?
+set -e
+
+# Did the direct attempt actually run the binary, or did the kernel or
+# the shell refuse it? "Never ran" signals only:
+#   126/127 — bash's exec-format ("cannot execute binary file"),
+#             permission, or not-found diagnostics.
+#   2 with EMPTY stdout — dash has no binary-magic guard: on ENOEXEC it
+#             re-parses a foreign ELF as a shell script and dies with a
+#             syntax error before executing anything. A binary that ran
+#             and really exited 2 WITH output is NOT routed to fallback.
+never_ran=0
+case "$direct_rc" in
+126 | 127)
+	never_ran=1
+	;;
+2)
+	if [ -z "$out" ]; then
+		never_ran=1
+	fi
+	;;
+esac
+
+if [ "$never_ran" -eq 0 ]; then
+	# The probe genuinely ran directly: rc 0 falls through to the
+	# version-line check below; any other rc is a real probe failure
+	# with the real exit code preserved.
+	if [ "$direct_rc" -ne 0 ]; then
+		echo "smoke [$target]: probe exited $direct_rc" >&2
+		exit "$direct_rc"
+	fi
+elif [ -z "$runner" ]; then
+	# Native target the kernel refused to run (corrupt ELF et al.): no
+	# emulator fallback exists or applies.
+	echo "smoke [$target]: native exec failed (rc=$direct_rc)" >&2
+	exit "$direct_rc"
+else
+	# Attempt 2: explicit qemu-user interpreter. $runner is UNQUOTED on
+	# purpose: exactly one word (the interpreter name); POSIX
+	# word-splitting is safe here. Any failure — e.g. the emulator not
+	# installed, exit 127 — aborts via set -e and takes the release with
+	# it, exactly as before.
+	# shellcheck disable=SC2086  # runner is "" or exactly one word
+	out=$($runner "$bin" -v)
+fi
+
 echo "smoke [$target]: $out"
 case "$out" in
 assay\ *) ;;
