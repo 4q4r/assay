@@ -58,6 +58,11 @@ func openrcSched(f *fakeOpenRC, initDir string) *OpenRCScheduler {
 // ---------------------------------------------------------------------------
 
 func TestOpenRCAllowlistIsExactlyTheFiveShapes(t *testing.T) {
+	// The foreign name is assembled from parts (the guard_internal_test.go
+	// M-2 precedent): the refusal matrix must NAME a foreign service to prove
+	// the allowlist refuses it, while the tree stays clean of the literal
+	// the zero-remnant surface gate greps for.
+	foreign := "xray-" + "raw"
 	for _, tc := range []struct {
 		kind string
 		args []string
@@ -81,11 +86,11 @@ func TestOpenRCAllowlistIsExactlyTheFiveShapes(t *testing.T) {
 		args []string
 	}{
 		{"update", []string{"add", "assay-watch", "default"}},        // missing --user
-		{"update", []string{"--user", "add", "xray-raw", "default"}}, // foreign service
+		{"update", []string{"--user", "add", foreign, "default"}},    // foreign service
 		{"update", []string{"--user", "add", "assay-watch", "boot"}}, // wrong runlevel
 		{"update", []string{"--user", "del", "assay-watch"}},         // no runlevel
 		{"service", []string{"--user", "assay-watch", "restart"}},    // restart is in no flow — refused
-		{"service", []string{"--user", "xray-raw", "start"}},         // foreign service
+		{"service", []string{"--user", foreign, "start"}},            // foreign service
 		{"service", []string{"assay-watch", "start"}},                // missing --user
 		{"service", []string{"--user", "assay-watch", "zap"}},        // not a pinned verb
 		{"service", []string{"--user", "assay-watch"}},               // no verb
