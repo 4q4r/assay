@@ -28,13 +28,15 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # qemu-user-static provides qemu-aarch64-static / qemu-arm-static /
-      # qemu-i386-static for the cross-arch smoke hook in
-      # .goreleaser.yaml (amd64 smokes natively). Direct qemu-user exec on
-      # static Go binaries; NOT docker/setup-qemu-action, whose binfmt
-      # handlers register for container exec only.
-      - name: install qemu-user-static
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+      # qemu-user-binfmt provides binfmt registration for the qemu-aarch64 /
+      # qemu-arm / qemu-i386 user emulators for the cross-arch smoke hook in
+      # .goreleaser.yaml (amd64 smokes natively). qemu-user-static became a
+      # virtual package on ubuntu-26.04 (resolute); qemu-user-binfmt is the
+      # real provider. Direct qemu-user exec on static Go binaries; NOT
+      # docker/setup-qemu-action, whose binfmt handlers register for
+      # container exec only.
+      - name: install qemu-user-binfmt
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-binfmt
       - name: goreleaser release
         uses: goreleaser/goreleaser-action@v7
         with:
