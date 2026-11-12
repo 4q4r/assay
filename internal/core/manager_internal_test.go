@@ -720,6 +720,42 @@ func TestAdoptedStopLogsPostPollTruth(t *testing.T) {
 		"the clean-stop line would be a lie for an unreapable pid")
 }
 
+// TestAdoptedStopTreatsGonePidAsClean: Stop of an ADOPTED pid that is
+// already fully gone (exited AND reaped — unix kill(0) reads ESRCH) is a
+// CLEAN stop: no error, the clean-stop line, the stale pidfile cleared.
+// This is the benign adopted-core-died-between-adoption-and-Stop race the
+// review P2-1 fix must preserve on unix while extending the ignore to the
+// windows ErrProcessGone sentinel (compile-pinned in internal/platform's
+// process_windows_test.go — the windows transport cannot run on linux).
+func TestAdoptedStopTreatsGonePidAsClean(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc — pid-gone probing is Linux-specific")
+	}
+	cmd := exec.CommandContext(context.Background(), "/bin/true")
+	require.NoError(t, cmd.Start())
+	pid := cmd.Process.Pid
+	_, _ = cmd.Process.Wait() // fully reap: unlike the zombie fixture, the pid is now GONE
+	require.Eventually(t, func() bool {
+		return syscall.Kill(pid, 0) != nil // ESRCH — the pid is fully gone
+	}, 5*time.Second, 20*time.Millisecond, "the child must be fully reaped for the test")
+
+	dataDir := t.TempDir()
+	log := &syncBuffer{}
+	m := newTestManager(t, config.CoreConfig{SocksPort: 22974, RollbackStrikes: 3}, dataDir, log)
+	// White-box adopted state, mirroring A2 adoption of a core that died
+	// between the previous daemon's exit and this Stop.
+	m.adoptedPID = pid
+	require.NoError(t, m.writePIDFile(pid))
+
+	require.NoError(t, m.Stop(), "a gone adopted pid is a benign race — the stop must be clean")
+	require.Contains(t, log.String(), fmt.Sprintf("stopped adopted pid %d", pid),
+		"a gone pid must be treated as a clean stop (the unix ESRCH contract)")
+	require.NotContains(t, log.String(), "still alive",
+		"a gone pid must never be reported as a surviving stop")
+	require.NoFileExists(t, filepath.Join(dataDir, PIDFileName),
+		"the clean-stop path must clear the stale pidfile")
+}
+
 // TestSingletonLockRefusedCrossProcess (T2 review M-5): the flock refusal is
 // kernel-guaranteed ACROSS PROCESSES — a helper process holding the lock
 // makes a manager in THIS process refuse with ErrDaemonHoldsCore.

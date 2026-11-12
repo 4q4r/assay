@@ -597,7 +597,11 @@ func (m *Manager) stopLocked() error {
 		_, _ = fmt.Fprintf(m.log, "core: stopped pid %d\n", pid)
 	case m.adoptedPID != 0:
 		pid := m.adoptedPID
-		if err := platform.KillProcessForce(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
+		// An adopted core that died between adoption and Stop is a benign
+		// race: unix signals it as ESRCH, windows as platform.ErrProcessGone
+		// (OpenProcess ERROR_INVALID_PARAMETER on a dead pid) — both ignored.
+		if err := platform.KillProcessForce(pid); err != nil &&
+			!errors.Is(err, syscall.ESRCH) && !errors.Is(err, platform.ErrProcessGone) {
 			return fmt.Errorf("core: kill adopted pid %d: %w", pid, err)
 		}
 		deadline := time.Now().Add(adoptedStopPoll)

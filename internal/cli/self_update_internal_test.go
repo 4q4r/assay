@@ -4,9 +4,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"assay/internal/platform"
 
 	"github.com/stretchr/testify/require"
 )
@@ -87,4 +90,27 @@ func TestSelfUpdateBadMagic(t *testing.T) {
 	ok, reason := verifyBinary(bin)
 	require.False(t, ok)
 	require.Contains(t, reason, "bad magic")
+}
+
+// TestMagicRejectionSkipsOversizedMagic (review P3-2): a magic longer than
+// the verifier's exact 4-byte read must be SKIPPED, never slice-panicked —
+// the defensive guard keeps a hypothetical future >4-byte ExecMagics entry
+// from turning the verifier into a panic. ExecMagics itself documents the
+// ≤4-byte table contract.
+func TestMagicRejectionSkipsOversizedMagic(t *testing.T) {
+	buf := []byte{'M', 'Z', 0x00, 0x01} // the exact 4 bytes verifyBinary reads
+
+	oversized := [][]byte{{'M', 'Z', 'X', 'Y', 'Z', 'W'}}
+	require.Equal(t, "not a PE binary (bad magic)",
+		magicRejection(buf, oversized, "PE"),
+		"an oversized magic cannot match a 4-byte buffer — skip it and keep the rejection")
+
+	mixed := [][]byte{oversized[0], platform.ExecMagic("windows")}
+	require.Empty(t, magicRejection(buf, mixed, "PE"),
+		"the oversized entry is skipped while the real magic still matches")
+
+	for _, magic := range platform.ExecMagics(runtime.GOOS) {
+		require.LessOrEqual(t, len(magic), len(buf),
+			"the ExecMagics table must stay within the verifier's 4-byte read")
+	}
 }

@@ -23,9 +23,15 @@ import (
 var binaryStabilityDelay = 2 * time.Second
 
 // magicRejection returns the verifier's rejection reason when buf does not
-// carry one of the platform's exec magics; "" when a magic matched.
+// carry one of the platform's exec magics; "" when a magic matched. A magic
+// longer than buf is skipped defensively (review P3-2): ExecMagics entries
+// are at most 4 bytes and the verifier reads exactly 4, but the guard keeps
+// a future oversized entry from slice-panicking here.
 func magicRejection(buf []byte, magics [][]byte, format string) string {
 	for _, magic := range magics {
+		if len(magic) > len(buf) {
+			continue
+		}
 		if bytes.Equal(buf[:len(magic)], magic) {
 			return ""
 		}
