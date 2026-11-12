@@ -107,7 +107,9 @@ type watchDeps struct {
 	// threshold, the transport fires onMiss: the daemon's CLEAN self-exit
 	// through the same graceful-stop seam SIGTERM uses, after which launchd
 	// KeepAlive restarts the agent. Inactive on other GOOS (linux keeps the
-	// sd_notify transport exclusively — byte-identical linux behavior).
+	// sd_notify transport exclusively — byte-identical linux behavior) EXCEPT
+	// the windows service context, which runs the same transport (clean
+	// self-exit → SCM recovery actions restart; see newServiceWatchDeps).
 	// Returns the beat feed, the stop func, and whether the transport is
 	// active (active=true additionally gets the daemon to run an idle tick
 	// into the scheduler loop so idle periods beat too).
@@ -115,6 +117,17 @@ type watchDeps struct {
 	// selfExit performs the transport's terminal step (production os.Exit;
 	// tests record). Code 0 = clean exit.
 	selfExit func(code int)
+	// restartNote names the transport's restart mechanism in the miss log
+	// line (the ADDENDUM §1 honesty contract): "" = the darwin default
+	// (launchd KeepAlive); the windows service context names the SCM
+	// recovery actions. Never printed on linux (the transport is inactive).
+	restartNote string
+	// serviceHooks is the windows service transport (§2.2.2/§2.2.3): Wired
+	// closes when wiring completes (the svc handler reports Running right
+	// after); StopRequest is the svc.Stop feed into the SAME graceful-stop
+	// seam the signals use. Nil on every other path — nil keeps the select
+	// case inert (linux behavior byte-identical).
+	serviceHooks *serviceWiring
 }
 
 func defaultWatchDeps() watchDeps {
@@ -357,6 +370,62 @@ func ensureBootstrapLiveConfig(out io.Writer, cfg *config.Config, p paths) error
 	return nil
 }
 
+// wireDaemonCore builds the daemon's manager, ensures the bootstrap live
+// config, and spawns/adopts the core (the S2 ordering: manager → bootstrap
+// config → EnsureRunning). The bootstrap legs degrade loud-NONFATAL per the
+// bootstrap-degradation closure: a transient boot race heals; a persistent
+// failure (e.g. the managed binary is absent) exhausts the retry budget and
+// lands on the loud non-fatal WARNING — the crash supervisor keeps retrying
+// on its own bounded ladder, and the waves retry through auto-update. The
+// spawn ctx is deliberately NON-canceling (C4): only the explicit Stop on
+// the shutdown path may kill this child. A MANAGER failure stays fatal
+// (nothing works without the data dir + the singleton lock, T4 review M-4).
+func wireDaemonCore(out io.Writer, cfg *config.Config, p paths) (*core.Manager, error) {
+	mgr, err := core.NewManager(cfg.Core, p.dataDir, out)
+	if err != nil {
+		return nil, fmt.Errorf("watch: core manager: %w", err)
+	}
+	if err := ensureBootstrapLiveConfig(out, cfg, p); err != nil {
+		outf(out, "WARNING: watch: bootstrap core config: %v (daemon stays up; the waves retry)\n", err)
+	}
+	if berr := bootstrapCoreWithRetries(out, mgr.EnsureRunning, bootstrapAttempts,
+		func(d time.Duration) { time.Sleep(d) }); berr != nil {
+		outf(out, "WARNING: watch: bootstrap core: %v (daemon stays up; the waves retry "+
+			"and the crash supervisor revives)\n", berr)
+	}
+	return mgr, nil
+}
+
+// startSelfUpdateWatcher arms the binary-change watcher on the scheduler
+// (the self-update restart path) and returns its closer for the caller to
+// defer for the daemon's lifetime. A start failure is loud but non-fatal —
+// the daemon keeps running without self-update (the honest degraded state),
+// reported with a nil closer.
+func startSelfUpdateWatcher(
+	out io.Writer, cfg *config.Config, sched *waveScheduler, exeDir, exeBase, exe string,
+) func() {
+	bw, werr := startBinarySelfWatcherWith(
+		exeDir, exeBase,
+		&sched.restartPending, &sched.restartArmed,
+		out, cfg.SelfUpdate.CheckInterval.Duration, exe,
+	)
+	if werr != nil {
+		outf(out, "WARNING: self-update watcher failed to start: %v\n", werr)
+		return nil
+	}
+	sched.selfWatcher = bw
+	return bw.close
+}
+
+// closeServiceWired fires the §2.2.2 wired handshake: the svc handler
+// reports Running the moment this closes. Nil-safe — the unix deps carry
+// no service hooks and this is a no-op (byte-identical behavior).
+func closeServiceWired(deps watchDeps) {
+	if hooks := deps.serviceHooks; hooks != nil && hooks.Wired != nil {
+		close(hooks.Wired)
+	}
+}
+
 // runWatch wires the daemon: watchdog → shared registry → core manager
 // (bootstrap spawn per S2) → scheduler with a between-stage shutdown
 // checkpoint → signal-driven graceful stop (exit 0).
@@ -390,26 +459,11 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// live config, Restart on a candidate (T4-I-1) — and the crash
 	// supervisor revives independently of the waves (G1).
 	p := newPaths(cfg)
-	mgr, err := core.NewManager(cfg.Core, p.dataDir, out)
+	mgr, err := wireDaemonCore(out, cfg, p)
 	if err != nil {
-		return fmt.Errorf("watch: core manager: %w", err)
+		return err
 	}
-	if err := ensureBootstrapLiveConfig(out, cfg, p); err != nil {
-		outf(out, "WARNING: watch: bootstrap core config: %v (daemon stays up; the waves retry)\n", err)
-	}
-	// Bootstrap spawn / adoption (S2, A2), retried with a doubling backoff
-	// before degrading (bootstrap-degradation closure): a transient boot
-	// race heals; a persistent failure (e.g. the managed binary is absent)
-	// exhausts the budget and lands on the loud non-fatal WARNING — the
-	// retry outcome is loud either way. The crash supervisor below keeps
-	// retrying on its own bounded ladder, so the degraded state is not
-	// permanent even without waves. The ctx is deliberately NON-canceling
-	// (C4): only the explicit Stop below may kill this child.
-	if berr := bootstrapCoreWithRetries(out, mgr.EnsureRunning, bootstrapAttempts,
-		func(d time.Duration) { time.Sleep(d) }); berr != nil {
-		outf(out, "WARNING: watch: bootstrap core: %v (daemon stays up; the waves retry "+
-			"and the crash supervisor revives)\n", berr)
-	}
+
 	// G1: the between-waves crash supervision. The loop dies with the
 	// daemon's stop channel; the child itself is stopped only by the
 	// explicit Stop on the shutdown path below.
@@ -498,20 +552,14 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		selfUpdateEnabled: cfg.SelfUpdate.Enabled,
 	}
 	// Self-update watcher (binary change detection) — started alongside the
-	// plugin watchdog when enabled.
+	// plugin watchdog when enabled (loud non-fatal on failure); the closer
+	// rides runWatch's lifetime.
 	if cfg.SelfUpdate.Enabled {
-		bw, werr := startBinarySelfWatcherWith(
-			exeDir, exeBase,
-			&sched.restartPending, &sched.restartArmed,
-			out, cfg.SelfUpdate.CheckInterval.Duration, exe,
-		)
-		if werr != nil {
-			outf(out, "WARNING: self-update watcher failed to start: %v\n", werr)
-		} else {
-			sched.selfWatcher = bw
-			defer bw.close()
+		if closeWatcher := startSelfUpdateWatcher(out, cfg, sched, exeDir, exeBase, exe); closeWatcher != nil {
+			defer closeWatcher()
 		}
 	}
+
 	sched.onRestart = func(reason string) {
 		outf(out, "watch: %s — graceful self-restart\n", reason)
 	}
@@ -532,6 +580,10 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		deps, out, sched, schedDone, requestStop, stopCore)
 	defer stopTransport()
 	beat = transportBeat
+	// The wired handshake (§2.2.2): the service context reports Running to
+	// the SCM right AFTER the wiring — before the scheduler goroutine (and
+	// its immediate first wave) starts, never gated on it. Nil on unix.
+	closeServiceWired(deps)
 	go func() {
 		_ = sched.run(stop, between)
 		close(schedDone)
@@ -541,6 +593,25 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	if cfg.SelfUpdate.Enabled {
 		outf(out, "watch: self-update enabled — watching %s\n", exe)
 	}
+	// The service stop transport (§2.2.3): the windows svc handler feeds
+	// svc.Stop|svc.Shutdown through it — the SAME graceful-stop seam the
+	// signals use below. A nil channel in a select case is never ready, so
+	// the unix path is byte-identical with the pre-service behavior.
+	var svcStop <-chan struct{}
+	if deps.serviceHooks != nil {
+		svcStop = deps.serviceHooks.StopRequest
+	}
+	// finishGraceful is the shared shutdown sequence (§2.2.3 — ONE seam,
+	// three feeds land here with the same unwinding): reason line →
+	// requestStop → scheduler unwind → explicit core stop → clean shutdown.
+	finishGraceful := func(reason string) error {
+		outln(out, reason)
+		requestStop()
+		<-schedDone
+		stopCore()
+		outln(out, "watch: clean shutdown")
+		return nil
+	}
 	select {
 	case <-schedDone:
 		if sched.restartRequested.Load() {
@@ -548,13 +619,10 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 			return nil
 		}
 		return nil
+	case <-svcStop:
+		return finishGraceful("watch: windows service stop — finishing the current stage, then exiting")
 	case sig := <-deps.signals:
-		outf(out, "watch: %v — finishing the current stage, then exiting\n", sig)
-		requestStop()
-		<-schedDone
-		stopCore()
-		outln(out, "watch: clean shutdown")
-		return nil
+		return finishGraceful(fmt.Sprintf("watch: %v — finishing the current stage, then exiting", sig))
 	}
 }
 
@@ -571,7 +639,13 @@ func startSelfWatchTransport(
 	if deps.selfWatch == nil {
 		return func() {}, nil, func() {}
 	}
-	miss := selfWatchMiss(out, schedDone, requestStop, stopCore, deps.selfExit)
+	// The restart mechanism line (ADDENDUM §1 honesty contract): the darwin
+	// default when unset, the SCM recovery actions in the service context.
+	note := deps.restartNote
+	if note == "" {
+		note = "launchd KeepAlive restarts the agent; mechanism: self-watchdog → KeepAlive restart"
+	}
+	miss := selfWatchMiss(out, schedDone, requestStop, stopCore, deps.selfExit, note)
 	transportBeat, stopTransport, active := deps.selfWatch(out, selfwatchdog.Threshold, miss)
 	stop := func() { stopTransport() }
 	if !active {
@@ -592,15 +666,15 @@ func startSelfWatchTransport(
 // selfWatchMiss builds the miss action of the self-watchdog transport
 // (ADDENDUM §1): the SAME graceful-stop seam SIGTERM uses (requestStop), a
 // best-effort core stop (a wedged loop must never orphan the child), a
-// bounded wait for the unwind, and a CLEAN exit 0 that launchd KeepAlive
-// answers with a restart. The mechanism is named loudly.
+// bounded wait for the unwind, and a CLEAN exit 0 that the platform's
+// supervisor answers with a restart (launchd KeepAlive / the Windows SCM
+// recovery actions — restartNote names the mechanism loudly).
 func selfWatchMiss(
-	out io.Writer, schedDone <-chan struct{}, requestStop, stopCore func(), selfExit func(int),
+	out io.Writer, schedDone <-chan struct{}, requestStop, stopCore func(), selfExit func(int), restartNote string,
 ) func() {
 	return func() {
 		outf(out, "watch: self-watchdog: no daemon progress for %s — clean self-exit "+
-			"(launchd KeepAlive restarts the agent; mechanism: self-watchdog → KeepAlive restart)\n",
-			selfwatchdog.Threshold)
+			"(%s)\n", selfwatchdog.Threshold, restartNote)
 		requestStop()
 		go stopCore() // best-effort child stop — never block the exit on a wedged unwind
 		select {
