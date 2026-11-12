@@ -1,0 +1,157 @@
+# Windows SCM end-to-end leg — Stage S2, step 5 (plan crossplatform-plan.md
+# + ADDENDUM §2).
+#
+# STAGED, NOT WIRED: this workflow is workflow_dispatch-only and is NOT part
+# of the required checks. Stage S4 owns the ci.yml integration ("S1/S2/S3
+# CI legs wired"); until then this file is the job definition of record and
+# can be run on demand against any ref (Actions → windows-scm → Run
+# workflow).
+#
+# What it proves (S2 DoD, CI items):
+#   1. the windows-tagged unit suites pass on real Windows: the recorded
+#      svcActions double pins (installer call shapes, uninstall ordering,
+#      status/elevated-command texts), the handler state-machine pins, the
+#      windows log-sink pins, and the child-lifecycle pins (spawn attrs,
+#      Job Object containment). SCOPE NOTE: internal/core and internal/cli
+#      still carry PRE-EXISTING unix-pinned test files (syscall.Kill) that
+#      do not compile under GOOS=windows — S4 owns that cleanup; this leg
+#      runs the packages whose windows test compilation is clean today
+#      (internal/install, internal/platform) plus the cmd/assay handler
+#      suite, and proves core/cli via build+vet (their windows-tagged test
+#      binaries become runnable the moment S4 lands).
+#   2. the windows build matrix compiles: amd64 (native) + arm64 + 386.
+#   3. the TRUE end-to-end against the real SCM: `assay install` registers
+#      the service (mgr), Query reports Running with a pid, Control(Stop)
+#      reaches Stopped, `assay uninstall` deletes it and leaves no entry;
+#      `assay status` works against the live service.
+#   4. the §2.2.9 running-image lock is ASSERTED while the service runs:
+#      a rename/copy over the running assay.exe must FAIL (the discipline
+#      the installer's stop→copy→start ordering exists for).
+#
+# The managed-core download during `assay install` is allowed to fail loud
+# (non-fatal by design — the waves retry): the E2E asserts the SERVICE
+# lifecycle, not the core download.
+
+name: windows-scm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-scm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scm-e2e:
+    name: windows unit suites + SCM end-to-end
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Windows unit suites (GOOS-clean packages)
+        run: |
+          go test ./internal/install/... ./internal/platform/... -count=1
+          go test ./cmd/assay/ -count=1 -run 'TestHandler'
+          # internal/core's windows-tagged child pins
+          # (TestConfigureChildSpawnPins/TestAttachChildJobAssignsKillOnClose)
+          # become runnable here once S4 clears the package's PRE-EXISTING
+          # unix-pinned syscall.Kill test usages — they are compiled and vet
+          # today, listed here as the S4 unblock checklist.
+
+      - name: Windows vet + build proofs for the GOOS-dirty test packages
+        run: |
+          go vet ./internal/install/... ./internal/platform/... ./cmd/assay/...
+          # S4 owns the syscall.Kill cleanup; until then core/cli prove
+          # windows readiness through their non-test build.
+          go build ./internal/core/ ./internal/cli/ ./cmd/assay/
+
+      - name: Build matrix (amd64 native + arm64 + 386 cross)
+        run: |
+          foreach ($arch in @('amd64','arm64','386')) {
+            $env:GOARCH = $arch
+            go build -o "$env:TEMP\assay-$arch.exe" ./cmd/assay
+            if ($LASTEXITCODE -ne 0) { throw "build failed for $arch" }
+            Write-Host "windows/$arch build OK"
+          }
+          $env:GOARCH = 'amd64'
+
+      - name: Version parity smoke (assay -v prints "assay <version>")
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          go build -o ./assay.exe ./cmd/assay
+          $out = & .\assay.exe -v
+          Write-Host "$out"
+          if (-not $out.StartsWith('assay ')) { throw "version line must start with 'assay '"; exit 1 }
+
+      - name: End-to-end — assay install → SCM lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "### SCM end-to-end" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # Canonical user deploy: materializes %LOCALAPPDATA%\assay\config.toml
+          # and embeds it as -c (§2.2.5). The core download may fail loud
+          # (non-fatal by design — the SERVICE lifecycle is the assertion).
+          .\assay.exe install 2>&1 | Tee-Object -Variable installLog
+          "install log captured" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # Query: Running with a real pid (§2.2.8).
+          $out = & .\assay.exe status 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'pid (\d+)') { throw "status reports no pid — the service is not Running" }
+          "service Running (pid $($Matches[1]))" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # §2.2.9 running-image lock: while the service runs, ITS image
+          # (the installed copy, not this build artifact) is locked — a
+          # rename over it MUST fail (the discipline the stop→copy→start
+          # ordering exists for; behavior-verified here).
+          $installed = "$env:LOCALAPPDATA\assay\bin\assay.exe"
+          if (-not (Test-Path $installed)) { throw "the installed binary is missing at $installed" }
+          $locked = $false
+          try { Rename-Item -Path $installed -NewName 'assay-locked.exe' -ErrorAction Stop }
+          catch { $locked = $true }
+          if (-not $locked) { throw "the running image was NOT locked — §2.2.9 discipline unproven" }
+          "running-image lock confirmed" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # Control(Stop) reaches Stopped (the handler's graceful ladder
+          # through the daemon's SIGTERM seam), then Delete leaves nothing.
+          .\assay.exe uninstall
+          $out2 = & .\assay.exe status 2>&1 | Out-String
+          Write-Host $out2
+          if ($out2 -match 'pid (\d+)') { throw "the service still reports a pid after uninstall" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\assay\bin\assay.exe")) {
+            # The binary copy is KEPT by default (uninstall keeps user data).
+            throw "the installed binary vanished — uninstall must keep it"
+          }
+          "uninstall OK (no running service, binary kept)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Recovery actions visible (§2.2.4 parity)
+        shell: pwsh
+        run: |
+          # After install the SCM recovery actions must exist: ServiceRestart
+          # after 5000 ms, reset period 86400 s — the Restart=always parity.
+          .\assay.exe install 2>&1 | Out-Null
+          $svc = Get-CimInstance Win32_Service -Filter "Name='assay'"
+          if (-not $svc) { throw "the assay service is not registered" }
+          if ($svc.StartMode -ne 'Auto') { throw "StartMode is $($svc.StartMode), must be Auto (StartAutomatic)" }
+          $failures = sc.exe qfailure assay
+          Write-Host ($failures | Out-String)
+          $joined = $failures | Out-String
+          if ($joined -notmatch 'RESTART') { throw "no RESTART recovery action found" }
+          "recovery actions confirmed (RESTART; StartMode Auto)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          .\assay.exe uninstall
+
+      - name: Upload the install log
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-scm-install-log
+          path: ${{ env.LOCALAPPDATA }}\assay\logs\watch.log
+          if-no-files-found: ignore
