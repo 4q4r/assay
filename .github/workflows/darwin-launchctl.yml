@@ -44,6 +44,9 @@ concurrency:
 
 jobs:
   launchctl-e2e:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: launchd unit tests + launchctl end-to-end
     runs-on: macos-latest
     steps:

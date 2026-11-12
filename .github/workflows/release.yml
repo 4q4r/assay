@@ -320,7 +320,7 @@ jobs:
               artifacts/dist-windows/checksums.txt | LC_ALL=C sort > release-assets/checksums.txt
           # Fail loud on drift: every shipped asset must be checksummed,
           # exactly once.
-          assets=$(ls release-assets/assay_* | wc -l)
+          assets=$(find release-assets -maxdepth 1 -name 'assay_*' | wc -l)
           sums=$(grep -c 'assay_' release-assets/checksums.txt)
           if [ "$assets" -ne "$sums" ]; then
             echo "::error::checksum/assets mismatch: $sums checksum lines for $assets assets"

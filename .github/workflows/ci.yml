@@ -254,25 +254,24 @@ jobs:
   # session (S2), and the sv status / s6-svstat literal formats (§5.17).
   # The plan's implementer-verify discipline wants them RUNNING and
   # RECORDING on every PR, not gating merges while their verdicts are
-  # still being collected. They are wired as reusable workflows with
-  # continue-on-error at the call site.
+  # still being collected. They are wired as reusable workflows whose
+  # own jobs carry continue-on-error (GitHub rejects continue-on-error
+  # at a reusable-workflow CALL SITE — the first main push after S4
+  # failed 0s on exactly that; softness lives in the callee jobs).
   #
   # FLIP-TO-REQUIRED GATE (owner-visible follow-up; recorded in the plan's
   # Stage S5 DoD): after the first fully-green cycle of darwin-launchctl,
   # windows-scm AND linux-schedulers on main, remove `continue-on-error`
-  # from the three call sites below — one line per leg. The legs must not
-  # silently stay non-required once their syntaxes ARE verified.
+  # from the jobs inside the three callee workflow files. The legs must
+  # not silently stay non-required once their syntaxes ARE verified.
   legacy-verify-darwin:
     name: legacy verify — darwin launchctl E2E
-    continue-on-error: true
     uses: ./.github/workflows/darwin-launchctl.yml
 
   legacy-verify-windows:
     name: legacy verify — windows SCM E2E
-    continue-on-error: true
     uses: ./.github/workflows/windows-scm.yml
 
   legacy-verify-linux-schedulers:
     name: legacy verify — linux scheduler container legs
-    continue-on-error: true
     uses: ./.github/workflows/linux-schedulers.yml

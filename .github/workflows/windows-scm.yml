@@ -51,6 +51,9 @@ concurrency:
 
 jobs:
   scm-e2e:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: windows unit suites + SCM end-to-end
     runs-on: windows-latest
     steps:

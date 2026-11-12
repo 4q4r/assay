@@ -52,6 +52,9 @@ permissions:
 
 jobs:
   runit:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: runit user supervision (container)
     runs-on: ubuntu-latest
     container:
@@ -97,6 +100,9 @@ jobs:
           echo "runit uninstall OK" >> "$GITHUB_STEP_SUMMARY"
 
   s6:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: s6 user svscan overlay (container)
     runs-on: ubuntu-latest
     container:
@@ -152,6 +158,9 @@ jobs:
           echo "s6 uninstall OK (s6-svc -d ran live)" >> "$GITHUB_STEP_SUMMARY"
 
   cron:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: cron @reboot fallback (container)
     runs-on: ubuntu-latest
     container:
@@ -184,6 +193,9 @@ jobs:
           echo "cron uninstall OK (marker fully removed)" >> "$GITHUB_STEP_SUMMARY"
 
   openrc:
+    # NON-REQUIRED verify-and-record leg (schema-valid softness lives
+    # here, not at the ci.yml call site — reusable-workflow calls reject it)
+    continue-on-error: true
     name: openrc user script validity (container)
     runs-on: ubuntu-latest
     container:
@@ -233,9 +245,11 @@ jobs:
           [ "$mode" = "644" ] || { echo "::error::openrc script mode is $mode, must be 644"; exit 1; }
           sh -n "$script" || { echo "::error::openrc script fails shell syntax check"; exit 1; }
           head -1 "$script" | grep -q openrc-run || { echo "::error::script is not an openrc-run script"; exit 1; }
-          echo "openrc script rendered ($mode):" >> "$GITHUB_STEP_SUMMARY"
-          cat "$script" >> "$GITHUB_STEP_SUMMARY"
-          echo "openrc version: $(cat /tmp/openrc-version.txt)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "openrc script rendered ($mode):"
+            cat "$script"
+            echo "openrc version: $(cat /tmp/openrc-version.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: rc-service --user status — real-parse validity, deviations recorded
         run: |
           set -e
