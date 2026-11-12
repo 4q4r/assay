@@ -389,7 +389,7 @@ func TestWatchFetchContinuesWithBrokenPlugin(t *testing.T) {
 	out := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(out)
-	_, err = runFetchWith(cmd, cfg, reg)
+	_, err = runFetchWith(cmd, cfg, reg, nil)
 	require.NoError(t, err, "wave with one broken plugin must continue")
 
 	text := out.String()

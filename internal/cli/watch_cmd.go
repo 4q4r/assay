@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"assay/internal/plugins"
 	"assay/internal/render"
 	"assay/internal/sdnotify"
+	"assay/internal/selfwatchdog"
 	"assay/internal/store"
 	"assay/internal/watchdog"
 
@@ -98,6 +101,20 @@ type watchDeps struct {
 	// restarts the unit — the honest backstop for hang classes the
 	// per-plugin run timeout cannot see.
 	sdNotify func(out io.Writer) (stop func())
+	// selfWatch is the self-watchdog transport (ADDENDUM §1): darwin runs
+	// the internal heartbeat supervisor (internal/selfwatchdog) — the daemon
+	// beats at every coordination-loop progress point and, on a missed
+	// threshold, the transport fires onMiss: the daemon's CLEAN self-exit
+	// through the same graceful-stop seam SIGTERM uses, after which launchd
+	// KeepAlive restarts the agent. Inactive on other GOOS (linux keeps the
+	// sd_notify transport exclusively — byte-identical linux behavior).
+	// Returns the beat feed, the stop func, and whether the transport is
+	// active (active=true additionally gets the daemon to run an idle tick
+	// into the scheduler loop so idle periods beat too).
+	selfWatch func(out io.Writer, threshold time.Duration, onMiss func()) (beat func(), stop func(), active bool)
+	// selfExit performs the transport's terminal step (production os.Exit;
+	// tests record). Code 0 = clean exit.
+	selfExit func(code int)
 }
 
 func defaultWatchDeps() watchDeps {
@@ -115,7 +132,36 @@ func defaultWatchDeps() watchDeps {
 		sdNotify: func(out io.Writer) func() {
 			return sdnotify.Watch(context.Background(), out)
 		},
+		selfWatch: productionSelfWatch,
+		selfExit:  os.Exit,
 	}
+}
+
+// The self-watchdog transport pacing constants (code-owned, not knobs — the
+// supervision-politeness ruling; the ADDENDUM §1 pacing loop analog of the
+// unit's WatchdogSec/2 contract).
+const (
+	// selfWatchTickInterval is the idle tick the scheduler loop waits on
+	// alongside the wave timers: every tick is a heartbeat (the loop reached
+	// its select), so idle periods beat at 60s — far under threshold/2.
+	selfWatchTickInterval = 60 * time.Second
+	// selfExitGrace bounds the miss action's wait for the scheduler to
+	// unwind through the graceful-stop seam before the clean exit fires
+	// anyway (a WEDGED loop — the reason we are here — will not unwind).
+	selfExitGrace = 30 * time.Second
+)
+
+// productionSelfWatch is the GOOS transport selector: darwin runs the
+// internal heartbeat supervisor; every other GOOS keeps the sd_notify
+// transport exclusively (the supervisor does not run on linux — the
+// byte-identical-linux binding) and returns a safe no-op beat.
+func productionSelfWatch(out io.Writer, threshold time.Duration, onMiss func()) (func(), func(), bool) {
+	if runtime.GOOS != "darwin" {
+		_ = out // no transport log on non-darwin — silence IS the off-state (sdnotify logs its own)
+		return func() {}, func() {}, false
+	}
+	sup := selfwatchdog.Start(threshold, onMiss, time.Now, time.After)
+	return sup.Beat, sup.Stop, true
 }
 
 // signalChannel is split out so the daemon never starts real signal
@@ -143,6 +189,12 @@ type waveScheduler struct {
 	runWave           waveRunner
 	deps              watchDeps
 	out               io.Writer
+
+	// Self-watchdog feeds (ADDENDUM §1): beat records one coordination-loop
+	// heartbeat (nil-safe — no transport on linux); heartbeatTick is the
+	// idle tick the run loop selects on (nil = never fires — no transport).
+	beat          func()
+	heartbeatTick <-chan time.Time
 
 	// Self-update state (shared with the binary watcher when present).
 	restartPending   atomic.Bool
@@ -186,6 +238,9 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 	// the start, the period between wave STARTS is exactly the interval.
 	start := s.deps.now()
 	combinedBetween := func() bool {
+		if s.beat != nil {
+			s.beat() // a stage boundary ran — coordination-loop progress
+		}
 		if between != nil && between() {
 			return true
 		}
@@ -199,6 +254,9 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 	}
 	ran = append(ran, waveRefresh)
 	s.lastWaveCompletedAt = s.deps.now()
+	if s.beat != nil {
+		s.beat() // the initial wave completed
+	}
 	if s.checkSelfUpdate() {
 		return ran
 	}
@@ -220,6 +278,16 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 		case <-stop:
 			return ran
 		case <-timer:
+			if s.beat != nil {
+				s.beat() // the loop woke for a due wave
+			}
+		case <-s.heartbeatTick:
+			// Idle tick: the loop reached its select — the strongest idle
+			// heartbeat there is. Re-arm and keep waiting.
+			if s.beat != nil {
+				s.beat()
+			}
+			continue
 		}
 		now := s.deps.now()
 		refreshDue := !now.Before(nextRefresh)
@@ -234,6 +302,9 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 			nextSpeedtest = start.Add(s.speedtestInterval)
 			nextRefresh = start.Add(s.refreshInterval)
 			s.lastWaveCompletedAt = s.deps.now()
+			if s.beat != nil {
+				s.beat() // the speedtest wave completed
+			}
 			if s.checkSelfUpdate() {
 				return ran
 			}
@@ -245,6 +316,9 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 			ran = append(ran, waveRefresh)
 			nextRefresh = start.Add(s.refreshInterval)
 			s.lastWaveCompletedAt = s.deps.now()
+			if s.beat != nil {
+				s.beat() // the refresh wave completed
+			}
 			if s.checkSelfUpdate() {
 				return ran
 			}
@@ -367,22 +441,50 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// disables plugins across waves. The activate stage gets the daemon's
 	// manager (T4): the D8 strike counter accumulates across waves, and the
 	// one-shot flock refusal can never fire against the daemon's own lock.
+	//
+	// The wave runners receive the self-watchdog beat through the closure
+	// variables the transport wiring fills in below (ADDENDUM §1) — closures
+	// capture by reference, so the runners pick the transport up once it is
+	// wired.
+	beat := func() {}
 	runWave := func(cfg *config.Config, opts maintainOptions, between func() bool) error {
 		// The daemon's ONE manager flows into every core-touching stage via
 		// defaultMaintainStages (fix I-1): the D8 strike counter accumulates
 		// across waves and the S5 inert INFO stays one-time.
 		stages := defaultMaintainStages(opts, mgr)
 		stages.fetch = func(c *cobra.Command, cc *config.Config) error {
-			_, err := runFetchWith(c, cc, reg)
+			_, err := runFetchWith(c, cc, reg, beat)
 			return err
 		}
 		stages.pluginStatsEnrich = func(c *cobra.Command, cc *config.Config) error {
 			return runPluginStatsEnrichment(c, cc, reg)
 		}
+		// The probe stage carries the same beat feed (per batch / per
+		// single-node job) — the probe stage is the longest legitimate
+		// in-wave beat gap.
+		stages.probe = func(c *cobra.Command, cc *config.Config) error {
+			return runProbe(c, cc, 0, opts.speedtest, beat)
+		}
 		return runMaintainGraceful(out, cfg, opts, stages, between)
 	}
 
 	var shutdown atomic.Bool
+	// The graceful-stop seam, exactly-once: SIGTERM and the self-watchdog
+	// miss BOTH land here (a double close of stop would panic), and the core
+	// stop is equally once-only — both paths may race to it.
+	requestStop := sync.OnceFunc(func() {
+		shutdown.Store(true)
+		close(stop)
+	})
+	stopCore := sync.OnceFunc(func() {
+		// C4/A2: the core is stopped EXPLICITLY on the daemon shutdown (the
+		// child never dies via ctx cancellation). A stop failure is loud but
+		// must not mask the clean shutdown — the pidfile and the flock die
+		// with the process either way.
+		if serr := mgr.Stop(); serr != nil {
+			outf(out, "watch: core stop failed: %v\n", serr)
+		}
+	})
 	between := shutdown.Load
 	sched := &waveScheduler{
 		cfg:             cfg,
@@ -414,6 +516,22 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		outf(out, "watch: %s — graceful self-restart\n", reason)
 	}
 	schedDone := make(chan struct{})
+
+	// The self-watchdog transport (ADDENDUM §1): on darwin the supervisor
+	// paces at threshold/2; a missed threshold fires the miss action — the
+	// SAME graceful-stop seam SIGTERM uses (requestStop), a best-effort core
+	// stop (a wedged loop must never orphan the child), a bounded wait for
+	// the unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
+	// restart. The mechanism is named loudly — status output states it the
+	// same way.
+	// The transport wiring happens HERE (after sched exists) — the wave
+	// runners capture the beat variable by reference and pick the transport
+	// up. The idle tick lives inside the scheduler (the helper sets
+	// sched.heartbeatTick); its channel has exactly one receiver.
+	transportBeat, _, stopTransport := startSelfWatchTransport(
+		deps, out, sched, schedDone, requestStop, stopCore)
+	defer stopTransport()
+	beat = transportBeat
 	go func() {
 		_ = sched.run(stop, between)
 		close(schedDone)
@@ -432,18 +550,67 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		return nil
 	case sig := <-deps.signals:
 		outf(out, "watch: %v — finishing the current stage, then exiting\n", sig)
-		shutdown.Store(true)
-		close(stop)
+		requestStop()
 		<-schedDone
-		// C4/A2: the core is stopped EXPLICITLY on the daemon shutdown (the
-		// child never dies via ctx cancellation). A stop failure is loud but
-		// must not mask the clean shutdown — the pidfile and the flock die
-		// with the process either way.
-		if serr := mgr.Stop(); serr != nil {
-			outf(out, "watch: core stop failed: %v\n", serr)
-		}
+		stopCore()
 		outln(out, "watch: clean shutdown")
 		return nil
+	}
+}
+
+// startSelfWatchTransport wires the self-watchdog transport (ADDENDUM §1):
+// it starts the transport with the code-owned threshold and the miss action,
+// and — when the transport is active — fills the scheduler's beat feed and
+// creates the idle tick the run loop selects on. Returns the beat, the tick
+// channel (nil = no transport), and the transport's stop func (always
+// non-nil; the caller defers it).
+func startSelfWatchTransport(
+	deps watchDeps, out io.Writer, sched *waveScheduler, schedDone <-chan struct{},
+	requestStop, stopCore func(),
+) (func(), <-chan time.Time, func()) {
+	if deps.selfWatch == nil {
+		return func() {}, nil, func() {}
+	}
+	miss := selfWatchMiss(out, schedDone, requestStop, stopCore, deps.selfExit)
+	transportBeat, stopTransport, active := deps.selfWatch(out, selfwatchdog.Threshold, miss)
+	stop := func() { stopTransport() }
+	if !active {
+		return func() {}, nil, stop
+	}
+	// The ticker's channel is consumed by EXACTLY one receiver — the
+	// scheduler run loop's select case — so every idle tick beats.
+	ticker := time.NewTicker(selfWatchTickInterval)
+	stop = func() {
+		ticker.Stop()
+		stopTransport()
+	}
+	sched.beat = transportBeat
+	sched.heartbeatTick = ticker.C
+	return transportBeat, ticker.C, stop
+}
+
+// selfWatchMiss builds the miss action of the self-watchdog transport
+// (ADDENDUM §1): the SAME graceful-stop seam SIGTERM uses (requestStop), a
+// best-effort core stop (a wedged loop must never orphan the child), a
+// bounded wait for the unwind, and a CLEAN exit 0 that launchd KeepAlive
+// answers with a restart. The mechanism is named loudly.
+func selfWatchMiss(
+	out io.Writer, schedDone <-chan struct{}, requestStop, stopCore func(), selfExit func(int),
+) func() {
+	return func() {
+		outf(out, "watch: self-watchdog: no daemon progress for %s — clean self-exit "+
+			"(launchd KeepAlive restarts the agent; mechanism: self-watchdog → KeepAlive restart)\n",
+			selfwatchdog.Threshold)
+		requestStop()
+		go stopCore() // best-effort child stop — never block the exit on a wedged unwind
+		select {
+		case <-schedDone:
+		case <-time.After(selfExitGrace):
+			// The loop is wedged (the reason this transport exists) —
+			// the grace expires and the clean exit fires anyway.
+		}
+		outln(out, "watch: clean self-exit (code 0)")
+		selfExit(0)
 	}
 }
 

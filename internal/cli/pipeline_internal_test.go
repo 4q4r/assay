@@ -128,7 +128,7 @@ func TestPluginRunTimeoutAbandonsHangingPlugin(t *testing.T) {
 	out := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(out)
-	_, err = runFetchWith(cmd, cfg, reg)
+	_, err = runFetchWith(cmd, cfg, reg, nil)
 	require.NoError(t, err, "the wave must complete despite the hung plugin")
 
 	text := out.String()
@@ -239,7 +239,7 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	out := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(out)
-	_, err = runFetchWith(cmd, cfg, reg)
+	_, err = runFetchWith(cmd, cfg, reg, nil)
 	require.NoError(t, err, "fetch wave must complete")
 
 	text := out.String()
@@ -295,7 +295,7 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	cmd.SetOut(out)
 	// We can't fully test live% without probe/geo, but we can verify the
 	// threshold check is wired by checking the stats collector is called
-	_, err = runFetchWith(cmd, cfg, reg)
+	_, err = runFetchWith(cmd, cfg, reg, nil)
 	require.NoError(t, err, "fetch wave must complete")
 
 	text = out.String()
@@ -692,7 +692,7 @@ func TestRunFetchWithCarriesOverEnrichedStats(t *testing.T) {
 		out := &bytes.Buffer{}
 		cmd := &cobra.Command{}
 		cmd.SetOut(out)
-		_, err := runFetchWith(cmd, cfg, reg)
+		_, err := runFetchWith(cmd, cfg, reg, nil)
 		require.NoError(t, err)
 		b, err := os.ReadFile(newPaths(cfg).manifest)
 		require.NoError(t, err)

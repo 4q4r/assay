@@ -76,6 +76,13 @@ type Options struct {
 	// net.Dialer; production leaves it nil).
 	dialer dialFunc
 
+	// Heartbeat is the per-item progress hook the daemon's self-watchdog
+	// feeds (ADDENDUM §1): invoked once per completed probe batch and per
+	// completed single-node job, so the widest legitimate beat gap inside
+	// the probe stage stays at batch granularity. May be called from
+	// concurrent goroutines; nil = no heartbeat feed (one-shot CLI runs).
+	Heartbeat func()
+
 	// Classifier runs the FULL classification battery (ip-api self-report +
 	// unlock battery v2) for ONE alive node THROUGH the SAME hot instance
 	// address the node's probe just passed (addr) — the tunnel is proven
@@ -293,6 +300,9 @@ func runJobs(ctx context.Context, f Factory, jobs []*probeJob, opts Options) []*
 				rtt := time.Duration(res.rttMS * float64(time.Millisecond))
 				limiter.RecordOutcome(rtt, !res.alive)
 			}
+			if opts.Heartbeat != nil {
+				opts.Heartbeat() // one single-node job completed — daemon heartbeat progress
+			}
 			close(done[i])
 		}(i)
 	}
@@ -358,6 +368,9 @@ func runBatchJobs(ctx context.Context, bf BatchFactory, jobs []*probeJob, opts O
 					rtt := time.Duration(o.rttMS * float64(time.Millisecond))
 					limiter.RecordOutcome(rtt, !o.alive)
 				}
+			}
+			if opts.Heartbeat != nil {
+				opts.Heartbeat() // one batch completed — daemon heartbeat progress
 			}
 			close(done[i])
 		}(i)

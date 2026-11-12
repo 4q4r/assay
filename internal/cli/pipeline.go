@@ -102,7 +102,7 @@ func newFetchCommand(cfgPath *string) *cobra.Command {
 // runFetch is the one-shot entry: fresh registry from disk (materialize
 // defaults, compile everything) — one-shot is implicitly fresh.
 func runFetch(cmd *cobra.Command, cfg *config.Config) error {
-	_, err := runFetchWith(cmd, cfg, nil)
+	_, err := runFetchWith(cmd, cfg, nil, nil)
 	return err
 }
 
@@ -114,11 +114,19 @@ func runFetch(cmd *cobra.Command, cfg *config.Config) error {
 // fresh registry from disk; the watch daemon passes its shared, watchdog-
 // maintained registry (the wave snapshots it once, at fetch start).
 //
+// heartbeat is the per-plugin progress hook the daemon's self-watchdog
+// feeds (ADDENDUM §1): invoked after every plugin run completes (each run
+// bounded by run_timeout), so the widest legitimate beat gap inside the
+// fetch stage stays at per-plugin granularity. nil = no feed (one-shot CLI
+// runs).
+//
 // The registry the wave used is RETURNED so later stages — the plugin-stats
 // enrichment seam — enforce thresholds on THE SAME registry. The old
 // enrichment path reloaded a throwaway copy and recorded its breaker
 // failures into it: loud lines, zero enforcement (adversarial review F1).
-func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry) (*plugins.Registry, error) {
+func runFetchWith(
+	cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry, heartbeat func(),
+) (*plugins.Registry, error) {
 	p := newPaths(cfg)
 	out := cmd.OutOrStdout()
 	if err := os.MkdirAll(p.cacheDir, 0o750); err != nil {
@@ -153,7 +161,7 @@ func runFetchWith(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry)
 	statsCollector := plugins.NewPluginStatsCollector(nil)
 
 	collected, failed, hinted, totalNodes := runAllPlugins(out, engine, snapshot, pluginRunTimeout(cfg),
-		pluginMaxFailures(cfg), reg, statsCollector)
+		pluginMaxFailures(cfg), reg, statsCollector, heartbeat)
 	if failed == len(snapshot) {
 		return reg, fmt.Errorf("all %d attempted plugins failed; nothing fetched", failed)
 	}
@@ -349,6 +357,7 @@ func pluginMaxFailures(cfg *config.Config) int {
 func runAllPlugins(
 	out io.Writer, engine *plugins.Engine, snapshot []*plugins.Plugin, runTimeout time.Duration,
 	maxFailures int, reg *plugins.Registry, statsCollector *plugins.PluginStatsCollector,
+	heartbeat func(),
 ) ([]pluginLinks, int, int, int) {
 	collected := []pluginLinks{}
 	failed, hinted, total := 0, 0, 0
@@ -388,6 +397,11 @@ func runAllPlugins(
 		// Collect plugin stats if collector provided
 		if statsCollector != nil {
 			statsCollector.AddPluginNodes(pl.ID, nodes)
+		}
+		// One plugin run completed (success or loud failure) — daemon
+		// heartbeat progress (ADDENDUM §1; nil on one-shot CLI runs).
+		if heartbeat != nil {
+			heartbeat()
 		}
 	}
 	if reg != nil {
@@ -642,7 +656,7 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runProbe(cmd, res.Config, limit, speedtest)
+			return runProbe(cmd, res.Config, limit, speedtest, nil)
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "probe only the first N filtered nodes (0 = all)")
@@ -780,8 +794,12 @@ func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*
 	}
 }
 
+// runProbe runs the probe stage. heartbeat feeds the daemon's self-watchdog
+// per completed probe batch / single-node job (ADDENDUM §1; nil on one-shot
+// CLI runs).
+//
 //nolint:cyclop // runProbe orchestrates the whole probe stage (probe + merged classification)
-func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool) error {
+func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool, heartbeat func()) error {
 	classifyStart := time.Now()
 	p := newPaths(cfg)
 	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
@@ -814,6 +832,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool)
 	factory := newProbeFactory(cfg, p)
 	batchFactory := newProbeBatchFactory(cfg, p)
 	opts := probeOptions(cfg, speedtest)
+	opts.Heartbeat = heartbeat // nil on one-shot runs — no feed
 	// Apply the wave-start resource budget (CPU/RAM/ports) to probe
 	// concurrency (threads + batch concurrency) — the scarcest resource wins.
 	portBudget := cfg.Probe.Threads
@@ -1323,13 +1342,13 @@ func defaultMaintainStages(opts maintainOptions, mgr *core.Manager) *maintainSta
 	var waveReg *plugins.Registry
 	return &maintainStages{
 		fetch: func(c *cobra.Command, cc *config.Config) error {
-			reg, err := runFetchWith(c, cc, nil)
+			reg, err := runFetchWith(c, cc, nil, nil)
 			waveReg = reg
 			return err
 		},
 		parse:  runParse,
 		filter: func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
-		probe:  func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest) },
+		probe:  func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, nil) },
 		pluginStatsEnrich: func(c *cobra.Command, cc *config.Config) error {
 			return runPluginStatsEnrichment(c, cc, waveReg)
 		},
