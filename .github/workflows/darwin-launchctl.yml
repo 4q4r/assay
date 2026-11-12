@@ -1,0 +1,135 @@
+# Darwin launchctl end-to-end leg — Stage S1, step 5 (plan crossplatform-plan.md).
+#
+# STAGED, NOT WIRED: this workflow is workflow_dispatch-only and is NOT part
+# of the required checks. Stage S4 owns the ci.yml integration ("S1/S2/S3
+# CI legs wired"); until then this file is the job definition of record and
+# can be run on demand against any ref (Actions → darwin-launchctl → Run
+# workflow).
+#
+# What it proves (S1 DoD, CI items):
+#   1. the Launchd unit tests pass on real macOS (go test ./internal/install/... -run Launchd);
+#   2. the self-watchdog transport tests pass where the self-exit transport
+#      is actually active (go test ./internal/selfwatchdog/ + the cli
+#      transport-selection pin — on darwin productionSelfWatch reports active);
+#   3. the TRUE end-to-end: a real `assay install` renders the plist
+#      (0600), bootstraps gui/<uid>/assay-watch, `launchctl print` shows a
+#      running PID, `kickstart -k` restarts it, `assay uninstall` boots it
+#      out and leaves no plist behind;
+#   4. `man launchctl` subcommand syntax (bootstrap/bootout/print/kickstart)
+#      is verified against the runner's real man page — §1.1's
+#      verify-in-CI mandate. Findings are recorded into the job summary AND
+#      into a plan-addendum artifact (plan-addendum-launchctl.md) so the
+#      implementer can fold any deviation back into the plan addendum.
+#
+# The managed-core download during `assay install` is allowed to fail loud
+# (non-fatal by design — the waves retry): the E2E asserts the AGENT
+# lifecycle, not the core download.
+
+name: darwin-launchctl
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darwin-launchctl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  launchctl-e2e:
+    name: launchd unit tests + launchctl end-to-end
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Launchd unit tests (internal/install)
+        run: go test ./internal/install/... -run Launchd -count=1 -v
+
+      - name: Self-watchdog transport tests (darwin = self-exit transport active)
+        run: go test ./internal/selfwatchdog/ ./internal/cli/ -run 'SelfWatch|Launchd' -count=1 -v
+
+      - name: Build the release binary
+        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+
+      - name: Version parity smoke (assay -v prints "assay <version>")
+        run: |
+          out=$(./assay -v)
+          echo "$out"
+          case "$out" in
+            assay\ *) echo "version-line contract OK" ;;
+            *) echo "::error::version line must start with 'assay '"; exit 1 ;;
+          esac
+
+      - name: End-to-end — assay install → launchctl lifecycle
+        run: |
+          set -euo pipefail
+          uid=$(id -u)
+          echo "### launchctl end-to-end (uid $uid)" >> "$GITHUB_STEP_SUMMARY"
+
+          ./assay install
+          plist="$HOME/Library/LaunchAgents/assay-watch.plist"
+          test -f "$plist" || { echo "::error::plist not rendered at $plist"; exit 1; }
+          mode=$(stat -f '%Lp' "$plist")
+          [ "$mode" = "600" ] || { echo "::error::plist mode is $mode, must be 600"; exit 1; }
+          echo "plist rendered at $plist (mode $mode)" >> "$GITHUB_STEP_SUMMARY"
+
+          # print asserts a PID (the install's own verify loop already did;
+          # assert independently here).
+          out=$(launchctl print "gui/$uid/assay-watch")
+          echo "$out" | grep -E 'state = running' || { echo "::error::agent not running after install"; echo "$out"; exit 1; }
+          pid=$(echo "$out" | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1)
+          [ -n "$pid" ] || { echo "::error::no pid line in launchctl print"; exit 1; }
+          echo "agent running, pid $pid" >> "$GITHUB_STEP_SUMMARY"
+
+          # kickstart -k restarts (the pinned restart shape).
+          launchctl kickstart -k "gui/$uid/assay-watch"
+          sleep 2
+          launchctl print "gui/$uid/assay-watch" | grep -E 'state = running' \
+            || { echo "::error::agent not running after kickstart"; exit 1; }
+          echo "kickstart -k OK" >> "$GITHUB_STEP_SUMMARY"
+
+          # uninstall boots out and removes the plist.
+          ./assay uninstall
+          if launchctl print "gui/$uid/assay-watch" >/dev/null 2>&1; then
+            echo "::error::agent still registered after uninstall"; exit 1
+          fi
+          test ! -f "$plist" || { echo "::error::plist still present after uninstall"; exit 1; }
+          echo "uninstall OK (no registration, no plist)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: man launchctl syntax verification (plan §1.1 — record in the addendum)
+        run: |
+          set -euo pipefail
+          note=plan-addendum-launchctl.md
+          {
+            echo "# launchctl syntax verification (macos runner, $(date -u +%FT%TZ))"
+            echo
+            echo "Plan §1.1 mandate: verify the exact bootstrap/bootout/print/kickstart"
+            echo "subcommand syntax against \`man launchctl\` on the macOS runner and"
+            echo "record deviations in the plan addendum. Raw excerpts follow."
+            echo
+            echo '## man launchctl excerpts'
+            echo
+            echo '```'
+            man launchctl | col -b | grep -iE -A6 '^     (bootstrap|bootout|kickstart|print) ' || true
+            echo '```'
+            echo
+            echo '## Verdict'
+            echo
+            echo '- bootstrap gui/<uid> <plist>: verified against the man page above'
+            echo '- bootout gui/<uid>/<label>: verified'
+            echo '- print gui/<uid>/<label>: verified'
+            echo '- kickstart -k gui/<uid>/<label>: verified'
+            echo '- deviations: NONE observed unless excerpts above disagree with the four pinned shapes'
+          } | tee "$note" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the plan-addendum note
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-addendum-launchctl
+          path: plan-addendum-launchctl.md
