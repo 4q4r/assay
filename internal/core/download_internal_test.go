@@ -8,11 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,9 +25,11 @@ import (
 )
 
 // fakeCoreReleaseServer is the hermetic release double for the managed-core
-// download tests: the API base rides the releaseAPIBase seam, the asset name
-// matches the platform table entry for THIS test host (linux/amd64 — the
-// suite runs on the pinned platform), and every request is counted so the
+// download tests: the API base rides the releaseAPIBase seam, the index
+// carries an asset for EVERY release-matrix host arch (linux
+// amd64/arm64/386/arm7 — production picks its own entry by runtime.GOARCH
+// through xrayupdate's platform table), each arch ships a DISTINCT body
+// (the fixture-arch zip entry), and every request is counted so the
 // hermeticity and the "no download happened" assertions are positive.
 // binSource's CONTENT becomes the zip's `xray` entry (a shell script for the
 // pure download tests; the COREFAKE test binary itself for the swap+restart
@@ -36,33 +38,61 @@ import (
 func fakeCoreReleaseServer(t *testing.T, tag, binSource, dgstOverride string, extraFiles map[string][]byte) (*httptest.Server, *int) {
 	t.Helper()
 
-	var zipBuf bytes.Buffer
-	zw := zip.NewWriter(&zipBuf)
+	// Mirrors internal/xrayupdate's platformAssets entries for the release
+	// host matrix; the map is unexported and its names are pinned by
+	// TestAssetForPlatform + TestReleaseFixtureServesFullReleaseMatrix.
+	archAssets := []struct{ name, mark string }{
+		{"Xray-linux-64.zip", "amd64"},
+		{"Xray-linux-arm64-v8a.zip", "arm64"},
+		{"Xray-linux-32.zip", "386"},
+		{"Xray-linux-arm32-v7a.zip", "arm7"},
+	}
+
+	var payload []byte
 	if binSource != "" {
 		raw, err := os.ReadFile(binSource)
 		require.NoError(t, err)
-		w, err := zw.Create("xray")
-		require.NoError(t, err)
-		_, err = w.Write(raw)
-		require.NoError(t, err)
+		payload = raw
 	}
-	for name, content := range extraFiles {
-		w, err := zw.Create(name)
+	type served struct {
+		body []byte
+		sha  string
+	}
+	assets := make(map[string]served, len(archAssets))
+	var index bytes.Buffer
+	_, _ = fmt.Fprintf(&index, `{"tag_name":%q,"assets":[`, tag)
+	for i, a := range archAssets {
+		var zipBuf bytes.Buffer
+		zw := zip.NewWriter(&zipBuf)
+		if payload != nil {
+			w, err := zw.Create("xray")
+			require.NoError(t, err)
+			_, err = w.Write(payload)
+			require.NoError(t, err)
+		}
+		for name, content := range extraFiles {
+			w, err := zw.Create(name)
+			require.NoError(t, err)
+			_, err = w.Write(content)
+			require.NoError(t, err)
+		}
+		w, err := zw.Create("fixture-arch-" + a.mark)
 		require.NoError(t, err)
-		_, err = w.Write(content)
+		_, err = w.Write([]byte(a.mark))
 		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+		sum := sha256Sum(zipBuf.Bytes())
+		if dgstOverride != "" {
+			sum = dgstOverride
+		}
+		assets[a.name] = served{body: zipBuf.Bytes(), sha: sum}
+		if i > 0 {
+			index.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(&index, `{"name":%q,"browser_download_url":"http://HOST/ASSET/%s"}`, a.name, a.name)
 	}
-	require.NoError(t, zw.Close())
-	asset := zipBuf.Bytes()
-	sum := sha256Sum(asset)
-	if dgstOverride != "" {
-		sum = dgstOverride
-	}
-
-	assetName := "Xray-linux-64.zip"
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		t.Skipf("the release fixture pins the linux/amd64 asset name (host: %s/%s)", runtime.GOOS, runtime.GOARCH)
-	}
+	index.WriteString("]}")
+	indexBytes := index.Bytes()
 
 	var mu sync.Mutex
 	hits := 0
@@ -74,17 +104,26 @@ func fakeCoreReleaseServer(t *testing.T, tag, binSource, dgstOverride string, ex
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/XTLS/Xray-core/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		count()
-		_, _ = fmt.Fprintf(w,
-			`{"tag_name":%q,"assets":[{"name":%q,"browser_download_url":"http://%s/ASSET"}]}`,
-			tag, assetName, r.Host)
+		_, _ = w.Write(bytes.ReplaceAll(indexBytes, []byte("http://HOST/"), []byte("http://"+r.Host+"/")))
 	})
-	mux.HandleFunc("/ASSET", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/ASSET/", func(w http.ResponseWriter, r *http.Request) {
 		count()
-		_, _ = w.Write(asset)
-	})
-	mux.HandleFunc("/ASSET.dgst", func(w http.ResponseWriter, _ *http.Request) {
-		count()
-		_, _ = fmt.Fprintf(w, "MD5= x\nSHA1= x\nSHA2-256= %s\nSHA2-512= x\n", sum)
+		name := strings.TrimPrefix(r.URL.Path, "/ASSET/")
+		if base, isDgst := strings.CutSuffix(name, ".dgst"); isDgst {
+			a, ok := assets[base]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "MD5= x\nSHA1= x\nSHA2-256= %s\nSHA2-512= x\n", a.sha)
+			return
+		}
+		a, ok := assets[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(a.body)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -97,6 +136,71 @@ func sha256Sum(b []byte) string {
 }
 
 func releaseHits(hits *int) int { return *hits }
+
+// httpGetBody fetches url with a context-carrying request and returns the
+// body of a 200 response (test-side helper, fail-loud on every leg).
+func httpGetBody(t *testing.T, url string) []byte {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "%s must serve 200", url)
+	return body
+}
+
+// TestCoreReleaseFixtureServesFullReleaseMatrix pins the managed-core
+// fixture against single-arch regression: the fake release index must
+// carry an asset for every host arch the release matrix (.goreleaser.yaml:
+// linux amd64/arm64/386/arm7) can run on, with pairwise-distinct bodies so
+// the per-arch checksum paths stay meaningful. Production (xrayupdate,
+// which owns all asset selection) resolves the name by runtime.GOARCH — a
+// single-arch index must not rely on an amd64-only skip to stay green on
+// other runners (the arm CI gate failure class).
+func TestCoreReleaseFixtureServesFullReleaseMatrix(t *testing.T) {
+	srv, hits := fakeCoreReleaseServer(t, "v26.10.31", "", "", nil)
+
+	var idx struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	require.NoError(t, json.Unmarshal(httpGetBody(t, srv.URL+"/repos/XTLS/Xray-core/releases/latest"), &idx))
+	require.Equal(t, "v26.10.31", idx.TagName)
+
+	// Mirrors internal/xrayupdate's platformAssets entries for the release
+	// host matrix; the map is unexported and its names are pinned by
+	// TestAssetForPlatform + TestReleaseFixtureServesFullReleaseMatrix.
+	want := map[string]string{
+		"Xray-linux-64.zip":        "amd64",
+		"Xray-linux-arm64-v8a.zip": "arm64",
+		"Xray-linux-32.zip":        "386",
+		"Xray-linux-arm32-v7a.zip": "arm7",
+	}
+	require.Len(t, idx.Assets, len(want),
+		"the fake index carries exactly the release-matrix assets")
+	bodies := make(map[string]string, len(idx.Assets))
+	names := make([]string, 0, len(idx.Assets))
+	for _, a := range idx.Assets {
+		body := httpGetBody(t, a.URL)
+		owner, dup := bodies[string(body)]
+		require.False(t, dup,
+			"assets %s and %s share one body — the per-arch paths would be indistinguishable",
+			owner, a.Name)
+		bodies[string(body)] = a.Name
+		names = append(names, a.Name)
+	}
+	for name, arch := range want {
+		require.Contains(t, names, name,
+			"the fixture index must ship the linux/%s asset %q — production asks for it on that host", arch, name)
+	}
+	assert.Positive(t, releaseHits(hits), "the fixture served real requests")
+}
 
 // writeUpdateStateFixture writes the auto-update state file (the due/not-due
 // lever for the interval tests).
