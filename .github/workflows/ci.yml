@@ -175,9 +175,11 @@ jobs:
     # from .goreleaser.yaml (single source of truth), `goreleaser check`
     # the full config AND each partial, and pin the partial-union parity
     # (the union of the generated partials' targets == the full-matrix
-    # targets == the plan §4.4 release matrix). Runs the exact local
-    # commands (scripts/goreleaser-split.sh parity + goreleaser check) so
-    # CI cannot drift from the local gate.
+    # targets == the plan §4.4 release matrix, BOTH directions — a target
+    # dropped from the config, or added outside the pin, must fail). Runs
+    # the exact local commands (scripts/goreleaser-split.sh parity +
+    # goreleaser-split-parity-test.sh + goreleaser check) so CI cannot
+    # drift from the local gate.
     name: release config (partials + parity)
     runs-on: ubuntu-latest
     steps:
@@ -227,6 +229,9 @@ jobs:
       - name: partial-union parity (union of partials == full matrix == plan §4.4)
         shell: bash
         run: bash scripts/goreleaser-split.sh parity
+      - name: parity mutation red-check (dropped/extra pinned target must fail)
+        shell: bash
+        run: bash scripts/goreleaser-split-parity-test.sh
 
   markdownlint:
     name: markdownlint
@@ -250,8 +255,13 @@ jobs:
   # The plan's implementer-verify discipline wants them RUNNING and
   # RECORDING on every PR, not gating merges while their verdicts are
   # still being collected. They are wired as reusable workflows with
-  # continue-on-error at the call site; flipping them to required is a
-  # one-line change per leg once the first verified-green cycle lands.
+  # continue-on-error at the call site.
+  #
+  # FLIP-TO-REQUIRED GATE (owner-visible follow-up; recorded in the plan's
+  # Stage S5 DoD): after the first fully-green cycle of darwin-launchctl,
+  # windows-scm AND linux-schedulers on main, remove `continue-on-error`
+  # from the three call sites below — one line per leg. The legs must not
+  # silently stay non-required once their syntaxes ARE verified.
   legacy-verify-darwin:
     name: legacy verify — darwin launchctl E2E
     continue-on-error: true

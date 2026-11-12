@@ -237,11 +237,14 @@ jobs:
             Write-Host "::warning::windows/arm64 smoke NOT run — the windows-11-arm label served a '$arch' host; shipping build-only with a loud release-body warning"
             "windows/arm64 SMOKE NOT RUN: label served a '$arch' host" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           }
-      # Native path: build the arm64 binary (same trimpath/ldflags contract;
-      # the version is stamped from the tag) and smoke it on the REAL arm64
-      # hardware via the shared smoke script. The SHIPPED arm64 asset comes
-      # from the x64 goreleaser run (same commit, same flags modulo the
-      # build-date stamp) — this job owns the ABI/run proof.
+      # Native path: build the arm64 binary (same trimpath; the Version
+      # stamp — the only load-bearing ldflag, per the `assay <version>`
+      # output-line contract in internal/cli/root.go — is stamped from the
+      # tag; Commit/Date are informational and left unset) and smoke it on
+      # the REAL arm64 hardware via the shared smoke script. The SHIPPED
+      # arm64 asset comes from the x64 goreleaser run (same commit, with
+      # the full Version/Commit/Date stamps) — this job owns the ABI/run
+      # proof.
       - name: build + native windows/arm64 smoke
         if: steps.precondition.outputs.native == 'true'
         shell: pwsh
@@ -272,9 +275,9 @@ jobs:
           Set-Content -Path smoke-verdict/smoke-gap-windows-arm64.md -Value @"
           > [!WARNING]
           > windows/arm64 was **not** smoke-probed in this release: the
-          > windows-11-arm runner was unavailable at release time (build-only
-          > proof ran instead). The asset ships unsmoked — this is the only
-          > sanctioned smoke gap, by owner decision (plan §4.4/§4.5.2).
+          > windows-11-arm label served a non-ARM64 host at release time
+          > (build-only proof ran instead). The asset ships unsmoked — this
+          > is the only sanctioned smoke gap, by owner decision (plan §4.4/§4.5.2).
           "@
       - uses: actions/upload-artifact@v4
         with:
@@ -304,7 +307,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
           mkdir -p release-assets
           cp artifacts/dist-linux/assay_*.tar.gz release-assets/
           cp artifacts/dist-darwin/assay_*.tar.gz release-assets/

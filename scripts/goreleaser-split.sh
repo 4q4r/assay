@@ -41,7 +41,7 @@ OS_LIST="linux darwin windows"
 # — the BASE target without goreleaser's microarch-level suffixes; both
 # comparison sides are extracted from config files, so the convention is
 # self-consistent.
-EXPECTED_MATRIX="darwin_amd64 darwin_arm64 linux_386 linux_amd64 linux_arm_7 windows_386 windows_amd64 windows_arm64"
+EXPECTED_MATRIX="darwin_amd64 darwin_arm64 linux_386 linux_amd64 linux_arm64 linux_arm_7 windows_386 windows_amd64 windows_arm64"
 
 die() {
 	echo "goreleaser-split: $1" >&2
@@ -135,7 +135,7 @@ cmd_parity() {
 	# full_targets/union_targets/tmp are deliberately GLOBAL: the EXIT trap
 	# (set below) fires after this function returns, where locals are gone —
 	# referencing a local there is an unbound-variable error under set -u.
-	local full_targets missing_in_full missing_in_union os_ partial_targets bleed
+	local full_targets missing_in_full extra_in_full missing_in_union os_ partial_targets bleed
 	full_targets=$(config_targets "$src")
 	union_targets=""
 
@@ -162,6 +162,14 @@ cmd_parity() {
   full config: $(echo "$full_targets" | tr '\n' ' ')
   expected:    $EXPECTED_MATRIX"
 	fi
+	# Constraint 1 is BIDIRECTIONAL: the full config must also carry NO
+	# targets outside the pin. One direction alone would let a config edit
+	# silently drop a shipped target (a release would then miss an asset
+	# with this gate green) — the exact drift this gate exists to catch.
+	extra_in_full=$(comm -13 <(echo "$EXPECTED_MATRIX" | tr ' ' '\n' | LC_ALL=C sort) <(echo "$full_targets"))
+	[ -z "$extra_in_full" ] || die "full config carries targets outside the pinned §4.4 matrix:
+  extra: $(echo "$extra_in_full" | tr '\n' ' ')
+  full:  $(echo "$full_targets" | tr '\n' ' ')"
 
 	# Constraint 2: union of partials == full matrix (both directions).
 	missing_in_union=$(comm -23 <(echo "$full_targets") <(echo "$union_targets"))
@@ -179,7 +187,7 @@ cmd_parity() {
   union:  $(echo "$union_targets" | tr '\n' ' ')"
 	fi
 
-	echo "goreleaser-split parity: OK — 9 targets pinned, union of partials == full matrix"
+	echo "goreleaser-split parity: OK — $(echo "$full_targets" | grep -c .) targets pinned, union of partials == full matrix"
 	echo "  targets: $(echo "$full_targets" | tr '\n' ' ')"
 }
 
