@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"assay/internal/config"
@@ -36,6 +37,30 @@ func resolveExecutable() (string, error) {
 // cobra-level install flow never executes systemd (same pattern as
 // signalChannel in watch_cmd.go).
 var installExecutor = func() install.Executor { return install.SystemctlExecutor{} }
+
+// scheduler is the CLI's consumer-side lifecycle seam over the per-OS
+// schedulers (plan §4.1; the interface is defined at the CONSUMER per the
+// go-design ruling — the CLI drives lifecycle control, the install package
+// owns the per-OS implementations with their pinned executors).
+type scheduler interface {
+	Name() string
+	Available() (bool, string)
+	Install(spec install.LaunchdInstallSpec) (install.Result, error)
+	Uninstall(spec install.LaunchdUninstallSpec) (install.UninstallResult, error)
+	Status() (install.SchedulerStatus, error)
+	HeldRegistration() (bool, string)
+}
+
+// darwinHost is the GOOS probe seam: tests pin the darwin branch without a
+// Mac (production reads runtime.GOOS exactly).
+var darwinHost = func() bool { return runtime.GOOS == "darwin" }
+
+// launchdSchedulerFactory is the darwin scheduler seam: production wires
+// the allowlist-checked LaunchctlExecutor inside the LaunchdScheduler;
+// tests inject a recorder so the cobra-level flow never executes launchctl.
+var launchdSchedulerFactory = func() scheduler {
+	return install.NewLaunchdScheduler(install.LaunchctlExecutor{})
+}
 
 // ensureCoreBinary is the D4 install-bootstrap seam: production wires
 // core.EnsureCoreBinary (download the managed core, sha-verified, atomic —
@@ -199,15 +224,24 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
-	unitDir, cfgAbs, err := prepareInstallPaths(cfgPath, binDir, opts)
-	if err != nil {
-		return err
-	}
 	running, err := resolveExecutable()
 	if err != nil {
 		return err
 	}
 	dataDir, err := materializeDataDir(cfg, opts)
+	if err != nil {
+		return err
+	}
+	// darwin branch (plan §1/§S1): macOS is always launchd — the scheduler
+	// owns the whole §1.2.6 flow. Branched BEFORE prepareInstallPaths: the
+	// systemd-only constraints (the --unit-dir default, the ExecStart
+	// whitespace check — ProgramArguments is an XML array, whitespace-safe)
+	// do not apply to the LaunchAgent. --no-systemd keeps its binary-only
+	// meaning on every platform, so it falls through to the code below.
+	if darwinHost() && !opts.noSystemd {
+		return runInstallLaunchd(w, cfg, running, binDir, dataDir, cfgPath, opts)
+	}
+	unitDir, cfgAbs, err := prepareInstallPaths(cfgPath, binDir, opts)
 	if err != nil {
 		return err
 	}
@@ -295,6 +329,99 @@ func printInstallSummary(w io.Writer, cfgAbs string,
 		daemonCfgPath+" (the daemon reads the default location — no -c in the unit)", color))
 }
 
+// explicitConfigAbs resolves the explicit -c for the launchd branch:
+// absolute as given, relative resolved against the cwd. No ExecStart
+// whitespace check — ProgramArguments is an XML array (whitespace-safe);
+// the plist's own XML-hostile-character check lives in renderPlist.
+func explicitConfigAbs(cfgPath string) (string, error) {
+	if filepath.IsAbs(cfgPath) {
+		return cfgPath, nil
+	}
+	abs, err := filepath.Abs(cfgPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve config path: %w", err)
+	}
+	return abs, nil
+}
+
+// runInstallLaunchd is the darwin install flow (plan §1/§S1): the
+// LaunchdScheduler owns the whole §1.2.6 sequence (copyBinary → config
+// materialize → agent dir → plist 0600 → print-probe → bootout-if-loaded →
+// bootstrap → bounded print-verify), and the D4 core bootstrap runs
+// unchanged afterwards. Every scheduler failure already carries the exact
+// launchctl line (owner UX rule) — this layer adds nothing but the summary.
+func runInstallLaunchd(
+	w io.Writer, cfg *config.Config, running, binDir, dataDir, cfgPath string, opts installOptions,
+) error {
+	cfgAbs := ""
+	if opts.embedsConfig && cfgPath != "" {
+		abs, err := explicitConfigAbs(cfgPath)
+		if err != nil {
+			return err
+		}
+		cfgAbs = abs
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("install: resolve home dir: %w", err)
+	}
+	sched := launchdSchedulerFactory()
+	if avail, reason := sched.Available(); !avail {
+		return fmt.Errorf("install: the launchd scheduler is unavailable: %s", reason)
+	}
+	res, err := sched.Install(install.LaunchdInstallSpec{
+		RunningBinary:     running,
+		BinDir:            binDir,
+		ConfigPath:        cfgAbs,
+		DefaultConfigPath: opts.materializePath,
+		DataDir:           dataDir,
+		AgentDir:          filepath.Join(home, "Library", "LaunchAgents"),
+	})
+	if err != nil {
+		return err
+	}
+	// D4 core bootstrap: identical contract to the systemd branch (loud
+	// non-fatal warning; the waves retry through auto-update).
+	if cfg != nil {
+		if berr := ensureCoreBinary(context.Background(), cfg.Core, config.ExpandHome(cfg.DataDir), w); berr != nil {
+			outf(w, "%s\n", ui.Warn("WARNING: core bootstrap: "+berr.Error()+
+				" (install completes; the daemon's waves retry through auto-update)", ui.Amber, opts.color))
+		}
+	}
+	printLaunchdInstallSummary(w, res, dataDir, cfgAbs, opts)
+	return nil
+}
+
+// printLaunchdInstallSummary is the loud post-install report for the
+// LaunchAgent: the plist path, the supervision + hang mechanism (ADDENDUM
+// §1 — named, never hidden), the unrotated-log caveat, and the config
+// guidance.
+func printLaunchdInstallSummary(w io.Writer, res install.Result, dataDir, cfgAbs string, opts installOptions) {
+	outf(w, "%s\n", ui.ChipKV("installed binary: ", res.BinaryPath+" (copy of the running image, mode 0755)", opts.color))
+	if res.ConfigWritten != "" {
+		outf(w, "%s\n", ui.ChipKV("config created:   ", res.ConfigWritten+
+			" (materialized defaults — edit to configure; a re-install never overwrites it)", opts.color))
+	}
+	if res.ConfigKept != "" {
+		outf(w, "%s\n", ui.ChipKV("config kept:      ",
+			res.ConfigKept+" (already present — never overwritten)", opts.color))
+	}
+	for _, p := range res.UnitPaths {
+		outf(w, "%s\n", ui.ChipKV("agent written:    ",
+			p+" (mode 0600 — RunAtLoad=true, KeepAlive=true, ThrottleInterval=5, ProcessType=Background)", opts.color))
+	}
+	outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+		"assay watch (KeepAlive restart on exit; hang detection: "+
+			"self-watchdog → clean self-exit → KeepAlive restart)", opts.color))
+	outf(w, "%s\n", ui.ChipKV("logs:             ",
+		filepath.Join(dataDir, "logs", "watch.out.log")+" + watch.err.log "+
+			"(launchd redirect — unrotated; loglevel warning default)", opts.color))
+	if cfgAbs != "" {
+		outf(w, "%s\n", ui.ChipKV("config reference: ",
+			cfgAbs+" (install never creates or moves it — keep it in place)", opts.color))
+	}
+}
+
 func newUninstallCommand(cfgPath *string) *cobra.Command {
 	var (
 		unitDir string
@@ -372,6 +499,11 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	if opts.purge && cfg == nil {
 		return errors.New("--purge needs the config (-c) to resolve the data dir")
 	}
+	// darwin branch (plan §1.2.7): bootout via the scheduler, plist removal,
+	// managed-core teardown unchanged, purge passthrough.
+	if darwinHost() {
+		return runUninstallLaunchd(w, cfg, cfgPath, opts)
+	}
 	unitDir, err := absDir(config.ExpandHome(opts.unitDir))
 	if err != nil {
 		return err
@@ -394,6 +526,13 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	if err != nil {
 		return err
 	}
+	printSystemdUninstall(w, res, opts.purge)
+	return nil
+}
+
+// printSystemdUninstall renders the systemd uninstall report: what was
+// disabled, removed, already-absent, the managed-core teardown, purge.
+func printSystemdUninstall(w io.Writer, res install.UninstallResult, purge bool) {
 	switch {
 	case len(res.DisabledUnits) > 0:
 		outf(w, "disabled:         %s\n", strings.Join(res.DisabledUnits, ", "))
@@ -412,10 +551,62 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	for _, p := range res.Purged {
 		outf(w, "purged:           %s\n", p)
 	}
-	if !opts.purge {
+	if !purge {
 		outln(w, "user data kept (config, data dir, installed binary) — pass --purge to remove config + data")
 	}
+}
+
+// runUninstallLaunchd is the darwin teardown (§1.2.7): bootout (reported
+// honestly when nothing is registered), plist removal, the D4 managed-core
+// teardown on the resolved data dir, purge passthrough. No legacy cleanup
+// exists on darwin (no prior darwin installs).
+func runUninstallLaunchd(w io.Writer, cfg *config.Config, cfgPath string, opts uninstallOptions) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("uninstall: resolve home dir: %w", err)
+	}
+	sched := launchdSchedulerFactory()
+	spec := install.LaunchdUninstallSpec{
+		AgentDir: filepath.Join(home, "Library", "LaunchAgents"),
+	}
+	if cfg != nil {
+		spec.DataDir = config.ExpandHome(cfg.DataDir)
+	}
+	if opts.purge {
+		spec.PurgeConfigPath = cfgPath
+		if cfg != nil {
+			spec.PurgeDataDir = config.ExpandHome(cfg.DataDir)
+		}
+	}
+	res, err := sched.Uninstall(spec)
+	if err != nil {
+		return err
+	}
+	printLaunchdUninstall(w, res, opts.purge)
 	return nil
+}
+
+// printLaunchdUninstall renders the darwin uninstall report: the bootout
+// outcome (nothing registered is REPORTED, never faked), the plist removal,
+// the managed-core teardown, and the purge passthrough.
+func printLaunchdUninstall(w io.Writer, res install.UninstallResult, purge bool) {
+	if len(res.DisabledUnits) > 0 {
+		outf(w, "booted out:       %s\n", strings.Join(res.DisabledUnits, ", "))
+	} else {
+		outf(w, "agent:            not registered (nothing to boot out)\n")
+	}
+	for _, name := range res.RemovedUnits {
+		outf(w, "agent removed:    %s\n", name)
+	}
+	for _, name := range res.CoreRemoved {
+		outf(w, "core removed:     %s\n", name)
+	}
+	for _, p := range res.Purged {
+		outf(w, "purged:           %s\n", p)
+	}
+	if !purge {
+		outln(w, "user data kept (config, data dir, installed binary) — pass --purge to remove config + data")
+	}
 }
 
 // absDir rejects empty expansions and makes the path absolute.
@@ -482,27 +673,13 @@ func binariesDiffer(a, b string) (bool, error) {
 // unlike the W5 timers — there is no configured-vs-installed mismatch class.
 func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unitDir string, color bool) {
 	outln(out, ui.Header("install:", color))
-	binPath := filepath.Join(binDir, "assay")
-	if st, err := os.Stat(binPath); err == nil {
-		outf(out, "%s\n", ui.ChipKV("  binary:    ",
-			fmt.Sprintf("%s (mode %s)", binPath, st.Mode()), color))
-		// W13 stale-binary notice (the owner's incident): the installed
-		// binary does NOT self-update on `git pull` — a rebuilt-but-not-
-		// reinstalled binary keeps running OLD code under the daemon unit.
-		// A cheap sha256 pair names the drift and the recovery. Honest in
-		// every divergence case, including dev builds (`go run` differs
-		// from the install by definition).
-		if running, e := os.Executable(); e == nil && running != binPath {
-			if differ, shaErr := binariesDiffer(running, binPath); shaErr == nil && differ {
-				outf(out, "%s\n", ui.Warn("  STALE:     running binary differs from the installed one — "+
-					"the installed binary does not self-update; re-run `assay install` "+
-					"(self-copy) and restart assay-watch.service to load the new code", ui.Red, color))
-			}
-		}
-	} else {
-		outf(out, "%s\n", ui.ChipKV("  binary:    ",
-			"not installed ("+binPath+" missing) — run `assay install`", color))
+	// darwin branch (§1.2.8 + ADDENDUM §1): the LaunchAgent state via the
+	// scheduler seam, with the supervision mechanism named honestly.
+	if darwinHost() {
+		printLaunchdStatus(out, binDir, color)
+		return
 	}
+	printInstalledBinary(out, binDir, color)
 	// unitDir arrives already expanded (status flags → ExpandHome at the
 	// caller); the rest of this function only joins names onto it.
 	_, watchErr := os.Stat(filepath.Join(unitDir, install.WatchService))
@@ -548,4 +725,53 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 				"with a config (-c or %s) to migrate", present, config.ShareConfigDisplay), ui.Amber, color))
 		}
 	}
+}
+
+// printInstalledBinary renders the installed-binary line plus the W13
+// stale-binary notice — shared by the systemd and launchd install-status
+// sections.
+func printInstalledBinary(out io.Writer, binDir string, color bool) {
+	binPath := filepath.Join(binDir, "assay")
+	if st, err := os.Stat(binPath); err == nil {
+		outf(out, "%s\n", ui.ChipKV("  binary:    ",
+			fmt.Sprintf("%s (mode %s)", binPath, st.Mode()), color))
+		// W13 stale-binary notice (the owner's incident): the installed
+		// binary does NOT self-update on `git pull` — a rebuilt-but-not-
+		// reinstalled binary keeps running OLD code under the daemon unit.
+		// A cheap sha256 pair names the drift and the recovery. Honest in
+		// every divergence case, including dev builds (`go run` differs
+		// from the install by definition).
+		if running, e := os.Executable(); e == nil && running != binPath {
+			if differ, shaErr := binariesDiffer(running, binPath); shaErr == nil && differ {
+				outf(out, "%s\n", ui.Warn("  STALE:     running binary differs from the installed one — "+
+					"the installed binary does not self-update; re-run `assay install` "+
+					"(self-copy) and restart assay-watch.service to load the new code", ui.Red, color))
+			}
+		}
+	} else {
+		outf(out, "%s\n", ui.ChipKV("  binary:    ",
+			"not installed ("+binPath+" missing) — run `assay install`", color))
+	}
+}
+
+// printLaunchdStatus is the darwin install-status section (§1.2.8): the
+// print-derived agent state and PID plus the HONEST supervision note —
+// "self-watchdog → KeepAlive restart" (ADDENDUM §1) — and the unrotated-log
+// caveat.
+func printLaunchdStatus(out io.Writer, binDir string, color bool) {
+	printInstalledBinary(out, binDir, color)
+	st, err := launchdSchedulerFactory().Status()
+	if err != nil {
+		outf(out, "%s\n", ui.Warn("  agent:     launchctl print failed: "+err.Error(), ui.Amber, color))
+		return
+	}
+	if st.Active {
+		outf(out, "%s\n", ui.ChipKV("  agent:     ",
+			fmt.Sprintf("assay-watch registered (pid %d)", st.PID), color))
+	} else {
+		outf(out, "%s\n", ui.ChipKV("  agent:     ", st.Note, color))
+	}
+	outf(out, "%s\n", ui.ChipKV("  supervision:", st.Note, color))
+	outf(out, "%s\n", ui.ChipKV("  logs:      ",
+		"~/Library/Application Support/assay/logs/watch.{out,err}.log (launchd redirect — unrotated)", color))
 }

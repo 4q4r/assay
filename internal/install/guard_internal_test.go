@@ -101,13 +101,14 @@ func TestExecutorRejectsEverythingOutsideAllowlist(t *testing.T) {
 }
 
 // TestInstallSourceUsesOnlyTheSanctionedConstructors pins the source-level
-// shape: exactly one exec site (the SystemctlExecutor), and every Systemctl
-// call goes through the command constructors — no literal args at call
-// sites, no second exec path.
+// shape: exactly TWO exec sites (the allowlist-checked SystemctlExecutor and
+// the allowlist-checked LaunchctlExecutor — S1), and every executor call
+// goes through the command constructors — no literal args at call sites, no
+// third exec path.
 func TestInstallSourceUsesOnlyTheSanctionedConstructors(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
-	execSites, callSites := 0, 0
+	execSites, callSites, launchctlCallSites := 0, 0, 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
 			continue
@@ -117,14 +118,20 @@ func TestInstallSourceUsesOnlyTheSanctionedConstructors(t *testing.T) {
 		s := string(src)
 		execSites += strings.Count(s, "exec.Command")
 		callSites += strings.Count(s, ".Systemctl(cmd")
+		launchctlCallSites += strings.Count(s, ".Launchctl(cmd")
 		assert.NotContains(t, s, `"restart"`,
 			"%s: the string literal \"restart\" must never appear — no restart verb anywhere in the install surface", e.Name())
 	}
-	assert.Equal(t, 1, execSites, "exactly one exec site: the allowlist-checked systemctl executor")
+	assert.Equal(t, 2, execSites, "exactly two exec sites: the allowlist-checked systemctl and launchctl executors")
 	// Install: legacy disable (conditional) + reload + enable = up to 3;
 	// cleanupLegacyUnits: legacy disable = 1; Uninstall: disable + post-removal
 	// reload = 2. All flow through the constructors; no new command shape.
 	assert.Equal(t, 6, callSites, "Install(3) + cleanupLegacyUnits(1) + Uninstall(2) call Systemctl only via the constructors")
+	// launchd flow: Install probe(1) + bootout(1) + bootstrap(1) +
+	// waitBootout(1) + waitRunning(1); Uninstall print(1) + bootout(1);
+	// Status print(1); HeldRegistration print(1). All flow through the four
+	// pinned constructors; no new launchctl shape.
+	assert.Equal(t, 9, launchctlCallSites, "the launchd flow calls Launchctl only via the pinned constructors")
 }
 
 // TestUnitTemplatesAreTheSingleSource pins that the embedded unit comes from

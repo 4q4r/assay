@@ -68,13 +68,21 @@ func AllKnownUnitNames() []string {
 	return append(LegacyUnitNames(), WatchService)
 }
 
-// TemplateData is rendered into the systemd unit template.
+// TemplateData is rendered into the systemd unit template. The plist
+// renderer (launchd.go) reuses the same two core fields with the SAME
+// semantics (§1.2.2: TemplateData parity) plus the two log-path fields the
+// launchd StandardOutPath/StandardErrorPath keys need (systemd logs go to
+// journald, so the unit template ignores them).
 type TemplateData struct {
 	BinaryPath string
 	// ConfigPath embeds into ExecStart as `-c <path>`. EMPTY = the daemon
 	// runs plain `watch` and reads the default config location (the
 	// W13-deploy canonical user flow — the local-share config).
 	ConfigPath string
+	// LogOutPath / LogErrPath feed the launchd plist's StandardOutPath /
+	// StandardErrorPath (under <data>/logs/). Unused by the unit template.
+	LogOutPath string
+	LogErrPath string
 }
 
 // defaultConfigData is rendered into the embedded default-config TOML.

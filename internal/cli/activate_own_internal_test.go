@@ -728,6 +728,7 @@ func TestDaemonCoreExecSurfaceIsPinned(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{
 		"internal/install/install.go",       // systemctl allowlist executor (its own guard)
+		"internal/install/launchd.go",       // launchctl allowlist executor (S1, its own guard)
 		"internal/activate/activate.go",     // the -test gate child (WaitDelay-safe)
 		"internal/checker/instance.go",      // probe/check temp-instance fleets
 		"internal/core/manager.go",          // core spawn/kill (the daemon's own child)
