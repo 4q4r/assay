@@ -125,6 +125,23 @@ func TestDetectRunitRequiresSvOnPath(t *testing.T) {
 	assert.Equal(t, "foreground", Detect(fix.fs(), exec).Name())
 }
 
+func TestDetectRunitZombieEmptyCmdlineDetectsNothingInsteadOfPanicking(t *testing.T) {
+	home := t.TempDir()
+	fix := newProcFixture(t)
+	// P2-1 (S3 review): a zombie's /proc cmdline is EMPTY while comm is
+	// retained — an own-uid exiting runsvdir (or any own-uid process whose
+	// comm carries the prefix) must detect as not-runit, never panic
+	// (nil[1:] slice-bounds). A runsvdir with no dir argument cannot name a
+	// service dir anyway. Pins BOTH consumers of detectRunitServiceDir
+	// (Detect and HeldByAny).
+	fix.addProc(t, 210, 1000, "runsvdir", nil, "")
+	exec := testExecutors(home)
+	exec.SvOnPath = func() bool { return true }
+	assert.Equal(t, "foreground", Detect(fix.fs(), exec).Name())
+	_, _, held := HeldByAny(fix.fs(), exec)
+	assert.False(t, held)
+}
+
 func TestDetectRunitForeignUidRunsvdirIgnored(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)

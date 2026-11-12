@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +131,24 @@ func TestRunScriptContentDefaultLocationGolden(t *testing.T) {
 func TestRunScriptContentRefusesQuoteHostilePaths(t *testing.T) {
 	_, err := runScriptContent(`/home/u/we"ird/assay`, "", "/data")
 	require.Error(t, err, "a double quote would break the sh quoting — refused before writing")
+}
+
+func TestRunScriptContentRefusesShellHostilePaths(t *testing.T) {
+	// P3-1 (S3 review): the line lands inside DOUBLE QUOTES in an sh script —
+	// $var and backticks EXPAND at script-run time (a silently-broken service
+	// path), and backslash is refused for the OpenRC-precedent consistency.
+	// Every field (binary, config, data dir) is refused before any write.
+	for _, hostile := range []string{"/opt/$HOME/assay", "/opt/a`id`/assay", `/opt/back\slash/assay`} {
+		_, err := runScriptContent("/bin/assay", "", hostile)
+		require.Error(t, err, "data dir %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+		_, err = runScriptContent(hostile, "", "/data")
+		require.Error(t, err, "binary path %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+		_, err = runScriptContent("/bin/assay", hostile, "/data")
+		require.Error(t, err, "config path %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+	}
 }
 
 func TestRunitInstallWritesRunScript0755(t *testing.T) {
@@ -284,11 +301,4 @@ func TestRunitInstallErrorNamesSchedulerAndCommand(t *testing.T) {
 	_, err := s.Install(SchedulerInstallSpec{RunningBinary: filepath.Join(home, "running-assay"), BinDir: filepath.Join(home, "bin")})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "runit")
-}
-
-func TestRunitRunScriptNameSkipsDotNames(t *testing.T) {
-	// §3.2: disable = the dot-prefixed sibling (runsvdir.8: dot-names are
-	// skipped); pin the disabled name shape once, here.
-	assert.True(t, strings.HasPrefix(".assay-watch.disabled", "."))
-	assert.False(t, strings.HasPrefix("assay-watch", "."), "the live name must never be dot-prefixed")
 }

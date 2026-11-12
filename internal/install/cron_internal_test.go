@@ -115,6 +115,23 @@ func TestCronLineRefusesCrontabHostilePaths(t *testing.T) {
 	}
 }
 
+func TestCronLineRefusesShellExpansionPaths(t *testing.T) {
+	// P3-1 (S3 review): a crontab command line runs under sh — $var and
+	// backticks EXPAND at job-run time (a silently-broken path). Every field
+	// (binary, config, data dir) is refused before any spool write.
+	for _, hostile := range []string{"/opt/$HOME/assay", "/opt/a`id`/assay"} {
+		_, err := cronLineData("/bin/assay", "", hostile)
+		require.Error(t, err, "data dir %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+		_, err = cronLineData(hostile, "", "/data")
+		require.Error(t, err, "binary path %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+		_, err = cronLineData("/bin/assay", hostile, "/data")
+		require.Error(t, err, "config path %q must be refused", hostile)
+		assert.Contains(t, err.Error(), "hostile")
+	}
+}
+
 func TestCronInstallAppendsMarkedLine(t *testing.T) {
 	spec, binDir, dataDir := cronSpec(t)
 	f := &fakeCrontab{read: "*/5 * * * * /usr/bin/something\n"}

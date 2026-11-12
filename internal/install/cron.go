@@ -152,17 +152,19 @@ func cronLineData(binaryPath, configPath, dataDir string) (string, error) {
 		"BinaryPath": binaryPath,
 		"DataDir":    dataDir,
 	} {
-		if strings.ContainsAny(p, "\"%\n") {
+		if strings.ContainsAny(p, "\"$`%\n") {
 			return "", fmt.Errorf("install: %s %q contains a crontab-hostile character "+
-				"(\", %%, or newline — %% means newline inside a crontab command); "+
+				"(\", $, backtick, %%, or newline — %% means newline inside a crontab command, "+
+				"and $ and backtick expand in the sh the line runs under); "+
 				"choose a path without these characters", field, p)
 		}
 	}
 	args := "watch"
 	if configPath != "" {
-		if strings.ContainsAny(configPath, "\"%\n") {
+		if strings.ContainsAny(configPath, "\"$`%\n") {
 			return "", fmt.Errorf("install: ConfigPath %q contains a crontab-hostile character "+
-				"(\", %%, or newline — %% means newline inside a crontab command); "+
+				"(\", $, backtick, %%, or newline — %% means newline inside a crontab command, "+
+				"and $ and backtick expand in the sh the line runs under); "+
 				"choose a path without these characters", configPath)
 		}
 		args = `watch -c "` + configPath + `"`

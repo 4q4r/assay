@@ -86,6 +86,40 @@ var launchdSchedulerFactory = func() scheduler {
 	return install.NewLaunchdScheduler(install.LaunchctlExecutor{})
 }
 
+// newLinuxHolderScheduler builds the scheduler that OWNS a held assay-watch
+// registration over the production executors (§3.3 + S3 review P2-2): the
+// holder knows its own artifacts, so uninstall routes to it and status
+// renders its state. The artifact location comes from the holder scan —
+// runit/s6/openrc carry <dir>/assay-watch (the parent is the service dir /
+// scandir / init dir); cron needs no location. A systemd holder (the generic
+// path owns the systemd teardown byte-identically) and an unknown name build
+// nothing.
+func newLinuxHolderScheduler(holder, holderLoc string) scheduler { //nolint:ireturn // the §4.1 consumer-side seam
+	switch holder {
+	case install.SchedulerRunit:
+		return install.NewRunitScheduler(install.RunitExecutor{}, filepath.Dir(holderLoc))
+	case install.SchedulerOpenRC:
+		return install.NewOpenRCScheduler(install.OpenRCExecutorImpl{}, filepath.Dir(holderLoc))
+	case install.SchedulerS6:
+		return install.NewS6Scheduler(install.S6ExecutorImpl{}, filepath.Dir(holderLoc))
+	case install.SchedulerCron:
+		return install.NewCronScheduler(install.CronExecutorImpl{})
+	default:
+		return nil
+	}
+}
+
+// linuxHolderScheduler is the linux holder-routing seam (§3.3 + S3 review
+// P2-2): production asks the linuxSchedulerProbe for the registration holder
+// and builds the holder's scheduler — uninstall routes to it, status renders
+// its state. nil (a systemd holder, or nothing held) keeps the generic
+// systemd paths byte-identical. Tests inject fakes so the cobra layer never
+// touches /proc, sv, rc-*, s6-*, or crontab.
+var linuxHolderScheduler = func(unitDir string) scheduler {
+	_, holder, loc := linuxSchedulerProbe(unitDir)
+	return newLinuxHolderScheduler(holder, loc)
+}
+
 // ensureCoreBinary is the D4 install-bootstrap seam: production wires
 // core.EnsureCoreBinary (download the managed core, sha-verified, atomic —
 // inert for an overridden [core].xray_bin per S5); tests stub it so the
@@ -709,6 +743,13 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	if err != nil {
 		return err
 	}
+	// §3.3 linux routing (S3 review P2-2): a non-systemd HOLDER owns its own
+	// teardown — `assay uninstall` removes exactly the artifacts the install
+	// refusal names, so the advice is literally true. A systemd holder (or
+	// nothing held) keeps the generic path below byte-identically.
+	if handled, lerr := runUninstallLinuxHolder(w, cfg, cfgPath, opts, unitDir); handled {
+		return lerr
+	}
 	executor := opts.exec
 	if executor == nil {
 		executor = installExecutor()
@@ -729,6 +770,39 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	}
 	printSystemdUninstall(w, res, opts.purge)
 	return nil
+}
+
+// runUninstallLinuxHolder drives the HOLDER's scheduler teardown when a
+// non-systemd registration exists (§3.3 + S3 review P2-2): the holder knows
+// its own artifacts, so `assay uninstall` removes exactly what the install
+// refusal names. handled=false (a systemd holder, or nothing held) keeps the
+// generic systemd path byte-identical.
+func runUninstallLinuxHolder(
+	w io.Writer, cfg *config.Config, cfgPath string, opts uninstallOptions, unitDir string,
+) (bool, error) {
+	if !linuxHost() {
+		return false, nil
+	}
+	hs := linuxHolderScheduler(unitDir)
+	if hs == nil {
+		return false, nil
+	}
+	spec := install.SchedulerUninstallSpec{}
+	if cfg != nil {
+		spec.DataDir = config.ExpandHome(cfg.DataDir)
+	}
+	if opts.purge {
+		spec.PurgeConfigPath = cfgPath
+		if cfg != nil {
+			spec.PurgeDataDir = config.ExpandHome(cfg.DataDir)
+		}
+	}
+	res, err := hs.Uninstall(spec)
+	if err != nil {
+		return true, err
+	}
+	printSystemdUninstall(w, res, opts.purge)
+	return true, nil
 }
 
 // printSystemdUninstall renders the systemd uninstall report: what was
@@ -886,6 +960,16 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 		printWinSvcStatus(out, binDir, color)
 		return
 	}
+	// linux branch (§3.3 + S3 review P2-2): the holding scheduler's state
+	// through the scheduler seam — its honest probe note verbatim, no state
+	// guessing. A systemd holder (or nothing held) keeps the generic section
+	// below byte-identical.
+	if linuxHost() {
+		if sched := linuxHolderScheduler(unitDir); sched != nil {
+			printLinuxSchedulerStatus(out, sched, binDir, color)
+			return
+		}
+	}
 	printInstalledBinary(out, binDir, color)
 	// unitDir arrives already expanded (status flags → ExpandHome at the
 	// caller); the rest of this function only joins names onto it.
@@ -960,6 +1044,26 @@ func printInstalledBinary(out io.Writer, binDir string, color bool) {
 		outf(out, "%s\n", ui.ChipKV("  binary:    ",
 			"not installed ("+binPath+" missing) — run `assay install`", color))
 	}
+}
+
+// printLinuxSchedulerStatus is the linux install-status section for a
+// non-systemd holder (§3.3 + S3 review P2-2): the installed-binary line the
+// generic section also carries, then the holding scheduler's Status answer —
+// the honest probe note verbatim (the raw sv/s6-svstat/rc-service line where
+// one exists, the supervision posture, the no-supervision caveat for cron).
+// A Status ERROR renders as a loud warning line, never a silent skip.
+func printLinuxSchedulerStatus(out io.Writer, sched scheduler, binDir string, color bool) {
+	printInstalledBinary(out, binDir, color)
+	st, err := sched.Status()
+	if err != nil {
+		outf(out, "%s\n", ui.Warn("  scheduler: "+err.Error(), ui.Amber, color))
+		return
+	}
+	if st.Active {
+		outf(out, "%s\n", ui.ChipKV("  scheduler: ", sched.Name()+" — "+st.Note, color))
+		return
+	}
+	outf(out, "%s\n", ui.ChipKV("  scheduler: ", st.Note, color))
 }
 
 // printLaunchdStatus is the darwin install-status section (§1.2.8): the

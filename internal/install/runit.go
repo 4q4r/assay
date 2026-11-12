@@ -35,9 +35,6 @@ import (
 // the runit analog of WatchService.
 const WatchDirName = "assay-watch"
 
-// RunitDisabledPrefix is the dot-prefix runsvdir skips (§3.2 disable).
-const RunitDisabledPrefix = ".assay-watch.disabled"
-
 // ---------------------------------------------------------------------------
 // SvExecutor — the injected sv seam with its byte-pinned allowlist
 // ---------------------------------------------------------------------------

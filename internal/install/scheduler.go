@@ -151,8 +151,10 @@ func splitCmdline(raw string) []string {
 	return argv
 }
 
-// procUID extracts the owner uid from /proc/<pid>/status (the second field
-// of the `Uid:` line — the effective uid the process runs as).
+// procUID extracts the owner uid from /proc/<pid>/status (the real uid —
+// the first field of the `Uid:` line, whose order is real, effective, saved,
+// filesystem; real == effective for every realistic scheduler, and real
+// excludes a setuid'd helper — desirable for own-user detection).
 func procUID(fs ProcFS, pid string) (int, error) {
 	status, err := fs.ReadProcFile(pid, "status")
 	if err != nil {
@@ -332,6 +334,12 @@ func detectRunitServiceDir(proc ProcFS, exec *Executors) string {
 	}
 	for _, p := range scanOwnProcesses(proc) {
 		if !strings.HasPrefix(p.comm, "runsvdir") {
+			continue
+		}
+		// A zombie's /proc cmdline is EMPTY while comm is retained — skip it
+		// (a runsvdir with no dir argument cannot name a service dir anyway);
+		// slicing nil[1:] would panic (P2-1, S3 review).
+		if len(p.cmdline) < 2 {
 			continue
 		}
 		argv := p.cmdline[1:] // skip argv[0]
@@ -655,18 +663,20 @@ func runScriptLine(binaryPath, configPath, dataDir string) (string, error) {
 		"BinaryPath": binaryPath,
 		"DataDir":    dataDir,
 	} {
-		if strings.ContainsAny(p, "\"\n") {
+		if strings.ContainsAny(p, "\"$`\\\n") {
 			return "", fmt.Errorf("install: %s %q contains a quote-hostile character "+
-				"(\" or newline) — the run script would not exec correctly; "+
-				"choose a path without these characters", field, p)
+				"(\", $, backtick, backslash, or newline) — the line lands inside double quotes "+
+				"in an sh script, where $ and backtick expand and a backslash eats the next "+
+				"character; choose a path without these characters", field, p)
 		}
 	}
 	args := "watch"
 	if configPath != "" {
-		if strings.ContainsAny(configPath, "\"\n") {
+		if strings.ContainsAny(configPath, "\"$`\\\n") {
 			return "", fmt.Errorf("install: ConfigPath %q contains a quote-hostile character "+
-				"(\" or newline) — the run script would not exec correctly; "+
-				"choose a path without these characters", configPath)
+				"(\", $, backtick, backslash, or newline) — the line lands inside double quotes "+
+				"in an sh script, where $ and backtick expand and a backslash eats the next "+
+				"character; choose a path without these characters", configPath)
 		}
 		args = `watch -c "` + configPath + `"`
 	}
