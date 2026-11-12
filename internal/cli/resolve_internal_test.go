@@ -1,3 +1,5 @@
+//go:build linux
+
 package cli
 
 import (
@@ -574,7 +576,3 @@ func TestInstallConfiglessStateMaterializesNewPath(t *testing.T) {
 		"the configless case is the only one with a materialize target — and it is the NEW canonical path")
 	assert.False(t, ir.embedsConfig, "configless install renders plain watch")
 }
-
-// newTestRoot builds a fresh root command (each call gets its own flag
-// state).
-func newTestRoot() *cobra.Command { return New() }

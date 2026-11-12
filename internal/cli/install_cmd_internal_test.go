@@ -1,8 +1,9 @@
+//go:build linux
+
 package cli
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,40 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeCtl records systemctl invocations — the CLI-level seam twin of the
-// install package's fake executor. Tests never execute systemd.
-type fakeCtl struct {
-	calls [][]string
-}
-
-func (f *fakeCtl) Systemctl(args ...string) error {
-	f.calls = append(f.calls, args)
-	return nil
-}
-
-func writeWaveConfig(t *testing.T, dir string, refresh, speedtest time.Duration) string {
-	t.Helper()
-	// Hermetic session probe (install/uninstall check for a user session).
-	run := filepath.Join(dir, "run")
-	require.NoError(t, os.MkdirAll(filepath.Join(run, "systemd"), 0o755))
-	t.Setenv("XDG_RUNTIME_DIR", run)
-	cfgPath := filepath.Join(dir, "config.toml")
-	refreshSpan := (config.Duration{Duration: refresh}).String()
-	speedSpan := (config.Duration{Duration: speedtest}).String()
-	body := fmt.Sprintf(`
-data_dir = %q
-
-[maintain]
-refresh_interval = %q
-speedtest_interval = %q
-`, filepath.Join(dir, "data"), refreshSpan, speedSpan)
-	require.NoError(t, os.WriteFile(cfgPath, []byte(body), 0o600))
-	return cfgPath
-}
-
-// explicitResolved wraps a loaded config as an explicit-source resolution —
-// the direct-call seam the runStatus tests use (the cobra-level resolution
-// itself is pinned in resolve_internal_test.go).
 func explicitResolved(t *testing.T, cfgPath string) *config.Resolved {
 	t.Helper()
 	return &config.Resolved{Config: mustLoad(t, cfgPath), Source: config.SourceExplicit, Path: cfgPath}
@@ -370,11 +337,4 @@ func TestStatusHelpDocumentsDirFlags(t *testing.T) {
 	assert.Contains(t, help, "no state file", "the design rationale stays documented")
 	assert.NotContains(t, help, "NOT tracked",
 		"custom-dir installs are now tracked via the flags (the old caveat is gone)")
-}
-
-func mustLoad(t *testing.T, path string) *config.Config {
-	t.Helper()
-	cfg, err := config.Load(path)
-	require.NoError(t, err)
-	return cfg
 }

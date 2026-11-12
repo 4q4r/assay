@@ -1,3 +1,5 @@
+//go:build unix
+
 package core
 
 // resolve_internal_test.go pins the OWNER-RULING resolution order (2026-11-11,

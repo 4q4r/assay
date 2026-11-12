@@ -1,3 +1,5 @@
+//go:build unix
+
 package stats_test
 
 import (

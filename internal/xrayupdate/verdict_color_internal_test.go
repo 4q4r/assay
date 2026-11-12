@@ -1,3 +1,5 @@
+//go:build unix
+
 // W18 xray-update verdict chips: the final outcome lines render as chips
 // when Options.Color is set; stage progress lines stay plain.
 

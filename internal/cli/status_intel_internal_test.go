@@ -1,3 +1,5 @@
+//go:build linux
+
 // Phase 4 status intelligence dashboard tests: verdict-threshold bands
 // (table-driven), the --json machine-readable contract (field names, order,
 // round-trip), the --overlap composition, NO_COLOR / plain-ASCII fallbacks

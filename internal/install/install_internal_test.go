@@ -1,3 +1,5 @@
+//go:build unix
+
 package install
 
 import (
@@ -9,20 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// fakeExecutor records every invocation; tests never execute systemctl.
-type fakeExecutor struct {
-	calls [][]string
-	fail  error
-}
-
-func (f *fakeExecutor) Systemctl(args ...string) error {
-	if f.fail != nil {
-		return f.fail
-	}
-	f.calls = append(f.calls, args)
-	return nil
-}
 
 // stubBinary writes a tiny stand-in for the running executable.
 func stubBinary(t *testing.T) string {

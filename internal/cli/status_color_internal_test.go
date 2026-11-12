@@ -1,3 +1,5 @@
+//go:build linux
+
 // W18 status-screen chips: labels dim 241, values info 45, section title
 // accent 99; STALE keeps its warning semantics in red 196, LEGACY migrates
 // in amber 214. The whole screen rides the W12 color contract via

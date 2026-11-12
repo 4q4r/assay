@@ -1,3 +1,5 @@
+//go:build unix
+
 package activate_test
 
 import (
