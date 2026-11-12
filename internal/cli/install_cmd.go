@@ -56,6 +56,29 @@ type scheduler interface {
 // Mac (production reads runtime.GOOS exactly).
 var darwinHost = func() bool { return runtime.GOOS == "darwin" }
 
+// linuxHost is the GOOS probe seam for the linux scheduler branch (the S3
+// sibling of darwinHost/windowsHost): tests pin the branch without /proc
+// fixtures; production reads runtime.GOOS exactly.
+var linuxHost = func() bool { return runtime.GOOS == "linux" }
+
+// linuxSchedulerProbe is the CLI's linux detection seam (plan §3.3 step 2):
+// production = install.Detect over the real /proc plus the production
+// executors, followed by the §3.1 cross-scheduler held scan. Returns the
+// detected scheduler and — when a DIFFERENT scheduler already holds an
+// assay-watch registration — the holder's name and artifact location ("" =
+// nothing held). Tests inject fakes so the cobra layer never touches /proc
+// or any scheduler binary.
+var linuxSchedulerProbe = func(unitDir string) (install.Scheduler, string, string) {
+	exec := install.ProductionExecutors(unitDir)
+	proc := install.NewOSProcFS()
+	sched := install.Detect(proc, exec)
+	holder, loc, ok := install.HeldByAny(proc, exec)
+	if !ok {
+		return sched, "", ""
+	}
+	return sched, holder, loc
+}
+
 // launchdSchedulerFactory is the darwin scheduler seam: production wires
 // the allowlist-checked LaunchctlExecutor inside the LaunchdScheduler;
 // tests inject a recorder so the cobra-level flow never executes launchctl.
@@ -71,9 +94,10 @@ var ensureCoreBinary = core.EnsureCoreBinary
 
 func newInstallCommand(cfgPath *string) *cobra.Command {
 	var (
-		binDir    string
-		unitDir   string
-		noSystemd bool
+		binDir      string
+		unitDir     string
+		noSystemd   bool
+		noScheduler bool
 	)
 	cmd := &cobra.Command{
 		Use: "install",
@@ -139,6 +163,7 @@ session.`,
 				binDir:          binDir,
 				unitDir:         unitDir,
 				noSystemd:       noSystemd,
+				noScheduler:     noScheduler,
 				embedsConfig:    res.embedsConfig,
 				materializePath: res.materializePath,
 				color:           color,
@@ -152,7 +177,9 @@ session.`,
 		"directory for the installed assay binary")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user", "systemd user unit directory")
 	cmd.Flags().BoolVar(&noSystemd, "no-systemd", false,
-		"install the binary only (no unit files, no timers) — for hosts without a user systemd session")
+		"renamed to --no-scheduler; kept as a loud alias (install the binary only)")
+	cmd.Flags().BoolVar(&noScheduler, "no-scheduler", false,
+		"install the binary only (no scheduler registration on any platform)")
 	return cmd
 }
 
@@ -211,7 +238,10 @@ type installOptions struct {
 	binDir    string
 	unitDir   string
 	noSystemd bool
-	exec      install.Executor // nil = production SystemctlExecutor
+	// noScheduler spans EVERY scheduler (§3.1.6): skip detection and any
+	// registration — binary + config only. --no-systemd is its loud alias.
+	noScheduler bool
+	exec        install.Executor // nil = production SystemctlExecutor
 	// embedsConfig renders `watch -c <cfgPath>` (explicit -c / legacy-path
 	// installs); false renders plain `watch` (default-location installs).
 	embedsConfig bool
@@ -224,6 +254,7 @@ type installOptions struct {
 }
 
 func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOptions) error {
+	opts = applyNoSchedulerAlias(w, opts)
 	binDir, err := absDir(config.ExpandHome(opts.binDir))
 	if err != nil {
 		return err
@@ -236,9 +267,10 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
-	// The per-OS scheduler branches (darwin/launchd, windows/SCM) own the
-	// whole flow when they match; --no-systemd keeps its binary-only meaning
-	// on every platform and falls through to the generic path below.
+	// The per-OS scheduler branches (darwin/launchd, windows/SCM, and the
+	// S3 linux scheduler detection) own the whole flow when they match;
+	// --no-systemd / --no-scheduler keep their binary-only meaning on every
+	// platform and fall through to the generic path below.
 	if handled, serr := runInstallPerOSScheduler(w, cfg, running, binDir, dataDir, cfgPath, opts); handled {
 		return serr
 	}
@@ -257,7 +289,7 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 		ConfigPath:        cfgAbs,
 		DefaultConfigPath: opts.materializePath,
 		DataDir:           dataDir,
-		NoSystemd:         opts.noSystemd,
+		NoSystemd:         opts.noSystemd || opts.noScheduler,
 		Exec:              executor,
 	})
 	if err != nil {
@@ -284,13 +316,32 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 			res.ConfigKept+" (already present — never overwritten)", opts.color))
 	}
 	if res.SkippedUnits {
-		outf(w, "%s\n", ui.ChipKV("systemd units skipped (--no-systemd): ",
-			"no timers installed; run the maintain wave manually or from your own scheduler", opts.color))
+		label := "--no-systemd"
+		if opts.noScheduler {
+			label = "--no-scheduler"
+		}
+		outf(w, "%s\n", ui.ChipKV("scheduler skipped ("+label+"): ",
+			"no registration on any scheduler; run the maintain wave manually or from your own scheduler", opts.color))
 		return nil
 	}
 	printInstallSummary(w, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
 	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u assay-watch.service -f", opts.color))
 	return nil
+}
+
+// applyNoSchedulerAlias carries the --no-systemd → --no-scheduler rename
+// (the alias warning lives HERE — one source, exercised on the direct-call
+// path the tests drive too; the alias behaves identically to --no-scheduler,
+// which S3 widened to span every scheduler).
+func applyNoSchedulerAlias(w io.Writer, opts installOptions) installOptions {
+	if opts.noSystemd && !opts.noScheduler {
+		outf(w, "%s\n", ui.Warn(
+			"NOTE: --no-systemd was renamed to --no-scheduler (it now spans every scheduler, "+
+				"not only systemd); the old flag is kept as an alias and behaves identically",
+			ui.Amber, opts.color))
+		opts.noScheduler = true
+	}
+	return opts
 }
 
 // runInstallPerOSScheduler routes the darwin and windows installs to their
@@ -304,13 +355,137 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 func runInstallPerOSScheduler(
 	w io.Writer, cfg *config.Config, running, binDir, dataDir, cfgPath string, opts installOptions,
 ) (bool, error) {
-	if darwinHost() && !opts.noSystemd {
+	if darwinHost() && !opts.noSystemd && !opts.noScheduler {
 		return true, runInstallLaunchd(w, cfg, running, binDir, dataDir, cfgPath, opts)
 	}
-	if windowsHost() && !opts.noSystemd {
+	if windowsHost() && !opts.noSystemd && !opts.noScheduler {
 		return true, runInstallWinSvc(w, cfg, running, binDir, dataDir, cfgPath, opts)
 	}
+	// §3.3 linux branching: detect → refuse-on-held → render+activate via
+	// the matched scheduler. handled=false ONLY for the systemd fall-through
+	// (the generic path below owns systemd byte-identically).
+	if linuxHost() && !opts.noSystemd && !opts.noScheduler {
+		return runInstallLinuxScheduler(w, cfg, running, binDir, dataDir, cfgPath, opts)
+	}
 	return false, nil
+}
+
+// runInstallLinuxScheduler is the §3.3 linux flow: detection through the
+// linuxSchedulerProbe seam (§3.1 order), the cross-scheduler double-install
+// refusal (the W5 stampede class — a holder from a DIFFERENT scheduler
+// refuses loudly naming both locations), the byte-identical systemd
+// fall-through, and the matched scheduler's render+activate flow followed by
+// the D4 core bootstrap and the loud summary.
+func runInstallLinuxScheduler(
+	w io.Writer, cfg *config.Config, running, binDir, dataDir, cfgPath string, opts installOptions,
+) (bool, error) {
+	unitDir, uerr := absDir(config.ExpandHome(opts.unitDir))
+	if uerr != nil {
+		return true, uerr
+	}
+	sched, holder, holderLoc := linuxSchedulerProbe(unitDir)
+	if holder != "" && holder != sched.Name() {
+		return true, fmt.Errorf("install: refusing double registration: assay-watch is already "+
+			"installed under %s (%s) and this install would register it under %s — "+
+			"two schedulers running waves concurrently is the stampede class this install "+
+			"refuses by design; uninstall from %s first (`assay uninstall`)",
+			holder, holderLoc, sched.Name(), holder)
+	}
+	if sched.Name() == install.SchedulerSystemd {
+		// §3.1.1: today's path, unchanged — the generic flow below renders
+		// and enables the unit through the same allowlisted executor.
+		return false, nil
+	}
+	if avail, reason := sched.Available(); !avail {
+		return true, fmt.Errorf("install: the %s scheduler is unavailable: %s", sched.Name(), reason)
+	}
+	cfgAbs := ""
+	if opts.embedsConfig && cfgPath != "" {
+		abs, err := explicitConfigAbs(cfgPath)
+		if err != nil {
+			return true, err
+		}
+		cfgAbs = abs
+	}
+	res, err := sched.Install(install.SchedulerInstallSpec{
+		RunningBinary:     running,
+		BinDir:            binDir,
+		ConfigPath:        cfgAbs,
+		DefaultConfigPath: opts.materializePath,
+		DataDir:           dataDir,
+	})
+	if err != nil {
+		return true, err
+	}
+	// D4 core bootstrap: identical contract to the systemd/launchd/windows
+	// branches (loud non-fatal warning; the waves retry through auto-update).
+	if cfg != nil {
+		if berr := ensureCoreBinary(context.Background(), cfg.Core, config.ExpandHome(cfg.DataDir), w); berr != nil {
+			outf(w, "%s\n", ui.Warn("WARNING: core bootstrap: "+berr.Error()+
+				" (install completes; the daemon's waves retry through auto-update)", ui.Amber, opts.color))
+		}
+	}
+	printLinuxSchedulerSummary(w, sched.Name(), res, dataDir, cfgAbs, opts.color)
+	return true, nil
+}
+
+// printLinuxSchedulerSummary is the loud post-install report per scheduler:
+// artifacts written, the supervision mechanism (honest parity — plan §5.22),
+// the unrotated-log caveat where logs land in files, and for the foreground
+// fall-through the EXACT run instructions (§3.1.6).
+func printLinuxSchedulerSummary(w io.Writer, name string, res install.Result, dataDir, cfgAbs string, color bool) {
+	outf(w, "%s\n", ui.ChipKV("scheduler:        ", name+" detected — waves are supervised by this scheduler", color))
+	outf(w, "%s\n", ui.ChipKV("installed binary: ", res.BinaryPath+" (copy of the running image, mode 0755)", color))
+	if res.ConfigWritten != "" {
+		outf(w, "%s\n", ui.ChipKV("config created:   ", res.ConfigWritten+
+			" (materialized defaults — edit to configure; a re-install never overwrites it)", color))
+	}
+	if res.ConfigKept != "" {
+		outf(w, "%s\n", ui.ChipKV("config kept:      ",
+			res.ConfigKept+" (already present — never overwritten)", color))
+	}
+	for _, p := range res.UnitPaths {
+		outf(w, "%s\n", ui.ChipKV("registered:       ", p, color))
+	}
+	switch name {
+	case install.SchedulerRunit:
+		outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+			"assay watch under runsvdir (picked up within its 5s rescan; runsv restart-on-exit, "+
+				"1s backoff); logs "+filepath.Join(dataDir, "logs", "watch.out.log")+
+				" + watch.err.log (unrotated)", color))
+		outf(w, "%s\n", ui.ChipKV("manage:           ",
+			"sv status|stop|restart <service-dir>/assay-watch", color))
+	case install.SchedulerOpenRC:
+		outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+			"assay watch under supervise-daemon (restart-on-crash; rc-service --user assay-watch {status,stop})", color))
+		outf(w, "%s\n", ui.ChipKV("session note:     ",
+			"user services run while the session lives — no lingering without root (OpenRC >= 0.60)", color))
+	case install.SchedulerS6:
+		outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+			"assay watch under s6-supervise (restart-on-exit; activated via s6-svscanctl -a); logs "+
+				filepath.Join(dataDir, "logs", "watch.out.log")+" + watch.err.log (unrotated)", color))
+		outf(w, "%s\n", ui.ChipKV("manage:           ",
+			"s6-svstat <scandir>/assay-watch (stop: s6-svc -d)", color))
+	case install.SchedulerCron:
+		outf(w, "%s\n", ui.ChipKV("daemon active:    ",
+			"assay watch via the @reboot crontab entry (fires when cron starts, i.e. at boot — not at login)", color))
+		outf(w, "%s\n", ui.Warn("NOTE: cron carries NO supervision — no crash restart; "+
+			"`assay watch` runs until it exits", ui.Amber, color))
+	case install.SchedulerForeground:
+		outf(w, "%s\n", ui.Warn("NOTE: no scheduler detected — nothing will start the daemon automatically", ui.Amber, color))
+		if cfgAbs != "" {
+			outf(w, "%s\n", ui.ChipKV("run in foreground:", res.BinaryPath+" watch -c "+cfgAbs, color))
+		} else {
+			outf(w, "%s\n", ui.ChipKV("run in foreground:", res.BinaryPath+" watch", color))
+		}
+		outf(w, "%s\n", ui.ChipKV("                  ",
+			"no supervision: no crash restart — the daemon runs until it exits; "+
+				"install again once systemd (user session), runit, OpenRC >= 0.60, s6, or cron is available", color))
+	}
+	if cfgAbs != "" && name != install.SchedulerForeground {
+		outf(w, "%s\n", ui.ChipKV("config reference: ",
+			cfgAbs+" (install never creates or moves it — keep it in place)", color))
+	}
 }
 
 // daemonCfg resolves the default-location config display path: the
