@@ -232,10 +232,13 @@ func printWinSvcStatus(out io.Writer, binDir string, color bool) {
 	if st.Active {
 		outf(out, "%s\n", ui.ChipKV("  service:   ",
 			fmt.Sprintf("assay registered in the SCM (pid %d)", st.PID), color))
+		// The supervision mechanisms carry real content only for a
+		// registered agent — on the inactive branch the note already said
+		// everything on the "service:" line (P3-4: never print it twice).
+		outf(out, "%s\n", ui.ChipKV("  supervision:", st.Note, color))
 	} else {
 		outf(out, "%s\n", ui.ChipKV("  service:   ", st.Note, color))
 	}
-	outf(out, "%s\n", ui.ChipKV("  supervision:", st.Note, color))
 	outf(out, "%s\n", ui.ChipKV("  logs:      ",
 		"%LOCALAPPDATA%\\assay\\logs\\watch.log (file sink — unrotated)", color))
 	// The core-binary row mirrors the §4.2 table (managed core <data>\bin\xray.exe).

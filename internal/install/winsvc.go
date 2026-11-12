@@ -160,6 +160,10 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 		return res, connectError("install", err)
 	}
 	defer func() { _ = s.actions.disconnect() }()
+	// The openService exists-probe below opens the service handle; release
+	// it on EVERY exit path, exactly like Uninstall's teardown does (the
+	// seam already owns the idempotent closeService).
+	defer s.actions.closeService()
 
 	// §2.2.9 (load-bearing): the running image is locked by Windows —
 	// Control(Stop) + wait BEFORE copyBinary. A fresh host skips this.
@@ -174,7 +178,7 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 			}
 			_ = accepted
 			s.step("controlStop")
-			if werr := s.awaitStopped(&pid); werr != nil {
+			if werr := s.awaitStopped(&pid, "install"); werr != nil {
 				return res, werr
 			}
 		}
@@ -244,8 +248,9 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 }
 
 // awaitStopped polls Query until Stopped (§2.2.7/§2.2.9), bounded. The
-// timeout error carries the EXACT sc.exe/taskkill lines (owner UX rule).
-func (s *WinSvcScheduler) awaitStopped(lastPID *uint32) error {
+// timeout error carries the flow's verb (install/uninstall) plus the EXACT
+// sc.exe/taskkill lines (owner UX rule).
+func (s *WinSvcScheduler) awaitStopped(lastPID *uint32, verb string) error {
 	s.step("pollStopped")
 	for range s.stopPollAttempts {
 		state, pid, err := s.actions.query(WinSvcName)
@@ -258,7 +263,7 @@ func (s *WinSvcScheduler) awaitStopped(lastPID *uint32) error {
 		}
 		time.Sleep(s.stopPollInterval)
 	}
-	return errors.New(WinSvcStopTimeoutMessage(*lastPID, WinSvcStopBound()))
+	return errors.New(WinSvcStopTimeoutMessage(*lastPID, WinSvcStopBound(), verb))
 }
 
 // awaitRunning polls Query until Running with a real pid (bounded) —
@@ -314,7 +319,7 @@ func (s *WinSvcScheduler) Uninstall(spec SchedulerUninstallSpec) (UninstallResul
 				"(run by hand: sc.exe stop assay, then re-run `assay uninstall`)", serr)
 		}
 		s.step("controlStop")
-		if werr := s.awaitStopped(&pid); werr != nil {
+		if werr := s.awaitStopped(&pid, "uninstall"); werr != nil {
 			return res, werr
 		}
 	}

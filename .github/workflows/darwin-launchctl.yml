@@ -106,6 +106,15 @@ jobs:
         run: |
           set -euo pipefail
           note=plan-addendum-launchctl.md
+          excerpts=$(man launchctl | col -b | grep -iE -A6 '^     (bootstrap|bootout|kickstart|print) ')
+          # The §1.1 machine gate: this step proves only that the man page
+          # yields the four subcommand excerpts. An empty result fails the
+          # leg loudly — the artifact must never claim a verification that
+          # did not run.
+          if [ -z "$excerpts" ]; then
+            echo "::error::man launchctl yielded no bootstrap/bootout/kickstart/print excerpts — nothing to record"
+            exit 1
+          fi
           {
             echo "# launchctl syntax verification (macos runner, $(date -u +%FT%TZ))"
             echo
@@ -116,16 +125,12 @@ jobs:
             echo '## man launchctl excerpts'
             echo
             echo '```'
-            man launchctl | col -b | grep -iE -A6 '^     (bootstrap|bootout|kickstart|print) ' || true
+            printf '%s\n' "$excerpts"
             echo '```'
             echo
             echo '## Verdict'
             echo
-            echo '- bootstrap gui/<uid> <plist>: verified against the man page above'
-            echo '- bootout gui/<uid>/<label>: verified'
-            echo '- print gui/<uid>/<label>: verified'
-            echo '- kickstart -k gui/<uid>/<label>: verified'
-            echo '- deviations: NONE observed unless excerpts above disagree with the four pinned shapes'
+            echo '- compare the excerpts above; deviations, if any, go into the plan addendum'
           } | tee "$note" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the plan-addendum note

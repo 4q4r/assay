@@ -262,7 +262,7 @@ func TestLaunchctlAllowlistRefusesEverythingElse(t *testing.T) {
 		{"sudo", "bootstrap", "gui/501", plist},         // no sudo, ever (binding constraint)
 		{"bootout", "gui/501/com.other.agent"},          // foreign label
 		{"bootout", "gui/501/assay-watch", "extra"},     // arity drift
-		{"print", "gui/501/xray-raw"},                   // foreign unit — the W13 ruling
+		{"print", "gui/501/com.other.agent"},            // foreign unit — the W13 ruling class
 		{"kickstart", "gui/501/assay-watch"},            // missing -k
 		{"kickstart", "-k", "gui/501/assay-watch", "x"}, // arity drift
 		{"enable", "gui/501/assay-watch"},               // not a sanctioned verb
@@ -491,6 +491,35 @@ func TestLaunchdStatusParsesStateAndPID(t *testing.T) {
 	assert.Equal(t, 4242, st.PID)
 	assert.Contains(t, st.Note, "self-watchdog", "the note names the mechanism (ADDENDUM §1)")
 	assert.Contains(t, st.Note, "KeepAlive")
+}
+
+// printFixtureNoPid is the launchctl print(8) shape for a REGISTERED agent
+// with no running pid right now (the KeepAlive throttle/restart window):
+// the state line is there, the pid line is not.
+const printFixtureNoPid = `assay-watch = {
+	state = running
+	program = assay
+	...
+}
+`
+
+// TestLaunchdStatusRegisteredWithoutRunningPid pins the §5.22 honest-status
+// rule: print succeeds but parseLaunchdPID finds no running pid → the agent
+// is still registered (Active=true) and the note NAMES that state instead
+// of repeating the running-agent note.
+func TestLaunchdStatusRegisteredWithoutRunningPid(t *testing.T) {
+	f := newFakeLaunchctl()
+	f.expect("print", printFixtureNoPid, nil)
+	s := launchdScheduler(f)
+
+	st, err := s.Status()
+	require.NoError(t, err)
+	assert.True(t, st.Active, "registered is active even without a running pid")
+	assert.Zero(t, st.PID)
+	assert.Contains(t, st.Note, "registered; no running pid right now",
+		"the note names the registered-but-not-running state (§5.22)")
+	assert.Contains(t, st.Note, "self-watchdog → KeepAlive restart",
+		"the note still names the mechanism (ADDENDUM §1)")
 }
 
 // TestLaunchdStatusNotInstalled pins the not-registered case: print fails →

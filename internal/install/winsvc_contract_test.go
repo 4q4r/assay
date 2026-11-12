@@ -71,16 +71,24 @@ func TestWinSvcStateStrings(t *testing.T) {
 	assert.Equal(t, uint32(4), WinSvcStateRunning)
 }
 
-// TestWinSvcStopTimeoutMessage pins the §2.2.7 uninstall-timeout loudness:
-// a bounded-wait expiry carries the EXACT commands to run by hand —
-// sc.exe query assay plus taskkill /PID <pid> /F when a pid is known.
+// TestWinSvcStopTimeoutMessage pins the §2.2.7/§2.2.9 stop-timeout loudness:
+// a bounded-wait expiry carries the verb of the flow that hit it (install
+// and uninstall both poll through awaitStopped) and the EXACT commands to
+// run by hand — sc.exe query assay plus taskkill /PID <pid> /F when a pid
+// is known.
 func TestWinSvcStopTimeoutMessage(t *testing.T) {
-	msg := WinSvcStopTimeoutMessage(4242, 30*time.Minute)
+	msg := WinSvcStopTimeoutMessage(4242, 30*time.Minute, "install")
+	assert.Contains(t, msg, "install: the assay service did not reach Stopped within 30m")
+	assert.Contains(t, msg, "re-run `assay install`")
 	assert.Contains(t, msg, "sc.exe query assay")
 	assert.Contains(t, msg, "taskkill /PID 4242 /F")
-	assert.Contains(t, msg, "30m")
 
-	msg = WinSvcStopTimeoutMessage(0, 30*time.Minute)
+	msg = WinSvcStopTimeoutMessage(4242, 30*time.Minute, "uninstall")
+	assert.Contains(t, msg, "uninstall: the assay service did not reach Stopped within 30m")
+	assert.Contains(t, msg, "re-run `assay uninstall`")
+	assert.Contains(t, msg, "taskkill /PID 4242 /F")
+
+	msg = WinSvcStopTimeoutMessage(0, 30*time.Minute, "uninstall")
 	assert.Contains(t, msg, "sc.exe query assay")
 	assert.NotContains(t, msg, "taskkill", "no pid → no taskkill line (never a fabricated pid)")
 }

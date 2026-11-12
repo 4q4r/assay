@@ -237,6 +237,29 @@ func TestStatusWindowsBranchPins(t *testing.T) {
 	assert.Contains(t, text, platform.CoreBinaryName("windows"), "the core row names xray.exe")
 }
 
+// TestStatusWindowsNotInstalledNoteRendersOnce pins the P3-4 dedup: on the
+// inactive branch the not-installed note renders on the "service:" line
+// ONCE — the "supervision:" line carries real content only in the active
+// branch, so it must not repeat the same note.
+func TestStatusWindowsNotInstalledNoteRendersOnce(t *testing.T) {
+	_, dataDir := winSvcCliConfig(t)
+	sched := &fakeWinSvcCliScheduler{
+		status: install.SchedulerStatus{
+			Active: false,
+			Note:   "service not installed (assay — run `assay install`)",
+		},
+	}
+	withWindowsHost(t, sched)
+
+	out := &syncWriter{}
+	printWinSvcStatus(out, filepath.Join(dataDir, "bin"), false)
+	text := out.String()
+	assert.Equal(t, 1, strings.Count(text, "service not installed"),
+		"the not-installed note renders exactly once (P3-4)")
+	assert.NotContains(t, text, "supervision:",
+		"the supervision line is suppressed on the inactive branch (P3-4)")
+}
+
 // TestInstallBinDirDefaultTable pins the §2.2.10 bin-dir default: unix
 // keeps ~/.local/bin; windows resolves %LOCALAPPDATA%\assay\bin (never a
 // PATH modification — the summary points at the PowerShell line instead).

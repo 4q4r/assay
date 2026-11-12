@@ -67,7 +67,9 @@ func newServiceWatchDeps(wired chan<- struct{}, stopRequest <-chan struct{}) wat
 // `assay watch [-c <abs config>]` — anything else refuses loudly instead
 // of being silently mis-read. An absent -c is legal HERE (the §2.2.5
 // refusal applies downstream, in resolveServiceConfig) so a hand-created
-// -c-less service produces the actionable refusal rather than an arg error.
+// -c-less service produces the actionable refusal rather than an arg error;
+// an explicit EMPTY -c value refuses at this gate instead — an empty string
+// is a malformed value, not an absent one.
 func ParseServiceArgs(args []string) (string, error) {
 	if len(args) < 2 || args[0] != install.WinSvcName {
 		return "", fmt.Errorf("service arguments %v are malformed — the assay service runs "+
@@ -81,7 +83,11 @@ func ParseServiceArgs(args []string) (string, error) {
 	case 2:
 		return "", nil
 	case 4:
-		if args[2] == "-c" || args[2] == "--config" {
+		// An explicit `-c ""` is an EMPTY value, not an absent one: it
+		// refuses at this same malformed-args gate instead of silently
+		// downgrading to the default-resolution path (the §2.2.5 SYSTEM
+		// profile check is for the absent case, not the empty one).
+		if (args[2] == "-c" || args[2] == "--config") && args[3] != "" {
 			return args[3], nil
 		}
 	}

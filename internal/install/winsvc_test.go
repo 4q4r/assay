@@ -169,6 +169,7 @@ func TestWinSvcInstallFreshPins(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, res.ServiceActive)
 	assert.Equal(t, filepath.Join(spec.BinDir, "assay.exe"), res.BinaryPath)
+	assert.True(t, f.closed, "the openService handle is released on every Install path (P3-1)")
 
 	// The call-shape pins:
 	require.Equal(t, "assay", f.createName)
@@ -331,7 +332,28 @@ func TestWinSvcUninstallStopTimeoutMessage(t *testing.T) {
 	s := winSvcTestScheduler(f).withStopPolling(time.Millisecond, 3)
 	_, err := s.Uninstall(SchedulerUninstallSpec{DataDir: filepath.Join(t.TempDir(), "assay")})
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "uninstall: the assay service did not reach Stopped",
+		"the uninstall flow names its own verb (P3-3)")
+	assert.Contains(t, err.Error(), "re-run `assay uninstall`")
 	assert.Contains(t, err.Error(), "sc.exe query assay")
+	assert.Contains(t, err.Error(), "taskkill /PID 4242 /F")
+}
+
+// TestWinSvcInstallStopTimeoutMessage pins the §2.2.9 install-side stop
+// expiry: the message carries the INSTALL verb — the prefix and the re-run
+// advice name the same command (P3-3).
+func TestWinSvcInstallStopTimeoutMessage(t *testing.T) {
+	f := &fakeWinSvcActions{}
+	// The service exists (openService succeeds) and never leaves
+	// StopPending within the bounded wait.
+	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateStopPending, 4242})
+	s := winSvcTestScheduler(f).withStopPolling(time.Millisecond, 3)
+	spec, _ := winSvcSpec(t)
+	_, err := s.Install(spec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "install: the assay service did not reach Stopped",
+		"the install flow names its own verb (P3-3)")
+	assert.Contains(t, err.Error(), "re-run `assay install`")
 	assert.Contains(t, err.Error(), "taskkill /PID 4242 /F")
 }
 

@@ -111,11 +111,14 @@ func WinSvcStopBound() time.Duration { return winSvcStopBound }
 
 // WinSvcStopTimeoutMessage is the loud §2.2.7 expiry: the bounded wait ran
 // out, so the message carries the EXACT commands to run by hand — the
-// status probe and, when the Query reported a pid, the forceful kill.
-func WinSvcStopTimeoutMessage(pid uint32, bound time.Duration) string {
-	msg := fmt.Sprintf("install: the assay service did not reach Stopped within %s — "+
-		"stop it by hand, then re-run `assay uninstall`:\n"+
-		"  sc.exe query assay", bound)
+// status probe and, when the Query reported a pid, the forceful kill. The
+// verb names the flow that hit the bound ("install" §2.2.9 or "uninstall"
+// §2.2.7 — both poll through awaitStopped), so the prefix and the re-run
+// advice always name the same command.
+func WinSvcStopTimeoutMessage(pid uint32, bound time.Duration, verb string) string {
+	msg := fmt.Sprintf("%s: the assay service did not reach Stopped within %s — "+
+		"stop it by hand, then re-run `assay %s`:\n"+
+		"  sc.exe query assay", verb, bound, verb)
 	if pid > 0 {
 		msg += fmt.Sprintf("\n  taskkill /PID %d /F", pid)
 	}

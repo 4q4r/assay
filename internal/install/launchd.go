@@ -543,6 +543,17 @@ func (s *LaunchdScheduler) Status() (SchedulerStatus, error) {
 		}, nil
 	}
 	pid := parseLaunchdPID(out)
+	if pid == 0 {
+		// §5.22 honesty: registered-but-not-running (the KeepAlive
+		// throttle/restart window) is a distinct state — name it, never
+		// dress it up as the running-agent note.
+		return SchedulerStatus{
+			Active: true,
+			PID:    0,
+			Note: "registered; no running pid right now (KeepAlive/ThrottleInterval governs; " +
+				"mechanism: self-watchdog → KeepAlive restart)",
+		}, nil
+	}
 	return SchedulerStatus{
 		Active: true,
 		PID:    pid,

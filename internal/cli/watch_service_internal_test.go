@@ -192,6 +192,7 @@ func TestParseServiceArgsPins(t *testing.T) {
 		{"other", "watch"},
 		{"assay"},
 		{"assay", "watch", "-c"},
+		{"assay", "watch", "-c", ""},
 		{"assay", "watch", "-c", "a", "b"},
 		{"assay", "watch", "extra"},
 	} {
