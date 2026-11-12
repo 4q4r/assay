@@ -28,7 +28,7 @@ func DefaultDataDir(goos, home string) (string, bool) {
 			return "", false
 		}
 		return filepath.Join(home, "Library", "Application Support", "assay"), true
-	case "windows":
+	case windowsGOOS:
 		if local := os.Getenv("LOCALAPPDATA"); local != "" {
 			return filepath.Join(local, "assay"), true
 		}
@@ -59,7 +59,7 @@ func DefaultDataDir(goos, home string) (string, bool) {
 // without corrupting the table.
 func SystemXrayPaths(goos string) []string {
 	switch goos {
-	case "windows":
+	case windowsGOOS:
 		return []string{}
 	case "darwin":
 		return []string{"/usr/local/bin/xray", "/opt/homebrew/bin/xray"}

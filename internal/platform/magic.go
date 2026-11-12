@@ -9,7 +9,7 @@ package platform
 // (verifyBinary), so a longer entry could never match.
 func ExecMagics(goos string) [][]byte {
 	switch goos {
-	case "windows":
+	case windowsGOOS:
 		return [][]byte{{'M', 'Z'}}
 	case "darwin":
 		return [][]byte{
@@ -32,7 +32,7 @@ func ExecMagic(goos string) []byte {
 // verifier messages: "ELF", "Mach-O", or "PE".
 func ExecFormatName(goos string) string {
 	switch goos {
-	case "windows":
+	case windowsGOOS:
 		return "PE"
 	case "darwin":
 		return "Mach-O"

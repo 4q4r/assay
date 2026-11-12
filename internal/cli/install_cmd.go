@@ -14,6 +14,7 @@ import (
 	"assay/internal/config"
 	"assay/internal/core"
 	"assay/internal/install"
+	"assay/internal/platform"
 	"assay/internal/ui"
 
 	"github.com/spf13/cobra"
@@ -145,7 +146,10 @@ session.`,
 		},
 	}
 	attachColorFlags(cmd)
-	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin", "directory for the installed assay binary")
+	// The bin-dir default is the §4.2 per-OS table (§2.2.10 on windows:
+	// %LOCALAPPDATA%\assay\bin — never PATH-modified).
+	cmd.Flags().StringVar(&binDir, "bin-dir", installBinDirDefault(runtime.GOOS),
+		"directory for the installed assay binary")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user", "systemd user unit directory")
 	cmd.Flags().BoolVar(&noSystemd, "no-systemd", false,
 		"install the binary only (no unit files, no timers) — for hosts without a user systemd session")
@@ -232,14 +236,11 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
-	// darwin branch (plan §1/§S1): macOS is always launchd — the scheduler
-	// owns the whole §1.2.6 flow. Branched BEFORE prepareInstallPaths: the
-	// systemd-only constraints (the --unit-dir default, the ExecStart
-	// whitespace check — ProgramArguments is an XML array, whitespace-safe)
-	// do not apply to the LaunchAgent. --no-systemd keeps its binary-only
-	// meaning on every platform, so it falls through to the code below.
-	if darwinHost() && !opts.noSystemd {
-		return runInstallLaunchd(w, cfg, running, binDir, dataDir, cfgPath, opts)
+	// The per-OS scheduler branches (darwin/launchd, windows/SCM) own the
+	// whole flow when they match; --no-systemd keeps its binary-only meaning
+	// on every platform and falls through to the generic path below.
+	if handled, serr := runInstallPerOSScheduler(w, cfg, running, binDir, dataDir, cfgPath, opts); handled {
+		return serr
 	}
 	unitDir, cfgAbs, err := prepareInstallPaths(cfgPath, binDir, opts)
 	if err != nil {
@@ -290,6 +291,26 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	printInstallSummary(w, cfgAbs, daemonCfg(opts, cfgPath), res, opts.color)
 	outf(w, "%s\n", ui.ChipKV("journal: ", "journalctl --user -u assay-watch.service -f", opts.color))
 	return nil
+}
+
+// runInstallPerOSScheduler routes the darwin and windows installs to their
+// schedulers (plan §1/§S1 launchd; §2/§S2 windows SCM). Branched BEFORE
+// prepareInstallPaths: the systemd-only constraints (the --unit-dir
+// default, the ExecStart whitespace check) do not apply to the LaunchAgent
+// plist (XML array, whitespace-safe) or the SCM registration (args are
+// typed strings, not a split line). handled=false (linux, or --no-systemd
+// on any platform) falls through to the generic systemd path — which never
+// touches systemctl when NoSystemd is set.
+func runInstallPerOSScheduler(
+	w io.Writer, cfg *config.Config, running, binDir, dataDir, cfgPath string, opts installOptions,
+) (bool, error) {
+	if darwinHost() && !opts.noSystemd {
+		return true, runInstallLaunchd(w, cfg, running, binDir, dataDir, cfgPath, opts)
+	}
+	if windowsHost() && !opts.noSystemd {
+		return true, runInstallWinSvc(w, cfg, running, binDir, dataDir, cfgPath, opts)
+	}
+	return false, nil
 }
 
 // daemonCfg resolves the default-location config display path: the
@@ -504,6 +525,11 @@ func runUninstall(w io.Writer, cfg *config.Config, cfgPath string, opts uninstal
 	if darwinHost() {
 		return runUninstallLaunchd(w, cfg, cfgPath, opts)
 	}
+	// windows branch (plan §2.2.7): Control(Stop) → poll → Delete via the
+	// scheduler, managed-core teardown unchanged, purge passthrough.
+	if windowsHost() {
+		return runUninstallWinSvc(w, cfg, cfgPath, opts)
+	}
 	unitDir, err := absDir(config.ExpandHome(opts.unitDir))
 	if err != nil {
 		return err
@@ -679,6 +705,12 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 		printLaunchdStatus(out, binDir, color)
 		return
 	}
+	// windows branch (§2.2.8 + ADDENDUM §1): the SCM Query state + pid via
+	// the scheduler seam, with the recovery/child-stop mechanisms named.
+	if windowsHost() {
+		printWinSvcStatus(out, binDir, color)
+		return
+	}
 	printInstalledBinary(out, binDir, color)
 	// unitDir arrives already expanded (status flags → ExpandHome at the
 	// caller); the rest of this function only joins names onto it.
@@ -728,10 +760,11 @@ func printInstallStatus(out io.Writer, cfg *config.Config, cfgPath, binDir, unit
 }
 
 // printInstalledBinary renders the installed-binary line plus the W13
-// stale-binary notice — shared by the systemd and launchd install-status
-// sections.
+// stale-binary notice — shared by the systemd, launchd, and windows
+// install-status sections. The name joins through the platform table
+// (assay.exe on windows, assay elsewhere — §4.2).
 func printInstalledBinary(out io.Writer, binDir string, color bool) {
-	binPath := filepath.Join(binDir, "assay")
+	binPath := filepath.Join(binDir, platform.AssayBinaryName(runtime.GOOS))
 	if st, err := os.Stat(binPath); err == nil {
 		outf(out, "%s\n", ui.ChipKV("  binary:    ",
 			fmt.Sprintf("%s (mode %s)", binPath, st.Mode()), color))

@@ -34,8 +34,12 @@ import (
 //go:embed defaults_config.toml
 var defaultConfigFS embed.FS
 
-// installedBinaryName is the fixed executable name in BinDir.
-const installedBinaryName = "assay"
+// installedBinaryName is the executable name in BinDir (the §4.2 "Installed
+// binary" row): GOOS-aware through the platform table — "assay.exe" on
+// windows (SCM + CreateProcess need the extension), "assay" elsewhere.
+func installedBinaryName() string {
+	return platform.AssayBinaryName(runtime.GOOS)
+}
 
 // WatchService is the W10 daemon unit installed into the user unit
 // directory.
@@ -120,6 +124,10 @@ type Result struct {
 	LegacyCleaned []string // legacy timer units disabled + removed by this install
 	ServiceActive bool
 	SkippedUnits  bool // --no-systemd: binary copy only, units skipped
+	// ServiceNote carries a non-fatal activation note (the windows
+	// installer's §2.2.4 success-with-note when the service was already
+	// running); "" everywhere else.
+	ServiceNote string
 	// ConfigWritten is the default-config path materialized by this install
 	// ("" = explicit -c install or the file already existed).
 	ConfigWritten string
@@ -400,7 +408,7 @@ func copyBinary(src, dir string) (string, error) {
 		return "", fmt.Errorf("install: open running binary %s: %w", src, err)
 	}
 	defer func() { _ = in.Close() }() // read-only handle on the running image
-	target := filepath.Join(dir, installedBinaryName)
+	target := filepath.Join(dir, installedBinaryName())
 	tmp, err := os.CreateTemp(dir, ".assay-*")
 	if err != nil {
 		return "", fmt.Errorf("install: temp file in %s: %w", dir, err)

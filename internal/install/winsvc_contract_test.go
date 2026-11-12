@@ -51,9 +51,9 @@ func TestWinSvcRecoveryPins(t *testing.T) {
 	assert.Equal(t, WinSvcRecoveryRestart, actions[0].Type)
 	assert.Equal(t, 5*time.Second, actions[0].Delay)
 	assert.Equal(t, uint32(86400), WinSvcRecoveryResetPeriod)
-	// The windows value this maps to is SC_ACTION_RESTART (1) — pinned so a
+	// The windows value this maps to is SC_ACTION_RESTART (1) — pinned so an
 	// accidental renumber cannot silently change the SCM recovery semantic.
-	assert.Equal(t, WinSvcRecoveryType(1), WinSvcRecoveryRestart)
+	assert.Equal(t, WinSvcRecoveryRestart, WinSvcRecoveryType(1))
 }
 
 // TestWinSvcStateStrings pins the Query-state rendering (§2.2.8): the
@@ -67,8 +67,8 @@ func TestWinSvcStateStrings(t *testing.T) {
 	assert.Equal(t, "Paused", WinSvcStateString(WinSvcStatePaused))
 	assert.Equal(t, "State(99)", WinSvcStateString(99))
 	// The Win32 numbers the mapping encodes (stable SERVICE_* values).
-	assert.Equal(t, uint32(1), uint32(WinSvcStateStopped))
-	assert.Equal(t, uint32(4), uint32(WinSvcStateRunning))
+	assert.Equal(t, uint32(1), WinSvcStateStopped)
+	assert.Equal(t, uint32(4), WinSvcStateRunning)
 }
 
 // TestWinSvcStopTimeoutMessage pins the §2.2.7 uninstall-timeout loudness:

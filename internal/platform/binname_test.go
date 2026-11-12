@@ -29,3 +29,13 @@ func TestCoreBinaryNameTable(t *testing.T) {
 			"CoreBinaryName(%q) must follow the §4.2 managed-core row", tt.goos)
 	}
 }
+
+// TestAssayBinaryName pins the installed-binary name table (§4.2 "Installed
+// binary"): assay.exe on windows (the SCM registration and CreateProcess
+// need the PE extension), assay elsewhere — the S0 Review-Focus-5 discipline
+// applied to assay's own name.
+func TestAssayBinaryName(t *testing.T) {
+	assert.Equal(t, "assay.exe", AssayBinaryName("windows"))
+	assert.Equal(t, "assay", AssayBinaryName("linux"))
+	assert.Equal(t, "assay", AssayBinaryName("darwin"))
+}

@@ -38,6 +38,18 @@ const (
 	LaunchdPlistName = LaunchdLabel + ".plist"
 )
 
+// SchedulerInstallSpec is the §4.1 scheduler-neutral name of the
+// per-scheduler install input — a type ALIAS of LaunchdInstallSpec (its
+// fields are platform-generic: running binary, bin dir, config paths, data
+// dir). The windows scheduler (winsvc.go) and the CLI consumer seam use the
+// neutral names; the launchd implementation and its tests keep theirs.
+type SchedulerInstallSpec = LaunchdInstallSpec
+
+// SchedulerUninstallSpec is the §4.1 scheduler-neutral name of the
+// uninstall input — a type ALIAS of LaunchdUninstallSpec. One type, two
+// spellings, zero conversion.
+type SchedulerUninstallSpec = LaunchdUninstallSpec
+
 // launchdTemplates carries the embedded agent plist template (single source
 // of truth, go:embed — the sibling of the unit-template pattern).
 //
