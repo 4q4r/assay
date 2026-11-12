@@ -17,8 +17,7 @@ import (
 // the plain contract on the progress lines.
 func TestVerdictLinesColored(t *testing.T) {
 	t.Run("installed verdict is green chip", func(t *testing.T) {
-		asset := fakeXrayZip(t, "26.10.21")
-		srv := releaseServer(t, "v26.10.21", asset, "")
+		srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 		target := filepath.Join(t.TempDir(), "bin", "xray")
 		installFakeXray(t, target, "Xray 26.3.27")
 
@@ -46,8 +45,7 @@ func TestVerdictLinesColored(t *testing.T) {
 	})
 
 	t.Run("declined verdict stays dim", func(t *testing.T) {
-		asset := fakeXrayZip(t, "26.10.21")
-		srv := releaseServer(t, "v26.10.21", asset, "")
+		srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 		target := filepath.Join(t.TempDir(), "bin", "xray")
 		installFakeXray(t, target, "Xray 26.3.27")
 
@@ -63,8 +61,7 @@ func TestVerdictLinesColored(t *testing.T) {
 	})
 
 	t.Run("color-off is byte-plain", func(t *testing.T) {
-		asset := fakeXrayZip(t, "26.10.21")
-		srv := releaseServer(t, "v26.10.21", asset, "")
+		srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 		target := filepath.Join(t.TempDir(), "bin", "xray")
 		installFakeXray(t, target, "Xray 26.3.27")
 

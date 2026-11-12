@@ -3,9 +3,11 @@ package xrayupdate
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,16 +56,19 @@ esac
 exit 1
 `
 
-// fakeXrayZip builds the release asset: a zip whose entries mirror the real
-// Xray-linux-64.zip layout (binary + dat files). The script variant selects
-// the fake's behavior (default vs bad-version).
-func fakeXrayZipScript(t *testing.T, script string) []byte {
+// fakeXrayZipScript builds a release asset: a zip whose entries mirror the
+// real Xray-linux-64.zip layout (binary + dat files). The script variant
+// selects the fake's behavior (default vs bad-version); archMark (the
+// release-matrix arch key) tags the geoip entry so every arch ships a
+// DISTINCT body — the per-arch checksum/validation paths must stay
+// distinguishable.
+func fakeXrayZipScript(t *testing.T, script, archMark string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, entry := range []struct{ name, body string }{
 		{"xray", script},
-		{"geoip.dat", "fake-geoip"},
+		{"geoip.dat", "fake-geoip-for-" + archMark},
 		{"geosite.dat", "fake-geosite"},
 	} {
 		w, err := zw.Create(entry.name)
@@ -75,9 +80,18 @@ func fakeXrayZipScript(t *testing.T, script string) []byte {
 	return buf.Bytes()
 }
 
-func fakeXrayZip(t *testing.T, _ string) []byte {
-	t.Helper()
-	return fakeXrayZipScript(t, fakeXraySh)
+// releaseMatrix is the host-arch surface the release can run on
+// (.goreleaser.yaml: linux amd64/arm64/386/arm, goarm 7). The fake release
+// index must carry an asset for EVERY entry: production asks for the entry
+// of runtime.GOARCH (assetForPlatform), so a single-arch index makes every
+// update-path test pass on amd64 and fail on other runners.
+func releaseMatrix() []struct{ arch, arm string } {
+	return []struct{ arch, arm string }{
+		{arch: "amd64", arm: ""},
+		{arch: "arm64", arm: ""},
+		{arch: "386", arm: ""},
+		{arch: "arm", arm: "7"},
+	}
 }
 
 const dgstLine = "MD5= deadbeef\nSHA1= deadbeef\nSHA2-256= %s\nSHA2-512= deadbeef\n"
@@ -89,26 +103,63 @@ func sha256Hex(b []byte) string {
 }
 
 // releaseServer is the fake GitHub release surface: /releases/latest JSON
-// plus the asset + .dgst downloads. checksum overrides the real digest so
-// the mismatch path is testable.
-func releaseServer(t *testing.T, tag string, assetBody []byte, checksum string) *httptest.Server {
+// plus the asset + .dgst downloads for EVERY release-matrix arch — each
+// asset name resolved THROUGH the production map (assetForPlatform) so the
+// fixture cannot drift from the code's naming table. The host picks its own
+// entry at runtime; a single-arch index would pass on amd64 and break the
+// suite on every other runner. checksum overrides every published digest so
+// the mismatch path stays testable on any host.
+func releaseServer(t *testing.T, tag, script, checksum string) *httptest.Server {
 	t.Helper()
-	sha := sha256Hex(assetBody)
-	if checksum != "" {
-		sha = checksum
+	type served struct {
+		body []byte
+		sha  string
 	}
+	assets := make(map[string]served, len(releaseMatrix()))
+	idx := release{TagName: tag}
+	for _, m := range releaseMatrix() {
+		name := assetForPlatform(platLinux, m.arch, m.arm)
+		require.NotEmpty(t, name,
+			"release-matrix arch linux/%s (arm %q) must map to a release asset", m.arch, m.arm)
+		body := fakeXrayZipScript(t, script, m.arch)
+		sha := sha256Hex(body)
+		if checksum != "" {
+			sha = checksum
+		}
+		assets[name] = served{body: body, sha: sha}
+		idx.Assets = append(idx.Assets, asset{
+			Name: name,
+			URL:  "http://HOST/ASSET/" + name,
+		})
+	}
+	index, err := json.Marshal(idx)
+	require.NoError(t, err)
+	hostIdx := func(host string) []byte {
+		return bytes.ReplaceAll(index, []byte("http://HOST/"), []byte("http://"+host+"/"))
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/XTLS/Xray-core/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w,
-			`{"tag_name":"`+tag+`","assets":[{"name":"Xray-linux-64.zip","browser_download_url":"http://%s/ASSET"}]}`,
-			r.Host)
+		_, _ = w.Write(hostIdx(r.Host))
 	})
-	mux.HandleFunc("/ASSET", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(assetBody)
-	})
-	mux.HandleFunc("/ASSET.dgst", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(strings.Replace(dgstLine, "%s", sha, 1)))
+	mux.HandleFunc("/ASSET/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/ASSET/")
+		if base, isDgst := strings.CutSuffix(name, ".dgst"); isDgst {
+			a, ok := assets[base]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(strings.Replace(dgstLine, "%s", a.sha, 1)))
+			return
+		}
+		a, ok := assets[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(a.body)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -136,6 +187,63 @@ func baseOpts(t *testing.T, api string) Options {
 }
 
 // --- platform asset mapping ---
+
+// httpGetBody fetches url with a context-carrying request and returns the
+// body of a 200 response (test-side helper, fail-loud on every leg).
+func httpGetBody(t *testing.T, url string) []byte {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "%s must serve 200", url)
+	return body
+}
+
+// TestReleaseFixtureServesFullReleaseMatrix pins the fixture's hermeticity
+// contract: the fake release index must carry an asset for EVERY host arch
+// the release matrix (.goreleaser.yaml: linux amd64/arm64/386/arm7) can run
+// on, and the per-arch bodies must be pairwise distinct so the per-arch
+// checksum/validation paths stay meaningful. Production resolves the asset
+// name via assetForPlatform(runtime.GOARCH): a single-arch index passes on
+// amd64 and breaks every update-path test on other runners (the arm CI
+// gate failure "release v26.10.21 ships no asset"), so this test must fail
+// on ANY host the moment the index loses an arch.
+func TestReleaseFixtureServesFullReleaseMatrix(t *testing.T) {
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
+
+	var rel release
+	require.NoError(t, json.Unmarshal(httpGetBody(t, srv.URL+"/repos/XTLS/Xray-core/releases/latest"), &rel),
+		"the fake index must decode through the production release struct")
+	require.Equal(t, "v26.10.21", rel.TagName)
+
+	bodies := make(map[string][]byte, len(rel.Assets))
+	for _, a := range rel.Assets {
+		bodies[a.Name] = httpGetBody(t, a.URL)
+	}
+
+	for _, m := range releaseMatrix() {
+		name := assetForPlatform(platLinux, m.arch, m.arm)
+		require.NotEmpty(t, name,
+			"release-matrix arch linux/%s (arm %q) must map to a release asset", m.arch, m.arm)
+		a, err := findAsset(&rel, name)
+		require.NoError(t, err,
+			"the fixture index must ship the linux/%s asset %q — production asks for it on that host", m.arch, name)
+		require.NotEmpty(t, bodies[a.Name], "the linux/%s asset must be downloadable", m.arch)
+	}
+
+	seen := make(map[string]string, len(bodies))
+	for name, body := range bodies {
+		owner, clash := seen[string(body)]
+		require.False(t, clash,
+			"assets %s and %s share one body — the per-arch checksum/validation paths would be indistinguishable",
+			owner, name)
+		seen[string(body)] = name
+	}
+}
 
 func TestAssetForPlatform(t *testing.T) {
 	for _, tc := range []struct {
@@ -171,8 +279,7 @@ func TestParseVersionBanner(t *testing.T) {
 // --- --check mode ---
 
 func TestCheckModeReportsVersions(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27 (Xray, Penetrates Everything.)")
 
@@ -194,8 +301,7 @@ func TestCheckModeReportsVersions(t *testing.T) {
 // --- full update happy path ---
 
 func TestFullUpdateHappyPath(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27 (Xray, Penetrates Everything.)")
 
@@ -238,8 +344,7 @@ func TestFullUpdateHappyPath(t *testing.T) {
 // --- checksum verification ---
 
 func TestChecksumMismatchFailsLoudAndLeavesTargetUntouched(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "0000000000000000000000000000000000000000000000000000000000000000")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "0000000000000000000000000000000000000000000000000000000000000000")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27")
 	before, err := os.ReadFile(target)
@@ -261,8 +366,7 @@ func TestChecksumMismatchFailsLoudAndLeavesTargetUntouched(t *testing.T) {
 // --- -test gate on the staged binary ---
 
 func TestStagedBinaryFailingTestGateAbortsReplace(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27")
 	before, err := os.ReadFile(target)
@@ -285,8 +389,7 @@ func TestStagedBinaryFailingTestGateAbortsReplace(t *testing.T) {
 // backup back over the target (same-directory rename) and error loud
 // naming the rollback — a broken install must never be the resting state.
 func TestPostReplaceValidationFailureRollsBackToBackup(t *testing.T) {
-	asset := fakeXrayZipScript(t, fakeXrayBadVersionSh)
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXrayBadVersionSh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27 (Xray, Penetrates Everything.)")
 	before, err := os.ReadFile(target)
@@ -312,8 +415,7 @@ func TestPostReplaceValidationFailureRollsBackToBackup(t *testing.T) {
 // the sudo stage-and-instruct path died with the external mode) ---
 
 func TestUnwritableTargetRefusesLoudWithoutPrivilegedCommands(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	rootDir := t.TempDir()
 	require.NoError(t, os.Chmod(rootDir, 0o555)) // root-owned-directory simulation
 	t.Cleanup(func() { _ = os.Chmod(rootDir, 0o750) })
@@ -337,8 +439,7 @@ func TestUnwritableTargetRefusesLoudWithoutPrivilegedCommands(t *testing.T) {
 // the backup — pre-fix the backup copy ran first and died with a generic
 // "backup … permission denied" naming nothing actionable.
 func TestUnwritableTargetWithExistingBinaryRefusesBeforeBackup(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	rootDir := t.TempDir()
 	target := filepath.Join(rootDir, "xray")
 	installFakeXray(t, target, "Xray 26.3.27")
@@ -367,8 +468,7 @@ func TestUnwritableTargetWithExistingBinaryRefusesBeforeBackup(t *testing.T) {
 // --- confirmation discipline ---
 
 func TestNonTTYWithoutYesRefuses(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27")
 
@@ -381,8 +481,7 @@ func TestNonTTYWithoutYesRefuses(t *testing.T) {
 }
 
 func TestTTYConfirmationDeclinedAborts(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27")
 	before, err := os.ReadFile(target)
@@ -402,8 +501,7 @@ func TestTTYConfirmationDeclinedAborts(t *testing.T) {
 // --- already up to date ---
 
 func TestUpToDateShortCircuits(t *testing.T) {
-	asset := fakeXrayZip(t, "26.3.27")
-	srv := releaseServer(t, "v26.3.27", asset, "")
+	srv := releaseServer(t, "v26.3.27", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray")
 	installFakeXray(t, target, "Xray 26.3.27 (Xray, Penetrates Everything.)")
 
@@ -419,8 +517,7 @@ func TestUpToDateShortCircuits(t *testing.T) {
 // --- missing target binary ---
 
 func TestMissingTargetBinaryInstallsFresh(t *testing.T) {
-	asset := fakeXrayZip(t, "26.10.21")
-	srv := releaseServer(t, "v26.10.21", asset, "")
+	srv := releaseServer(t, "v26.10.21", fakeXraySh, "")
 	target := filepath.Join(t.TempDir(), "bin", "xray") // never installed
 
 	opts := baseOpts(t, srv.URL)
