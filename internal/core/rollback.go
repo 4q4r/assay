@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"assay/internal/config"
 	"assay/internal/store"
 )
 
@@ -26,7 +28,9 @@ const StateFileName = "core-state.json"
 // K/K — T2 review M-1) and reset with it: a fresh manager resets the file
 // (NewManager), because the streak lives in the process that counts it.
 // The rollback record is DISK truth — the restore really happened — and
-// survives restarts.
+// survives restarts. The Binary* fields are the core-binary RESOLUTION
+// provenance (owner ruling 2026-11-11): written on every resolution change
+// by the core lifecycle, read cross-process by the status block.
 type HealthState struct {
 	Strikes            int       `json:"strikes"`
 	LastCheckAt        time.Time `json:"last_check_at,omitzero"`
@@ -34,6 +38,15 @@ type HealthState struct {
 	LastError          string    `json:"last_error,omitempty"`
 	LastRollbackAt     time.Time `json:"last_rollback_at,omitzero"`
 	LastRollbackBackup string    `json:"last_rollback_backup,omitempty"`
+	// BinarySource is the resolution provenance: "override" (an explicit
+	// [core].xray_bin), "user-local" (~/.local/bin/xray — assay's own
+	// binary), or "system-preexisting" (a system xray bound as found).
+	BinarySource string `json:"binary_source,omitempty"`
+	// BinaryPath is the bound binary's absolute path.
+	BinaryPath string `json:"binary_path,omitempty"`
+	// BinaryVersion is the bound binary's parsed `xray version` ("" when
+	// the binary cannot answer).
+	BinaryVersion string `json:"binary_version,omitempty"`
 }
 
 // writeHealthStateFile persists the state atomically (the store's
@@ -78,6 +91,36 @@ func ReadHealthState(dataDir string) (*HealthState, error) {
 		return nil, fmt.Errorf("core: decode health state: %w", err)
 	}
 	return &s, nil
+}
+
+// writeCoreProvenance merges the resolution provenance into the persisted
+// core-state.json (read-modify-write — the D8 health mirror and the
+// rollback record are preserved). Called by the core lifecycle on every
+// RESOLUTION CHANGE; an identical provenance skips the write (no churn).
+// The state file is observability, not control flow: a write failure warns
+// loud and never breaks the resolution.
+func writeCoreProvenance(dataDir string, src BinarySource, path, version string, log io.Writer) {
+	state, err := ReadHealthState(dataDir)
+	switch {
+	case err != nil:
+		// F9 honesty precedent: a corrupt artifact is named loud, never
+		// swallowed — this rewrite LOSES whatever disk history (e.g. the
+		// rollback record) the corrupt file carried.
+		_, _ = fmt.Fprintf(log, "WARNING: core: persisted %s is corrupt (%v) — rewriting it; "+
+			"any rollback record in it is lost\n", StateFileName, err)
+		state = &HealthState{}
+	case state == nil:
+		state = &HealthState{}
+	}
+	if state.BinarySource == string(src) && state.BinaryPath == path && state.BinaryVersion == version {
+		return
+	}
+	state.BinarySource = string(src)
+	state.BinaryPath = path
+	state.BinaryVersion = version
+	if err := writeHealthStateFile(dataDir, state); err != nil {
+		_, _ = fmt.Fprintf(log, "WARNING: core: persist resolution provenance: %v\n", err)
+	}
 }
 
 // RecordHealth feeds the D8 strike counter. A nil error is a healthy check:
@@ -157,11 +200,55 @@ func (m *Manager) readHealthStateLocked() *HealthState {
 	return state
 }
 
+// userLocalPreviousBin is the binary-level rollback artifact: the copy of
+// ~/.local/bin/xray as it was BEFORE the latest update's atomic swap. Kept
+// through the swap (graceful-migration contract), restored by the D8
+// strike trigger — the binary-level mirror of the config-level rollback.
+func userLocalPreviousBin() string {
+	user := config.UserLocalXrayBin()
+	if user == "" {
+		return ""
+	}
+	return user + ".previous"
+}
+
+// restorePreviousBinaryLocked performs the binary-level rollback when one
+// is possible: the bound binary is assay's own user-local install AND the
+// .previous copy exists. The restore is the atomic same-directory rename —
+// the swap's own mechanism, run in reverse. Reports whether a restore
+// happened (the caller's log line names it).
+func (m *Manager) restorePreviousBinaryLocked() bool {
+	prev := userLocalPreviousBin()
+	if prev == "" || m.source != SourceUserLocal {
+		return false
+	}
+	if _, err := os.Stat(prev); err != nil {
+		return false
+	}
+	user := config.UserLocalXrayBin()
+	if err := os.Rename(prev, user); err != nil {
+		_, _ = fmt.Fprintf(m.log, "WARNING: core: binary rollback failed — the previous binary stays at %s: %v\n",
+			prev, err)
+		return false
+	}
+	_, _ = fmt.Fprintf(m.log, "core: binary-level rollback — restored the previous core binary over %s\n", user)
+	// The resolution CHANGED (a different binary now sits at the bound path)
+	// — re-probe its version and rewrite the provenance record (the
+	// "provenance on every resolution change" contract); the record must
+	// never keep describing the failed update.
+	version := probeBoundVersion(context.Background(), user, m.log)
+	warnBelowFloor(binarySourceKind(m.source), user, version, m.log)
+	writeCoreProvenance(m.dataDir, m.source, user, version, m.log)
+	return true
+}
+
 // rollbackLocked performs the D8 sequence on the already-struck manager:
-// newest backup → `-test` gate → atomic restore of live.json → core
-// restart → loud line. Every refusal keeps the previous state untouched and
-// is logged loud.
+// (binary-level restore first, when one is possible — the -test gate and
+// the respawn must run the known-good binary) → newest backup → `-test`
+// gate → atomic restore of live.json → core restart → loud line. Every
+// refusal keeps the previous state untouched and is logged loud.
 func (m *Manager) rollbackLocked() bool {
+	m.restorePreviousBinaryLocked()
 	bak, err := newestBackup(m.backupDir)
 	if err != nil {
 		_, _ = fmt.Fprintf(m.log, "core: rollback refused — %v (keeping current state)\n", err)
@@ -199,12 +286,14 @@ func (m *Manager) rollbackLocked() bool {
 		"restored %s, core restarted\n", min(m.strikes, m.strikeK), bak)
 	// The rollback record is disk truth (the restore really happened): it
 	// lands in the mirror immediately, before RecordHealth's post-rollback
-	// strike reset rewrites the file around it.
-	m.writeHealthStateLocked(&HealthState{
-		Strikes:            min(m.strikes, m.strikeK),
-		LastRollbackAt:     time.Now(),
-		LastRollbackBackup: filepath.Base(bak),
-	})
+	// strike reset rewrites the file around it. Read-modify-write — the
+	// resolution provenance fields are DISK HISTORY too and must survive
+	// the record (a fresh struct here would silently drop them).
+	state := m.readHealthStateLocked()
+	state.Strikes = min(m.strikes, m.strikeK)
+	state.LastRollbackAt = time.Now()
+	state.LastRollbackBackup = filepath.Base(bak)
+	m.writeHealthStateLocked(state)
 	return true
 }
 

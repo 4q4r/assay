@@ -4,12 +4,23 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
 	"assay/internal/config"
 
 	"github.com/spf13/cobra"
+)
+
+// Build coordinates injected at link time by goreleaser (see
+// .goreleaser.yaml ldflags); these defaults are what plain `go build`
+// produces. Commit and Date stay informational; Version alone is the
+// release smoke-probe token.
+var (
+	Version = "dev"
+	Commit  = "none"
+	Date    = "unknown"
 )
 
 // New builds the root command.
@@ -24,7 +35,9 @@ func New() *cobra.Command {
 		CompletionOptions: cobra.CompletionOptions{
 			HiddenDefaultCmd: true,
 		},
+		Version: fmt.Sprintf("%s (%s) %s", Version, Commit, Date),
 	}
+	root.SetVersionTemplate("assay {{.Version}}\n")
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", "",
 		"path to the TOML configuration file (optional — resolution: this path, else "+
 			config.ShareConfigDisplay+", else ./config.toml, else built-in defaults; "+

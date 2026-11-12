@@ -132,14 +132,16 @@ func withVersionFloor(t *testing.T, floor string) {
 // parsable banner.
 const shellCoreScript = "#!/bin/sh\necho \"Xray 1.0.0 fixture-banner\"\nexit 0\n"
 
-// TestEnsureCoreDownloadsVerifiesAndInstalls (plan test 1): a clean data dir
-// gets the latest release asset downloaded, sha256-verified against the
-// release checksum file, and installed ATOMICALLY to <data>/bin/xray with
-// the assets materialized in <data>/share/xray (the C2 contract). A wrong
-// checksum refuses LOUD and leaves NO file behind.
+// TestEnsureCoreDownloadsVerifiesAndInstalls (plan test 1, reworked to the
+// owner-ruling resolution order): a clean data dir gets the latest release
+// asset downloaded, sha256-verified against the release checksum file, and
+// installed ATOMICALLY to the user-local ~/.local/bin/xray (NO elevation)
+// with the assets materialized in <data>/share/xray (the C2 contract). A
+// wrong checksum refuses LOUD and leaves NO file behind anywhere.
 func TestEnsureCoreDownloadsVerifiesAndInstalls(t *testing.T) {
 	t.Run("wrong checksum refuses loud, installs nothing", func(t *testing.T) {
 		dir := t.TempDir()
+		withResolutionSeams(t)
 		srv, hits := fakeCoreReleaseServer(t, "v26.10.31", "", "deadbeef", nil)
 		withReleaseAPIBase(t, srv.URL)
 
@@ -147,15 +149,16 @@ func TestEnsureCoreDownloadsVerifiesAndInstalls(t *testing.T) {
 		err := EnsureCoreBinary(context.Background(), config.CoreConfig{}, dir, log)
 		require.Error(t, err, "a checksum mismatch must refuse")
 		assert.Contains(t, err.Error(), "verification FAILED", "the refusal names the verification")
-		_, statErr := os.Stat(filepath.Join(dir, "bin", "xray"))
+		_, statErr := os.Stat(config.UserLocalXrayBin())
 		assert.True(t, os.IsNotExist(statErr), "no binary was installed by the refused download")
 		_, statErr = os.Stat(filepath.Join(dir, "share", "xray"))
 		assert.True(t, os.IsNotExist(statErr), "no assets were materialized by the refused download")
 		assert.Positive(t, releaseHits(hits), "the refusal happened AFTER a real fetch (the test is not vacuous)")
 	})
 
-	t.Run("correct checksum installs atomically with assets", func(t *testing.T) {
+	t.Run("verified release installs user-locally with assets", func(t *testing.T) {
 		dir := t.TempDir()
+		userLocal, _ := withResolutionSeams(t)
 		script := filepath.Join(t.TempDir(), "core-script")
 		require.NoError(t, os.WriteFile(script, []byte(shellCoreScript), 0o755))
 		srv, hits := fakeCoreReleaseServer(t, "v26.10.31", script, "", map[string][]byte{
@@ -167,29 +170,41 @@ func TestEnsureCoreDownloadsVerifiesAndInstalls(t *testing.T) {
 		log := &bytes.Buffer{}
 		require.NoError(t, EnsureCoreBinary(context.Background(), config.CoreConfig{}, dir, log))
 
-		bin, err := os.ReadFile(filepath.Join(dir, "bin", "xray"))
-		require.NoError(t, err, "the managed binary is installed at <data>/bin/xray")
-		assert.Equal(t, shellCoreScript, string(bin), "the installed binary is the verified payload")
-		st, err := os.Stat(filepath.Join(dir, "bin", "xray"))
-		require.NoError(t, err)
+		raw, err := os.ReadFile(userLocal)
+		require.NoError(t, err, "the verified binary is installed at the user-local path")
+		assert.Equal(t, shellCoreScript, string(raw), "the installed binary is the verified payload")
+		st, statErr := os.Stat(userLocal)
+		require.NoError(t, statErr)
 		assert.Equal(t, os.FileMode(0o755), st.Mode().Perm(), "the core binary is executable")
+		_, statErr = os.Stat(filepath.Join(dir, "bin", "xray"))
+		assert.True(t, os.IsNotExist(statErr),
+			"the data-dir bin/xray layout is dead — no stale data-dir-first install")
 
 		for name, want := range map[string]string{
 			"geoip.dat":   "GEOIP-FIXTURE",
 			"geosite.dat": "GEOSITE-FIXTURE",
 		} {
-			raw, err := os.ReadFile(filepath.Join(dir, "share", "xray", name))
+			rawData, err := os.ReadFile(filepath.Join(dir, "share", "xray", name))
 			require.NoError(t, err, "asset %s materialized in <data>/share/xray (C2)", name)
-			assert.Equal(t, want, string(raw))
+			assert.Equal(t, want, string(rawData))
 		}
 		logs := log.String()
 		assert.Contains(t, logs, "v26.10.31", "the installed version is loud")
 		assert.Contains(t, logs, "sha256", "the verification is loud")
+		assert.Contains(t, logs, "PATH", "the PATH note is loud on a fresh install")
+		assert.NotContains(t, logs, "sudo", "no elevation exists anywhere on the install path")
 		assert.Positive(t, releaseHits(hits), "a real download happened")
+
+		state, rerr := ReadHealthState(dir)
+		require.NoError(t, rerr)
+		require.NotNil(t, state)
+		assert.Equal(t, SourceUserLocal, BinarySource(state.BinarySource),
+			"the fresh user-local install is recorded")
 	})
 
 	t.Run("below-floor latest refuses loud", func(t *testing.T) {
 		dir := t.TempDir()
+		withResolutionSeams(t)
 		srv, _ := fakeCoreReleaseServer(t, "v26.3.27", "", "", nil)
 		withReleaseAPIBase(t, srv.URL)
 		withVersionFloor(t, "26.9.9")
@@ -198,17 +213,19 @@ func TestEnsureCoreDownloadsVerifiesAndInstalls(t *testing.T) {
 		err := EnsureCoreBinary(context.Background(), config.CoreConfig{}, dir, log)
 		require.Error(t, err, "a below-floor release must refuse")
 		assert.Contains(t, err.Error(), "version floor")
-		_, statErr := os.Stat(filepath.Join(dir, "bin", "xray"))
+		_, statErr := os.Stat(config.UserLocalXrayBin())
 		assert.True(t, os.IsNotExist(statErr), "nothing was installed below the floor")
 	})
 }
 
-// TestEnsureCoreNoopWhenOverriddenOrPresent (plan test 2): EnsureCoreBinary
-// is a NO-OP when [core].xray_bin is overridden (ONE loud INFO per S5) or
-// when the managed binary already exists — neither case touches the network.
+// TestEnsureCoreNoopWhenOverriddenOrPresent (plan test 2, reworked):
+// EnsureCoreBinary is a NO-OP when [core].xray_bin is overridden (ONE loud
+// INFO per S5) or when the user-local binary already exists — neither case
+// touches the download path.
 func TestEnsureCoreNoopWhenOverriddenOrPresent(t *testing.T) {
 	t.Run("overridden binary is inert with one loud INFO", func(t *testing.T) {
 		dir := t.TempDir()
+		withResolutionSeams(t) // the seams stay armed; an override must touch nothing
 		srv, hits := fakeCoreReleaseServer(t, "v26.10.31", "", "", nil)
 		withReleaseAPIBase(t, srv.URL)
 
@@ -218,21 +235,28 @@ func TestEnsureCoreNoopWhenOverriddenOrPresent(t *testing.T) {
 
 		assert.Zero(t, releaseHits(hits), "an overridden binary never touches the network")
 		assert.Contains(t, log.String(), "inert", "the S5 INFO is loud")
-		_, statErr := os.Stat(filepath.Join(dir, "bin", "xray"))
-		assert.True(t, os.IsNotExist(statErr), "no managed binary is installed for an override")
+		_, statErr := os.Stat(config.UserLocalXrayBin())
+		assert.True(t, os.IsNotExist(statErr), "no user-local binary is installed for an override")
+
+		state, rerr := ReadHealthState(dir)
+		require.NoError(t, rerr)
+		require.NotNil(t, state)
+		assert.Equal(t, SourceOverride, BinarySource(state.BinarySource),
+			"the override provenance is recorded")
 	})
 
-	t.Run("existing managed binary is a no-op", func(t *testing.T) {
+	t.Run("existing user-local binary is a no-op", func(t *testing.T) {
 		dir := t.TempDir()
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, "bin"), 0o750))
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "bin", "xray"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		userLocal, _ := withResolutionSeams(t)
+		writeVersionScript(t, userLocal, "26.10.31")
 		srv, hits := fakeCoreReleaseServer(t, "v26.10.31", "", "", nil)
 		withReleaseAPIBase(t, srv.URL)
 
 		log := &bytes.Buffer{}
 		require.NoError(t, EnsureCoreBinary(context.Background(), config.CoreConfig{}, dir, log))
-		assert.Zero(t, releaseHits(hits), "an existing managed binary downloads nothing")
-		assert.Contains(t, log.String(), "present", "the presence is reported loud")
+		assert.Zero(t, releaseHits(hits), "an existing user-local binary downloads nothing")
+		assert.Contains(t, log.String(), "user-local", "the binding is reported loud")
+		assert.Equal(t, SourceUserLocal, BinarySource(readProvenanceFixture(t, dir).BinarySource))
 	})
 }
 
@@ -257,8 +281,9 @@ func TestAutoUpdateInertWhenOverridden(t *testing.T) {
 	m := newTestManager(t, config.CoreConfig{XrayBin: "/usr/bin/xray", SocksPort: 22900}, dir, log)
 
 	ctx := context.Background()
-	require.NoError(t, m.AutoUpdate(ctx, config.CoreConfig{XrayBin: "/usr/bin/xray"}))
-	require.NoError(t, m.AutoUpdate(ctx, config.CoreConfig{XrayBin: "/usr/bin/xray"}))
+	cfg := config.CoreConfig{AutoUpdate: true, XrayBin: "/usr/bin/xray"}
+	require.NoError(t, m.AutoUpdate(ctx, cfg))
+	require.NoError(t, m.AutoUpdate(ctx, cfg))
 
 	assert.Zero(t, releaseHits(hits), "the inert path never touches the network")
 	assert.Equal(t, 1, strings.Count(log.String(), "inert"),
@@ -267,7 +292,7 @@ func TestAutoUpdateInertWhenOverridden(t *testing.T) {
 
 // TestAutoUpdateRespectsVersionFloor (plan test 6): the latest release being
 // below the observatory-safe floor is refused loud — no download, no swap,
-// the installed binary untouched.
+// the staged binary untouched.
 func TestAutoUpdateRespectsVersionFloor(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(t.TempDir(), "core-script")
@@ -279,11 +304,11 @@ func TestAutoUpdateRespectsVersionFloor(t *testing.T) {
 
 	log := &syncBuffer{}
 	m := newManagedTestManager(t, config.CoreConfig{SocksPort: 22902}, dir, log)
-	err := m.AutoUpdate(context.Background(), config.CoreConfig{UpdateInterval: config.Duration{Duration: time.Hour}})
+	err := m.AutoUpdate(context.Background(), config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: time.Hour}})
 	require.Error(t, err, "a below-floor latest must refuse")
 	assert.Contains(t, err.Error(), "version floor")
 	assert.Zero(t, releaseHits(hits)-1, "no asset download happens below the floor (only the release check)")
-	st, rerr := os.Lstat(filepath.Join(dir, "bin", "xray"))
+	st, rerr := os.Lstat(config.UserLocalXrayBin())
 	require.NoError(t, rerr)
 	assert.NotZero(t, st.Mode()&os.ModeSymlink,
 		"the planted binary is untouched (still the symlink — no swap happened below the floor)")
@@ -300,7 +325,7 @@ func TestAutoUpdateRespectsUpdateInterval(t *testing.T) {
 	srv, hits := fakeCoreReleaseServer(t, "v26.10.31", script, "", nil)
 	withReleaseAPIBase(t, srv.URL)
 
-	cfg := config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
+	cfg := config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
 
 	t.Run("fresh check inside the interval is skipped", func(t *testing.T) {
 		writeUpdateStateFixture(t, dir, time.Now().Add(-1*time.Hour))
@@ -347,7 +372,7 @@ func TestAutoUpdateDownloadsSwapsAndRestarts(t *testing.T) {
 	pid := readPIDFileForTest(t, filepath.Join(dir, "core.pid"))
 
 	require.NoError(t, m.AutoUpdate(context.Background(),
-		config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}}))
+		config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}}))
 
 	logs := log.String()
 	assert.Contains(t, logs, "updated", "the swap is loud")
@@ -359,34 +384,37 @@ func TestAutoUpdateDownloadsSwapsAndRestarts(t *testing.T) {
 	assert.GreaterOrEqual(t, releaseHits(hits), 3, "a real download happened")
 }
 
-// TestAutoUpdateInstallsWhenBinaryMissing: with no managed binary at all,
-// the auto-update path IS the recovery path — it installs the latest
-// release (no restart: nothing was running) and the next EnsureRunning
-// boots the core.
+// TestAutoUpdateInstallsWhenBinaryMissing: with no binary anywhere, the
+// auto-update path IS the recovery path — it installs the latest release
+// at the user-local target (no elevation anywhere; no restart: nothing was
+// running) and the next EnsureRunning boots it.
 func TestAutoUpdateInstallsWhenBinaryMissing(t *testing.T) {
 	dir := t.TempDir()
 	const port = 22910
+	target, _ := withResolutionSeams(t)
 	writeLiveFixture(t, dir, port, "autoupdate-install")
-	script := filepath.Join(t.TempDir(), "core-script")
-	require.NoError(t, os.WriteFile(script, []byte(shellCoreScript), 0o755))
+	script := writeVersionScript(t, filepath.Join(t.TempDir(), "release"), "26.10.31")
 
 	srv, _ := fakeCoreReleaseServer(t, "v26.10.31", script, "", nil)
 	withReleaseAPIBase(t, srv.URL)
 
 	log := &syncBuffer{}
-	// A managed manager with NO binary placed: the auto-update path IS the
-	// recovery path (the helper would plant the fake — build it by hand).
+	// A manager with NO binary placed: the auto-update path IS the recovery
+	// path (the helper would plant the fake — build it by hand).
 	m, err := NewManager(config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dir, log)
 	require.NoError(t, err)
 	t.Cleanup(m.release)
 	require.NoError(t, m.AutoUpdate(context.Background(),
-		config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}}))
+		config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}}))
 
 	logs := log.String()
 	assert.Contains(t, logs, "installed at", "the fresh install is loud")
+	assert.Contains(t, logs, "PATH", "the PATH note is loud on a fresh install")
 	assert.NotContains(t, logs, "core: stopped pid", "nothing was running — no restart leg")
-	_, statErr := os.Stat(filepath.Join(dir, "bin", "xray"))
-	require.NoError(t, statErr, "the managed binary exists after the auto-update install")
+	_, statErr := os.Stat(target)
+	require.NoError(t, statErr, "the user-local binary exists after the auto-update install")
+	assert.Equal(t, target, m.bin,
+		"the manager binds the user-local binary it just installed")
 }
 
 // bootDeathCoreScript passes the staged `-test` gate (exit 0) but DIES as a
@@ -414,7 +442,7 @@ func TestAutoUpdateRestartFailureDoesNotAdvanceState(t *testing.T) {
 	m := newManagedTestManager(t, config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dir, log)
 	require.NoError(t, m.EnsureRunning(context.Background()))
 
-	cfg := config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
+	cfg := config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
 	err := m.AutoUpdate(context.Background(), cfg)
 	require.Error(t, err, "the boot-death swap must fail the restart leg")
 	assert.Contains(t, err.Error(), "restart failed")
@@ -469,7 +497,7 @@ func TestAutoUpdatePendingRestartReattemptsDespiteSameVersion(t *testing.T) {
 	// the running core predates it.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, coreRestartPendingName), []byte("v26.10.31"), 0o600))
 
-	cfg := config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
+	cfg := config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}}
 	require.NoError(t, m.AutoUpdate(context.Background(), cfg),
 		"the pending restart leg succeeds on a healthy core")
 	assert.Contains(t, log.String(), "pending restart leg completed",
@@ -497,19 +525,21 @@ func TestAutoUpdateFailsFastOnUnreadableCurrentBinaryBeforeNetwork(t *testing.T)
 	srv, hits := fakeCoreReleaseServer(t, "v26.10.31", "", "", nil)
 	withReleaseAPIBase(t, srv.URL)
 
-	// The managed binary cannot answer `version` (exit 1 on every argv).
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "bin"), 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "bin", "xray"), []byte("#!/bin/sh\nexit 1\n"), 0o755))
+	// The bound binary cannot answer `version` (exit 1 on every argv) — it
+	// sits at the USER-LOCAL path (the no-override resolution binds it).
+	target, _ := withResolutionSeams(t)
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o750))
+	require.NoError(t, os.WriteFile(target, []byte("#!/bin/sh\nexit 1\n"), 0o755))
 
 	log := &syncBuffer{}
-	// Managed layout by hand: the broken script sits AT the managed default
-	// <data>/bin/xray (no override).
+	// User-local layout by hand: the broken script sits AT the user-local
+	// binary path (no override).
 	m, err := NewManager(config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dir, log)
 	require.NoError(t, err)
 	t.Cleanup(m.release)
 
 	cerr := m.AutoUpdate(context.Background(),
-		config.CoreConfig{UpdateInterval: config.Duration{Duration: 24 * time.Hour}})
+		config.CoreConfig{AutoUpdate: true, UpdateInterval: config.Duration{Duration: 24 * time.Hour}})
 	require.Error(t, cerr, "an unreadable current binary must fail the update leg")
 	assert.Contains(t, cerr.Error(), "could not read the current version")
 	assert.Zero(t, releaseHits(hits),

@@ -1,0 +1,124 @@
+# Per-commit gate: mirrors the proven local gate commands exactly
+# (golangci-lint v2 config with `default: all` covers go vet inside its
+# linter set; the test job still runs vet + build explicitly so the
+# gate list stays visible in CI; gofumpt has a dedicated job because
+# .golangci.yml hands format ownership to the standalone gofumpt binary).
+name: ci
+
+on:
+  # Branch filters per the binding brief ("push to main + pull_request"):
+  # PR-head commits are covered by the pull_request trigger's merge-run
+  # semantics, so bare `push:` would double-run every PR commit (push
+  # event + PR event, disjoint concurrency groups) in the metered
+  # private window — and would also fire ci.yml on tag pushes.
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Save runner minutes on superseded pushes; never cancel main.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint (zero issues, no caps — repo .golangci.yml is authoritative)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14
+
+  format-gofumpt:
+    name: gofumpt format gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # The standalone gofumpt binary is the single owner of gofumpt
+      # formatting (.golangci.yml deliberately excludes it from the
+      # golangci formatter set); pinned to the exact local version so CI
+      # cannot drift from the local gate.
+      - name: fail on any gofumpt finding
+        run: |
+          out=$(go run mvdan.cc/gofumpt@v0.12.0 -l .)
+          if [ -n "$out" ]; then
+            echo "gofumpt violations in:"
+            echo "$out"
+            exit 1
+          fi
+
+  test:
+    name: test (${{ matrix.runs-on }} -race)
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      # Flake protocol (documented): the test suites use DISJOINT fixed
+      # port bands far below the Linux ephemeral range — cli tests bind
+      # 21800-21999, fake cores in internal/probe bind 22900-22999 with
+      # the manager band at 22940-22980, the checker band is 28500-28799.
+      # The historical flake (TestBootSmokeEveryProtocolFamily) was a
+      # cross-package collision before the bands were made disjoint and
+      # is FIXED; no blanket retry logic is configured here because
+      # retries mask real regressions. If that documented port-band class
+      # ever fires on CI: one manual re-run to confirm, then a fix wave.
+      - name: test (-race, never cached)
+        run: go test -race -count=1 ./...
+
+  build-matrix:
+    name: build (${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: amd64, goarm: "" }
+          - { goarch: arm64, goarm: "" }
+          - { goarch: "386", goarm: "" }
+          - { goarch: arm, goarm: "7" }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Compile-only per-arch gate on EVERY commit; runtime smoke of the
+      # release binaries happens per-arch at release time (scripts/smoke.sh
+      # via the goreleaser post-build hook in .goreleaser.yaml).
+      - name: cross-compile linux target
+        run: |
+          [ -z "${{ matrix.goarm }}" ] || export GOARM=${{ matrix.goarm }}
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -trimpath ./cmd/assay
+
+  markdownlint:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Reads .markdownlint-cli2.jsonc from the repo root automatically —
+      # same config as the local markdownlint-cli2 gate.
+      - uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: "*.md"

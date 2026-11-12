@@ -716,8 +716,9 @@ func newProbeFactory(cfg *config.Config, p paths) probe.Factory {
 }
 
 // coreXrayBin resolves the SINGLE core binary knob (S1): the explicit
-// [core].xray_bin override (~-expanded), else the managed default
-// <data>/bin/xray. Every consumer in this package — the probe/check
+// [core].xray_bin override (~-expanded), else the owner-ruling resolution
+// (user-local ~/.local/bin/xray → existing system xray → the user-local
+// install target). Every consumer in this package — the probe/check
 // temp-instance fleets, the activation -test gate, the core manager — goes
 // through this one resolver; [activate].xray_bin is retired for all of them.
 func coreXrayBin(cfg *config.Config) string {

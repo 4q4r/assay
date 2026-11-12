@@ -1,0 +1,32 @@
+# Nightly benchmark run (load/perf pick of ci-actions-plan.md 3):
+# measurement only, not a gate — per-commit bench gates are flaky on
+# shared runners, so perf history is collected on a schedule and kept as
+# run artifacts (-count=5 gives benchstat-able samples). Manual trigger
+# available before releases. Regression gating against a pinned baseline
+# is deliberately NOT configured (owner decision, parked in the plan).
+name: load
+
+on:
+  schedule:
+    # Nightly, off the hour.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: run benchmark suite
+        run: go test -run='^$' -bench=. -benchmem -benchtime=2s -count=5 ./internal/... > bench.txt
+      - name: upload benchmark artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ github.run_id }}
+          path: bench.txt

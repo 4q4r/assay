@@ -13,6 +13,8 @@ Assay turns public xray share links into a geo-diverse, continuously re-verified
 [![TOML](https://img.shields.io/badge/config-TOML-9C4121?style=for-the-badge)](https://toml.io/)
 
 [![License](https://img.shields.io/github/license/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay/blob/main/LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/4q4r/assay/ci.yml?style=flat-square&logo=github)](https://github.com/4q4r/assay/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/4q4r/assay?style=flat-square&logo=github)](https://github.com/4q4r/assay/releases/latest)
 [![Last commit](https://img.shields.io/github/last-commit/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay/commits/main)
 [![Repo size](https://img.shields.io/github/repo-size/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay)
 [![Go Reference](https://img.shields.io/badge/Go_Reference-assay-00ADD8?style=flat-square&logo=go&logoColor=white)](https://github.com/4q4r/assay)
@@ -69,7 +71,7 @@ flowchart TB
 
     Activate -->|"only on a real diff"| Core["core manager\nflock + restart + D8 strikes"]
     Core --> Health["post-activation health check"]
-    Health --> Client["Own xray core\n<data>/bin/xray on live.json"]
+    Health --> Client["Own xray core\n~/.local/bin/xray on live.json"]
     Client -->|"statsquery -reset"| Stats
     Stats -->|"fold"| ColdBase["geo-base.jsonl\ncold base"]
     ColdBase --> Rank
@@ -123,7 +125,7 @@ assay/
 
 ### 1. Build
 
-You need Go 1.27+. The xray core itself is **managed**: `assay install` downloads it into `<data>/bin/xray` (sha256-verified, floor-pinned at 26.9.9+ and auto-updated by default) — the probe, the site check, the `-test` gate, and the core manager all exec the single `[core].xray_bin` knob, which may also point at a system xray if you prefer to manage it yourself.
+You need Go 1.27+. The xray core itself is **managed, user-local**: `assay install` resolves the core per the owner-ruling order — an existing `~/.local/bin/xray` is bound (assay's own binary, auto-updated), else an existing system xray (`/usr/local/bin/xray`, `/usr/bin/xray`) is bound as found (auto-update inert), else the sha256-verified release downloads and installs ATOMICALLY to `~/.local/bin/xray` (user-writable, no elevation; the previous binary stays at `~/.local/bin/xray.previous` for instant rollback; floor-pinned at 26.9.9+). `~/.local/bin` precedes `/usr/bin` on PATH, so assay's copy shadows any later apt-installed xray. The probe, the site check, the `-test` gate, and the core manager all exec the single `[core].xray_bin` knob, which may also point at a binary of your choice (auto-update inert then).
 
 ```bash
 go build ./cmd/assay
@@ -263,8 +265,8 @@ The adaptive timeout formula: each classification request gets `clamp(10 × the 
 
 | Knob | Default | Meaning |
 | :-- | :-- | :-- |
-| `xray_bin` | `<data>/bin/xray` | the SINGLE binary knob — probe/check fleets, the `-test` gate, and the core manager all resolve it; a system override makes auto-update inert (S5) |
-| `auto_update` | `true` | managed-core auto-update (D4); checked each maintenance wave |
+| `xray_bin` | resolution: `~/.local/bin/xray` → system xray → install target | the SINGLE binary knob — probe/check fleets, the `-test` gate, and the core manager all resolve it; a system xray binds as found (auto-update inert); an explicit override makes auto-update inert (S5) |
+| `auto_update` | `true` | core auto-update for the assay-owned user-local binary (D4 + owner ruling); checked each maintenance wave |
 | `update_interval` | `24h` | auto-update check cadence |
 | `socks_port` | `10810` | the own socks5 inbound, loopback-only (D2) |
 | `http_port` | `10811` | the own http inbound, loopback-only |

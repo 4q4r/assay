@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,6 +107,7 @@ func TestStatusCoreBlockRunning(t *testing.T) {
 // as stale, never rendered as running; a missing managed binary degrades
 // the version line instead of crashing the section.
 func TestStatusCoreBlockNotRunning(t *testing.T) {
+	injectCoreBinSeams(t) // the resolved path must be a fixture, never the machine's real binaries
 	dir := t.TempDir()
 	cfg := statusCoreConfig(t, dir, nextCoreTestPort())
 
@@ -133,8 +135,8 @@ func TestStatusCoreBlockNotRunning(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(staleDir, "rendered", "live.json"), []byte("{}"), 0o600))
 	b.Reset()
 	printCoreStatus(&b, collectCoreState(newPaths(cfgStale), cfgStale), false)
-	assert.Contains(t, b.String(), "managed binary missing",
-		"the missing managed binary degrades the version line")
+	assert.Contains(t, b.String(), "no core binary at the resolved path",
+		"the missing core binary degrades the version line")
 }
 
 // TestStatusCoreBlockRollbackState pins the rollback half of the strike
@@ -185,4 +187,101 @@ func deadPID() int {
 	cmd := exec.CommandContext(context.Background(), "true")
 	_ = cmd.Run()
 	return cmd.Process.Pid
+}
+
+// injectCoreBinSeams points the core-binary resolution seams (the
+// owner-ruling user-local dir and the standard-path list) at fixture dirs,
+// so the status tests never depend on the machine's real ~/.local/bin/xray
+// or /usr/bin/xray. Returns the (absent unless planted) user-local and
+// canonical system binary paths.
+func injectCoreBinSeams(t *testing.T) (string, string) {
+	t.Helper()
+	userBin := filepath.Join(t.TempDir(), "local-bin")
+	sysDir := t.TempDir()
+	origDir, origPaths := config.UserLocalBinDir, config.DefaultSystemXrayPaths
+	config.UserLocalBinDir = func() string { return userBin }
+	config.DefaultSystemXrayPaths = []string{filepath.Join(sysDir, "xray")}
+	t.Cleanup(func() {
+		config.UserLocalBinDir = origDir
+		config.DefaultSystemXrayPaths = origPaths
+	})
+	return filepath.Join(userBin, "xray"), filepath.Join(sysDir, "xray")
+}
+
+// statusFixtureBinary plants a stand-in "xray" answering `version` with the
+// given version banner.
+func statusFixtureBinary(t *testing.T, path, ver string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path,
+		[]byte("#!/bin/sh\necho \"Xray "+ver+" (status fixture, Penetrates Nothing.)\"\nexit 0\n"),
+		0o755))
+}
+
+// TestStatusCoreBlockSourceProvenance pins the owner-ruling addition: the
+// core block renders the resolution provenance (binary_source/binary_path)
+// from the persisted core-state.json, with the floor-warning state for a
+// below-floor binding — non-blocking by contract.
+func TestStatusCoreBlockSourceProvenance(t *testing.T) {
+	dir := t.TempDir()
+	userLocal, system := injectCoreBinSeams(t)
+
+	render := func(t *testing.T, cfg *config.Config) string {
+		t.Helper()
+		var b strings.Builder
+		printCoreStatus(&b, collectCoreState(newPaths(cfg), cfg), false)
+		return b.String()
+	}
+
+	t.Run("system-preexisting renders with the non-blocking floor warning", func(t *testing.T) {
+		dataDir := filepath.Join(dir, "data-sys")
+		socksPort := nextCoreTestPort()
+		statusCoreLiveConfig(t, dataDir, socksPort, nextCoreTestPort())
+		statusFixtureBinary(t, system, "26.3.27")
+
+		cfg := statusCoreConfig(t, dir, socksPort)
+		cfg.DataDir = dataDir
+		// The install-time resolution binds the pre-existing system core and
+		// records the provenance (below floor — the binding proceeds).
+		require.NoError(t, core.EnsureCoreBinary(context.Background(), config.CoreConfig{}, dataDir, io.Discard))
+
+		out := render(t, cfg)
+		assert.Contains(t, out, "source:  system-preexisting ("+system+")", "the bound source and path render")
+		assert.Contains(t, out, "BELOW the observatory-safe floor "+core.VersionFloor(),
+			"the floor warning renders for the below-floor binding")
+		assert.Contains(t, out, "non-blocking", "the floor warning states its non-blocking contract")
+		assert.Contains(t, out, "auto-update inert", "the system binding names the inert auto-update")
+	})
+
+	t.Run("user-local renders as assay-owned and updatable", func(t *testing.T) {
+		dataDir := filepath.Join(dir, "data-user")
+		socksPort := nextCoreTestPort()
+		statusCoreLiveConfig(t, dataDir, socksPort, nextCoreTestPort())
+		statusFixtureBinary(t, userLocal, "26.10.31")
+
+		cfg := statusCoreConfig(t, dir, socksPort)
+		cfg.DataDir = dataDir
+		require.NoError(t, core.EnsureCoreBinary(context.Background(), config.CoreConfig{}, dataDir, io.Discard))
+
+		out := render(t, cfg)
+		assert.Contains(t, out, "source:  user-local ("+userLocal+")", "the user-local source and path render")
+		assert.Contains(t, out, "auto-update keeps it current", "the updatable contract renders")
+		assert.NotContains(t, out, "BELOW the observatory-safe floor",
+			"no floor warning for an above-floor binding")
+	})
+
+	t.Run("override renders inert", func(t *testing.T) {
+		dataDir := filepath.Join(dir, "data-override")
+		socksPort := nextCoreTestPort()
+		statusCoreLiveConfig(t, dataDir, socksPort, nextCoreTestPort())
+
+		cfg := statusCoreConfig(t, dir, socksPort)
+		cfg.DataDir = dataDir
+		cfg.Core.XrayBin = "/opt/foreign/xray"
+		require.NoError(t, core.EnsureCoreBinary(context.Background(), cfg.Core, dataDir, io.Discard))
+
+		out := render(t, cfg)
+		assert.Contains(t, out, "source:  override (/opt/foreign/xray)", "the override source renders")
+		assert.Contains(t, out, "auto-update inert", "the override inertness renders")
+	})
 }

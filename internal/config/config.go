@@ -554,9 +554,11 @@ type CoreConfig struct {
 	// XrayBin is the SINGLE core-binary knob (S1): a path to the xray
 	// binary every consumer (probe/check temp-instance fleets, the batch
 	// pre-filter, the activation -test gate, the core manager) resolves.
-	// Empty = the managed default <data>/bin/xray (resolved by
-	// CoreXrayBin, never stored); a system xray may be pointed at instead
-	// — core auto-update goes inert there with a one-time loud INFO (S5).
+	// Empty = the owner-ruling resolution (CoreXrayBin, never stored):
+	// the user-local ~/.local/bin/xray first (assay's own install and
+	// auto-update target), then an existing system xray (bound, auto-update
+	// inert per S5), else the user-local install target. An explicit value
+	// makes core auto-update inert with a one-time loud INFO (S5).
 	XrayBin string `toml:"xray_bin"`
 	// AutoUpdate is the managed-core auto-update switch, default ON (D4,
 	// managed core only per S5). The default is pre-seeded by Load and
@@ -619,15 +621,73 @@ const (
 	DefaultCoreLoglevel = "warning"
 )
 
-// CoreXrayBin resolves the SINGLE binary knob (S1): the explicit
-// [core].xray_bin when set (a system xray override), else the managed
-// default <data>/bin/xray joined from the resolved data dir. Callers keep
-// their ExpandHome discipline for ~-prefixed overrides.
-func (c *Config) CoreXrayBin() string {
-	if c.Core.XrayBin != "" {
-		return c.Core.XrayBin
+// UserLocalBinDir resolves the user-local bin dir (~/.local/bin) — the
+// owner-ruling install and auto-update target for the core binary (2026-11-11
+// ruling, revised 2026-11-12: «запись в локал не требует судо» — the
+// user-local tree needs no elevation). A var, not a const func: test suites
+// inject fixture dirs through it. "" = the home dir could not be resolved
+// (the resolution then degrades to the system paths only).
+var UserLocalBinDir = func() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
 	}
-	return filepath.Join(c.DataDir, "bin", "xray")
+	return filepath.Join(home, ".local", "bin")
+}
+
+// UserLocalXrayBin is the user-local core binary path — ~/.local/bin/xray
+// through the injectable dir seam; "" when no home dir resolves.
+func UserLocalXrayBin() string {
+	dir := UserLocalBinDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "xray")
+}
+
+// DefaultSystemXrayPaths is the standard-path scan list of the core-binary
+// resolution: an existing system xray at the FIRST of these paths binds
+// when no user-local binary exists. A var, not a const: slices are not
+// constant expressions, and the test suites inject fixture dirs through it.
+var DefaultSystemXrayPaths = []string{"/usr/local/bin/xray", "/usr/bin/xray"}
+
+// isRegularExecutable reports whether path exists as a regular file with
+// any execute bit set.
+func isRegularExecutable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0
+}
+
+// ResolveCoreXrayBin resolves the SINGLE binary knob (S1) in the
+// owner-ruling order: the explicit [core].xray_bin override when set
+// (~-expansion stays the caller's discipline); else the EXISTING user-local
+// ~/.local/bin/xray (assay's own binary — the install and auto-update
+// target); else an EXISTING system xray at the first standard path (bound,
+// never updated); else the user-local path again — the canonical install
+// target the next resolution pass fills.
+func ResolveCoreXrayBin(xrayBin, dataDir string) string {
+	if xrayBin != "" {
+		return xrayBin
+	}
+	if user := UserLocalXrayBin(); user != "" && isRegularExecutable(user) {
+		return user
+	}
+	for _, sys := range DefaultSystemXrayPaths {
+		if isRegularExecutable(sys) {
+			return sys
+		}
+	}
+	if user := UserLocalXrayBin(); user != "" {
+		return user
+	}
+	return filepath.Join(dataDir, "bin", "xray")
+}
+
+// CoreXrayBin resolves the SINGLE binary knob (S1) through
+// ResolveCoreXrayBin. Callers keep their ExpandHome discipline for
+// ~-prefixed overrides. dataDir only feeds the degenerate no-home fallback.
+func (c *Config) CoreXrayBin() string {
+	return ResolveCoreXrayBin(c.Core.XrayBin, c.DataDir)
 }
 
 // Config is the pipeline configuration root.

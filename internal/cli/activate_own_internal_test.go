@@ -252,10 +252,14 @@ func newOwnFixture(t *testing.T) *ownFixture {
 		// Backups land in the FIXED <data>/backups (S4: the backup-dir knob
 		// is retired — the C1/D8 rollback glob reads exactly this dir).
 		Core: config.CoreConfig{
-			XrayBin:   cliFakeBinary(t),
-			SocksPort: port,
-			HTTPPort:  port + 1,
-			Loglevel:  "warning",
+			// AutoUpdate: true mirrors the LOADED-config default (Load
+			// pre-seeds it before decode); a hand-built zero value would
+			// read as the explicit-off master switch.
+			AutoUpdate: true,
+			XrayBin:    cliFakeBinary(t),
+			SocksPort:  port,
+			HTTPPort:   port + 1,
+			Loglevel:   "warning",
 		},
 	}
 	log := &syncBuffer{}
@@ -418,10 +422,14 @@ func TestWatchBootstrapsCoreAtStart(t *testing.T) {
 		DataDir: dir,
 		Plugins: config.PluginsConfig{Dir: filepath.Join(dir, "plugins")},
 		Core: config.CoreConfig{
-			XrayBin:   cliFakeBinary(t),
-			SocksPort: port,
-			HTTPPort:  port + 1,
-			Loglevel:  "warning",
+			// AutoUpdate: true mirrors the LOADED-config default (Load
+			// pre-seeds it before decode); a hand-built zero value would
+			// read as the explicit-off master switch.
+			AutoUpdate: true,
+			XrayBin:    cliFakeBinary(t),
+			SocksPort:  port,
+			HTTPPort:   port + 1,
+			Loglevel:   "warning",
 		},
 	}
 
@@ -566,54 +574,123 @@ func cliMkSelected(t *testing.T, tag, cc, city, host string, port int) (*model.N
 	return n, model.SelectedNode{Tag: tag, Key: n.Key, Country: cc, City: city, RTTMs: 100, Checks: 3, Total: 3}
 }
 
-// TestProbeAndCheckFleetsResolveCoreBin is the S1 pin (brief test 5): on a
-// clean data dir with the fake binary at the MANAGED default location
-// (<data>/bin/xray) and the legacy [activate].xray_bin knob POISONED, both
-// probe fleets (single + batch) and the check fleet's binary resolution
-// boot through [core].xray_bin — no /usr/bin/xray dependency anywhere.
-func TestProbeAndCheckFleetsResolveCoreBin(t *testing.T) {
-	dir := t.TempDir()
-	port := nextCoreTestPort()
-	cfg := &config.Config{
-		DataDir: dir,
-		Core: config.CoreConfig{
-			// MANAGED default: the knob resolves <data>/bin/xray — the fake
-			// binary sits exactly there (T5's managed layout pre-shadow).
-			SocksPort: port,
-			HTTPPort:  port + 1,
-		},
+// cliBootMarkerBinary plants a boot-marker wrapper at path: executing the
+// wrapper appends its OWN path ($0) to the marker file and then execs the
+// COREFAKE test double (the mode env rides the inherited environment), so a
+// fleet that boots the wrapper both SERVES socks AND proves — by the
+// marker's content — exactly WHICH binary path was exec'd. The fixture
+// assertion this enables is the hermeticity proof for the S1 fleet pin: the
+// marker must name the injected fixture path and never the machine's real
+// xray.
+func cliBootMarkerBinary(t *testing.T, path, marker string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	script := "#!/bin/sh\nprintf '%s\\n' \"$0\" >> " + strconv.Quote(marker) +
+		"\nexec " + strconv.Quote(cliFakeBinary(t)) + " \"$@\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(script), 0o755))
+}
+
+// readBootMarker reads the boot marker, empty when nothing booted yet.
+func readBootMarker(t *testing.T, marker string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(marker)
+	if os.IsNotExist(err) {
+		return nil
 	}
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "bin"), 0o750))
-	require.NoError(t, os.Symlink(cliFakeBinary(t), filepath.Join(dir, "bin", "xray")))
-	p := newPaths(cfg)
-	require.NoError(t, os.MkdirAll(p.workDir, 0o750))
-	t.Cleanup(func() { _ = os.RemoveAll(p.workDir) })
+	require.NoError(t, err)
+	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
 
-	node, _ := cliMkSelected(t, "pool-de-01", "de", "Berlin", "a.example.com", 2053)
-	ctx := context.Background()
+// TestProbeAndCheckFleetsResolveCoreBin is the S1 pin (brief test 5, T5b
+// resolution order): with the resolution SEAMS armed (the machine's real
+// ~/.local/bin/xray and /usr/bin/xray are invisible), a clean data dir, and
+// the fake wrapper at the injected DEFAULT location (~/.local/bin/xray —
+// the user-local install target), both probe fleets (single + batch) and
+// the check fleet resolve and BOOT that exact binary — proven by the boot
+// marker naming the injected path, never /usr/bin/xray. The bind-existing
+// leg is pinned the same way for a fake planted at the injected system
+// path. The test is hermetic on an xray-less machine: only fixture paths
+// exist on the scan list.
+func TestProbeAndCheckFleetsResolveCoreBin(t *testing.T) {
+	newSeams := func(t *testing.T) (string, string, *config.Config) {
+		t.Helper()
+		userLocal, system := injectCoreBinSeams(t)
+		port := nextCoreTestPort()
+		cfg := &config.Config{
+			DataDir: t.TempDir(),
+			Core: config.CoreConfig{
+				// Empty override: the owner-ruling resolution decides (the
+				// S1 contract under test).
+				SocksPort: port,
+				HTTPPort:  port + 1,
+			},
+		}
+		p := newPaths(cfg)
+		require.NoError(t, os.MkdirAll(p.workDir, 0o750))
+		t.Cleanup(func() { _ = os.RemoveAll(p.workDir) })
+		return userLocal, system, cfg
+	}
 
-	// Probe BATCH fleet (pipeline.go batch factory — StartTempXrayBatch).
-	batchFactory := newProbeBatchFactory(cfg, p)
-	batchInst, err := batchFactory(ctx, []*model.Node{node})
-	require.NoError(t, err, "the batch fleet must boot the managed fake binary")
-	require.Len(t, batchInst.Addrs(), 1)
-	require.NoError(t, batchInst.Close())
+	runFleets := func(t *testing.T, cfg *config.Config, wantBin string, marker string) {
+		t.Helper()
+		p := newPaths(cfg)
+		node, _ := cliMkSelected(t, "pool-de-01", "de", "Berlin", "a.example.com", 2053)
+		ctx := context.Background()
 
-	// Probe SINGLE fleet (pipeline.go factory — checker.NewXrayFactory).
-	probeFactory := newProbeFactory(cfg, p)
-	singleInst, err := probeFactory(ctx, node)
-	require.NoError(t, err, "the single fleet must boot the managed fake binary")
-	require.NoError(t, singleInst.Close())
+		// Probe BATCH fleet (pipeline.go batch factory — StartTempXrayBatch).
+		batchFactory := newProbeBatchFactory(cfg, p)
+		batchInst, err := batchFactory(ctx, []*model.Node{node})
+		require.NoError(t, err, "the batch fleet must boot the resolved fake binary")
+		require.Len(t, batchInst.Addrs(), 1)
+		require.NoError(t, batchInst.Close())
 
-	// Check fleet: the cli Options resolution + a real boot through the
-	// SAME factory machinery the check stage runs.
-	opts := newCheckOptions(cfg, p, []string{"https://example.com"}, checkFlags{})
-	assert.Equal(t, config.ExpandHome(cfg.CoreXrayBin()), opts.XrayBin,
-		"the check fleet resolves [core].xray_bin (the managed default), not the legacy knob")
-	checkFactory := checker.NewXrayFactory(opts.XrayBin, p.workDir, opts.Render)
-	checkInst, err := checkFactory(ctx, node)
-	require.NoError(t, err, "the check fleet must boot the managed fake binary")
-	require.NoError(t, checkInst.Close())
+		// Probe SINGLE fleet (pipeline.go factory — checker.NewXrayFactory).
+		probeFactory := newProbeFactory(cfg, p)
+		singleInst, err := probeFactory(ctx, node)
+		require.NoError(t, err, "the single fleet must boot the resolved fake binary")
+		require.NoError(t, singleInst.Close())
+
+		// Check fleet: the cli Options resolution + a real boot through the
+		// SAME factory machinery the check stage runs.
+		opts := newCheckOptions(cfg, p, []string{"https://example.com"}, checkFlags{})
+		assert.Equal(t, wantBin, opts.XrayBin,
+			"the check fleet resolves the S1 resolution, not a machine-dependent path")
+		checkFactory := checker.NewXrayFactory(opts.XrayBin, p.workDir, opts.Render)
+		checkInst, err := checkFactory(ctx, node)
+		require.NoError(t, err, "the check fleet must boot the resolved fake binary")
+		require.NoError(t, checkInst.Close())
+
+		// The FIXTURE-ASSERTION hermeticity proof: every boot exec'd the
+		// injected path (the wrapper recorded $0) and NOTHING booted the
+		// machine's real xray.
+		boots := readBootMarker(t, marker)
+		// Exactly ONE boot per fleet — batch, single, check — each the
+		// injected wrapper. A fleet that exec'd anything else (e.g. the
+		// machine's real xray via a stale resolution) would drop a marker
+		// line and fail this exact count.
+		require.Len(t, boots, 3,
+			"exactly one boot per fleet (batch, single, check), all the injected wrapper")
+		for _, booted := range boots {
+			assert.Equal(t, wantBin, booted,
+				"the fleet exec'd the injected fixture path — never any machine binary")
+		}
+		assert.NotContains(t, boots, "/usr/bin/xray",
+			"the machine's real system xray must never be booted by this test")
+	}
+
+	t.Run("fake at the default (user-local) location resolves and boots", func(t *testing.T) {
+		userLocal, _, cfg := newSeams(t)
+		marker := filepath.Join(t.TempDir(), "boot-marker")
+		cliBootMarkerBinary(t, userLocal, marker)
+		runFleets(t, cfg, userLocal, marker)
+	})
+
+	t.Run("fake at the injected system path binds first-match", func(t *testing.T) {
+		_, system, cfg := newSeams(t)
+		marker := filepath.Join(t.TempDir(), "boot-marker")
+		cliBootMarkerBinary(t, system, marker)
+		runFleets(t, cfg, system, marker)
+	})
 }
 
 // TestDaemonCoreExecSurfaceIsPinned extends the W13 pinning story to the
@@ -834,177 +911,4 @@ func TestBootstrapCoreRetriesExhaustsLoud(t *testing.T) {
 	assert.Equal(t, 3, attempts, "exactly N attempts run — no unbounded retry")
 	assert.Contains(t, err.Error(), "boom 3", "the LAST attempt's error surfaces")
 	assert.Contains(t, out.String(), "attempt 3/3", "the final failed attempt is loud")
-}
-
-// --- ports from the external restart-flow era -------------------------------
-//
-// The external activation-flow suite (restart_flow_internal_test.go,
-// verdict_chips_internal_test.go) died with the external mode: its fixtures
-// hung off the retired systemctl seam of the foreign-unit restart flow —
-// all of it undefined after T6's external-surface deletion. Three of its
-// pins hold LIVE own-core behavior that nothing else covered; they live
-// here, adapted to the own-core flow.
-
-// TestActivateStageVerdictChipsColored ports the W18 verdict-chip pin to the
-// own-core stage: the stage's verdict lines render as chips when color is on
-// — "activation complete:" is the dim-241 label + bold info-45 value chip,
-// the D8 rollback renders the amber-214 "wave verdict:" chip — and the
-// diagnostic lines around them carry NO styling bytes (journald-safe). With
-// color off the stage output carries zero ANSI bytes.
-func TestActivateStageVerdictChipsColored(t *testing.T) {
-	t.Run("activation complete → dim label + info value, styled exactly once", func(t *testing.T) {
-		f := newOwnFixture(t)
-		mgr := f.ownManager(t)
-		t.Cleanup(func() { _ = mgr.Stop() })
-		f.writeOwnLive(t, "gen-0")
-		f.writeOwnCandidate(t, "gen-new")
-
-		buf := &syncBuffer{}
-		cmd := &cobra.Command{}
-		cmd.SetOut(buf)
-		attachColorFlags(cmd)
-		require.NoError(t, cmd.Flags().Set("color", "always"))
-
-		require.NoError(t, runActivateStageWithManager(cmd, f.cfg, mgr))
-		s := buf.String()
-		require.Contains(t, s, "\x1b[38;5;241m", "verdict labels are dim 241")
-		require.Contains(t, s, "38;5;45", "the activation-complete value is info 45")
-		require.Contains(t, s, "activation complete:", "the verdict text survives inside the chip")
-		require.Equal(t, 1, strings.Count(s, "\x1b[38;5;241mactivation complete:"),
-			"the activation-complete label is chip-styled exactly once")
-	})
-
-	t.Run("D8 rollback → amber wave-verdict chip, diagnostics plain", func(t *testing.T) {
-		f := newOwnFixture(t)
-		f.cfg.Core.RollbackStrikes = 1 // one failed post-activation health = strike-out
-		mgr := f.ownManager(t)
-		t.Cleanup(func() { _ = mgr.Stop() })
-		f.writeOwnLive(t, "gen-0")
-		f.writeOwnCandidate(t, "gen-new")
-
-		buf := &syncBuffer{}
-		cmd := &cobra.Command{}
-		cmd.SetOut(buf)
-		attachColorFlags(cmd)
-		require.NoError(t, cmd.Flags().Set("color", "always"))
-
-		require.NoError(t, runActivateStageWithManager(cmd, f.cfg, mgr),
-			"the rollback, not the wave, is the health-failure remedy")
-		s := buf.String()
-		require.Contains(t, s, "\x1b[38;5;214m", "the rollback wave verdict is amber 214")
-		require.Contains(t, s, "wave verdict:", "the verdict label survives")
-		require.Contains(t, s, "activation ROLLED BACK", "the verdict class survives")
-		require.Contains(t, s, "WARNING: the post-activation health check FAILED",
-			"the diagnostic text survives")
-		for _, line := range strings.Split(s, "\n") {
-			if strings.Contains(line, "WARNING:") {
-				require.NotContains(t, line, "\x1b[",
-					"diagnostic lines stay PLAIN (journald-friendly — no ANSI on them)")
-			}
-		}
-	})
-
-	t.Run("color-off stays byte-plain", func(t *testing.T) {
-		f := newOwnFixture(t)
-		mgr := f.ownManager(t)
-		t.Cleanup(func() { _ = mgr.Stop() })
-		f.writeOwnLive(t, "gen-0")
-		f.writeOwnCandidate(t, "gen-new")
-
-		buf := &syncBuffer{}
-		cmd := &cobra.Command{}
-		cmd.SetOut(buf)
-		require.NoError(t, runActivateStageWithManager(cmd, f.cfg, mgr))
-		out := buf.String()
-		require.NotContains(t, out, "\x1b[", "no color mode resolved = plain")
-		require.Contains(t, out, "activation complete:", "the legacy plain verdict line")
-	})
-}
-
-// TestMidActivateShutdownCannotInterruptActivate ports the W17 part-b pin
-// (non-interruptible step) to the own-core wave: replace→restart→health is
-// ONE step, and the shutdown checkpoint fires only at stage ENTRY
-// (waveRunState.runStage/checkpoint) — never inside one. A SIGTERM landing
-// while the activate stage is in flight must not orphan the live client
-// (new config on disk, core never restarted on it). The flag flips INSIDE
-// the activate closure — past the stage's checkpoint — and the whole
-// sequence must run to completion. The old pin's mid-restart-leg slice is
-// covered structurally: the wave loop consults the flag exactly once per
-// stage boundary and the stage body never reads it.
-func TestMidActivateShutdownCannotInterruptActivate(t *testing.T) {
-	f := newOwnFixture(t)
-	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
-	f.writeOwnLive(t, "gen-0")
-	f.writeOwnCandidate(t, "gen-new")
-
-	var shutdown atomic.Bool
-	noop := func(*cobra.Command, *config.Config) error { return nil }
-	stages := &maintainStages{
-		fetch: noop, parse: noop, filter: noop, probe: noop,
-		stats: noop, prune: noop, selectS: noop, render: noop,
-		activate: func(c *cobra.Command, cc *config.Config) error {
-			shutdown.Store(true) // SIGTERM lands exactly as activate starts
-			return runActivateStageWithManager(c, cc, mgr)
-		},
-		// coreAutoUpdate stays nil: activate is the wave's last stage, so no
-		// post-stage checkpoint can fire after the flip (mirrors the
-		// external-era pin, where activate was likewise the last stage).
-	}
-
-	buf := &syncBuffer{}
-	require.NoError(t, runMaintainGraceful(buf, f.cfg, maintainOptions{}, stages, shutdown.Load),
-		"an in-flight activate completes even with shutdown already requested")
-
-	out := buf.String()
-	assert.Contains(t, out, "activation complete", "the activate stage ran to completion")
-	assert.NotContains(t, out, "wave paused",
-		"no checkpoint fired inside the activate stage: the pause can only precede the stage")
-	live, err := os.ReadFile(ownLivePath(f.p))
-	require.NoError(t, err)
-	assert.Equal(t, string(ownLiveBytes(f.cfg.Core.SocksPort, "gen-new")), string(live),
-		"live.json replaced with the candidate")
-	require.Eventually(t, func() bool { return coreServing(f.cfg.Core.SocksPort) },
-		5*time.Second, 50*time.Millisecond, "the core was restarted on the new config")
-}
-
-// TestActivateRestartFailureNamesOnDiskConfig ports the restart-failure
-// class pin from the external era (TestW13RestartFailureIsDONE_WITH): a
-// restart that fails must be LOUD and must tell the operator the truth —
-// the gated new config IS on disk. The DONE_WITH restart-failure wave
-// verdict is gone with the external mode (a failed core restart now fails
-// the stage loud); what survives is the operator contract: the error names
-// the on-disk config, the pre-activate backup exists for the manual
-// remedy, and nothing auto-reverts behind the operator's back (the D8
-// rollback only ever fires on failed HEALTH checks, never on a failed
-// restart).
-func TestActivateRestartFailureNamesOnDiskConfig(t *testing.T) {
-	f := newOwnFixture(t)
-	// A binary that passes the -test gate but dies at boot: the gate leg
-	// exits 0, the long-lived serve leg exits 3 immediately — Restart's
-	// spawn/boot fails AFTER the gate passed and the live config was
-	// replaced.
-	gateOkBootDead := filepath.Join(t.TempDir(), "gate-ok-boot-dead.sh")
-	require.NoError(t, os.WriteFile(gateOkBootDead,
-		[]byte("#!/bin/sh\ncase \"$*\" in *-test*) exit 0 ;; *) exit 3 ;; esac\n"), 0o755))
-	f.cfg.Core.XrayBin = gateOkBootDead
-
-	f.writeOwnLive(t, "gen-0")
-	f.writeOwnCandidate(t, "gen-new")
-
-	err := runActivateStage(f.cmd, f.cfg)
-	require.Error(t, err, "a failed core restart fails the wave loud")
-	assert.Contains(t, err.Error(), "core restart failed")
-	assert.Contains(t, err.Error(), "is on disk",
-		"the error names the replaced config the core failed to boot on")
-
-	live, readErr := os.ReadFile(ownLivePath(f.p))
-	require.NoError(t, readErr)
-	assert.Equal(t, string(ownLiveBytes(f.cfg.Core.SocksPort, "gen-new")), string(live),
-		"the gated new config stays on disk — nothing auto-reverts on a failed restart")
-	matches, globErr := filepath.Glob(filepath.Join(f.p.backupDir, "config.json.bak-*"))
-	require.NoError(t, globErr)
-	assert.Len(t, matches, 1, "the pre-activate backup exists as the manual remedy")
-	assert.NotContains(t, f.log.String(), "ROLLBACK",
-		"a failed restart must not trigger the D8 rollback (strikes move only on failed health)")
 }

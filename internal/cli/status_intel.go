@@ -1413,12 +1413,15 @@ func printCoreStatus(out io.Writer, cs *coreState, color bool) {
 	switch {
 	case cs.binMissing:
 		outf(out, "%s\n", ui.ChipKV("  version: ",
-			fmt.Sprintf("managed binary missing (%s) — install downloads it; assay xray-update re-fetches it",
+			fmt.Sprintf("no core binary at the resolved path (%s) — install downloads it "+
+				"(the user-local ~/.local/bin/xray by default); assay xray-update re-fetches it",
 				cs.binPath), color))
 	case cs.versionErr != nil:
 		outf(out, "%s\n", ui.ChipKV("  version: ",
 			fmt.Sprintf("unknown (%v)", cs.versionErr), color))
 	}
+
+	printCoreSource(out, cs, color)
 
 	switch {
 	case cs.liveErr != nil:
@@ -1431,6 +1434,46 @@ func printCoreStatus(out io.Writer, cs *coreState, color bool) {
 	}
 
 	printCoreHealth(out, cs.health, cs.healthErr, cs.strikeK, cs.running, color)
+}
+
+// printCoreSource renders the core-binary RESOLUTION provenance (owner
+// ruling 2026-11-11, revised 2026-11-12): the binary_source/binary_path
+// recorded in <data>/core-state.json by the core lifecycle, plus the
+// floor-warning state — a bound binary below the observatory-safe floor is
+// a LOUD, NON-BLOCKING warning (the owner's 26.3.27 bound core is the
+// expected case; the W19 adaptive observatory interval caps the probe
+// rate). No provenance on file = no line (the core has never been
+// resolved). The floor is judged on the LIVE probed version (the same
+// binary the block already bounded-exec'd), falling back to the persisted
+// binary_version when the live probe degraded.
+func printCoreSource(out io.Writer, cs *coreState, color bool) {
+	if cs.health == nil || cs.health.BinarySource == "" {
+		return
+	}
+	line := fmt.Sprintf("%s (%s)", cs.health.BinarySource, cs.health.BinaryPath)
+	switch cs.health.BinarySource {
+	case string(core.SourceOverride):
+		line += " — auto-update inert (S5)"
+	case string(core.SourceUserLocal):
+		line += " — assay-owned; auto-update keeps it current"
+	case string(core.SourceSystemPreexisting):
+		line += " — auto-update inert (assay does not manage a binary it did not install)"
+	}
+	version := cs.version
+	if version == "" {
+		version = cs.health.BinaryVersion
+	}
+	if version != "" {
+		below, err := core.VersionBelowFloor(version)
+		switch {
+		case err != nil:
+			line += fmt.Sprintf(" — version %q does not parse against the floor %s", version, core.VersionFloor())
+		case below:
+			line += fmt.Sprintf(" — v%s is BELOW the observatory-safe floor %s (non-blocking warning)",
+				version, core.VersionFloor())
+		}
+	}
+	outf(out, "%s\n", ui.ChipKV("  source:  ", line, color))
 }
 
 // formatCoreInbounds renders the D2 surface: the two base inbounds first

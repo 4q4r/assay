@@ -5,6 +5,14 @@ binding. Awaiting owner approval to start waves. Supersedes the external-client
 activation story (`render` into a foreign xray-raw config + `systemctl` restart)
 for the publication pivot.
 
+> AMENDED 2026-11-12 (owner rulings 2026-11-11 + 2026-11-12: «xray стоит
+> ставить системно всегда когда его нет», then «запись в локал не требует
+> судо»): the core-binary resolution, install target and auto-update
+> semantics changed from the managed `<data>/bin/xray` story to the
+> user-local story below. S1, S5 and D4 carry the amended wording in place
+> (marked AMENDED); the original D4 text above is superseded by its
+> amendment.
+
 ## Intent and why
 
 assay today manages a FOREIGN client: it renders the selected pool into the
@@ -61,11 +69,19 @@ primary client and consumes the pool through ONE forwarded proxy outbound.
 - D3 (Q3): the external mode is REMOVED entirely — render has one target (the
   own live config), activate knows one lifecycle (own core). The foreign-config
   template seam, the foreign-unit restart allowlist, and their tests die.
-- D4 (Q4): `install` downloads the xray core into the assay data dir
-  (`~/.local/share/assay/bin/xray`), sha-verified, atomically placed; core
-  auto-update is configurable and defaults ON (checked each maintenance wave,
-  interval knob); `assay xray-update` stays as the manual path. A system xray
-  may be pointed at via `[core].xray_bin` for users who prefer it.
+- D4 (Q4, AMENDED 2026-11-12): the core binary lives USER-LOCAL at
+  `~/.local/bin/xray` — user-writable, no elevation anywhere («запись в локал
+  не требует судо»). With no binary present, `install` downloads the release
+  (sha-verified) and installs it ATOMICALLY there, keeping the previous
+  binary as `~/.local/bin/xray.previous` through every swap for instant
+  binary-level rollback, and prints a one-time loud PATH note
+  (`~/.local/bin` precedes `/usr/bin` on PATH, so assay's copy shadows any
+  later apt-installed xray — the duplicate-core concern is solved by PATH
+  precedence). Core auto-update stays configurable, defaults ON, checked
+  each maintenance wave by the WATCHER (`[core].update_interval`, default
+  24h); `assay xray-update` stays as the manual path. A different binary may
+  be pointed at via `[core].xray_bin` for users who prefer it (auto-update
+  inert there per S5).
 - D5 (Q5): the owner's xray-raw migration starts from the CURRENT live config:
   the hand core (direct/block/fox-proxy/proxy-0/proxy-1, `best_rtt` leastLoad
   balancer, the owner's routing rules) is intact inside it — the migration
@@ -87,11 +103,22 @@ primary client and consumes the pool through ONE forwarded proxy outbound.
 
 ## Builder-check settlements (binding, from the 9-question check)
 
-- S1 (Q1): `[core].xray_bin` is the SINGLE binary knob — the probe/check
-  temp-instance fleets, the batch pre-filter, and the activation `-test` gate
-  resolve it (managed default `<data>/bin/xray`, system override).
-  `[activate].xray_bin` retires. `install` guarantees the managed binary
-  exists before the first wave. Render goldens track the managed core version.
+- S1 (Q1, AMENDED 2026-11-12): `[core].xray_bin` is the SINGLE binary knob —
+  the probe/check temp-instance fleets, the batch pre-filter, the activation
+  `-test` gate, the D8 rollback gate and the core manager resolve it in the
+  owner-ruling order: (1) the explicit override; (2) an EXISTING user-local
+  `~/.local/bin/xray` — assay's OWN binary, bound and UPDATABLE; (3) an
+  EXISTING system xray (`/usr/local/bin/xray`, `/usr/bin/xray` — first
+  match) bound AS FOUND (auto-update inert; a below-floor core warns LOUD
+  and non-blocking — the owner's 26.3.27 bound core is the expected case,
+  and the W19 adaptive observatory interval already caps the probe rate);
+  (4) none of the above → the user-local install target (the next
+  resolution fills it). `[activate].xray_bin` retires. `install` guarantees
+  a usable binary exists before the first wave. Render goldens track the
+  core version. The resolution provenance (`binary_source`:
+  `override | user-local | system-preexisting`, plus `binary_path` and
+  `binary_version`) is written to `<data>/core-state.json` on every
+  resolution change and rendered by `assay status`.
 - S2 (Q3): readiness = Option B — the daemon spawns a bootstrap core at start
   (bootstrap config: empty-pool posture per D7), READY=1 fires once that core
   is reachable; each wave re-renders and restarts on activate-if-changed.
@@ -115,11 +142,13 @@ primary client and consumes the pool through ONE forwarded proxy outbound.
   `[render].pool_inbound_tags` → retire (inbound tags are generated);
   `[render].pool_routes` → KEPT, re-homed under `[render]` unchanged (see S6);
   `[maintain].auto_restart` → retire (core restart is the core manager's job).
-- S5 (Q8): auto-update ON applies to the MANAGED core only — deliberate
-  reversal of the xray-raw frozen-core ruling, scoped to assay's own binary;
-  when `[core].xray_bin` points at a system binary, auto-update is inert with
-  a one-time loud INFO line. The W5 runbook restates that xray-raw's core is
-  NEVER touched by assay.
+- S5 (Q8, AMENDED 2026-11-12): auto-update ON applies to the ASSAY-OWNED
+  USER-LOCAL core only — deliberate reversal of the xray-raw frozen-core
+  ruling, scoped to the binary assay itself installed at
+  `~/.local/bin/xray`. A bound PRE-EXISTING system core and an explicit
+  `[core].xray_bin` override make auto-update inert with a one-time loud
+  INFO line. The W5 runbook restates that xray-raw's core is NEVER touched
+  by assay.
 - S6 (Q7): domain→balancer trust-wall routes survive in the own config
   (`[render].pool_routes` re-homed semantics unchanged: only these
   destinations may reach the pool, matched against the GENERATED inbound
@@ -148,9 +177,12 @@ bootstrap core is reachable (S2).
 
 New `[core]` section (TOML, repo-local config only — no env):
 
-- `xray_bin` — path to the core binary; default `<data>/bin/xray` (managed);
-  may point at a system xray (S1; auto-update inert then, S5).
-- `auto_update` — bool, default true (D4, managed core only per S5).
+- `xray_bin` — path to the core binary; default = the owner-ruling
+  resolution (user-local `~/.local/bin/xray` → existing system xray → the
+  user-local install target; S1 as amended; auto-update inert for a system
+  or overridden binary, S5 as amended).
+- `auto_update` — bool, default true (D4 as amended; the assay-owned
+  user-local binary only per S5).
 - `update_interval` — duration, default "24h"; checked each maintenance wave.
 - `socks_port` / `http_port` — defaults 10810/10811 (do NOT collide with the
   owner's xray-raw 10808/10809; config.example documents the distinction).
@@ -178,14 +210,36 @@ summary; failed health checks feed the D8 strike counter.
 ### Install / core lifecycle
 
 `assay install` (configless or -c): binary self-copy, config materialize 0600
-never-overwrite, unit write, THEN core bootstrap — if `<data>/bin/xray` absent
-and `[core].xray_bin` not overridden: download the matching release asset
-(GitHub XTLS/Xray-core, linux-amd64 default), sha256-verify against the release
-checksums, atomic install, loud version log. Auto-update: each wave checks the
-latest release (respecting `update_interval`), downloads to staging, verifies,
-atomic swap, core restart — all logged; failures never break the wave. Manual:
-`assay xray-update` (same path, forced). Uninstall: remove unit + binaries +
-(opt-in) data dir.
+never-overwrite, unit write, THEN core bootstrap per the owner-ruling order:
+an existing user-local or system binary is bound (no download; the system one
+warns non-blocking below the floor); with neither, the matching release asset
+(GitHub XTLS/Xray-core, linux-amd64 default) downloads, sha256-verifies
+against the release checksums, and installs ATOMICALLY to `~/.local/bin/xray`
+(user-writable — no elevation anywhere; the previous binary is preserved as
+`~/.local/bin/xray.previous`; the release assets materialize in
+`<data>/share/xray` and the spawn wires `XRAY_LOCATION_ASSET` there for the
+assay-owned binaries). Auto-update (watcher stage): each wave re-runs the
+binary resolution first (per-wave re-detection), then — for the assay-owned
+user-local binary only — checks the latest release (respecting
+`update_interval` and the floor), stages, verifies, atomic swap (keeping the
+previous binary), core restart — all logged; failures never break the wave.
+
+GRACEFUL MIGRATION (owner requirement 2026-11-12): the binary swap itself is
+an atomic rename — zero downtime at the file level. For the CORE cutover the
+chosen option is (a): the proven stop+start restart (~1-3s gap — the
+documented downtime budget). Option (b), a true zero-downtime SO_REUSEPORT
+handoff, is NOT achievable on Xray-core 26.x: the SockoptObject exposes NO
+reuseport field (verified against the sockopt reference,
+xtls.github.io/config/transports/sockopt.html — mark/tcpMaxSeg/tcpFastOpen/
+tproxy/tcpcongestion/customSockopt etc. only; `customSockopt` can set raw
+socket options but there is no listen-fd handoff or drain mechanism between
+xray processes), so two live cores cannot share the inbound safely. The
+binary-level rollback mirrors the config-level D8: K consecutive failed
+health checks restore `~/.local/bin/xray.previous` over the binary FIRST
+(atomic rename), then the `-test` gate, config restore and restart run on
+the known-good binary; loud journal lines at every step. Manual:
+`assay xray-update` (same surface, forced). Uninstall: remove unit + binaries
++ (opt-in) data dir.
 
 ### CLI surface changes
 

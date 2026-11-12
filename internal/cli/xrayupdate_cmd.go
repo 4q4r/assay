@@ -54,9 +54,10 @@ func runXrayUpdate(cmd *cobra.Command, cfg *config.Config,
 	checkOnly bool, binPath string, assumeYes bool, color bool,
 ) error {
 	p := newPaths(cfg)
-	// The S1 single binary knob (T5 managed-core path): the manual update
-	// targets [core].xray_bin — the managed default <data>/bin/xray or the
-	// system override. The retired [activate].xray_bin knob is dead here.
+	// The S1 single binary knob: the manual update targets [core].xray_bin —
+	// the owner-ruling resolution (the user-local ~/.local/bin/xray, an
+	// existing system xray, or the explicit override). The retired
+	// [activate].xray_bin knob is dead here.
 	target := config.ExpandHome(cfg.CoreXrayBin())
 	if binPath != "" {
 		target = config.ExpandHome(binPath)

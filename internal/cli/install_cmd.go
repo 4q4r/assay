@@ -69,10 +69,13 @@ WITHOUT -c (the canonical flow):
   4. enables it:
        systemctl --user daemon-reload
        systemctl --user enable --now assay-watch.service
-  5. downloads the managed xray core into <data>/bin/xray — sha256-verified
-     against the release checksums, atomically placed (D4); skipped with a
-     loud INFO when [core].xray_bin points at a system binary (S5 —
-     auto-update stays inert there);
+  5. resolves the xray core per the owner-ruling order: an existing
+     ~/.local/bin/xray binds (assay-owned, auto-updated), an existing
+     system xray binds as found (auto-update inert, S5), otherwise the
+     release downloads sha256-verified and installs ATOMICALLY to
+     ~/.local/bin/xray — user-writable, no elevation anywhere (D4 + the
+     2026-11-11 ruling); the previous binary stays at
+     ~/.local/bin/xray.previous for instant rollback;
   6. prints a loud summary. Every data stage (fetch → parse → filter →
      probe → select) runs meanwhile; the daemon spawns the own core on a
      fail-closed bootstrap config at start (empty pool → block, D7) and

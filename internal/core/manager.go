@@ -131,6 +131,8 @@ type Manager struct {
 	mu sync.Mutex
 
 	bin       string // resolved SINGLE binary knob (S1) — mirrors CoreXrayBin
+	override  string // the raw [core].xray_bin override ("" = resolved order)
+	source    BinarySource
 	dataDir   string
 	livePath  string
 	lockPath  string
@@ -138,7 +140,6 @@ type Manager struct {
 	backupDir string
 	socksPort int
 	strikeK   int
-	managed   bool // bin is the managed default (S6 asset wiring applies)
 
 	log      io.Writer
 	lockFile *os.File
@@ -181,10 +182,13 @@ type Manager struct {
 // NewManager takes the singleton flock for dataDir (S3) and returns the
 // manager. A second manager over the same data dir fails with
 // ErrDaemonHoldsCore. The binary knob resolves exactly like
-// config.CoreXrayBin (managed default <data>/bin/xray when [core].xray_bin
-// is empty, else the override) — the equality is guard-pinned by a test
-// because NewManager receives CoreConfig + dataDir, not the whole Config.
-// A nil log defaults to os.Stdout (the daemon's stdout IS the journal).
+// config.CoreXrayBin — the owner-ruling order (override → user-local
+// → system-preexisting → the user-local install target); the equality is
+// guard-pinned by a test because NewManager receives CoreConfig + dataDir,
+// not the whole Config. The binding is probed and recorded once here
+// (version, floor warning, provenance), and re-detected per wave by
+// AutoUpdate's reattach. A nil log defaults to os.Stdout (the daemon's
+// stdout IS the journal).
 func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager, error) {
 	if dataDir == "" {
 		return nil, errors.New("core: dataDir is empty — the manager cannot take its singleton lock")
@@ -203,11 +207,7 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 	if err != nil {
 		return nil, err
 	}
-	bin := cfg.XrayBin
-	managed := bin == ""
-	if managed {
-		bin = filepath.Join(dataDir, "bin", "xray")
-	}
+	bin := config.ResolveCoreXrayBin(cfg.XrayBin, dataDir)
 	socksPort := cfg.SocksPort
 	if socksPort <= 0 {
 		socksPort = config.DefaultCoreSocksPort
@@ -218,6 +218,8 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 	}
 	m := &Manager{
 		bin:        bin,
+		override:   cfg.XrayBin,
+		source:     classifyBinarySource(cfg.XrayBin, bin),
 		dataDir:    dataDir,
 		livePath:   filepath.Join(dataDir, "rendered", "live.json"),
 		lockPath:   filepath.Join(dataDir, coreLockName),
@@ -225,7 +227,6 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 		backupDir:  filepath.Join(dataDir, "backups"),
 		socksPort:  socksPort,
 		strikeK:    strikeK,
-		managed:    managed,
 		log:        log,
 		lockFile:   lockFile,
 		healthURL:  defaultHealthURL,
@@ -251,6 +252,12 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 			_, _ = fmt.Fprintf(log, "WARNING: core: reset health state: %v\n", err)
 		}
 	}
+	// The binding probe: version, floor warning, provenance — once per
+	// manager lifetime (the per-wave re-detection is reattach). The pending
+	// state (no binary anywhere) binds the install target silently.
+	m.mu.Lock()
+	m.applyBindingLocked(m.source, m.bin)
+	m.mu.Unlock()
 	_, _ = fmt.Fprintf(log, "core: manager holds the singleton lock (%s) — binary %s, "+
 		"socks 127.0.0.1:%d, rollback strikes %d\n", m.lockPath, bin, socksPort, strikeK)
 	return m, nil
@@ -667,11 +674,12 @@ func (m *Manager) portServing() bool {
 
 // childEnv strips ambient proxy variables (L5: nothing the core does may
 // silently ride the live client) and wires the managed asset dir at spawn
-// for the managed binary only (S6; a system-xray override resolves its own
-// assets).
+// for the ASSAY-OWNED binaries only (S6 — user-local and the pending
+// install target; their geoip/geosite assets live in <data>/share/xray).
+// An override and a pre-existing system core resolve their own assets.
 func (m *Manager) childEnv() []string {
 	env := dropProxyEnv(os.Environ())
-	if m.managed {
+	if m.source == SourceUserLocal || m.source == "" {
 		env = append(env, "XRAY_LOCATION_ASSET="+filepath.Join(m.dataDir, managedAssetDirRel))
 	}
 	return env

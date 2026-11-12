@@ -1,0 +1,51 @@
+# goreleaser v2 release config — R1 matrix: linux only, four arches.
+version: 2
+
+project_name: assay
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: assay
+    main: ./cmd/assay
+    binary: assay
+    # go.mod has zero cgo dependencies — fully static binaries, which is
+    # what lets the qemu-user smoke probe run each target in-hook.
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X assay/internal/cli.Version={{.Version}} -X assay/internal/cli.Commit={{.FullCommit}} -X assay/internal/cli.Date={{.Date}}
+    # R1 owner ruling: linux only — assay is a systemd-user-unit daemon
+    # managing an xray child process; Windows has no systemd and macOS is
+    # outside the deployment surface. No universal binary.
+    goos: [linux]
+    goarch: [amd64, arm64, "386", arm]
+    goarm: ["7"]
+    # Reproducible-ish: source-date epoch pinned to the commit timestamp.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # R3: per-target smoke probe runs INSIDE the pipeline (before SCM
+    # publish), so a broken binary aborts the release. Mechanism chosen
+    # over a separate smoke job because a separate job can only inspect
+    # dist/ after the release already shipped (ci-actions-plan.md 4.3).
+    hooks:
+      post:
+        - ./scripts/smoke.sh "{{ .Target }}" "{{ .Path }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+
+release:
+  # R2: vX.Y.Z-<suffix> tags (rc/beta) auto-mark as GitHub pre-releases.
+  prerelease: auto
+  footer: |
+    Verify: sha256sum -c checksums.txt

@@ -258,18 +258,19 @@ func TestOneShotWaveSharedManagerCompletesCoreStages(t *testing.T) {
 // TestCoreAutoUpdateStageSwallowsFailuresLoud (fix M-2): a FAILING
 // AutoUpdate through the stage returns NIL — the wave continues — with the
 // loud WARNING in the journal. The failure is injected hermetically: the
-// managed core binary cannot answer `version`, and the current-version read
-// runs BEFORE any network (pinned at the core level by
+// bound USER-LOCAL core binary cannot answer `version`, and the
+// current-version read runs BEFORE any network (pinned at the core level by
 // TestAutoUpdateFailsFastOnUnreadableCurrentBinaryBeforeNetwork), so the
 // stage fails without touching GitHub.
 func TestCoreAutoUpdateStageSwallowsFailuresLoud(t *testing.T) {
+	userLocal, _ := injectCoreBinSeams(t)
 	dir := t.TempDir()
 	port := nextCoreTestPort()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "bin"), 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "bin", "xray"), []byte("#!/bin/sh\nexit 1\n"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(userLocal), 0o750))
+	require.NoError(t, os.WriteFile(userLocal, []byte("#!/bin/sh\nexit 1\n"), 0o755))
 	cfg := &config.Config{
 		DataDir: dir,
-		Core:    config.CoreConfig{SocksPort: port, HTTPPort: port + 1},
+		Core:    config.CoreConfig{AutoUpdate: true, SocksPort: port, HTTPPort: port + 1},
 	}
 	out := &syncBuffer{}
 	cmd := &cobra.Command{}

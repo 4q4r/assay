@@ -207,12 +207,16 @@ tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance join
 # process's knob surface.
 # xray_bin = ""              # the SINGLE binary knob (S1): path to the xray binary
                             # every consumer resolves (probe/check fleets, the -test
-                            # gate, the core manager). Empty = the managed default
-                            # <data>/bin/xray (installed by `assay install`); a system
-                            # xray may be pointed at instead — core auto-update goes
-                            # inert there with a one-time loud INFO (S5).
-# auto_update = true         # managed-core auto-update, default ON (D4, managed core
-                            # only per S5); checked each maintenance wave
+                            # gate, the core manager). Empty = the owner-ruling
+                            # resolution: the user-local ~/.local/bin/xray first (assay's
+                            # own install, auto-updated), then an existing system xray
+                            # (/usr/local/bin/xray, /usr/bin/xray — bound as found, with a
+                            # non-blocking floor warning; auto-update inert there), else
+                            # the user-local install target. An explicit value makes
+                            # auto-update inert with a one-time loud INFO (S5).
+# auto_update = true         # core auto-update for the assay-owned user-local binary,
+                            # default ON (D4 + owner ruling); checked each maintenance
+                            # wave — inert for a system or overridden binary (S5)
 # update_interval = "24h"    # auto-update check cadence
 socks_port = 10810          # own socks5 inbound, loopback-only (D2). Deliberately
                             # distinct from the owner's hand-managed client (10808)

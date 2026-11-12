@@ -2,11 +2,11 @@
 // latest Xray-core release for this platform, VERIFY its published sha256
 // (every release asset ships a .dgst companion), unpack, validate the NEW
 // binary with `xray run -test`, and atomically replace the target binary
-// with a date-stamped backup of the old one. Since D4/S5 the update surface
-// is MANAGED-ONLY: the target resolves through [core].xray_bin (the managed
-// default <data>/bin/xray or the explicit override). An unwritable target
-// directory is a loud misconfiguration — nothing is half-applied, and no
-// privileged commands are ever printed (the managed core never needs sudo).
+// with a date-stamped backup of the old one. The target resolves through
+// [core].xray_bin — under the owner-ruling resolution that is the
+// user-local ~/.local/bin/xray, an existing system xray, or the explicit
+// override; the managed-core lifecycle's own stage+install dance (internal/
+// core) needs no elevation anywhere (the user-local tree is user-writable).
 package xrayupdate
 
 import (

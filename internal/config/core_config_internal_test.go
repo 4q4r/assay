@@ -59,12 +59,28 @@ func writeCoreConfig(t *testing.T, dir string, body string) string {
 	return path
 }
 
+// withAbsentCoreBinaries points the core-binary resolution seams at
+// fixture dirs where NEITHER a user-local ~/.local/bin/xray NOR a system
+// xray exists — the fresh-install state. Returns the (absent) user-local
+// install target the resolution falls back to.
+func withAbsentCoreBinaries(t *testing.T) string {
+	t.Helper()
+	origDir, origPaths := UserLocalBinDir, DefaultSystemXrayPaths
+	userBin := filepath.Join(t.TempDir(), "local-bin")
+	UserLocalBinDir = func() string { return userBin }
+	DefaultSystemXrayPaths = []string{filepath.Join(t.TempDir(), "usr-local-bin", "xray")}
+	t.Cleanup(func() { UserLocalBinDir, DefaultSystemXrayPaths = origDir, origPaths })
+	return UserLocalXrayBin()
+}
+
 // TestCoreDefaultsAbsentSection pins the verbatim [core] defaults when the
 // section is absent from the file AND on the configless path: socks 10810,
 // http 10811, api 15491, auto_update true, update_interval 24h,
-// rollback_strikes 3, loglevel "warning", per-country off, and the managed
-// binary default <data>/bin/xray resolved by CoreXrayBin.
+// rollback_strikes 3, loglevel "warning", per-country off, and the
+// owner-ruling binary resolution: with no binary anywhere, CoreXrayBin
+// resolves the user-local install target ~/.local/bin/xray.
 func TestCoreDefaultsAbsentSection(t *testing.T) {
+	userLocalTarget := withAbsentCoreBinaries(t)
 	dir := t.TempDir()
 	path := writeCoreConfig(t, dir,
 		fmt.Sprintf("data_dir = %q\n", filepath.Join(dir, "data")))
@@ -80,12 +96,12 @@ func TestCoreDefaultsAbsentSection(t *testing.T) {
 	assert.Equal(t, 3, cfg.Core.RollbackStrikes)
 	assert.Equal(t, "warning", cfg.Core.Loglevel)
 	assert.False(t, cfg.Core.PerCountryInbounds, "per-country inbounds default OFF (D2)")
-	assert.Empty(t, cfg.Core.XrayBin, "the managed default is resolved, not stored")
-	assert.Equal(t, filepath.Join(filepath.Join(dir, "data"), "bin", "xray"),
-		cfg.CoreXrayBin(), "CoreXrayBin resolves <data>/bin/xray from the data dir")
+	assert.Empty(t, cfg.Core.XrayBin, "the binary default is resolved, not stored")
+	assert.Equal(t, userLocalTarget,
+		cfg.CoreXrayBin(), "CoreXrayBin resolves the user-local install target when no binary exists anywhere (owner ruling)")
 
-	// The configless path carries the same defaults, with the managed binary
-	// joined from the configless data dir.
+	// The configless path carries the same defaults, with the same
+	// user-local resolution.
 	home := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", "")
 	res, err := Resolve("", home, t.TempDir())
@@ -99,8 +115,9 @@ func TestCoreDefaultsAbsentSection(t *testing.T) {
 	assert.Equal(t, 3, res.Config.Core.RollbackStrikes)
 	assert.Equal(t, "warning", res.Config.Core.Loglevel)
 	assert.False(t, res.Config.Core.PerCountryInbounds)
-	assert.Equal(t, filepath.Join(DefaultDataDir(home), "bin", "xray"),
-		res.Config.CoreXrayBin())
+	assert.Equal(t, userLocalTarget,
+		res.Config.CoreXrayBin(),
+		"the configless path resolves the same user-local install target")
 }
 
 // TestCoreExplicitValuesSurvive pins the flip side: every explicit [core]

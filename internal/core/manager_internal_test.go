@@ -302,18 +302,22 @@ func newTestManager(t *testing.T, cfg config.CoreConfig, dataDir string, log io.
 	return m
 }
 
-// newManagedTestManager builds a manager in the MANAGED layout (empty
-// [core].xray_bin → the managed default <data>/bin/xray) with the fake
-// binary placed exactly there — the shape the download/AutoUpdate tests
-// exercise (S5 inertness keys on the override being ABSENT).
+// newManagedTestManager builds a manager in the USER-LOCAL layout (empty
+// [core].xray_bin, the fake binary at the injected ~/.local/bin/xray, no
+// system xray on the injected standard paths) — the shape the
+// download/AutoUpdate tests exercise (S5 inertness keys on the override
+// being ABSENT). The user-local dir and the standard-path list are
+// seam-injected here so no manager in this suite can ever scan the real
+// $HOME/.local or /usr trees.
 func newManagedTestManager(t *testing.T, cfg config.CoreConfig, dataDir string, log io.Writer) *Manager {
 	t.Helper()
 	require.Empty(t, cfg.XrayBin, "the managed-layout helper takes an empty override")
+	userLocal, _ := withResolutionSeams(t)
 	fake := fakeBin(t)
-	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "bin"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Dir(userLocal), 0o750))
 	// Idempotent: subtests may share the data dir fixture.
-	_ = os.Remove(filepath.Join(dataDir, "bin", "xray"))
-	require.NoError(t, os.Symlink(fake, filepath.Join(dataDir, "bin", "xray")))
+	_ = os.Remove(userLocal)
+	require.NoError(t, os.Symlink(fake, userLocal))
 	m, err := NewManager(cfg, dataDir, log)
 	require.NoError(t, err)
 	t.Cleanup(m.release)

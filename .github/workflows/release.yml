@@ -1,0 +1,44 @@
+# Tag-triggered release (R2): fires on exact semver tags and semver
+# pre-release suffixes only (v1.2.3, v1.2.3-rc1, v1.2.3-beta.1); rejects
+# non-semver tags (v1.2, nightly). goreleaser runs the full pipeline from
+# .goreleaser.yaml, including the per-arch smoke hook.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    permissions:
+      # Create the GitHub Release and upload assets; write is granted at
+      # job level only (workflow level stays read).
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 is mandatory: the changelog needs full tag history.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # qemu-user-static provides qemu-aarch64-static / qemu-arm-static /
+      # qemu-i386-static for the cross-arch smoke hook in
+      # .goreleaser.yaml (amd64 smokes natively). Direct qemu-user exec on
+      # static Go binaries; NOT docker/setup-qemu-action, whose binfmt
+      # handlers register for container exec only.
+      - name: install qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+      - name: goreleaser release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
