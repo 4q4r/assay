@@ -1,4 +1,15 @@
-# goreleaser v2 release config — R1 matrix: linux only, four arches.
+# goreleaser v2 release config — the FULL release matrix, single source of
+# truth (crossplatform-plan.md §4.5): linux amd64/arm64/386/armv7,
+# darwin amd64/arm64, windows amd64/arm64/386. NO windows/arm7: upstream
+# Xray-core ships no arm32 windows asset, so the managed core is impossible
+# there (§4.4 — the degraded build-only posture exists if the owner ever
+# overrides).
+#
+# Per-OS partial runs (release.yml) are GENERATED from this file by
+# scripts/goreleaser-split.sh (yq filter on builds.goos) — goreleaser OSS has
+# no split/merge (Pro-only) — and each partial carries the same smoke hook,
+# checksum and changelog blocks as this file. A CI step pins that the union
+# of generated partials' targets equals this file's targets.
 version: 2
 
 project_name: assay
@@ -8,30 +19,76 @@ before:
     - go mod tidy
 
 builds:
-  - id: assay
+  # One build entry per GOOS (single-goos lists): the split filter selects
+  # whole entries, and per-OS arch tables stay explicit. All three entries
+  # share the binary name, env, flags and ldflags — version-flag parity
+  # (`assay <version>` on every OS) is the smoke contract (§4.6).
+  - id: assay-linux
     main: ./cmd/assay
     binary: assay
     # go.mod has zero cgo dependencies — fully static binaries, which is
-    # what lets the qemu-user smoke probe run each target in-hook.
+    # what lets the qemu-user smoke probe run each foreign-arch target
+    # in-hook on the linux runner.
     env: [CGO_ENABLED=0]
     flags: [-trimpath]
     ldflags:
       - -s -w -X assay/internal/cli.Version={{.Version}} -X assay/internal/cli.Commit={{.FullCommit}} -X assay/internal/cli.Date={{.Date}}
-    # R1 owner ruling: linux only — assay is a systemd-user-unit daemon
-    # managing an xray child process; Windows has no systemd and macOS is
-    # outside the deployment surface. No universal binary.
     goos: [linux]
     goarch: [amd64, arm64, "386", arm]
     goarm: ["7"]
-    # Reproducible-ish: source-date epoch pinned to the commit timestamp.
-    mod_timestamp: "{{ .CommitTimestamp }}"
     # R3: per-target smoke probe runs INSIDE the pipeline (before SCM
-    # publish), so a broken binary aborts the release. Mechanism chosen
-    # over a separate smoke job because a separate job can only inspect
-    # dist/ after the release already shipped (ci-actions-plan.md 4.3).
+    # publish), so a broken binary aborts the release. The hook is invoked
+    # through `bash` (not as a direct shebang exec) because goreleaser
+    # executes hook commands via argv directly with no shell: on windows
+    # runners a .sh file cannot be exec'd by the kernel, while `bash`
+    # resolves on every GitHub runner (git-bash there).
     hooks:
       post:
-        - ./scripts/smoke.sh "{{ .Target }}" "{{ .Path }}"
+        - bash ./scripts/smoke.sh "{{ .Target }}" "{{ .Path }}"
+    # Reproducible-ish: source-date epoch pinned to the commit timestamp.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: assay-darwin
+    main: ./cmd/assay
+    binary: assay
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X assay/internal/cli.Version={{.Version}} -X assay/internal/cli.Commit={{.FullCommit}} -X assay/internal/cli.Date={{.Date}}
+    # darwin/arm (32-bit) is absent on purpose: unsupported by Apple
+    # hardware in practice and not in the plan matrix (§4.4).
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    hooks:
+      post:
+        - bash ./scripts/smoke.sh "{{ .Target }}" "{{ .Path }}"
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: assay-windows
+    main: ./cmd/assay
+    binary: assay
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X assay/internal/cli.Version={{.Version}} -X assay/internal/cli.Commit={{.FullCommit}} -X assay/internal/cli.Date={{.Date}}
+    # NO windows/arm7 (GOARM): upstream ships no arm32 windows core asset
+    # (§4.4); windows/arm64 IS shipped — its native smoke runs on the
+    # windows-11-arm runner (release.yml), never on the x64 runner this
+    # config is built on when SMOKE_DELEGATED_TARGETS carries it.
+    goos: [windows]
+    goarch: [amd64, arm64, "386"]
+    hooks:
+      post:
+        - bash ./scripts/smoke.sh "{{ .Target }}" "{{ .Path }}"
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# tar.gz everywhere (the goreleaser default, declared explicitly), except
+# windows: zip via format_overrides — the goreleaser docs' required form.
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
@@ -45,6 +102,10 @@ changelog:
       - "^test:"
 
 release:
+  # Partial runs use --skip=publish: this block governs only the publish
+  # job's `gh release create` contract in release.yml, kept here for
+  # parity documentation (prerelease auto == the tag-suffix rule; the
+  # footer is reproduced verbatim in the publish job's release body).
   # R2: vX.Y.Z-<suffix> tags (rc/beta) auto-mark as GitHub pre-releases.
   prerelease: auto
   footer: |

@@ -1,7 +1,30 @@
 # Tag-triggered release (R2): fires on exact semver tags and semver
 # pre-release suffixes only (v1.2.3, v1.2.3-rc1, v1.2.3-beta.1); rejects
-# non-semver tags (v1.2, nightly). goreleaser runs the full pipeline from
-# .goreleaser.yaml, including the per-arch smoke hook.
+# non-semver tags (v1.2, nightly).
+#
+# The pipeline is split per OS (crossplatform-plan.md §4.5): goreleaser OSS
+# cannot split one release across runners (split & merge is Pro-only), so
+# each native runner runs a per-OS PARTIAL config — generated from the
+# single source of truth .goreleaser.yaml by scripts/goreleaser-split.sh —
+# with --skip=publish, and every partial's post-build hook smokes each of
+# its targets natively. The final publish job is gated by `needs:` on ALL
+# partial jobs: a failed or missing smoke aborts the release BEFORE
+# anything is published (R3).
+#
+# Smoke matrix (plan §4.5/§4.4):
+#   linux amd64        | ubuntu-latest      | direct exec
+#   linux arm64/386/arm7| ubuntu-latest     | qemu-user unsuffixed names
+#   darwin arm64       | macos-latest (arm) | direct exec
+#   darwin amd64       | macos-latest       | Rosetta 2 via `arch -x86_64`
+#                      |                    | (hard-probed; job fails loud)
+#   windows amd64      | windows-latest     | direct exec (native x64)
+#   windows 386        | windows-latest     | direct exec (WOW64 x86-on-x64)
+#   windows arm64      | windows-11-arm     | direct exec (native arm64);
+#                      |                    | if the runner is unavailable,
+#                      |                    | build-only + smoke-gap artifact
+#                      |                    | and a loud release-body warning
+#                      |                    | (the ONLY sanctioned gap path).
+
 name: release
 
 on:
@@ -13,21 +36,42 @@ on:
 permissions:
   contents: read
 
+env:
+  # mikefarah/yq, pinned — the per-OS partial generator's only dependency.
+  # scripts/goreleaser-split.sh documents the local-install command for the
+  # same version.
+  YQ_VERSION: "v4.54.3"
+
 jobs:
-  release:
-    permissions:
-      # Create the GitHub Release and upload assets; write is granted at
-      # job level only (workflow level stays read).
-      contents: write
+  release-linux:
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth 0 is mandatory: the changelog needs full tag history.
+      # fetch-depth 0 is mandatory: goreleaser resolves the tag metadata and
+      # the publish job needs full history for the changelog.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - name: install yq (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) asset=yq_linux_amd64 ;;
+            Linux/aarch64) asset=yq_linux_arm64 ;;
+            Darwin/arm64) asset=yq_darwin_arm64 ;;
+            MINGW*|MSYS*) asset=yq_windows_amd64.exe ;;
+            *) echo "::error::unsupported runner for yq: $(uname -s)/$(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: generate the linux partial from the full config
+        shell: bash
+        run: bash scripts/goreleaser-split.sh generate linux "$RUNNER_TEMP/goreleaser/linux.yaml"
       # qemu-user provides the user-mode emulator binaries the smoke hook
       # invokes: /usr/bin/qemu-aarch64, /usr/bin/qemu-arm, /usr/bin/qemu-i386
       # (file list: https://packages.ubuntu.com/resolute/qemu-user). On
@@ -42,10 +86,286 @@ jobs:
       # whose binfmt handlers register for container exec only.
       - name: install qemu-user emulators + binfmt registration
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user qemu-user-binfmt
-      - name: goreleaser release
+      - name: goreleaser check (linux partial)
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: check -f ${{ runner.temp }}/goreleaser/linux.yaml
+      - name: goreleaser release (linux partial; publish skipped — the publish job owns it)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/linux.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist
+          if-no-files-found: error
+
+  release-darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install yq (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) asset=yq_linux_amd64 ;;
+            Linux/aarch64) asset=yq_linux_arm64 ;;
+            Darwin/arm64) asset=yq_darwin_arm64 ;;
+            MINGW*|MSYS*) asset=yq_windows_amd64.exe ;;
+            *) echo "::error::unsupported runner for yq: $(uname -s)/$(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: generate the darwin partial from the full config
+        shell: bash
+        run: bash scripts/goreleaser-split.sh generate darwin "$RUNNER_TEMP/goreleaser/darwin.yaml"
+      # Rosetta 2 provisioning for the darwin/amd64 smoke (plan §4.5.2, §5.12):
+      # the arm64 runner translates x86_64 Mach-O only with Rosetta installed.
+      # The final `arch -x86_64` probe is the contract — if x86_64 execution
+      # is unavailable for ANY reason (softwareupdate failed, image drift),
+      # the JOB FAILS LOUD here, never a silent skip (R3; §5.13 documents the
+      # owner fallback: pin this leg to a paid x64 mac runner).
+      - name: provision Rosetta 2 + hard-probe x86_64 execution
+        run: |
+          softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+      - name: goreleaser check (darwin partial)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check -f ${{ runner.temp }}/goreleaser/darwin.yaml
+      # The partial's post-build hook: darwin/arm64 direct exec; darwin/amd64
+      # direct-under-Rosetta (transparent) or via `arch -x86_64` fallback.
+      - name: goreleaser release (darwin partial; publish skipped — the publish job owns it)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/darwin.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin
+          path: dist
+          if-no-files-found: error
+
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install yq (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) asset=yq_linux_amd64 ;;
+            Linux/aarch64) asset=yq_linux_arm64 ;;
+            Darwin/arm64) asset=yq_darwin_arm64 ;;
+            MINGW*|MSYS*) asset=yq_windows_amd64.exe ;;
+            *) echo "::error::unsupported runner for yq: $(uname -s)/$(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: generate the windows partial from the full config
+        shell: bash
+        run: bash scripts/goreleaser-split.sh generate windows "$RUNNER_TEMP/goreleaser/windows.yaml"
+      - name: goreleaser check (windows partial)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check -f ${{ runner.temp }}/goreleaser/windows.yaml
+      # This x64 run builds ALL THREE windows targets (amd64, 386, arm64 —
+      # the arm64 ASSET ships from this dist), but it can only EXECUTE amd64
+      # natively and 386 via WOW64: x64 Windows cannot run arm64 binaries.
+      # The windows/arm64 smoke is therefore DELEGATED (loud DELEGATED line
+      # in the hook log, not a silent skip): release-windows-arm64 — a
+      # `needs:` gate of the publish job — either smokes it natively or, only
+      # on runner unavailability, ships the smoke-gap artifact that the
+      # release body then warns about.
+      - name: goreleaser release (windows partial; publish skipped — the publish job owns it)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/windows.yaml
+        env:
+          SMOKE_DELEGATED_TARGETS: windows_arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist
+          if-no-files-found: error
+
+  release-windows-arm64:
+    # Public-preview arm64 runner (plan §4.4/§4.5.2). The precondition
+    # guards against label drift: if this job ever lands on a NON-arm64
+    # host, the native smoke is impossible and the job degrades to
+    # build-only + smoke-gap artifact — never silently unsmoked (§5.11).
+    # If the label itself cannot be served, the job never starts and the
+    # whole release blocks on it — loud by construction (R3).
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - id: precondition
+        name: precondition — the host must genuinely be arm64
+        shell: pwsh
+        run: |
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          Write-Host "runner PROCESSOR_ARCHITECTURE: $arch"
+          if ($arch -eq 'ARM64') {
+            "native=true" | Out-File -Append $env:GITHUB_OUTPUT
+            "windows/arm64 native smoke: ARM64 host confirmed" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          } else {
+            "native=false" | Out-File -Append $env:GITHUB_OUTPUT
+            Write-Host "::warning::windows/arm64 smoke NOT run — the windows-11-arm label served a '$arch' host; shipping build-only with a loud release-body warning"
+            "windows/arm64 SMOKE NOT RUN: label served a '$arch' host" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          }
+      # Native path: build the arm64 binary (same trimpath/ldflags contract;
+      # the version is stamped from the tag) and smoke it on the REAL arm64
+      # hardware via the shared smoke script. The SHIPPED arm64 asset comes
+      # from the x64 goreleaser run (same commit, same flags modulo the
+      # build-date stamp) — this job owns the ABI/run proof.
+      - name: build + native windows/arm64 smoke
+        if: steps.precondition.outputs.native == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:GITHUB_REF_NAME -replace '^v', ''
+          go build -trimpath -ldflags "-s -w -X assay/internal/cli.Version=$ver" -o assay-arm64-smoke.exe ./cmd/assay
+          if ($LASTEXITCODE -ne 0) { throw "windows/arm64 build failed" }
+          bash scripts/smoke.sh windows_arm64 assay-arm64-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "windows/arm64 native smoke failed" }
+          New-Item -ItemType Directory -Force smoke-verdict | Out-Null
+          Set-Content -Path smoke-verdict/smoke-ok-windows-arm64.md -Value @"
+          windows/arm64 native smoke: PASS on a real ARM64 host ($env:GITHUB_RUN_ID).
+          "@
+      # Degraded path (the ONLY sanctioned gap, plan §4.4): compile proof
+      # only, plus the smoke-gap artifact consumed by the publish job to
+      # append the loud warning to the release body.
+      - name: build-only proof + smoke-gap artifact
+        if: steps.precondition.outputs.native != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'arm64'
+          go build -trimpath ./cmd/assay
+          if ($LASTEXITCODE -ne 0) { throw "windows/arm64 build-only proof failed" }
+          New-Item -ItemType Directory -Force smoke-verdict | Out-Null
+          Set-Content -Path smoke-verdict/smoke-gap-windows-arm64.md -Value @"
+          > [!WARNING]
+          > windows/arm64 was **not** smoke-probed in this release: the
+          > windows-11-arm runner was unavailable at release time (build-only
+          > proof ran instead). The asset ships unsmoked — this is the only
+          > sanctioned smoke gap, by owner decision (plan §4.4/§4.5.2).
+          "@
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-verdict
+          path: smoke-verdict
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - release-linux
+      - release-darwin
+      - release-windows
+      - release-windows-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      # Create the GitHub Release and upload assets; write is granted at
+      # job level only (workflow level stays read).
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: assemble assets + merge checksums (LC_ALL=C sort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p release-assets
+          cp artifacts/dist-linux/assay_*.tar.gz release-assets/
+          cp artifacts/dist-darwin/assay_*.tar.gz release-assets/
+          cp artifacts/dist-windows/assay_*.zip release-assets/
+          # One checksums.txt covering EVERY asset: the three per-partial
+          # fragments are disjoint (each partial checksums only what it
+          # built), so a plain merge + LC_ALL=C sort is the deterministic
+          # union. sha256sum -c stays the cross-OS verify contract (§4.6).
+          cat artifacts/dist-linux/checksums.txt \
+              artifacts/dist-darwin/checksums.txt \
+              artifacts/dist-windows/checksums.txt | LC_ALL=C sort > release-assets/checksums.txt
+          # Fail loud on drift: every shipped asset must be checksummed,
+          # exactly once.
+          assets=$(ls release-assets/assay_* | wc -l)
+          sums=$(grep -c 'assay_' release-assets/checksums.txt)
+          if [ "$assets" -ne "$sums" ]; then
+            echo "::error::checksum/assets mismatch: $sums checksum lines for $assets assets"
+            ls release-assets/
+            cat release-assets/checksums.txt
+            exit 1
+          fi
+          echo "release assets ($assets):"; ls release-assets/
+      - name: build the release body (changelog parity + smoke-gap warning + Verify footer)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Changelog from git log with the SAME exclusion filters as the
+          # goreleaser changelog config (parity, §4.6); oldest first, as
+          # goreleaser's `sort: asc`. Partial changelogs are discarded —
+          # publish is the only release-notes author.
+          prev=$(git describe --tags --match 'v[0-9]*' --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then range="$prev..$TAG"; else range="$TAG"; fi
+          echo "changelog range: $range"
+          changelog=$(git log --reverse --format='- %s' "$range" | grep -vE '^- (docs|chore|test):' || true)
+          {
+            if [ -n "$changelog" ]; then
+              printf '%s\n' "$changelog"
+            else
+              echo "No release-note-worthy commits (docs/chore/test-only changes are filtered)."
+            fi
+            if [ -f artifacts/windows-arm64-verdict/smoke-gap-windows-arm64.md ]; then
+              echo
+              cat artifacts/windows-arm64-verdict/smoke-gap-windows-arm64.md
+            fi
+            echo
+            echo "Verify: sha256sum -c checksums.txt"
+          } > body.md
+          echo "--- release body ---"; cat body.md
+      - name: gh release create (--prerelease iff the tag carries a suffix)
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          flags=()
+          # R2 parity with goreleaser `prerelease: auto`: any semver
+          # pre-release suffix (v1.2.3-rc1) marks the GitHub pre-release.
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" --title "assay ${TAG}" \
+            --notes-file body.md "${flags[@]}" release-assets/*
