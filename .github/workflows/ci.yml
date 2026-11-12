@@ -3,6 +3,16 @@
 # linter set; the test job still runs vet + build explicitly so the
 # gate list stays visible in CI; gofumpt has a dedicated job because
 # .golangci.yml hands format ownership to the standalone gofumpt binary).
+#
+# S4 additions (crossplatform-plan.md §4.5.4/§S4): test legs on
+# macos-latest and windows-latest (`go test -race ./...` — the linux-only
+# goldens are build-tag scoped, see the internal/config and internal/cli
+# test files), an extended build matrix covering every shipped target
+# (darwin amd64/arm64 + windows amd64/arm64/386 build-only on every PR;
+# NO windows/arm7 — plan §4.4), a windows-11-arm native build proof, the
+# release-config gate (per-partial goreleaser check + the partial-union
+# parity test), and the S1/S2/S3 platform E2E legs wired as NON-REQUIRED
+# reusable workflows.
 name: ci
 
 on:
@@ -23,6 +33,11 @@ concurrency:
   group: ci-${{ github.ref }}
   # Save runner minutes on superseded pushes; never cancel main.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # mikefarah/yq, pinned — matches release.yml and the install command
+  # documented in scripts/goreleaser-split.sh's header.
+  YQ_VERSION: "v4.54.3"
 
 jobs:
   lint:
@@ -60,11 +75,17 @@ jobs:
           fi
 
   test:
+    # S4: the -race gate now runs on all three OSes. The linux-only
+    # contracts (XDG goldens, systemd-user-session defaults, unix process
+    # semantics) are build-tag scoped (`//go:build linux` / `//go:build
+    # unix`) so the darwin and windows legs carry the portable + per-OS
+    # suites; per-OS truths get their own per-OS tests (platform tables,
+    # winsvc, launchd suites).
     name: test (${{ matrix.runs-on }} -race)
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [ubuntu-latest, ubuntu-24.04-arm]
+        runs-on: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v7
@@ -79,38 +100,133 @@ jobs:
       # port bands far below the Linux ephemeral range — cli tests bind
       # 21800-21999, fake cores in internal/probe bind 22900-22999 with
       # the manager band at 22940-22980, the checker band is 28500-28799.
-      # The historical flake (TestBootSmokeEveryProtocolFamily) was a
-      # cross-package collision before the bands were made disjoint and
-      # is FIXED; no blanket retry logic is configured here because
+      # The bands are OS-independent (loopback TCP on every platform) and
+      # disjoint from each other, so one band per suite holds on macos and
+      # windows too. The historical flake (TestBootSmokeEveryProtocolFamily)
+      # was a cross-package collision before the bands were made disjoint
+      # and is FIXED; no blanket retry logic is configured here because
       # retries mask real regressions. If that documented port-band class
       # ever fires on CI: one manual re-run to confirm, then a fix wave.
       - name: test (-race, never cached)
         run: go test -race -count=1 ./...
 
   build-matrix:
-    name: build (${{ matrix.goarch }})
+    # Compile-only proof for EVERY shipped target on EVERY commit (plan
+    # §4.5.4): linux amd64/arm64/386/arm7 + darwin amd64/arm64 + windows
+    # amd64/arm64/386. windows/arm7 is absent by §4.4 (no upstream core
+    # asset). Runtime smoke of release binaries happens per-arch at
+    # release time (scripts/smoke.sh via the goreleaser post-build hooks).
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goarch: amd64, goarm: "" }
-          - { goarch: arm64, goarm: "" }
-          - { goarch: "386", goarm: "" }
-          - { goarch: arm, goarm: "7" }
+          - { goos: linux, goarch: amd64, goarm: "" }
+          - { goos: linux, goarch: arm64, goarm: "" }
+          - { goos: linux, goarch: "386", goarm: "" }
+          - { goos: linux, goarch: arm, goarm: "7" }
+          - { goos: darwin, goarch: amd64, goarm: "" }
+          - { goos: darwin, goarch: arm64, goarm: "" }
+          - { goos: windows, goarch: amd64, goarm: "" }
+          - { goos: windows, goarch: arm64, goarm: "" }
+          - { goos: windows, goarch: "386", goarm: "" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # Compile-only per-arch gate on EVERY commit; runtime smoke of the
-      # release binaries happens per-arch at release time (scripts/smoke.sh
-      # via the goreleaser post-build hook in .goreleaser.yaml).
-      - name: cross-compile linux target
+      - name: cross-compile target
         run: |
           [ -z "${{ matrix.goarm }}" ] || export GOARM=${{ matrix.goarm }}
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath ./cmd/assay
+
+  windows-arm64-native:
+    # Native arm64 windows compile proof on the public-preview runner
+    # (plan §S4 step 5): the cross-compile in build-matrix covers the
+    # compile graph; this leg additionally proves the arm64 binary RUNS on
+    # real arm64 windows hardware (the version-line contract). Build-only
+    # by design — the full windows suite runs on the windows-latest leg,
+    # and the release-time arm64 smoke owns the release gate.
+    # continue-on-error: the windows-11-arm label is public preview — an
+    # availability gap must not poison every PR run; the RELEASE pipeline
+    # (release.yml) gates on the arm64 leg hard.
+    name: windows-11-arm native build
+    continue-on-error: true
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: native windows/arm64 build + version-line contract
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -o assay-arm64-native.exe ./cmd/assay
+          if ($LASTEXITCODE -ne 0) { throw "windows/arm64 native build failed" }
+          $out = & .\assay-arm64-native.exe -v
+          Write-Host "$out"
+          if (-not "$out".StartsWith('assay ')) { throw "version line must start with 'assay '" }
+
+  release-config:
+    # The release pipeline's config gate: generate every per-OS partial
+    # from .goreleaser.yaml (single source of truth), `goreleaser check`
+    # the full config AND each partial, and pin the partial-union parity
+    # (the union of the generated partials' targets == the full-matrix
+    # targets == the plan §4.4 release matrix). Runs the exact local
+    # commands (scripts/goreleaser-split.sh parity + goreleaser check) so
+    # CI cannot drift from the local gate.
+    name: release config (partials + parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install yq (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) asset=yq_linux_amd64 ;;
+            Linux/aarch64) asset=yq_linux_arm64 ;;
+            Darwin/arm64) asset=yq_darwin_arm64 ;;
+            MINGW*|MSYS*) asset=yq_windows_amd64.exe ;;
+            *) echo "::error::unsupported runner for yq: $(uname -s)/$(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${asset}"
+          chmod +x "$RUNNER_TEMP/yq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: install goreleaser (binary only)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          install-only: true
+      - name: generate all per-OS partials
+        shell: bash
+        run: bash scripts/goreleaser-split.sh generate-all "$RUNNER_TEMP/goreleaser"
+      - name: goreleaser check — full config + every generated partial
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc=0
+          for cfg in .goreleaser.yaml "$RUNNER_TEMP"/goreleaser/linux.yaml \
+                     "$RUNNER_TEMP"/goreleaser/darwin.yaml \
+                     "$RUNNER_TEMP"/goreleaser/windows.yaml; do
+            echo "::group::goreleaser check -f $cfg"
+            if ! goreleaser check -f "$cfg"; then
+              echo "::error::goreleaser check failed for $cfg"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+      - name: partial-union parity (union of partials == full matrix == plan §4.4)
+        shell: bash
+        run: bash scripts/goreleaser-split.sh parity
 
   markdownlint:
     name: markdownlint
@@ -122,3 +238,31 @@ jobs:
       - uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           globs: "*.md"
+
+  # ── S1/S2/S3 platform E2E legs (crossplatform-plan.md §S4 step 5) ─────
+  #
+  # NON-REQUIRED by explicit choice, rationale: these legs exercise
+  # platform syntaxes that are UNVERIFIED until their first live runs —
+  # launchctl bootstrap/bootout/print/kickstart output formats (verified
+  # IN the darwin leg against man launchctl, §1.1), the SCM stop
+  # lifecycle and CTRL_BREAK delivery through a console-less LocalSystem
+  # session (S2), and the sv status / s6-svstat literal formats (§5.17).
+  # The plan's implementer-verify discipline wants them RUNNING and
+  # RECORDING on every PR, not gating merges while their verdicts are
+  # still being collected. They are wired as reusable workflows with
+  # continue-on-error at the call site; flipping them to required is a
+  # one-line change per leg once the first verified-green cycle lands.
+  legacy-verify-darwin:
+    name: legacy verify — darwin launchctl E2E
+    continue-on-error: true
+    uses: ./.github/workflows/darwin-launchctl.yml
+
+  legacy-verify-windows:
+    name: legacy verify — windows SCM E2E
+    continue-on-error: true
+    uses: ./.github/workflows/windows-scm.yml
+
+  legacy-verify-linux-schedulers:
+    name: legacy verify — linux scheduler container legs
+    continue-on-error: true
+    uses: ./.github/workflows/linux-schedulers.yml

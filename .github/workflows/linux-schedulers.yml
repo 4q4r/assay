@@ -1,0 +1,331 @@
+# Linux non-systemd scheduler container legs — Stage S3 step 5
+# (crossplatform-plan.md §S3, §3.2), wired from ci.yml as NON-REQUIRED legs.
+#
+# What each leg proves (S3 DoD, CI items):
+#   runit  — real runsvdir supervision: `assay install` detects the user
+#            runsvdir (comm match, same uid, service dir from its cmdline)
+#            with sv on PATH, renders the 0755 run script into the scanned
+#            dir, `sv status` exits 0 (the S3 verify contract: sv reached
+#            the live runsv — the status-line FORMAT stays unparsed, it is
+#            UNVERIFIED upstream), the supervised watch process is alive,
+#            and `assay uninstall` stops and removes the dir.
+#   s6     — real s6-svscan user overlay: scandir taken from the scanner's
+#            cwd (never invented), activation via `s6-svscanctl -a`,
+#            `s6-svstat` first token == `up`, and the VERIFIED live-stop
+#            contract (`s6-svc -d`, plan §3.2/§5.17) exercised by the real
+#            uninstall. Raw status output is recorded in the summary so the
+#            verify loop can be tightened without guessing formats.
+#   cron   — the marked @reboot line contract: install appends exactly one
+#            `# assay-watch`-marked line, re-install is idempotent (still
+#            exactly one), uninstall removes it (empty crontab → -r).
+#   openrc — script VALIDITY against the real OpenRC (plan: the login-cycle
+#            needs pam_openrc at login → OWN item): an own-uid process
+#            named `openrc-user` (comm match) plus the real rc-update/rc-
+#            service binaries drive the detection, the script lands at
+#            ~/.config/rc/init.d/assay-watch mode 0644, passes `sh -n`, and
+#            `rc-service --user assay-watch status` runs without a script
+#            parse error. The openrc version and ANY deviation (e.g. an
+#            image whose openrc predates 0.60 --user support) are recorded
+#            loudly in the summary — the leg verifies and records, never
+#            silently downgrades.
+#
+# Managed-core download during install is allowed to fail loud (non-fatal
+# by design — these legs assert the SUPERVISOR lifecycle, not the core
+# download), same posture as the darwin/windows E2E legs.
+#
+# Containers run as root deliberately: §3.1 detection matches processes of
+# the CURRENT uid, and root-owned user-scheduler processes match uid 0 —
+# the no-sudo constraint governs the product, not the CI sandbox.
+
+name: linux-schedulers
+
+on:
+  workflow_dispatch:
+  # S4 wiring: NON-REQUIRED from ci.yml (continue-on-error at the call
+  # site) — sv status / s6-svstat literal formats are UNVERIFIED upstream
+  # (plan §5.17); the legs VERIFY and record. Requiredness flips only after
+  # the first verified-green cycle.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  runit:
+    name: runit user supervision (container)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: install git (checkout prerequisite)
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install runit
+        run: apt-get install -y --no-install-recommends runit
+      - name: build assay
+        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+      - name: start the user runsvdir (the detection subject)
+        run: |
+          mkdir -p /root/service
+          nohup runsvdir /root/service >/runsvdir.log 2>&1 &
+          sleep 1
+          pgrep -x runsvdir || { echo "::error::runsvdir did not start"; cat /runsvdir.log; exit 1; }
+      - name: assay install detects runit and supervises the watch
+        run: |
+          set -e
+          ./assay install 2>&1 | tee install.log
+          dir=/root/service/assay-watch
+          test -f "$dir/run" || { echo "::error::run script missing at $dir/run"; exit 1; }
+          mode=$(stat -c '%a' "$dir/run")
+          [ "$mode" = "755" ] || { echo "::error::run script mode is $mode, must be 755"; exit 1; }
+          echo "run script rendered ($mode):" >> "$GITHUB_STEP_SUMMARY"
+          cat "$dir/run" >> "$GITHUB_STEP_SUMMARY"
+          # S3 verify contract: sv reaching the live runsv exit-0; the
+          # status line itself is recorded raw (its format is UNVERIFIED).
+          sv status "$dir" || { echo "::error::sv status failed"; exit 1; }
+          sv status "$dir" >> "$GITHUB_STEP_SUMMARY"
+          pgrep -f "$dir/run" >/dev/null || pgrep -x assay >/dev/null \
+            || { echo "::error::no supervised assay process"; exit 1; }
+      - name: assay uninstall stops and removes the service
+        run: |
+          set -e
+          ./assay uninstall
+          test ! -e /root/service/assay-watch || { echo "::error::service dir survived uninstall"; exit 1; }
+          echo "runit uninstall OK" >> "$GITHUB_STEP_SUMMARY"
+
+  s6:
+    name: s6 user svscan overlay (container)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: install git (checkout prerequisite)
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install s6
+        run: apt-get install -y --no-install-recommends s6
+      - name: build assay
+        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+      - name: start the user s6-svscan (the detection subject; cwd IS the scandir)
+        run: |
+          mkdir -p /root/scandir
+          cd /root/scandir
+          nohup s6-svscan >/s6-svscan.log 2>&1 &
+          cd "$GITHUB_WORKSPACE"
+          sleep 1
+          pgrep -x s6-svscan || { echo "::error::s6-svscan did not start"; cat /s6-svscan.log; exit 1; }
+      - name: assay install detects s6, activates via s6-svscanctl -a
+        run: |
+          set -e
+          ./assay install 2>&1 | tee install.log
+          dir=/root/scandir/assay-watch
+          test -f "$dir/run" || { echo "::error::run script missing at $dir/run"; exit 1; }
+          mode=$(stat -c '%a' "$dir/run")
+          [ "$mode" = "755" ] || { echo "::error::run script mode is $mode, must be 755"; exit 1; }
+          echo "run script rendered ($mode):" >> "$GITHUB_STEP_SUMMARY"
+          cat "$dir/run" >> "$GITHUB_STEP_SUMMARY"
+          # §3.2: s6-svscan detects new services "on demand — via
+          # s6-svscanctl -a" (skarnet s6-svscan.html).
+          s6-svscanctl -a /root/scandir
+          # S3 verify contract: the FIRST TOKEN of s6-svstat is the
+          # up/down summary (documented); the rest is recorded raw —
+          # formats are UNVERIFIED upstream (plan §5.17).
+          out=$(s6-svstat "$dir")
+          echo "s6-svstat raw: $out" >> "$GITHUB_STEP_SUMMARY"
+          first=$(echo "$out" | awk '{print $1}')
+          [ "$first" = "up" ] || { echo "::error::s6-svstat first token is '$first', expected 'up'"; exit 1; }
+          pgrep -x assay >/dev/null || { echo "::error::no supervised assay process"; exit 1; }
+      - name: assay uninstall exercises the verified live-stop (s6-svc -d)
+        run: |
+          set -e
+          ./assay uninstall
+          # The uninstall's stop ran the real `s6-svc -d` allowlisted
+          # command — §5.17's implementer-verify item, proven live here.
+          dir=/root/scandir/assay-watch
+          test ! -e "$dir" || { echo "::error::service dir survived uninstall"; exit 1; }
+          echo "s6 uninstall OK (s6-svc -d ran live)" >> "$GITHUB_STEP_SUMMARY"
+
+  cron:
+    name: cron @reboot fallback (container)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: install git (checkout prerequisite)
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates cron
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: build assay
+        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+      - name: assay install lands exactly one marked @reboot line (idempotent)
+        run: |
+          set -e
+          ./assay install 2>&1 | tee install.log
+          count() { crontab -l 2>/dev/null | grep -c '# assay-watch' || true; }
+          [ "$(count)" = "1" ] || { echo "::error::expected 1 marked line, got $(count)"; crontab -l; exit 1; }
+          ./assay install >/dev/null 2>&1
+          [ "$(count)" = "1" ] || { echo "::error::re-install is not idempotent: $(count) lines"; crontab -l; exit 1; }
+          echo "marked @reboot line (idempotent across re-install):" >> "$GITHUB_STEP_SUMMARY"
+          crontab -l | grep '# assay-watch' >> "$GITHUB_STEP_SUMMARY"
+      - name: assay uninstall removes the line
+        run: |
+          set -e
+          ./assay uninstall
+          rest=$(crontab -l 2>/dev/null | grep -c '# assay-watch' || true)
+          [ "$rest" = "0" ] || { echo "::error::marked line survived uninstall: $rest"; crontab -l; exit 1; }
+          echo "cron uninstall OK (marker fully removed)" >> "$GITHUB_STEP_SUMMARY"
+
+  openrc:
+    name: openrc user script validity (container)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:edge
+    # NO JS actions here (checkout/setup-go): the runner-mounted node is
+    # glibc-linked and cannot execute under alpine's musl — this leg checks
+    # out with plain git and uses the image's own Go.
+    steps:
+      - name: install git + openrc + go
+        run: |
+          set -e
+          apk update
+          apk add git ca-certificates go openrc bash
+          go version
+          openrc --version 2>&1 | tee /tmp/openrc-version.txt || true
+      - name: checkout (plain git — no JS actions on musl)
+        run: |
+          set -e
+          git init repo
+          cd repo
+          git config --global --add safe.directory "$PWD"
+          git fetch --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_REF"
+          git checkout FETCH_HEAD
+      - name: build assay
+        run: |
+          set -e
+          cd repo
+          CGO_ENABLED=0 go build -o /assay ./cmd/assay
+          cd /
+      - name: plant the openrc-user comm (detection subject) + XDG runtime dir
+        run: |
+          set -e
+          # Detection matches comm == "openrc-user" (the executable's
+          # basename): a copy of sleep under that name is a genuine own-uid
+          # process with the right comm — no guessing in the scanner.
+          cp /bin/sleep /tmp/openrc-user
+          /tmp/openrc-user 3600 &
+          mkdir -p /run/user/0
+          echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
+      - name: assay install detects openrc and renders the user script
+        run: |
+          set -e
+          /assay install 2>&1 | tee install.log
+          script=/root/.config/rc/init.d/assay-watch
+          test -f "$script" || { echo "::error::openrc script missing at $script"; tail install.log; exit 1; }
+          mode=$(stat -c '%a' "$script")
+          [ "$mode" = "644" ] || { echo "::error::openrc script mode is $mode, must be 644"; exit 1; }
+          sh -n "$script" || { echo "::error::openrc script fails shell syntax check"; exit 1; }
+          head -1 "$script" | grep -q openrc-run || { echo "::error::script is not an openrc-run script"; exit 1; }
+          echo "openrc script rendered ($mode):" >> "$GITHUB_STEP_SUMMARY"
+          cat "$script" >> "$GITHUB_STEP_SUMMARY"
+          echo "openrc version: $(cat /tmp/openrc-version.txt)" >> "$GITHUB_STEP_SUMMARY"
+      - name: rc-service --user status — real-parse validity, deviations recorded
+        run: |
+          set -e
+          # Validity contract: the status invocation must reach the script
+          # and not die on a parse error. If this image's openrc predates
+          # the 0.60 --user support, record the deviation LOUDLY and pin
+          # validity to sh -n + shebang checks (already asserted above) —
+          # never silently downgrade (plan §3.2/§5.16; live login cycle is
+          # the owner-manual OWN item).
+          out=$(rc-service --user assay-watch status 2>&1); rc=$?
+          {
+            echo "rc-service --user assay-watch status → rc=$rc"
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+            echo "Plan §5.16: full user lifecycle needs pam_openrc at login — owner-manual item."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            case "$out" in
+              *"unrecognized option"* | *"invalid option"* | *"Usage"*)
+                echo "::warning::openrc --user unsupported on this image (pre-0.60 openrc) — validity pinned to parse checks, deviation recorded"
+                ;;
+              *)
+                echo "::error::rc-service --user failed unexpectedly: $out"
+                exit 1
+                ;;
+            esac
+          fi
+      - name: assay uninstall removes the script and the runlevel entry
+        run: |
+          set -e
+          /assay uninstall
+          test ! -e /root/.config/rc/init.d/assay-watch \
+            || { echo "::error::openrc script survived uninstall"; exit 1; }
+          echo "openrc uninstall OK" >> "$GITHUB_STEP_SUMMARY"
+      - name: plant the openrc-user comm (detection subject) + XDG runtime dir
+        run: |
+          set -e
+          # Detection matches comm == "openrc-user" (the executable's
+          # basename): a copy of sleep under that name is a genuine own-uid
+          # process with the right comm — no guessing in the scanner.
+          cp /bin/sleep /tmp/openrc-user
+          /tmp/openrc-user 3600 &
+          mkdir -p /run/user/0
+          echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
+      - name: assay install detects openrc and renders the user script
+        run: |
+          set -e
+          ./assay install 2>&1 | tee install.log
+          script=/root/.config/rc/init.d/assay-watch
+          test -f "$script" || { echo "::error::openrc script missing at $script"; tail install.log; exit 1; }
+          mode=$(stat -c '%a' "$script")
+          [ "$mode" = "644" ] || { echo "::error::openrc script mode is $mode, must be 644"; exit 1; }
+          sh -n "$script" || { echo "::error::openrc script fails shell syntax check"; exit 1; }
+          head -1 "$script" | grep -q openrc-run || { echo "::error::script is not an openrc-run script"; exit 1; }
+          echo "openrc script rendered ($mode):" >> "$GITHUB_STEP_SUMMARY"
+          cat "$script" >> "$GITHUB_STEP_SUMMARY"
+          echo "openrc version: $(cat /tmp/openrc-version.txt)" >> "$GITHUB_STEP_SUMMARY"
+      - name: rc-service --user status — real-parse validity, deviations recorded
+        run: |
+          set -e
+          # Validity contract: the status invocation must reach the script
+          # and not die on a parse error. If this image's openrc predates
+          # the 0.60 --user support, record the deviation LOUDLY and pin
+          # validity to sh -n + shebang checks (already asserted above) —
+          # never silently downgrade (plan §3.2/§5.16; live login cycle is
+          # the owner-manual OWN item).
+          out=$(rc-service --user assay-watch status 2>&1); rc=$?
+          {
+            echo "rc-service --user assay-watch status → rc=$rc"
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+            echo "Plan §5.16: full user lifecycle needs pam_openrc at login — owner-manual item."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            case "$out" in
+              *"unrecognized option"* | *"invalid option"* | *"Usage"*)
+                echo "::warning::openrc --user unsupported on this image (pre-0.60 openrc) — validity pinned to parse checks, deviation recorded"
+                ;;
+              *)
+                echo "::error::rc-service --user failed unexpectedly: $out"
+                exit 1
+                ;;
+            esac
+          fi
+      - name: assay uninstall removes the script and the runlevel entry
+        run: |
+          set -e
+          ./assay uninstall
+          test ! -e /root/.config/rc/init.d/assay-watch \
+            || { echo "::error::openrc script survived uninstall"; exit 1; }
+          echo "openrc uninstall OK" >> "$GITHUB_STEP_SUMMARY"

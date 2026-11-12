@@ -36,6 +36,11 @@ name: windows-scm
 
 on:
   workflow_dispatch:
+  # S4 wiring: called from ci.yml as a NON-REQUIRED leg (continue-on-error
+  # at the call site) — the SCM lifecycle and CTRL_BREAK delivery it
+  # exercises are UNVERIFIED until this leg's first live run; requiredness
+  # is flipped only after the first verified-green cycle.
+  workflow_call:
 
 permissions:
   contents: read
