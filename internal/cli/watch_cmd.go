@@ -660,10 +660,17 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 // contract: adoption + last-good semantics recover on the next start. The
 // exit goes through the deps.selfExit seam — the production os.Exit rides
 // it, and tests record instead of exiting. release() disarms without
-// forcing (the normal unwind completed).
+// forcing (the normal unwind completed): the disarm is a full handshake —
+// release closes force AND waits for the watcher to leave the select, so
+// once release returns a released watcher can never act on a late signal
+// (a bare close(force) leaves the goroutine parked with both select cases
+// ready, and Go resolves a multi-ready select randomly — the watcher could
+// still force an exit after the normal unwind completed).
 func armSecondSignalForceExit(out io.Writer, signals <-chan os.Signal, selfExit func(int)) func() {
 	force := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		select {
 		case <-force:
 		case sig := <-signals:
@@ -672,7 +679,10 @@ func armSecondSignalForceExit(out io.Writer, signals <-chan os.Signal, selfExit 
 			selfExit(1)
 		}
 	}()
-	return func() { close(force) }
+	return func() {
+		close(force)
+		<-done
+	}
 }
 
 // startSelfWatchTransport wires the self-watchdog transport (ADDENDUM §1):
