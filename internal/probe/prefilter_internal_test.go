@@ -74,17 +74,57 @@ func (d *countingDialer) calls() []string {
 
 // refusedEndpoint hands out a loopback host:port that deterministically
 // refuses connections (bound, then closed — nothing listens).
+// refusedEndpoint returns a loopback endpoint that REFUSES connections: a
+// kernel-ephemeral port is bound, closed, and then VERIFIED to refuse. The
+// verification is the hermeticity (run 5a5d69b local -race flakes): long-
+// lived local services (dev-harness listeners, the live assay daemon's own
+// churn) allocate kernel-ephemeral ports through the same bind-:0 window,
+// the kernel favors just-freed ports, and an unverified freed port can be
+// re-bound by a foreign listener before the pre-filter's dial — which then
+// honestly reports the endpoint alive and the fixture's drop expectation
+// breaks. A candidate that fails verification (dials connect or time out)
+// is discarded and the next one is tried; the product's pre-filter is not
+// involved in the choice.
 func refusedEndpoint(t *testing.T) (string, int) {
 	t.Helper()
 	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	host, portStr, err := net.SplitHostPort(ln.Addr().String())
-	require.NoError(t, err)
-	require.NoError(t, ln.Close())
-	port, err := strconv.Atoi(portStr)
-	require.NoError(t, err)
-	return host, port
+	const maxCandidates = 32
+	for range maxCandidates {
+		ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		host, portStr, err := net.SplitHostPort(ln.Addr().String())
+		require.NoError(t, err)
+		require.NoError(t, ln.Close())
+		port, err := strconv.Atoi(portStr)
+		require.NoError(t, err)
+		if dialRefused(host, port) {
+			return host, port
+		}
+	}
+	t.Fatalf("no verifiably refused loopback endpoint after %d candidates — local port churn is hostile", maxCandidates)
+	return "", 0
+}
+
+// dialRefused reports whether dialing host:port reliably refuses: three
+// consecutive dial attempts must fail with a non-timeout dial error
+// (ECONNREFUSED on loopback). A successful dial means a foreign listener
+// owns the port; a timeout is an ambiguous state (a dropped SYN is not a
+// refusal) — both disqualify the candidate.
+func dialRefused(host string, port int) bool {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	for range 3 {
+		d := net.Dialer{Timeout: 250 * time.Millisecond}
+		c, err := d.DialContext(context.Background(), "tcp", addr)
+		if err == nil {
+			_ = c.Close() // a foreign listener owns the port — not refused
+			return false
+		}
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			return false // a dropped SYN is not a refusal — ambiguous state
+		}
+	}
+	return true
 }
 
 // tcpNode builds a plain vless/tcp/tls node with an explicit endpoint.
