@@ -69,7 +69,16 @@ jobs:
       - name: install runit
         run: apt-get install -y --no-install-recommends runit
       - name: build assay
-        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+        run: |
+          set -e
+          # The workspace mounts into the container owned by the host runner
+          # uid while this step runs as uid 0 — git refuses the "dubious
+          # ownership" tree and go build's VCS stamping died with
+          # "error obtaining VCS status: exit status 128" (the first
+          # container-leg cycle). The openrc leg already pins safe.directory
+          # in its checkout; the JS-checkout legs do it here.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CGO_ENABLED=0 go build -o ./assay ./cmd/assay
       - name: start the user runsvdir (the detection subject)
         run: |
           mkdir -p /root/service
@@ -117,7 +126,16 @@ jobs:
       - name: install s6
         run: apt-get install -y --no-install-recommends s6
       - name: build assay
-        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+        run: |
+          set -e
+          # The workspace mounts into the container owned by the host runner
+          # uid while this step runs as uid 0 — git refuses the "dubious
+          # ownership" tree and go build's VCS stamping died with
+          # "error obtaining VCS status: exit status 128" (the first
+          # container-leg cycle). The openrc leg already pins safe.directory
+          # in its checkout; the JS-checkout legs do it here.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CGO_ENABLED=0 go build -o ./assay ./cmd/assay
       - name: start the user s6-svscan (the detection subject; cwd IS the scandir)
         run: |
           mkdir -p /root/scandir
@@ -173,7 +191,16 @@ jobs:
         with:
           go-version-file: go.mod
       - name: build assay
-        run: CGO_ENABLED=0 go build -o ./assay ./cmd/assay
+        run: |
+          set -e
+          # The workspace mounts into the container owned by the host runner
+          # uid while this step runs as uid 0 — git refuses the "dubious
+          # ownership" tree and go build's VCS stamping died with
+          # "error obtaining VCS status: exit status 128" (the first
+          # container-leg cycle). The openrc leg already pins safe.directory
+          # in its checkout; the JS-checkout legs do it here.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CGO_ENABLED=0 go build -o ./assay ./cmd/assay
       - name: assay install lands exactly one marked @reboot line (idempotent)
         run: |
           set -e
