@@ -3,6 +3,7 @@
 package install
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,6 +37,11 @@ func installOpts(t *testing.T, ex *fakeExecutor) (Options, string, string) {
 		RunningBinary: stubBinary(t),
 		ConfigPath:    filepath.Join(home, "config.toml"),
 		Exec:          ex,
+		// Hermetic session probe: the production UserSystemdAvailable
+		// LookPaths the real systemctl (absent on darwin/windows runners —
+		// the first multi-OS cycle divergence) and reads the real runtime
+		// dir. Tests pin the probe instead.
+		SystemdProbe: func() error { return nil },
 	}, binDir, unitDir
 }
 
@@ -186,11 +192,17 @@ func TestInstallNoSystemdDefaultLocationMaterializes(t *testing.T) {
 }
 
 func TestInstallWithoutSystemdSessionFailsLoud(t *testing.T) {
-	// installOpts hermetically points XDG_RUNTIME_DIR at a VALID session —
-	// override it with an empty dir to force the no-session branch.
+	// installOpts pins a PASSING session probe — override it with a failing
+	// one to force the no-session branch (the production probe reads the
+	// real XDG_RUNTIME_DIR + PATH; the seam carries the negative case too).
 	ex := &fakeExecutor{}
 	opts, _, _ := installOpts(t, ex)
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	opts.SystemdProbe = func() error {
+		// The probe's error IS the loud refusal surface — the production
+		// probe names the --no-systemd escape hatch; the stub mirrors the
+		// contract the assert pins.
+		return errors.New("no systemd user session found (injected) — pass --no-systemd to install the binary only")
+	}
 	_, err := Install(opts)
 	require.Error(t, err, "a non-systemd host must fail loud, not half-install")
 	assert.Contains(t, err.Error(), "--no-systemd", "the failure must be actionable")
@@ -243,7 +255,7 @@ func TestUninstallDisablesAndRemoves(t *testing.T) {
 	_, err := Install(opts)
 	require.NoError(t, err)
 
-	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex})
+	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex, SystemdProbe: func() error { return nil }})
 	require.NoError(t, err)
 	assert.Equal(t, []string{WatchService}, res.DisabledUnits)
 	assert.Equal(t, []string{WatchService}, res.RemovedUnits)
@@ -276,7 +288,7 @@ func TestUninstallCleansLegacyUnits(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(unitDir, name), []byte("[Unit]\n"), 0o644))
 	}
 
-	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex})
+	res, err := Uninstall(UninstallOptions{UnitDir: unitDir, Exec: ex, SystemdProbe: func() error { return nil }})
 	require.NoError(t, err)
 	assert.Equal(t, LegacyUnitNames(), res.DisabledUnits)
 	assert.ElementsMatch(t, LegacyUnitNames(), res.RemovedUnits,

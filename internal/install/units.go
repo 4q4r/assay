@@ -115,6 +115,14 @@ type Options struct {
 	DataDir   string
 	NoSystemd bool
 	Exec      Executor // required unless NoSystemd
+
+	// SystemdProbe overrides the session/systemctl availability probe
+	// (nil = the production UserSystemdAvailable, which reads the real
+	// XDG_RUNTIME_DIR and LookPaths systemctl). Tests inject a stub so the
+	// unit flows stay hermetic on hosts without systemd (darwin/windows
+	// runners) — the probe is a real-env read, so it rides the same seam
+	// discipline as Exec.
+	SystemdProbe func() error
 }
 
 // Result reports what install did.
@@ -165,7 +173,11 @@ func Install(o Options) (Result, error) {
 	if o.Exec == nil {
 		return res, errors.New("install: no systemctl executor provided")
 	}
-	if err := UserSystemdAvailable(); err != nil {
+	probe := o.SystemdProbe
+	if probe == nil {
+		probe = UserSystemdAvailable
+	}
+	if err := probe(); err != nil {
 		return res, err
 	}
 	if o.UnitDir == "" {
@@ -286,6 +298,10 @@ type UninstallOptions struct {
 	// teardown (unit + binaries; the data dir itself stays behind --purge).
 	// Empty = skip (no known data dir — never a guess at the cwd).
 	ManagedCoreDataDir string
+
+	// SystemdProbe overrides the session probe (nil = production
+	// UserSystemdAvailable) — the same hermeticity seam as Options.
+	SystemdProbe func() error
 }
 
 // UninstallResult reports what uninstall did.
@@ -309,7 +325,11 @@ func Uninstall(o UninstallOptions) (UninstallResult, error) {
 	if o.UnitDir == "" {
 		return res, errors.New("uninstall: UnitDir is required")
 	}
-	talksToManager := o.Exec != nil && UserSystemdAvailable() == nil
+	probe := o.SystemdProbe
+	if probe == nil {
+		probe = UserSystemdAvailable
+	}
+	talksToManager := o.Exec != nil && probe() == nil
 	if talksToManager {
 		var disableErr error
 		res.DisabledUnits, disableErr = disablePresentUnits(o.UnitDir, o.Exec)

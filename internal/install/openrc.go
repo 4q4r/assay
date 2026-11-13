@@ -182,6 +182,29 @@ func (s *OpenRCScheduler) resolveInitDir() (string, error) {
 	return openrcDefaultInitDir(os.Getenv("XDG_CONFIG_HOME"), h), nil
 }
 
+// resolveRunlevelDir resolves the USER runlevel dir for the default
+// runlevel (${XDG_CONFIG_HOME:-~/.config}/rc/runlevels/default — the same
+// config base the init.d dir lives under). rc-update REQUIRES the runlevel
+// to exist: it refuses "`default' is not a valid runlevel" on a fresh user
+// account where no runlevel dir has been created yet (the alpine:edge CI
+// leg reproduced exactly that refusal — run 43330792666). System-mode
+// installs never hit this because /etc/runlevels/* ship pre-created.
+func (s *OpenRCScheduler) resolveRunlevelDir() (string, error) {
+	if s.InitDir != "" {
+		// A pinned init dir shares its config base: <initDir>/../../runlevels/default.
+		return filepath.Join(filepath.Dir(filepath.Dir(s.InitDir)), "runlevels", openrcRunlevel), nil
+	}
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("install: resolve home dir: %w", err)
+	}
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = filepath.Join(h, ".config")
+	}
+	return filepath.Join(base, "rc", "runlevels", openrcRunlevel), nil
+}
+
 // Name implements the Scheduler seam.
 func (s *OpenRCScheduler) Name() string { return SchedulerOpenRC }
 
@@ -260,6 +283,15 @@ func (s *OpenRCScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 	}
 	if err := os.MkdirAll(initDir, 0o750); err != nil {
 		return res, fmt.Errorf("install: create OpenRC init dir %s: %w", initDir, err)
+	}
+	// The user runlevel must exist before rc-update --user add (see
+	// resolveRunlevelDir) — create it idempotently, exactly like init.d.
+	runlevelDir, rerr := s.resolveRunlevelDir()
+	if rerr != nil {
+		return res, rerr
+	}
+	if err := os.MkdirAll(runlevelDir, 0o750); err != nil {
+		return res, fmt.Errorf("install: create OpenRC runlevel dir %s: %w", runlevelDir, err)
 	}
 	scriptPath := filepath.Join(initDir, OpenRCServiceName)
 	if err := writeFileAtomic(scriptPath, []byte(body), 0o644); err != nil {

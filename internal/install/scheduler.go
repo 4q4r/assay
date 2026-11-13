@@ -503,6 +503,7 @@ func (s *systemdUserScheduler) Install(spec SchedulerInstallSpec) (Result, error
 		DefaultConfigPath: spec.DefaultConfigPath,
 		DataDir:           spec.DataDir,
 		Exec:              s.exec,
+		SystemdProbe:      s.systemdProbe,
 	})
 }
 
@@ -514,6 +515,7 @@ func (s *systemdUserScheduler) Uninstall(spec SchedulerUninstallSpec) (Uninstall
 		ManagedCoreDataDir: spec.DataDir,
 		PurgeConfigPath:    spec.PurgeConfigPath,
 		PurgeDataDir:       spec.PurgeDataDir,
+		SystemdProbe:       s.systemdProbe,
 	})
 }
 
