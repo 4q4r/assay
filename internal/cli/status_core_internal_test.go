@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,7 +72,7 @@ func TestStatusCoreBlockRunning(t *testing.T) {
 
 	mgr, err := core.NewManager(cfg.Core, dataDir, &strings.Builder{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 
 	// Two failed post-activation health checks feed the D8 counter (the
@@ -91,7 +92,14 @@ func TestStatusCoreBlockRunning(t *testing.T) {
 	assert.Contains(t, out, "own core", "the section header renders")
 	assert.Contains(t, out, "running (pid ", "the alive state names the PID")
 	assert.Contains(t, out, strconv.Itoa(pidFromPidfile(t, dataDir)), "the pidfile's PID renders")
-	assert.Contains(t, out, "up ", "uptime renders")
+	// uptime renders from /proc/<pid>/stat — Linux-only by spec (N4); on
+	// darwin/windows the honest block DEGRADES (no ", up" segment) rather
+	// than fabricating a value, and the pin flips to that contract.
+	if runtime.GOOS == "linux" {
+		assert.Contains(t, out, "up ", "uptime renders")
+	} else {
+		assert.NotContains(t, out, ", up ", "no uptime is fabricated where the OS cannot derive it")
+	}
 	assert.Contains(t, out, "26.9.9", "the `xray version` banner parses (the fake's banner)")
 	assert.Contains(t, out, "socks 127.0.0.1:"+strconv.Itoa(socksPort), "the socks inbound renders")
 	assert.Contains(t, out, "http 127.0.0.1:"+strconv.Itoa(httpPort), "the http inbound renders")
@@ -157,7 +165,7 @@ func TestStatusCoreBlockRollbackState(t *testing.T) {
 	// ATTEMPT on the refused streak — the refused state renders honestly.
 	mgr, err := core.NewManager(cfg.Core, dataDir, &strings.Builder{})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "backups"), 0o750))
 	bak := filepath.Join(dataDir, "backups", "config.json.bak-20261111-000000")
 	require.NoError(t, os.WriteFile(bak, []byte("COREFAKE_GATE_FAIL_NOT_USED_HERE"), 0o600))

@@ -538,6 +538,11 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		if serr := mgr.Stop(); serr != nil {
 			outf(out, "watch: core stop failed: %v\n", serr)
 		}
+		// Release the singleton lock handle too: production freed it via
+		// process exit; an embedded run (tests) lives on, and windows cannot
+		// remove an open file — the leaked core.lock failed TempDir cleanup
+		// (run 43330792666). Lock-only: the child was already stopped above.
+		mgr.Release()
 	})
 	between := shutdown.Load
 	sched := &waveScheduler{

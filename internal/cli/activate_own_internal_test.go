@@ -57,7 +57,7 @@ func TestActivateOwnWritesBackupsAndRestarts(t *testing.T) {
 	// cleanup: a leaked fake core would hold the test-band port and collide
 	// with the next `go test` invocation.
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 	require.True(t, mgr.Alive(), "the old core must be running before the activation")
 
@@ -247,7 +247,7 @@ func TestStrikeCounterFeedsRollback(t *testing.T) {
 	f.writeOwnCandidate(t, gens[1])
 
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() }) // no leaked fake cores across invocations
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // no leaked fake cores (or lock handles) across invocations
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 
 	// Three activates, each with a fresh distinct candidate generation.
@@ -481,7 +481,7 @@ func TestActivateNoCandidateKeepsRunningCoreOnLastGood(t *testing.T) {
 	f := newOwnFixture(t)
 	f.writeOwnLive(t, "gen-last-good")
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 	require.True(t, coreServing(f.cfg.Core.SocksPort))
 
@@ -509,7 +509,7 @@ func TestActivateNoCandidateRevivesDeadCoreOnLastGood(t *testing.T) {
 	f := newOwnFixture(t)
 	f.writeOwnLive(t, "gen-last-good")
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 
 	// The daemon restarted after a manual kill: the child is dead, the

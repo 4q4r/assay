@@ -119,7 +119,7 @@ func ownMaintainFixture(t *testing.T) (*ownFixture, *maintainStages) {
 	t.Helper()
 	f := newOwnFixture(t)
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 	rec := &stageRecorder{}
 	stages := rec.stages()
 	stages.activate = func(c *cobra.Command, cc *config.Config) error {

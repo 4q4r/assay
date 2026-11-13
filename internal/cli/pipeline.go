@@ -2244,7 +2244,9 @@ func runCoreAutoUpdateStageWithManager(cmd *cobra.Command, cfg *config.Config, m
 		}
 		// The transient manager's lifecycle is the one-shot's: a spawned
 		// core survives the process by design (A2 — the pidfile is left for
-		// the daemon to adopt), exactly like the activate stage.
+		// the daemon to adopt), exactly like the activate stage. The lock
+		// release mirrors it (lock-only; the child is never stopped here).
+		defer mgr.Release()
 	}
 	if err := mgr.AutoUpdate(context.Background(), cfg.Core); err != nil {
 		outf(out, "WARNING: core auto-update: %v (the wave continues)\n", err)
@@ -2298,6 +2300,13 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 			}
 			return fmt.Errorf("activate: core manager: %w", err)
 		}
+		// One-shot lifecycle: the singleton hold's lifetime is the process
+		// (A2 — a spawned/adopted core outlives the stage; a one-shot CLI
+		// never stops the core). Releasing the lock HERE is byte-equivalent
+		// to the process exit that always freed it, and an embedded run
+		// (tests) stops pinning <data>/core.lock open past the stage —
+		// windows cannot remove an open file (run 43330792666).
+		defer mgr.Release()
 	}
 
 	candidate, err := os.ReadFile(ownCandidatePath(p))

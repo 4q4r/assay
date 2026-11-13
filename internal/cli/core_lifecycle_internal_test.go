@@ -146,7 +146,7 @@ func TestUninstallWithoutConfigSkipsCoreRemoval(t *testing.T) {
 func TestCoreAutoUpdateStageInertWhenOverridden(t *testing.T) {
 	f := newOwnFixture(t) // [core].xray_bin = the fake binary (an override)
 	mgr := f.ownManager(t)
-	t.Cleanup(func() { _ = mgr.Stop() })
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // stop the fake core + free the lock handle (windows cannot remove an open core.lock)
 
 	require.NoError(t, runCoreAutoUpdateStageWithManager(f.cmd, f.cfg, mgr))
 	require.NoError(t, runCoreAutoUpdateStageWithManager(f.cmd, f.cfg, mgr))
@@ -279,7 +279,7 @@ func TestCoreAutoUpdateStageSwallowsFailuresLoud(t *testing.T) {
 	cmd.SetOut(out)
 	mgr, err := core.NewManager(cfg.Core, dir, out)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = mgr.Stop() }) // exported teardown (release is core-internal)
+	t.Cleanup(func() { _ = mgr.Stop(); mgr.Release() }) // exported teardown + lock handle (release is core-internal)
 
 	require.NoError(t, runCoreAutoUpdateStageWithManager(cmd, cfg, mgr),
 		"the stage must SWALLOW the AutoUpdate failure — the wave continues (D4/S5)")
