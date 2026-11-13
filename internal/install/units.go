@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"text/template"
 	"time"
 
@@ -212,7 +213,19 @@ func Install(o Options) (Result, error) {
 // data_dir. An EXISTING file is never touched — (false, nil), the caller
 // reports "kept". Creation is atomic (temp file in the same directory →
 // fsync → rename), mode 0600: the schema carries optional token knobs.
+//
+// The template renders data_dir as a TOML LITERAL string (single quotes) so
+// windows paths keep their backslashes verbatim — a basic string would read
+// \U as a unicode escape and the daemon would die at first parse (the
+// windows SCM E2E failure). A literal string cannot carry a single quote,
+// so a path containing one is refused loudly instead of written broken.
 func MaterializeDefaultConfig(path, dataDir string) (bool, error) {
+	if strings.Contains(dataDir, "'") {
+		return false, fmt.Errorf("install: data dir %q contains a single quote — the default "+
+			"config renders data_dir as a TOML literal string (so windows paths keep their "+
+			"backslashes), and a literal string cannot contain a quote; move the data dir to a "+
+			"quote-free path or point -c at your own config", dataDir)
+	}
 	if _, err := os.Stat(path); err == nil {
 		return false, nil
 	}

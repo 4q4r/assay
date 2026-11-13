@@ -4,7 +4,7 @@
 # merged). A re-install NEVER overwrites it; `assay uninstall --purge`
 # removes it along with the data dir. Edit in place.
 
-data_dir = "{{ .DataDir }}"
+data_dir = '{{ .DataDir }}'
 
 [probe]
 # Throughput measurement per probe wave — default OFF (round-8 owner
