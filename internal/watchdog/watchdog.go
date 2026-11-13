@@ -116,6 +116,11 @@ func start(dir string, log io.Writer, debounce time.Duration) (*plugins.Registry
 		pending:  map[string]*time.Timer{},
 		stamps:   stampDir(dir),
 	}
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
 	go w.loop()
 	return reg, w, nil
 }

@@ -195,6 +195,11 @@ func startBinarySelfWatcherWith(
 	// teardown-symmetry contract (close used to wait only for loop(),
 	// leaving statLoop possibly mid os.Stat+log iteration after close
 	// returned).
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
 	go bw.statLoop()
 	go bw.loop()
 	outf(log, "self-update: watching %s (binary %s)\n", dir, base)

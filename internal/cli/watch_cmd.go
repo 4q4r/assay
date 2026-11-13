@@ -600,6 +600,11 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// the SCM right AFTER the wiring — before the scheduler goroutine (and
 	// its immediate first wave) starts, never gated on it. Nil on unix.
 	closeServiceWired(deps)
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
 	go func() {
 		_ = sched.run(stop, between)
 		close(schedDone)
@@ -724,7 +729,13 @@ func selfWatchMiss(
 		outf(out, "watch: self-watchdog: no daemon progress for %s — clean self-exit "+
 			"(%s)\n", selfwatchdog.Threshold, restartNote)
 		requestStop()
-		go stopCore() // best-effort child stop — never block the exit on a wedged unwind
+		// Best-effort child stop — never block the exit on a wedged unwind.
+		// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+		// process loudly — Go semantics — and every deployment transport answers a
+		// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+		// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+		// corrupted-state crash-loop the supervisor surfaces honestly.
+		go stopCore()
 		select {
 		case <-schedDone:
 		case <-time.After(selfExitGrace):
