@@ -1385,7 +1385,7 @@ func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *
 // core the wave spawned or adopted (A2 — the pidfile is left for the
 // daemon to adopt).
 func runOneShotMaintainWave(w io.Writer, cfg *config.Config, opts maintainOptions) error {
-	mgr, err := core.NewManager(cfg.Core, newPaths(cfg).dataDir, w)
+	mgr, err := core.NewTransientManager(cfg.Core, newPaths(cfg).dataDir, w)
 	if err != nil {
 		if errors.Is(err, core.ErrDaemonHoldsCore) {
 			return fmt.Errorf("maintain: %s", daemonOwnsCoreMessage)
@@ -2235,7 +2235,7 @@ func runCoreAutoUpdateStageWithManager(cmd *cobra.Command, cfg *config.Config, m
 	p := newPaths(cfg)
 	if mgr == nil {
 		var err error
-		mgr, err = core.NewManager(cfg.Core, p.dataDir, out)
+		mgr, err = core.NewTransientManager(cfg.Core, p.dataDir, out)
 		if err != nil {
 			if errors.Is(err, core.ErrDaemonHoldsCore) {
 				return fmt.Errorf("core auto-update: %s", daemonOwnsCoreMessage)
@@ -2293,7 +2293,7 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 	}
 	if mgr == nil {
 		var err error
-		mgr, err = core.NewManager(cfg.Core, p.dataDir, out)
+		mgr, err = core.NewTransientManager(cfg.Core, p.dataDir, out)
 		if err != nil {
 			if errors.Is(err, core.ErrDaemonHoldsCore) {
 				return fmt.Errorf("activate: %s", daemonOwnsCoreMessage)

@@ -4,9 +4,12 @@ package core
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
+
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,4 +83,25 @@ func TestStopLadderChildBoundPins(t *testing.T) {
 func TestStopLadderReapBoundPins(t *testing.T) {
 	assert.Greater(t, killWaitDelay, time.Duration(0), "the reap bound exists")
 	assert.LessOrEqual(t, killWaitDelay, 30*time.Second, "the reap bound stays supervision-snappy")
+}
+
+// TestTransientManagerHasNoJobHandle pins the audit P2-1 constructor split
+// on windows (the behavioral seam-record twin lives GOOS-neutral in
+// containment_internal_test.go and runs on this CI leg too): the daemon
+// constructor keeps containment, the transient one-shot constructor
+// carries none — a one-shot activate's spawned core must survive the
+// CLI's process exit (closing a KILL_ON_JOB_CLOSE handle would kill it).
+func TestTransientManagerHasNoJobHandle(t *testing.T) {
+	log := &strings.Builder{}
+	cfg := config.CoreConfig{RollbackStrikes: 3}
+	m, err := NewManager(cfg, t.TempDir(), log)
+	require.NoError(t, err)
+	t.Cleanup(func() { m.release() })
+	assert.True(t, m.containment, "the daemon manager assigns spawned children to the job")
+
+	tm, err := NewTransientManager(cfg, t.TempDir(), log)
+	require.NoError(t, err)
+	t.Cleanup(func() { tm.release() })
+	assert.False(t, tm.containment, "the transient manager skips the job attach (audit P2-1)")
+	assert.Nil(t, tm.job, "no containment job handle exists before any spawn")
 }
