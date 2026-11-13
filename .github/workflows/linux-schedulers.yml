@@ -232,6 +232,11 @@ jobs:
     continue-on-error: true
     name: openrc user script validity (container)
     runs-on: ubuntu-latest
+    # Backstop against any scheduler-level hang: the leg's own lifecycle is
+    # bounded in the product (the uninstall's §2.2.7-mirror stop poll), so a
+    # healthy run finishes in minutes; the bound exists so NO failure mode
+    # can ever eat hours again (run 43358084471 burned 3h to the cancel).
+    timeout-minutes: 20
     container:
       image: alpine:edge
     # NO JS actions here (checkout/setup-go): the runner-mounted node is

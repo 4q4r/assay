@@ -35,10 +35,17 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"assay/internal/platform"
 )
 
 // OpenRCServiceName is the service name inside the user init.d dir.
 const OpenRCServiceName = "assay-watch"
+
+// openrcPIDFileName is the pidfile the service script declares (the script
+// template and the loud manual-command errors share the one definition —
+// supervise-daemon's --pidfile and `kill $(cat ...)` must never drift).
+const openrcPIDFileName = "assay-watch.pid"
 
 // ---------------------------------------------------------------------------
 // OpenRCExecutor — the injected rc-update/rc-service seam with its
@@ -104,17 +111,50 @@ func (OpenRCExecutorImpl) RcService(args ...string) (string, error) {
 	return runOpenRCBinary("rc-service", args)
 }
 
+// Executor exec bounds (vars: test-shrunk — the dynamic repro test drives
+// the real kill path at sub-second scale).
+var (
+	// openrcExecBound is the ceiling for ONE rc-update/rc-service invocation
+	// (the pre-existing 2-minute ceiling).
+	openrcExecBound = 2 * time.Minute
+	// openrcWaitDelay bounds exec.Wait AFTER the bound's kill: lingering
+	// pipe-holding grandchildren can never hang the caller (the same
+	// contract as the core manager's killWaitDelay).
+	openrcWaitDelay = 5 * time.Second
+)
+
 // runOpenRCBinary executes one allowlist-checked OpenRC binary (2-minute
 // ceiling; a failure carries the exact command line).
 func runOpenRCBinary(name string, args []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), openrcExecBound)
 	defer cancel()
 	// args are allowlist-checked above; the binary name is a constant —
 	// G204's variable-args warning is the seam's entire purpose.
 	//nolint:gosec // allowlist-validated, see validateRcUpdate/validateRcService
 	cmd := exec.CommandContext(ctx, name, args...)
+	// The executor owns its whole process tree: rc-service forks openrc-run
+	// helpers (and a supervise-daemon --stop leg) that inherit this pipe —
+	// killing the direct child alone cannot unblock CombinedOutput's Wait
+	// while one of them lives. Live-proven on alpine:edge/openrc 0.63.2
+	// (run 43358084471): the --stop leg busy-spins forever when the
+	// supervisor already exited, holding the pipe; the uninstall then never
+	// returned (3h to the run cancel). The group kill reaps the tree at the
+	// bound; WaitDelay bounds the Wait afterwards even if a straggler still
+	// holds the pipe. Daemons that setsid away (supervise-daemon's child)
+	// are deliberately outside the group and unaffected.
+	platform.SetExecProcessGroup(cmd)
+	cmd.Cancel = func() error { return platform.KillExecProcessGroup(cmd) }
+	cmd.WaitDelay = openrcWaitDelay
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// The bound's kill surfaces as the child's own death signal
+		// ("signal: killed" *ExitError) — the mechanism, not the cause.
+		// Wrap the bound error HERE, where the bound fired, so callers
+		// classify the stop as bounded (isBoundedStopError) regardless of
+		// which error Go's Wait chose to surface.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = fmt.Errorf("%w (the %s executor bound fired)", ctxErr, openrcExecBound)
+		}
 		return string(out), fmt.Errorf("%s %v failed: %w\n%s\n(run by hand: %s %v)",
 			name, args, err, out, name, args)
 	}
@@ -147,17 +187,34 @@ type OpenRCScheduler struct {
 
 	verifyInterval time.Duration
 	verifyAttempts int
+
+	// stopPollInterval/stopPollAttempts bound the uninstall's post-stop
+	// wait (§2.2.7-mirror): production 500ms × 3600 = 30 minutes — the
+	// exact TimeoutStopSec=1800 parity, the same numbers the windows
+	// awaitStopped bound uses. Test-shrunk through withStopPolling.
+	stopPollInterval time.Duration
+	stopPollAttempts int
 }
 
 // NewOpenRCScheduler wires the scheduler over exec for initDir ("" = the
 // XDG/home default resolution).
 func NewOpenRCScheduler(exec OpenRCExecutor, initDir string) *OpenRCScheduler {
 	return &OpenRCScheduler{
-		exec:           exec,
-		InitDir:        initDir,
-		verifyInterval: schedulerVerifyInterval,
-		verifyAttempts: schedulerVerifyAttempts,
+		exec:             exec,
+		InitDir:          initDir,
+		verifyInterval:   schedulerVerifyInterval,
+		verifyAttempts:   schedulerVerifyAttempts,
+		stopPollInterval: 500 * time.Millisecond,
+		// 30 minutes — the §2.2.7 bound (TimeoutStopSec=1800 parity), the
+		// WinSvcScheduler awaitStopped mirror.
+		stopPollAttempts: 30 * 60 * 2,
 	}
+}
+
+// withStopPolling shrinks the uninstall stop-poll bound (tests).
+func (s *OpenRCScheduler) withStopPolling(interval time.Duration, attempts int) *OpenRCScheduler {
+	s.stopPollInterval, s.stopPollAttempts = interval, attempts
+	return s
 }
 
 // openrcDefaultInitDir resolves the user init.d dir: ${XDG_CONFIG_HOME}/rc/
@@ -242,7 +299,7 @@ func openrcScriptData(binaryPath, configPath, dataDir string) (string, error) {
 		`command="` + binaryPath + `"` + "\n" +
 		`command_args="` + args + `"` + "\n" +
 		`supervisor="supervise-daemon"` + "\n" +
-		`pidfile="` + filepath.Join(dataDir, "assay-watch.pid") + `"` + "\n" +
+		`pidfile="` + filepath.Join(dataDir, openrcPIDFileName) + `"` + "\n" +
 		`output_log="` + filepath.Join(dataDir, "logs", "watch.out.log") + `"` + "\n" +
 		`error_log="` + filepath.Join(dataDir, "logs", "watch.err.log") + `"` + "\n", nil
 }
@@ -325,7 +382,12 @@ func (s *OpenRCScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 }
 
 // Uninstall stops the service when the status probe reports it started,
-// removes it from the default runlevel, and deletes the script.
+// removes it from the default runlevel, and deletes the script. A stop that
+// outlives the executor bound is rescued by the §2.2.7-mirror bounded
+// status poll (the stop machinery keeps draining in background sessions, or
+// the service already stopped under us — the openrc 0.63.2 stop race);
+// a stop that never lands within the poll bound is a LOUD error naming the
+// exact manual commands.
 func (s *OpenRCScheduler) Uninstall(spec SchedulerUninstallSpec) (UninstallResult, error) {
 	res := UninstallResult{}
 	initDir, err := s.resolveInitDir()
@@ -342,9 +404,29 @@ func (s *OpenRCScheduler) Uninstall(spec SchedulerUninstallSpec) (UninstallResul
 		started = true
 	}
 	if started {
+		pidfilePath := filepath.Join(spec.DataDir, openrcPIDFileName)
 		if _, kerr := s.exec.RcService("--user", OpenRCServiceName, "stop"); kerr != nil {
-			return res, fmt.Errorf("uninstall: rc-service --user %s stop failed: %w\n"+
-				"(run by hand: rc-service --user %s stop)", OpenRCServiceName, kerr, OpenRCServiceName)
+			if !isBoundedStopError(kerr) {
+				// A real rc-service refusal (failed fast — nothing is
+				// stopping in the background). Loud, exact manual chain,
+				// nothing deleted behind a failed stop.
+				return res, fmt.Errorf("uninstall: rc-service --user %s stop failed: %w\n"+
+					"(finish it by hand, then re-run `assay uninstall`:\n"+
+					"  rc-service --user %s zap\n"+
+					"  kill $(cat %s)   # when the pidfile still exists)",
+					OpenRCServiceName, kerr, OpenRCServiceName, pidfilePath)
+			}
+			// The executor bound killed the rc-service wrapper mid-stop: the
+			// openrc stop machinery (openrc-run, supervise-daemon) may still
+			// be draining in background sessions, or the service already
+			// stopped under us (the openrc 0.63.2 stop race — its
+			// supervise-daemon --stop leg busy-spins AFTER the effective
+			// stop; live-proven on alpine:edge, run 43358084471). The
+			// §2.2.7-mirror bounded poll decides: proceed on observed
+			// stopped, loud error on exhaustion.
+			if werr := s.awaitStopped(pidfilePath); werr != nil {
+				return res, werr
+			}
 		}
 		res.DisabledUnits = []string{OpenRCServiceName}
 	}
@@ -358,6 +440,38 @@ func (s *OpenRCScheduler) Uninstall(spec SchedulerUninstallSpec) (UninstallResul
 	}
 	res.RemovedUnits = []string{OpenRCServiceName}
 	return s.finishUninstall(spec, res)
+}
+
+// isBoundedStopError reports whether the stop failure came from the
+// executor's bound (context deadline, the WaitDelay pipe-bound expiry, or an
+// explicit cancellation) rather than a fast real rc-service refusal. Only
+// bound failures leave background stop machinery worth polling; a fast
+// refusal gets the immediate loud error instead of a pointless poll budget.
+func isBoundedStopError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, exec.ErrWaitDelay)
+}
+
+// awaitStopped is the §2.2.7-mirror bounded stop-wait (the WinSvcScheduler
+// awaitStopped shape on the rc-service seam): poll `rc-service --user
+// assay-watch status` until it reports stopped — the probe exiting non-zero
+// IS the stopped verdict (rc-service status exits 3 on `* status: stopped`,
+// live-proven on alpine:edge 0.63.2). On exhaustion the error names the
+// exact manual commands (zap + the pidfile kill) and the re-run.
+func (s *OpenRCScheduler) awaitStopped(pidfilePath string) error {
+	for range s.stopPollAttempts {
+		if _, serr := s.exec.RcService("--user", OpenRCServiceName, "status"); serr != nil {
+			//nolint:nilerr // the probe's non-zero exit IS the stopped verdict — the answer, not an error
+			return nil // (rc-service status exits 3 on `* status: stopped`, live-proven on alpine:edge 0.63.2)
+		}
+		time.Sleep(s.stopPollInterval)
+	}
+	return fmt.Errorf("uninstall: the assay service did not reach stopped within %s — "+
+		"finish it by hand, then re-run `assay uninstall`:\n"+
+		"  rc-service --user %s zap\n"+
+		"  kill $(cat %s)   # when the pidfile still exists",
+		time.Duration(s.stopPollAttempts)*s.stopPollInterval, OpenRCServiceName, pidfilePath)
 }
 
 // finishUninstall is the shared tail: managed-core teardown + purge.

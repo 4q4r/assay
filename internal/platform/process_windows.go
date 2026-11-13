@@ -5,6 +5,7 @@ package platform
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 
 	"golang.org/x/sys/windows"
 )
@@ -70,4 +71,23 @@ func translateTerminateOpenErr(pid int, err error) error {
 		return ErrProcessGone
 	}
 	return fmt.Errorf("platform: open pid %d for terminate: %w", pid, err)
+}
+
+// SetExecProcessGroup is a deliberate no-op on windows: unix process groups
+// have no equivalent here (the windows child-containment mechanism is the
+// Job Object, wired in internal/core's child spawn — ADDENDUM §2), and the
+// only caller (the openrc executor, whose helpers fork-and-inherit on unix)
+// never runs on windows. Present so the GOOS-neutral executor compiles.
+func SetExecProcessGroup(*exec.Cmd) {}
+
+// KillExecProcessGroup terminates cmd's direct process: windows has no
+// process-group kill, and the executor's callers only reach this through the
+// context-bound Cancel on a unix-shaped command tree. The per-OS excellence
+// contract keeps the unix semantics on unix; this transport degrades to the
+// process handle, never pretending a group was killed.
+func KillExecProcessGroup(cmd *exec.Cmd) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	return cmd.Process.Kill()
 }
