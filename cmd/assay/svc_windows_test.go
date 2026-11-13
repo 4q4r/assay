@@ -75,7 +75,8 @@ func expectStatus(t *testing.T, s <-chan svc.Status) svc.Status {
 func TestHandlerStateMachineHappyPath(t *testing.T) {
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
-	h := svcTestHandler(func(_ chan<- struct{}, stopRequest <-chan struct{}) error {
+	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
+		close(wired)  // the wiring signal — Closing wired reports readiness
 		<-stopRequest // the graceful stop — this seam IS the SIGTERM seam
 		return nil
 	})
@@ -134,7 +135,8 @@ func TestHandlerRunningNotGatedOnWave(t *testing.T) {
 func TestHandlerInterrogateEchoes(t *testing.T) {
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
-	h := svcTestHandler(func(_ chan<- struct{}, stopRequest <-chan struct{}) error {
+	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
+		close(wired)
 		<-stopRequest
 		return nil
 	})
@@ -159,7 +161,8 @@ func TestHandlerInterrogateEchoes(t *testing.T) {
 func TestHandlerShutdownRidesStopSeam(t *testing.T) {
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
-	h := svcTestHandler(func(_ chan<- struct{}, stopRequest <-chan struct{}) error {
+	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
+		close(wired)
 		<-stopRequest
 		return nil
 	})
