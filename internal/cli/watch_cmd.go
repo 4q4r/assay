@@ -582,7 +582,9 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// The self-watchdog transport (ADDENDUM §1): on darwin the supervisor
 	// paces at threshold/2; a missed threshold fires the miss action — the
 	// SAME graceful-stop seam SIGTERM uses (requestStop), a best-effort core
-	// stop (a wedged loop must never orphan the child), a bounded wait for
+	// stop (a wedged loop never BLOCKS the exit on the child stop — the
+	// child is stopped best-effort and answered by pidfile adoption (A2) on
+	// unix / Job Object containment on windows), a bounded wait for the
 	// unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
 	// restart. The mechanism is named loudly — status output states it the
 	// same way.
@@ -707,10 +709,14 @@ func startSelfWatchTransport(
 
 // selfWatchMiss builds the miss action of the self-watchdog transport
 // (ADDENDUM §1): the SAME graceful-stop seam SIGTERM uses (requestStop), a
-// best-effort core stop (a wedged loop must never orphan the child), a
-// bounded wait for the unwind, and a CLEAN exit 0 that the platform's
-// supervisor answers with a restart (launchd KeepAlive / the Windows SCM
-// recovery actions — restartNote names the mechanism loudly).
+// best-effort core stop (a wedged loop never BLOCKS the exit on the child
+// stop — the child is stopped best-effort and answered by pidfile adoption
+// (A2) on unix / Job Object containment on windows; audit P3-7: the child
+// CAN briefly outlive the daemon — that is the design, the old wording
+// promised too much), a bounded wait for the unwind, and a CLEAN exit 0
+// that the platform's supervisor answers with a restart (launchd KeepAlive
+// / the Windows SCM recovery actions — restartNote names the mechanism
+// loudly).
 func selfWatchMiss(
 	out io.Writer, schedDone <-chan struct{}, requestStop, stopCore func(), selfExit func(int), restartNote string,
 ) func() {
