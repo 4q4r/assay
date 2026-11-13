@@ -617,10 +617,13 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	}
 	// finishGraceful is the shared shutdown sequence (§2.2.3 — ONE seam,
 	// three feeds land here with the same unwinding): reason line →
-	// requestStop → scheduler unwind → explicit core stop → clean shutdown.
+	// requestStop → armed second-signal force exit (P3-11) → scheduler
+	// unwind → explicit core stop → clean shutdown.
 	finishGraceful := func(reason string) error {
 		outln(out, reason)
 		requestStop()
+		releaseForceExit := armSecondSignalForceExit(out, deps.signals, deps.selfExit)
+		defer releaseForceExit()
 		<-schedDone
 		stopCore()
 		outln(out, "watch: clean shutdown")
@@ -638,6 +641,31 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	case sig := <-deps.signals:
 		return finishGraceful(fmt.Sprintf("watch: %v — finishing the current stage, then exiting", sig))
 	}
+}
+
+// armSecondSignalForceExit arms the second-signal force exit (audit P3-11)
+// for the duration of a graceful stop: during finishGraceful's wait for
+// the unwind — hours on a legitimately finishing mid-stage stop — a second
+// SIGTERM/SIGINT previously buffered unread (signalChannel cap 1) and a
+// supervisor-less `assay watch` was interruptible only by SIGKILL. From
+// the moment this arms, the next signal (including one already buffered
+// during the stage) forces the exit loud. Safe mid-stage by the A2
+// contract: adoption + last-good semantics recover on the next start. The
+// exit goes through the deps.selfExit seam — the production os.Exit rides
+// it, and tests record instead of exiting. release() disarms without
+// forcing (the normal unwind completed).
+func armSecondSignalForceExit(out io.Writer, signals <-chan os.Signal, selfExit func(int)) func() {
+	force := make(chan struct{})
+	go func() {
+		select {
+		case <-force:
+		case sig := <-signals:
+			outf(out, "watch: %v — forcing exit (a graceful stop is already in flight; "+
+				"adoption (A2) / last-good semantics recover on the next start)\n", sig)
+			selfExit(1)
+		}
+	}()
+	return func() { close(force) }
 }
 
 // startSelfWatchTransport wires the self-watchdog transport (ADDENDUM §1):
