@@ -155,8 +155,8 @@ func TestWatchBootstrapsCoreAtStart(t *testing.T) {
 		},
 		signals: sigs,
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires — only the signal ends it
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires — only the signal ends it
 		},
 		sdNotify: func(io.Writer) func() {
 			// THE S2 ordering proof: at READY time the bootstrap core must

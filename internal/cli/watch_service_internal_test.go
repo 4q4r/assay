@@ -61,8 +61,8 @@ func TestServiceStopRequestMirrorsSignal(t *testing.T) {
 		},
 		signals: make(chan os.Signal, 1), // never fired — the service feed ends it
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires
 		},
 		sdNotify: func(io.Writer) func() {
 			close(sdStarted)

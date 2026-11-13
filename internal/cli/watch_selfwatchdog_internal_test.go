@@ -102,8 +102,8 @@ func selfWatchTestDeps(rec *selfWatchRecord, probe *selfWatchProbe) (watchDeps, 
 		},
 		signals: sigs,
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires — only stop/miss end it
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires — only stop/miss end it
 		},
 		sdNotify: func(io.Writer) func() {
 			close(rec.sdOn)

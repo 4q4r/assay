@@ -93,7 +93,10 @@ type watchDeps struct {
 	startWatchdog func(dir string, log io.Writer) (*plugins.Registry, io.Closer, error)
 	signals       <-chan os.Signal
 	now           func() time.Time
-	after         func(time.Duration) <-chan time.Time
+	// after arms the scheduler wait and returns the timer channel plus a
+	// stop func — the re-arm path must stop the superseded timer (audit
+	// P3-10: a lingering time.After timer is GC-immune until it fires).
+	after func(d time.Duration) (<-chan time.Time, func())
 	// sdNotify runs the sd_notify(3) handshake: READY=1 plus the watchdog
 	// pinger when NOTIFY_SOCKET/WATCHDOG_USEC are present (systemd
 	// Type=notify + WatchdogSec), a logged no-op otherwise. Returns the stop
@@ -141,7 +144,10 @@ func defaultWatchDeps() watchDeps {
 		},
 		signals: signalChannel(),
 		now:     time.Now,
-		after:   time.After,
+		after: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTimer(d)
+			return t.C, func() { t.Stop() }
+		},
 		sdNotify: func(out io.Writer) func() {
 			return sdnotify.Watch(context.Background(), out)
 		},
@@ -286,17 +292,20 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 			due = nextSpeedtest
 		}
 		wait := max(due.Sub(s.deps.now()), 0)
-		timer := s.deps.after(wait)
+		timerC, stopTimer := s.deps.after(wait)
 		select {
 		case <-stop:
+			stopTimer()
 			return ran
-		case <-timer:
+		case <-timerC:
 			if s.beat != nil {
 				s.beat() // the loop woke for a due wave
 			}
 		case <-s.heartbeatTick:
 			// Idle tick: the loop reached its select — the strongest idle
-			// heartbeat there is. Re-arm and keep waiting.
+			// heartbeat there is. Stop the superseded timer and re-arm
+			// (P3-10: the old timer must not linger armed until it fires).
+			stopTimer()
 			if s.beat != nil {
 				s.beat()
 			}
@@ -574,7 +583,7 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// paces at threshold/2; a missed threshold fires the miss action — the
 	// SAME graceful-stop seam SIGTERM uses (requestStop), a best-effort core
 	// stop (a wedged loop must never orphan the child), a bounded wait for
-	// the unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
+	// unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
 	// restart. The mechanism is named loudly — status output states it the
 	// same way.
 	// The transport wiring happens HERE (after sched exists) — the wave
