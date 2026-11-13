@@ -51,8 +51,23 @@ systemctl --user enable --now assay-watch.service
 (A legacy-timer `disable --now` runs first, only when the old units are
 still present.) `uninstall` runs the symmetric disables and removes every
 known unit file (`--purge` also removes the config + data dir; default keeps
-user data). Hosts without a user systemd session: `assay install
---no-systemd` copies the binary only and skips the unit.
+user data). Hosts without a user systemd session: `assay install` detects
+the scheduler instead (runit, OpenRC user, s6, cron, or foreground — see
+the README's Cross-platform section); `--no-scheduler` (the old
+`--no-systemd`, kept as a loud alias) copies the binary only and skips any
+registration.
+
+## Sibling schedulers
+
+This unit is the systemd face of one install flow. The same `assay install`
+on macOS registers a launchd agent (`~/Library/LaunchAgents/assay-watch.plist`,
+mode 0600, KeepAlive), on Windows a Windows service (SCM entry `assay`,
+LocalSystem, explicit `-c`), and on non-systemd Linux one of runit /
+OpenRC user / s6 / cron — each executor pinned to its own exact command
+allowlist. Detection order: systemd user first (this unit), then the
+others; only one scheduler ever holds `assay-watch`. The full per-OS path
+table, the scheduler command matrix, and the honest supervision-parity
+table live in the main README's Cross-platform section.
 
 ## Journald cheatsheet
 

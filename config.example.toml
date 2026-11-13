@@ -28,6 +28,13 @@
 # Stages: fetch → parse → filter → probe (classification merged) → select →
 # render → activate.
 
+# data_dir default is per-OS (internal/platform tables): linux =
+# $XDG_DATA_HOME/assay (an ABSOLUTE XDG_DATA_HOME only — set-but-relative is
+# treated as unset) else ~/.local/share/assay; macOS =
+# ~/Library/Application Support/assay (XDG_DATA_HOME is NOT honored there —
+# no XDG contract on darwin); windows = %LOCALAPPDATA%\assay. The value
+# below is the linux default — set an explicit data_dir to override it on
+# any OS.
 data_dir = "~/.local/share/assay"
 
 # ── Plugins (W10): the source-ingest layer is LUA PLUGINS, not config
@@ -214,6 +221,13 @@ tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance join
                             # non-blocking floor warning; auto-update inert there), else
                             # the user-local install target. An explicit value makes
                             # auto-update inert with a one-time loud INFO (S5).
+                            #
+                            # Per-OS deltas (internal/platform tables): the core file
+                            # name is xray.exe on windows and xray elsewhere; the
+                            # system scan list is /usr/local/bin/xray +
+                            # /opt/homebrew/bin/xray on macOS, and EMPTY on windows
+                            # (upstream ships zips with no standard install location —
+                            # resolution there is override/managed-download only).
 # auto_update = true         # core auto-update for the assay-owned user-local binary,
                             # default ON (D4 + owner ruling); checked each maintenance
                             # wave — inert for a system or overridden binary (S5)

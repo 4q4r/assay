@@ -11,6 +11,7 @@ Assay turns public xray share links into a geo-diverse, continuously re-verified
 [![systemd](https://img.shields.io/badge/systemd-user%20units-30A3DA?style=for-the-badge&logo=systemd&logoColor=white)](https://www.freedesktop.org/wiki/Software/systemd/)
 [![Lua](https://img.shields.io/badge/Lua-5.1%20·%20gopher--lua-000080?style=for-the-badge&logo=lua&logoColor=white)](https://github.com/yuin/gopher-lua)
 [![TOML](https://img.shields.io/badge/config-TOML-9C4121?style=for-the-badge)](https://toml.io/)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20·%20macOS%20·%20Windows-2ea44f?style=for-the-badge)](https://github.com/4q4r/assay/releases/latest)
 
 [![License](https://img.shields.io/github/license/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay/blob/main/LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/4q4r/assay/ci.yml?style=flat-square&logo=github)](https://github.com/4q4r/assay/actions/workflows/ci.yml)
@@ -19,7 +20,7 @@ Assay turns public xray share links into a geo-diverse, continuously re-verified
 [![Repo size](https://img.shields.io/github/repo-size/4q4r/assay?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/assay)
 [![Go Reference](https://img.shields.io/badge/Go_Reference-assay-00ADD8?style=flat-square&logo=go&logoColor=white)](https://github.com/4q4r/assay)
 
-[Architecture](#-system-architecture) · [Quick Start](#-quick-start) · [CLI](#-cli-surface) · [Configuration](#-configuration) · [Security](#-security) · [Testing](#-testing)
+[Architecture](#-system-architecture) · [Quick Start](#-quick-start) · [CLI](#-cli-surface) · [Cross-platform](#-cross-platform) · [Configuration](#-configuration) · [Security](#-security) · [Testing](#-testing)
 
 </div>
 
@@ -32,6 +33,7 @@ Assay turns public xray share links into a geo-diverse, continuously re-verified
 - [Project tree](#-project-tree)
 - [Quick Start](#-quick-start)
 - [CLI surface](#-cli-surface)
+- [Cross-platform](#-cross-platform)
 - [Configuration](#-configuration)
 - [Security](#-security)
 - [Observability](#-observability)
@@ -199,7 +201,7 @@ assay check nyaa.si --top 10        # rank the pool by how well each location se
 | `assay activate` | `-test` gate → backup → atomic replace of `live.json` → core-manager restart → health |
 | `assay maintain` | One full maintenance wave end to end (stats poll + prune included) |
 | `assay status` | Install state, config resolution, source-quality dashboard, own-core state |
-| `assay install` | Canonical user deploy: binary + unit + default config (see Quick Start) |
+| `assay install` | Canonical user deploy: binary + scheduler service + default config (per-OS scheduler — see Cross-platform) |
 | `assay uninstall` | Disable and remove the daemon unit; user data kept unless `--purge` |
 | `assay check` | Site-to-location ranking through the alive pool (default cap 60 nodes; temp xray instances) |
 | `assay list` | Pool inventory by country/city, `--json` machine-readable twin |
@@ -207,6 +209,79 @@ assay check nyaa.si --top 10        # rank the pool by how well each location se
 | `assay xray-update` | Managed-core update: latest release, sha256-verify, `-test`, atomic replace with rollback |
 
 Every command accepts optional `-c <path>`; without it the config resolution order is the local-share default `~/.local/share/assay/config.toml`, then the deprecated legacy home location `~/.config/assay/config.toml` when it exists (still honored, with a loud move warning), then `./config.toml`, then configless built-in defaults — one file wins whole, nothing is ever merged, and the resolved source prints as a `config:` line.
+
+## 🖥 Cross-platform
+
+Assay is one static binary (`CGO_ENABLED=0`) released for **linux** (amd64, arm64, 386, armv7), **macOS** (amd64, arm64), and **Windows** (amd64, arm64, 386). Linux behavior is byte-identical to the pre-cross-platform releases; macOS and Windows get the mechanism each platform idiomatically uses — per-OS excellence, never a lowest-common-denominator compromise. `windows/arm7` is deliberately not built: upstream Xray-core ships no arm32 Windows asset, so a managed core cannot exist on that architecture.
+
+### Per-OS paths
+
+Every row comes from the platform tables in `internal/platform` — `assay status` prints the resolved values on your host.
+
+| Path | Linux | macOS | Windows |
+| :-- | :-- | :-- | :-- |
+| Default data dir (config, pool data, core, logs) | `$XDG_DATA_HOME/assay` (absolute only) else `~/.local/share/assay` | `~/Library/Application Support/assay` | `%LOCALAPPDATA%\assay` |
+| Installed assay binary | `~/.local/bin/assay` | `~/.local/bin/assay` | `%LOCALAPPDATA%\assay\bin\assay.exe` |
+| User-local xray (secondary) | `~/.local/bin/xray` | `~/.local/bin/xray` (optional) | `%USERPROFILE%\.local\bin\xray.exe` |
+| Managed xray core (auto-update target) | `<data>/bin/xray` | `<data>/bin/xray` | `<data>\bin\xray.exe` |
+| System-xray scan list | `/usr/local/bin/xray`, `/usr/bin/xray` | `/usr/local/bin/xray`, `/opt/homebrew/bin/xray` | none — managed download or explicit `[core].xray_bin` only |
+| Daemon logs | journald (user session) | `<data>/logs/watch.out.log` + `watch.err.log` | `<data>/logs/watch.log` (service context) |
+| Daemon environment | user manager (XDG honored) | launchd minimal env — no XDG, absolute paths only | SYSTEM profile — explicit `-c` enforced |
+
+### Schedulers
+
+`assay install` detects the scheduler and registers exactly one daemon. The detection order is binding, first match wins: systemd user → runit → OpenRC user → s6 → cron → foreground, and an existing `assay-watch` registration in any other scheduler is refused loudly — two schedulers launching waves is a stampede. Every scheduler executor is pinned to an exact command allowlist: nothing outside the pinned shapes ever runs, and nothing but assay's own artifacts is ever touched.
+
+| Scheduler | Detected when | Artifact | `assay install` runs (allowlisted) |
+| :-- | :-- | :-- | :-- |
+| systemd user | a user systemd session exists | `~/.config/systemd/user/assay-watch.service` | `systemctl --user daemon-reload` · `systemctl --user enable --now assay-watch.service` |
+| launchd | always — macOS is single-init | `~/Library/LaunchAgents/assay-watch.plist` (mode 0600) | `launchctl bootstrap gui/<uid> <plist>` · `launchctl bootout gui/<uid>/assay-watch` · `launchctl print` (verify) · `launchctl kickstart -k` (restart) |
+| runit | your own `runsvdir` runs and `sv` is on PATH | `<service-dir>/assay-watch/run` (0755) | creating the dir enables the service — runsvdir picks it up within its 5-second rescan; ops run `sv status/stop/restart/up/down <service-dir>/assay-watch` |
+| OpenRC user | an own-uid `openrc-user`, or `rc-status --user` exits 0 (OpenRC ≥ 0.60) | `~/.config/rc/init.d/assay-watch` (0755) | `rc-update --user add assay-watch default` · `rc-service --user assay-watch start` + `status` verify; uninstall runs `rc-service --user assay-watch stop` then `rc-update --user del assay-watch default` |
+| s6 | your own `s6-svscan` runs — its cwd is the scandir | `<scandir>/assay-watch/run` (0755) | `s6-svscanctl -a <scandir>` (activation rescan) · `s6-svstat <scandir>/assay-watch` (status) · `s6-svc -d <scandir>/assay-watch` (the verified live-stop) |
+| cron fallback | `crontab` is usable | one marked `@reboot` line in your user crontab | the line: `@reboot "<bin>" watch >> "<data>/logs/watch.out.log" 2>&1 # assay-watch` — added/removed idempotently via the marker |
+| windows service | a Windows host | SCM database entry `assay` | `svc/mgr` in-process: CreateService (`StartAutomatic`, command line always `watch -c <abs config>`), recovery actions, Start; uninstall: Stop → poll Stopped → Delete |
+| foreground | nothing above matched | none | nothing is registered — install prints the exact `assay watch` foreground command |
+
+`--no-scheduler` skips the registration on every platform (`--no-systemd` remains as a loud alias). Honest caveats: OpenRC user services live while your login session lives (no lingering without root); cron's `@reboot` fires when cron starts (boot), not at login, and carries no supervision; runit/s6/openrc and launchd logs are plain unrotated files.
+
+### Supervision parity — stated per platform, never hidden
+
+| Scheduler | Crash restart | Hang detection |
+| :-- | :-- | :-- |
+| systemd user | `Restart=always` (5s) | sd_notify watchdog (`WatchdogSec=300`) |
+| launchd | `KeepAlive` (`ThrottleInterval` 5) | the internal self-watchdog: a wedged daemon exits cleanly and KeepAlive restarts it |
+| windows service | SCM recovery action: ServiceRestart after 5s (failure count resets after 24h) | the same self-watchdog: clean self-exit, SCM recovery restarts |
+| runit / OpenRC / s6 | runsv / supervise-daemon / s6-supervise restart on exit | none beyond restart-on-exit |
+| cron / foreground | none — `assay watch` runs until it exits | none |
+
+The windows managed core stops through a graceful ladder — `CTRL_BREAK` to the child's own process group → bounded wait → `TerminateProcess` last resort — inside a Job Object (`KILL_ON_JOB_CLOSE`) so no child outlives the daemon; unix keeps the pre-existing hard kill + reap for the core child.
+
+### Platform notes
+
+**macOS.** The agent plist is written `0600` (Apple's LaunchAgent requirement — launchd refuses anything else). launchd agents get a minimal environment — no `XDG_*`, no shell profile — so nothing may depend on shell env. A downloaded release binary carries the Gatekeeper quarantine attribute; verify it against `checksums.txt` first, then clear it:
+
+```bash
+xattr -dr com.apple.quarantine ./assay
+```
+
+**Windows.** `assay install` needs an Administrator terminal (the Service Control Manager requires elevation; `assay status` still reads your data dir from a normal shell). The service runs as LocalSystem, and its command line always embeds your absolute config path — a service started without `-c` would resolve the SYSTEM profile's default location and refuses to start loudly. PATH is never modified silently; to call `assay` by name, add the bin dir yourself:
+
+```powershell
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";%LOCALAPPDATA%\assay\bin", "User")
+```
+
+SmartScreen warns on unsigned downloaded executables: verify the zip against `checksums.txt` (the trust anchor), then right-click the file → **Properties** → **Unblock**, or choose **More info → Run anyway** on first launch. One cmd.exe habit to keep in mind: it resolves bare commands against the current directory first — run installed tools by absolute path in scripts.
+
+### Releases and verification
+
+A release tag fires per-OS pipeline legs, and every shipped target is smoked before publish: linux foreign arches through qemu-user, darwin/arm64 natively with darwin/amd64 under Rosetta 2 (`arch -x86_64`), windows/amd64 natively with windows/386 through WOW64, and windows/arm64 natively on the arm64 runner (if that preview runner is unavailable, the release ships with a loud smoke-gap warning in its notes — never a silent gap). A failed or missing smoke aborts the release before anything is published. Every release carries one merged `checksums.txt` (sorted, one sha256 line per asset), and the release footer is the verify contract:
+
+```bash
+sha256sum -c checksums.txt
+```
+
+Run it in any POSIX shell — Git Bash and WSL both ship `sha256sum` on Windows; PowerShell users can compare `Get-FileHash -Algorithm SHA256 <archive>` output against the matching line instead.
 
 ## ⚙️ Configuration
 
