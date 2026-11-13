@@ -289,8 +289,10 @@ func TestAPIStatsBlockBoundToLoopback(t *testing.T) {
 	require.True(t, ok, "api/stats service block rendered")
 	assert.Equal(t, "api", api["tag"])
 	services := api["services"].([]any)
-	require.Len(t, services, 1)
-	assert.Equal(t, "StatsService", services[0], "xray api.services is a []string of service names")
+	require.Len(t, services, 3)
+	assert.Contains(t, services, "StatsService", "the production-proven stats surface stays")
+	assert.Contains(t, services, "RoutingService", "the hot-apply surface (adrules/lsrules) — T1")
+	assert.Contains(t, services, "HandlerService", "registered for future outbound work; unused in V1 — T1")
 
 	var apiIn map[string]any
 	for _, in := range m["inbounds"].([]any) {

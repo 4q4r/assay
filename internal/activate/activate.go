@@ -50,13 +50,23 @@ type Result struct {
 	BackupPath string
 }
 
+// TestGate runs ONLY the -test gate (L10): the hot-apply path gates its
+// candidate through the same `xray run -test` child without the
+// backup/replace half of Run (the 2026-11-13 hot-apply plan T4 extraction).
+func TestGate(in Input) error {
+	if err := xrayTest(in); err != nil {
+		return fmt.Errorf("-test gate failed; live config untouched: %w", err)
+	}
+	return nil
+}
+
 // Run executes -test → (optional) backup → retention → atomic replace.
 func Run(in Input) (Result, error) {
 	res := Result{}
 
 	// 1. -test gate on the rendered file (never the live one).
-	if err := xrayTest(in); err != nil {
-		return res, fmt.Errorf("-test gate failed; live config untouched: %w", err)
+	if err := TestGate(in); err != nil {
+		return res, err
 	}
 	res.TestPassed = true
 

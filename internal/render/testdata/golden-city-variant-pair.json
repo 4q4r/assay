@@ -1,7 +1,9 @@
 {
   "api": {
     "services": [
-      "StatsService"
+      "StatsService",
+      "RoutingService",
+      "HandlerService"
     ],
     "tag": "api"
   },

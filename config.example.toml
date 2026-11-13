@@ -236,7 +236,15 @@ socks_port = 10810          # own socks5 inbound, loopback-only (D2). Deliberate
                             # distinct from the owner's hand-managed client (10808)
 http_port = 10811           # own http inbound, loopback-only (D2; distinct from 10809)
 api_port = 15491            # own stats/API inbound, loopback-only (the hand-managed
-                            # client keeps 15490)
+                            # client keeps 15490). The rendered api services are
+                            # StatsService + RoutingService + HandlerService:
+                            # RoutingService is what `assay apply` uses to hot-apply
+                            # [[render.pool_routes]] / balancer edits to the RUNNING
+                            # core with no restart (the enablement needs exactly ONE
+                            # core restart after adopting the feature — the next
+                            # natural activation or wave; from then on applies are
+                            # hot). Loopback-only forever; the service-name strings
+                            # are exact (the core silently ignores unknown names).
 # per_country_inbounds = false # D2 option: one socks inbound per alive-country
                             # balancer (tags in-<cc>), default OFF. Traffic on these
                             # ports rides its country balancer WHOLESALE — it does not
@@ -300,6 +308,11 @@ balancer_tolerance = 0.2                      # leastLoad tolerance on country A
 # tag (D5: single-node cities render no city balancer; unknown-geo nodes are
 # pool-xx-NN); anything else fails the render loud (D6). Routes are operator
 # policy — this example ships none active.
+#
+# Hot-apply: pool_routes edits (and balancer-shape edits) are the ONE class
+# of config change `assay apply` can push to the RUNNING core without a
+# restart (api_port's RoutingService; `assay apply --dry-run` classifies
+# first; anything outside routing still needs `assay activate` or a wave).
 #[[render.pool_routes]]
 #balancer = "pool_de"       # or "pool_all" / "pool_unknown" / "pool-de-01"
 #domains = ["geosite:netflix", "domain:example.com"]

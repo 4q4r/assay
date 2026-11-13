@@ -51,6 +51,7 @@ func New() *cobra.Command {
 		newSelectCommand(&cfgPath),
 		newRenderCommand(&cfgPath),
 		newActivateCommand(&cfgPath),
+		newApplyCommand(&cfgPath),
 		newStatusCommand(&cfgPath),
 		newMaintainCommand(&cfgPath),
 		newWatchCommand(&cfgPath),

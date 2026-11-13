@@ -1,7 +1,9 @@
 {
   "api": {
     "services": [
-      "StatsService"
+      "StatsService",
+      "RoutingService",
+      "HandlerService"
     ],
     "tag": "api"
   },
@@ -496,6 +498,7 @@
           "in",
           "in-http"
         ],
+        "ruleTag": "pool-route-0",
         "type": "field"
       },
       {

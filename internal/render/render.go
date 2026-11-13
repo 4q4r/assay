@@ -288,11 +288,23 @@ func observatoryInterval(verbatim string, active int) string {
 
 // ensureAPIStats renders the api/stats service block bound to 127.0.0.1 only
 // (the own render is the only caller; the port is [core].api_port).
+//
+// The services list is the hot-apply gate (2026-11-13 plan T1): RoutingService
+// serves the adrules/lsrules/bi API surface `assay apply` execs through the
+// core binary; HandlerService is registered for future outbound work (it is
+// deliberately NOT exercised by any V1 code path). The exact strings are
+// load-bearing: infra/conf/api.go matches names case-INSENSITIVELY and
+// SILENTLY IGNORES unrecognized strings — a typo would quietly leave the
+// service unregistered (plan R2), which is why the list is pinned by test.
 func ensureAPIStats(m map[string]any, statsPort int) {
 	if _, ok := m["api"]; !ok {
 		m["api"] = map[string]any{
-			"tag":      "api",
-			"services": []any{"StatsService"},
+			"tag": "api",
+			"services": []any{
+				"StatsService",
+				"RoutingService",
+				"HandlerService",
+			},
 		}
 	}
 	// dokodemo-door inbound for the API, loopback only.
@@ -897,19 +909,27 @@ func addPoolRules(
 
 	var poolRules []any
 	var blocked []string
-	for _, route := range routes {
+	for i, route := range routes {
 		domains := make([]any, len(route.Domains))
-		for i, d := range route.Domains {
-			domains[i] = d
+		for j, d := range route.Domains {
+			domains[j] = d
 		}
 		tagged := make([]any, len(inboundTags))
-		for i, t := range inboundTags {
-			tagged[i] = t
+		for j, t := range inboundTags {
+			tagged[j] = t
 		}
 		rule := map[string]any{
 			"type":       "field",
 			"inboundTag": tagged,
 			"domain":     domains,
+			// The hot-apply ruleTag (plan T1/R6): a pure function of the route
+			// set in render order — identical routes re-render to identical
+			// tags, tags are unique per rule, and a balancer-target degradation
+			// to block keeps the tag (only the outboundTag changes). This is
+			// what `assay apply` verifies the running core against and what a
+			// future targeted `rmrules` would address; the api rule and the
+			// catch-all stay untagged (render-owned / the terminator).
+			"ruleTag": fmt.Sprintf("pool-route-%d", i),
 		}
 		switch {
 		case strings.HasPrefix(route.Balancer, poolBalancerPrefix):
