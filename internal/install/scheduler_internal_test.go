@@ -54,6 +54,13 @@ func (f *procFixture) fs() ProcFS { return newFixtureProcFS(f.root) } //nolint:i
 // fakeProbe is a scripted Detect probe seam (systemd / rc-status / cron).
 func fakeProbe(err error) func() error { return func() error { return err } }
 
+// selfUID is the current user's uid: scanOwnProcesses filters by os.Getuid(),
+// so every fixture process that must read as OWN-uid carries this value.
+// Hard-coding 1000 passed only on uid-1000 hosts (the S3 author's box) and
+// fell through to "foreground" on every CI runner (ubuntu runner=1001,
+// macos runner=501) — the run-43330792666 divergence class.
+func selfUID() int { return os.Getuid() }
+
 // testExecutors wires an Executors with everything inert except what a test
 // overrides: no systemd session, no sv, failing rc-status, unusable cron —
 // the "nothing detected" baseline every order pin starts from.
@@ -79,7 +86,7 @@ func TestDetectSystemdFirstBeatsEverything(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)
 	// runit, openrc and s6 all present — systemd still wins (§3.1 order 1).
-	fix.addProc(t, 100, 1000, "runsvdir", []string{"runsvdir", home + "/service"}, home+"/service")
+	fix.addProc(t, 100, selfUID(), "runsvdir", []string{"runsvdir", home + "/service"}, home+"/service")
 	fix.addProc(t, 101, 1000, "openrc-user", []string{"openrc-user"}, "")
 	fix.addProc(t, 102, 1000, "s6-svscan", []string{"s6-svscan"}, home+"/scan")
 	exec := testExecutors(home)
@@ -94,7 +101,7 @@ func TestDetectRunitFromRunsvdirCmdline(t *testing.T) {
 	// runsvdir with a NON-default service dir arg — the dir comes from the
 	// cmdline (§3.1.2: resolved from the process cmdline, never assumed),
 	// resolved against the process cwd when relative.
-	fix.addProc(t, 200, 1000, "runsvdir",
+	fix.addProc(t, 200, selfUID(), "runsvdir",
 		[]string{"/usr/bin/runsvdir", "-L", "/tmp/log", "/home/u/custom-services"}, "")
 	exec := testExecutors(home)
 	exec.SvOnPath = func() bool { return true }
@@ -102,18 +109,21 @@ func TestDetectRunitFromRunsvdirCmdline(t *testing.T) {
 	require.Equal(t, "runit", sched.Name())
 	rs, ok := sched.(*RunitScheduler)
 	require.True(t, ok, "Detect must return the concrete RunitScheduler")
-	assert.Equal(t, "/home/u/custom-services", rs.ServiceDir)
+	// filepath.Clean normalizes separators per host (windows symlinks store
+	// backslash targets) — the pin spells it through the same table.
+	assert.Equal(t, filepath.FromSlash("/home/u/custom-services"), rs.ServiceDir)
 }
 
 func TestDetectRunitRelativeDirResolvedAgainstProcCwd(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)
-	fix.addProc(t, 201, 1000, "runsvdir", []string{"runsvdir", "my-services"}, "/home/u/svcroot")
+	fix.addProc(t, 201, selfUID(), "runsvdir", []string{"runsvdir", "my-services"}, "/home/u/svcroot")
 	exec := testExecutors(home)
 	exec.SvOnPath = func() bool { return true }
 	sched := Detect(fix.fs(), exec)
 	require.Equal(t, "runit", sched.Name())
-	assert.Equal(t, "/home/u/svcroot/my-services", sched.(*RunitScheduler).ServiceDir)
+	assert.Equal(t, filepath.Join("/home/u/svcroot", "my-services"),
+		sched.(*RunitScheduler).ServiceDir, "the relative dir resolves against the process cwd")
 }
 
 func TestDetectRunitRequiresSvOnPath(t *testing.T) {
@@ -134,7 +144,7 @@ func TestDetectRunitZombieEmptyCmdlineDetectsNothingInsteadOfPanicking(t *testin
 	// (nil[1:] slice-bounds). A runsvdir with no dir argument cannot name a
 	// service dir anyway. Pins BOTH consumers of detectRunitServiceDir
 	// (Detect and HeldByAny).
-	fix.addProc(t, 210, 1000, "runsvdir", nil, "")
+	fix.addProc(t, 210, selfUID(), "runsvdir", nil, "")
 	exec := testExecutors(home)
 	exec.SvOnPath = func() bool { return true }
 	assert.Equal(t, "foreground", Detect(fix.fs(), exec).Name())
@@ -154,7 +164,7 @@ func TestDetectRunitForeignUidRunsvdirIgnored(t *testing.T) {
 func TestDetectOpenRCFromOpenrcUserProcess(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)
-	fix.addProc(t, 300, 1000, "openrc-user", []string{"openrc-user"}, "")
+	fix.addProc(t, 300, selfUID(), "openrc-user", []string{"openrc-user"}, "")
 	sched := Detect(fix.fs(), testExecutors(home))
 	assert.Equal(t, "openrc-user", sched.Name())
 }
@@ -178,10 +188,10 @@ func TestDetectS6ScanDirFromProcCwd(t *testing.T) {
 	fix := newProcFixture(t)
 	// §3.1.4: the scandir IS the detected s6-svscan's cwd (skarnet:
 	// "the scanner scans the current directory for subdirectories").
-	fix.addProc(t, 400, 1000, "s6-svscan", []string{"s6-svscan"}, "/home/u/scandir")
+	fix.addProc(t, 400, selfUID(), "s6-svscan", []string{"s6-svscan"}, "/home/u/scandir")
 	sched := Detect(fix.fs(), testExecutors(home))
 	require.Equal(t, "s6", sched.Name())
-	assert.Equal(t, "/home/u/scandir", sched.(*S6Scheduler).ScanDir)
+	assert.Equal(t, filepath.Join("/home", "u", "scandir"), sched.(*S6Scheduler).ScanDir)
 }
 
 func TestDetectS6SystemLevelPID1FallsThroughWithNote(t *testing.T) {
@@ -228,7 +238,8 @@ func TestOSProcFSReadsFixtureTree(t *testing.T) {
 	assert.Equal(t, []string{"s6-svscan", "-v"}, splitCmdline(cmdline))
 	cwd, err := fs.ProcCwd("500")
 	require.NoError(t, err)
-	assert.Equal(t, "/scan/dir", cwd)
+	assert.Equal(t, filepath.Join("/", "scan", "dir"), cwd,
+		"the cwd symlink resolves (windows normalizes stored targets to backslashes)")
 }
 
 func TestOSProcFSNonNumericDirsSkipped(t *testing.T) {
@@ -269,7 +280,7 @@ func TestHeldByAnySystemdUnitFile(t *testing.T) {
 func TestHeldByAnyRunitServiceDirDetected(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)
-	fix.addProc(t, 600, 1000, "runsvdir", []string{"runsvdir", home + "/service"}, home+"/service")
+	fix.addProc(t, 600, selfUID(), "runsvdir", []string{"runsvdir", home + "/service"}, home+"/service")
 	require.NoError(t, os.MkdirAll(filepath.Join(home, "service", "assay-watch"), 0o750))
 	holder, loc, ok := HeldByAny(fix.fs(), testExecutors(home))
 	require.True(t, ok)
@@ -298,6 +309,10 @@ func TestHeldByAnyRunitDotDisabledDirIsNotHeld(t *testing.T) {
 
 func TestHeldByAnyOpenRCScript(t *testing.T) {
 	home := t.TempDir()
+	// HeldByAny resolves the OpenRC init dir from the REAL XDG_CONFIG_HOME
+	// (Gentoo layout) — pin it empty so the fixture home owns the resolution
+	// on every host (a set XDG diverted the scan on the CI runners).
+	t.Setenv("XDG_CONFIG_HOME", "")
 	initDir := filepath.Join(home, ".config", "rc", "init.d")
 	require.NoError(t, os.MkdirAll(initDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(initDir, "assay-watch"), []byte("x"), 0o644))
@@ -313,7 +328,7 @@ func TestHeldByAnyS6OnlyWithLiveScanner(t *testing.T) {
 	// (the scandir convention is never invented, §3.2 s6).
 	require.NoError(t, os.MkdirAll(filepath.Join(home, "scan", "assay-watch"), 0o750))
 	fix := newProcFixture(t)
-	fix.addProc(t, 700, 1000, "s6-svscan", []string{"s6-svscan"}, home+"/scan")
+	fix.addProc(t, 700, selfUID(), "s6-svscan", []string{"s6-svscan"}, home+"/scan")
 	holder, loc, ok := HeldByAny(fix.fs(), testExecutors(home))
 	require.True(t, ok)
 	assert.Equal(t, "s6", holder)
