@@ -436,7 +436,12 @@ func (s *LaunchdScheduler) printProbe(uid int) (bool, int, error) {
 }
 
 // waitBootout polls print until the job stops responding (bounded) after a
-// successful bootout — the §1.2.6 "bootout → wait for exit" step.
+// successful bootout — the §1.2.6 "bootout → wait for exit" step. Used by
+// BOTH flows: install re-activation must never bootstrap over a live
+// registration, and uninstall must never claim "booted out" while launchd
+// still holds the job — launchctl bootout can return while launchd is still
+// tearing a live KeepAlive agent down (the darwin E2E hit exactly that:
+// bootout exit 0, a print 17ms later still found the registration).
 func (s *LaunchdScheduler) waitBootout(uid int) error {
 	for range s.bootoutAttempts {
 		if _, err := s.exec.Launchctl(cmdLaunchdPrint(uid)...); err != nil {
@@ -444,9 +449,11 @@ func (s *LaunchdScheduler) waitBootout(uid int) error {
 		}
 		time.Sleep(s.bootoutInterval)
 	}
-	return fmt.Errorf("install: the old agent registration survived bootout "+
-		"(%d probes) — refusing to bootstrap over a live registration\n"+
-		"(inspect by hand: launchctl print gui/%d/%s)", s.bootoutAttempts, uid, LaunchdLabel)
+	return fmt.Errorf("the agent registration survived bootout "+
+		"(%d probes over %s) — launchd has not torn the job down\n"+
+		"(run by hand: launchctl bootout gui/%d/%s; inspect: launchctl print gui/%d/%s)",
+		s.bootoutAttempts, time.Duration(s.bootoutAttempts)*s.bootoutInterval,
+		uid, LaunchdLabel, uid, LaunchdLabel)
 }
 
 // waitRunning polls print until the job reports a real PID (bounded,
@@ -491,9 +498,12 @@ func parseLaunchdPID(out string) int {
 }
 
 // Uninstall runs the §1.2.7 teardown: bootout (only when the probe proves
-// the job loaded — an absent registration is reported, never faked), remove
-// the plist file, managed-core teardown unchanged, purge passthrough. No
-// legacy cleanup exists on darwin (no prior darwin installs).
+// the job loaded — an absent registration is reported, never faked), the
+// §1.2.6 bootout→wait-for-exit verify (launchctl bootout is asynchronous in
+// practice for a live KeepAlive agent — the bounded gone-probe closes the
+// window where launchd still holds a job the CLI already reported booted
+// out), remove the plist file, managed-core teardown unchanged, purge
+// passthrough. No legacy cleanup exists on darwin (no prior darwin installs).
 func (s *LaunchdScheduler) Uninstall(spec LaunchdUninstallSpec) (UninstallResult, error) {
 	res := UninstallResult{}
 	uid := os.Getuid()
@@ -501,6 +511,9 @@ func (s *LaunchdScheduler) Uninstall(spec LaunchdUninstallSpec) (UninstallResult
 		if _, berr := s.exec.Launchctl(cmdLaunchdBootout(uid)...); berr != nil {
 			return res, fmt.Errorf("uninstall: bootout failed: %w\n"+
 				"(run by hand: launchctl bootout gui/%d/%s)", berr, uid, LaunchdLabel)
+		}
+		if werr := s.waitBootout(uid); werr != nil {
+			return res, fmt.Errorf("uninstall: %w", werr)
 		}
 		res.DisabledUnits = []string{LaunchdLabel}
 	}

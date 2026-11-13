@@ -102,10 +102,36 @@ jobs:
             || { echo "::error::agent not running after kickstart"; exit 1; }
           echo "kickstart -k OK" >> "$GITHUB_STEP_SUMMARY"
 
-          # uninstall boots out and removes the plist.
+          # uninstall boots out and removes the plist. launchctl bootout can
+          # return while launchd is still tearing the agent down (the CLI's
+          # own uninstall now verify-gones with a bounded probe — this leg
+          # double-checks independently and captures diagnostics on failure:
+          # run 43339290411 failed here 17ms after a clean bootout with
+          # zero diagnostic output to diagnose from).
           ./assay uninstall
-          if launchctl print "gui/$uid/assay-watch" >/dev/null 2>&1; then
-            echo "::error::agent still registered after uninstall"; exit 1
+          gone=0
+          for _ in $(seq 1 50); do
+            if ! launchctl print "gui/$uid/assay-watch" >/dev/null 2>&1; then
+              gone=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$gone" != "1" ]; then
+            {
+              echo "## uninstall failure diagnostics (registration survived the 10s bounded wait)"
+              echo
+              echo '```'
+              launchctl print "gui/$uid/assay-watch" 2>&1 || true
+              echo
+              echo "--- LaunchAgents dir ---"
+              ls -la "$HOME/Library/LaunchAgents/" 2>&1 || true
+              echo '```'
+              echo
+              echo "manual command: \`launchctl bootout gui/$uid/assay-watch\`"
+            } >> "$GITHUB_STEP_SUMMARY" || true
+            echo "::error::agent still registered after uninstall (10s bounded wait)"
+            exit 1
           fi
           test ! -f "$plist" || { echo "::error::plist still present after uninstall"; exit 1; }
           echo "uninstall OK (no registration, no plist)" >> "$GITHUB_STEP_SUMMARY"

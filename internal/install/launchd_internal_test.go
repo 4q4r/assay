@@ -424,8 +424,9 @@ func TestLaunchdInstallVerifyLoopTimesOutLoud(t *testing.T) {
 // cleanup exists on darwin (no prior darwin installs, §1.2.7).
 func TestLaunchdUninstallOrdering(t *testing.T) {
 	f := newFakeLaunchctl()
-	f.expect("print", printFixture, nil) // probe: loaded
-	f.expect("bootout", "", nil)
+	f.expect("print", printFixture, nil)            // probe: loaded
+	f.expect("bootout", "", nil)                    // boot it out
+	f.expect("print", "", errors.New("not loaded")) // verify-gone: the registration left
 	s := launchdScheduler(f)
 	home := t.TempDir()
 	agentDir := filepath.Join(home, "Library", "LaunchAgents")
@@ -443,7 +444,8 @@ func TestLaunchdUninstallOrdering(t *testing.T) {
 		PurgeConfigPath: filepath.Join(dataDir, "config.toml"),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"print", "bootout"}, f.verbs())
+	assert.Equal(t, []string{"print", "bootout", "print"}, f.verbs(),
+		"teardown: probe → bootout → verify-gone (§1.2.6 bootout→wait-for-exit)")
 	assert.Equal(t, []string{LaunchdLabel}, res.DisabledUnits, "the booted-out registration is reported")
 	_, statErr := os.Stat(plist)
 	assert.True(t, os.IsNotExist(statErr), "the plist file is removed")
@@ -472,6 +474,55 @@ func TestLaunchdUninstallWhenNotLoaded(t *testing.T) {
 	assert.Empty(t, res.DisabledUnits)
 	_, statErr := os.Stat(plist)
 	assert.True(t, os.IsNotExist(statErr), "the stale plist still gets removed")
+}
+
+// TestLaunchdUninstallWaitsForBootedOut pins the §1.2.6 bootout→wait-for-exit
+// verify on the uninstall path: launchctl bootout can return while launchd is
+// still tearing a live KeepAlive agent down — the darwin E2E leg hit exactly
+// that (bootout exit 0, a print 17ms later still found the registration, and
+// the leg failed with "agent still registered after uninstall" on code that
+// was green the previous cycle). The uninstall must verify-gone with the
+// bounded probe and only then report the registration as disabled.
+func TestLaunchdUninstallWaitsForBootedOut(t *testing.T) {
+	f := newFakeLaunchctl()
+	f.expect("print", printFixture, nil)            // probe: loaded
+	f.expect("bootout", "", nil)                    // bootout reports success…
+	f.expect("print", printFixture, nil)            // …but launchd still holds the job
+	f.expect("print", "", errors.New("not loaded")) // second probe: torn down
+	s := launchdScheduler(f)
+	home := t.TempDir()
+	agentDir := filepath.Join(home, "Library", "LaunchAgents")
+	require.NoError(t, os.MkdirAll(agentDir, 0o750))
+
+	res, err := s.Uninstall(LaunchdUninstallSpec{AgentDir: agentDir})
+	require.NoError(t, err, "a registration that leaves within the bounded window is a clean uninstall")
+	assert.Equal(t, []string{"print", "bootout", "print", "print"}, f.verbs(),
+		"probe → bootout → still-there probe → gone probe")
+	assert.Equal(t, []string{LaunchdLabel}, res.DisabledUnits,
+		"the registration is reported only after the gone-probe confirms it")
+}
+
+// TestLaunchdUninstallStillRegisteredIsLoud pins the loud timeout: a
+// registration that outlives the whole bounded probe fails the uninstall
+// carrying the EXACT manual commands, and never reports the unit disabled.
+func TestLaunchdUninstallStillRegisteredIsLoud(t *testing.T) {
+	f := newFakeLaunchctl()
+	f.expect("print", printFixture, nil) // probe: loaded
+	f.expect("bootout", "", nil)
+	for range 10 {
+		f.expect("print", printFixture, nil) // still registered through every probe
+	}
+	s := launchdScheduler(f)
+	home := t.TempDir()
+	agentDir := filepath.Join(home, "Library", "LaunchAgents")
+	require.NoError(t, os.MkdirAll(agentDir, 0o750))
+
+	res, err := s.Uninstall(LaunchdUninstallSpec{AgentDir: agentDir})
+	require.Error(t, err, "a registration that survives bootout must fail loud, not claim success")
+	assert.Contains(t, err.Error(),
+		fmt.Sprintf("launchctl bootout gui/%d/%s", os.Getuid(), LaunchdLabel),
+		"the error carries the exact manual command line")
+	assert.Empty(t, res.DisabledUnits, "a still-registered job is never reported booted-out")
 }
 
 // ---------------------------------------------------------------------------

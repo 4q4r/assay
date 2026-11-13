@@ -140,9 +140,12 @@ func TestInstallSourceUsesOnlyTheSanctionedConstructors(t *testing.T) {
 	// reload = 2. All flow through the constructors; no new command shape.
 	assert.Equal(t, 6, callSites, "Install(3) + cleanupLegacyUnits(1) + Uninstall(2) call Systemctl only via the constructors")
 	// launchd flow: Install probe(1) + bootout(1) + bootstrap(1) +
-	// waitBootout(1) + waitRunning(1); Uninstall print(1) + bootout(1);
-	// Status print(1); HeldRegistration print(1). All flow through the four
-	// pinned constructors; no new launchctl shape.
+	// waitBootout(1) + waitRunning(1); Uninstall print(1) + bootout(1) +
+	// waitBootout(1, shared with Install); Status print(1);
+	// HeldRegistration print(1). All flow through the four pinned
+	// constructors; no new launchctl shape (waitBootout's print site is
+	// shared, not duplicated — the uninstall verify-gone loop adds no call
+	// site).
 	assert.Equal(t, 9, launchctlCallSites, "the launchd flow calls Launchctl only via the pinned constructors")
 }
 
