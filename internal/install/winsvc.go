@@ -19,9 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -57,7 +59,12 @@ type winSvcActions interface {
 	// controlStop sends SERVICE_CONTROL_STOP; accepted=false means the
 	// service was not active (nothing to stop — never an error).
 	controlStop(name string) (accepted bool, err error)
-	query(name string) (state uint32, pid uint32, err error)
+	// query returns the service state, its pid, and the SCM CheckPoint
+	// counter. The CheckPoint is the running-verify's progress signal: the
+	// handler increments it on every start-wiring heartbeat, so a stalled
+	// counter is the installer's cue that the start is not making progress
+	// (the same signal the SCM itself enforces, SERVICE_STATUS dwCheckPoint).
+	query(name string) (state uint32, pid uint32, checkpoint uint32, err error)
 	deleteService(name string) error
 }
 
@@ -72,6 +79,7 @@ type WinSvcScheduler struct {
 	stopPollAttempts int
 	verifyInterval   time.Duration
 	verifyAttempts   int
+	staleAttempts    int
 
 	// verbs records the flow steps (SCM calls + copyBinary alike) — the
 	// unified ordering-pin channel the guard tests read. Production never
@@ -88,13 +96,20 @@ func NewWinSvcScheduler(actions winSvcActions) *WinSvcScheduler {
 		// 30 minutes — the §2.2.7 bound (TimeoutStopSec=1800 parity).
 		stopPollAttempts: 30 * 60 * 2,
 		verifyInterval:   500 * time.Millisecond,
-		// The running-verify waits exactly the StartPending WaitHint the
-		// service handler declares to the SCM (§2.2.2): the installer may
-		// never give up before the window it itself granted. The old
-		// arbitrary 10×500ms expired before the daemon finished wiring on
-		// the first-ever SCM E2E run (43358084471 — the daemon's best-effort
-		// bootstrap retries + a cold runner's start latency).
-		verifyAttempts: int(WinSvcStartPendingWaitHint / (500 * time.Millisecond)),
+		// The running-verify waits the START CEILING (three declared windows):
+		// the handler heartbeats the StartPending CheckPoint while the wiring
+		// runs, so the SCM keeps the start alive as long as the daemon makes
+		// progress — the installer may never give up earlier than the ceiling
+		// while that progress signal is alive. A checkpoint that stays put
+		// for ONE declared window (staleAttempts) is the SCM's own failure
+		// signal (SERVICE_STATUS dwWaitHint contract) — the installer gives
+		// up at exactly that point, never later. The old single-window budget
+		// (the run 43358084471 fix) turned a slow cold-runner wiring into a
+		// permanent SCM start failure on cycle 5 (43414096837: the full 30s
+		// elapsed, the service never reported Running, and a silent hint gave
+		// the SCM nothing to see but a stall).
+		verifyAttempts: int(WinSvcStartVerifyCeiling / (500 * time.Millisecond)),
+		staleAttempts:  int(WinSvcStartStaleBudget / (500 * time.Millisecond)),
 	}
 }
 
@@ -107,6 +122,12 @@ func (s *WinSvcScheduler) withStopPolling(interval time.Duration, attempts int) 
 // withVerifyPolling shrinks the running-verify loop (tests).
 func (s *WinSvcScheduler) withVerifyPolling(interval time.Duration, attempts int) *WinSvcScheduler {
 	s.verifyInterval, s.verifyAttempts = interval, attempts
+	return s
+}
+
+// withStaleVerify shrinks the checkpoint-stale budget (tests).
+func (s *WinSvcScheduler) withStaleVerify(attempts int) *WinSvcScheduler {
+	s.staleAttempts = attempts
 	return s
 }
 
@@ -176,7 +197,7 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 	exists := s.actions.openService(WinSvcName) == nil
 	if exists {
 		s.step("openService")
-		if state, pid, qerr := s.actions.query(WinSvcName); qerr == nil && state != WinSvcStateStopped {
+		if state, pid, _, qerr := s.actions.query(WinSvcName); qerr == nil && state != WinSvcStateStopped {
 			accepted, serr := s.actions.controlStop(WinSvcName)
 			if serr != nil {
 				return res, fmt.Errorf("install: stopping the running assay service: %w\n"+
@@ -245,7 +266,7 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 				"(inspect by hand: sc.exe query assay; event log: Windows Logs → Application)", serr)
 		}
 	}
-	if verr := s.awaitRunning(); verr != nil {
+	if verr := s.awaitRunning(filepath.Join(spec.DataDir, "logs", "watch.log")); verr != nil {
 		return res, verr
 	}
 	res.UnitPaths = []string{WinSvcName + " (SCM database entry)"}
@@ -259,7 +280,7 @@ func (s *WinSvcScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 func (s *WinSvcScheduler) awaitStopped(lastPID *uint32, verb string) error {
 	s.step("pollStopped")
 	for range s.stopPollAttempts {
-		state, pid, err := s.actions.query(WinSvcName)
+		state, pid, _, err := s.actions.query(WinSvcName)
 		if err != nil {
 			return fmt.Errorf("install: query the assay service: %w", err)
 		}
@@ -272,20 +293,58 @@ func (s *WinSvcScheduler) awaitStopped(lastPID *uint32, verb string) error {
 	return errors.New(WinSvcStopTimeoutMessage(*lastPID, WinSvcStopBound(), verb))
 }
 
-// awaitRunning polls Query until Running with a real pid (bounded) —
-// install never claims ServiceActive without a confirmed running service
-// (the launchd verify-loop precedent).
-func (s *WinSvcScheduler) awaitRunning() error {
+// awaitRunning polls Query until Running with a real pid — bounded by the
+// ceiling, but with two distinctions the old blind budget lacked:
+//
+//   - a service whose CheckPoint never advances for ONE declared window has
+//     failed by the SCM's own wait-hint contract (SERVICE_STATUS dwCheckPoint:
+//     no increment and no state change within the hint = the SCM may assume
+//     an error) — the installer gives up at exactly that point instead of
+//     burning the remaining ceiling;
+//   - a service that has fallen back to STOPPED after the start request has
+//     already failed (the process exited during start) — the fast-fail names
+//     the evidence pointers immediately instead of waiting out the SCM
+//     recovery-restart loop, whose every attempt of a deterministic failure
+//     ends identically. A Stopped reading BEFORE any pending state is
+//     tolerated (the SCM may not have dispatched the start yet) — only a
+//     Stopped AFTER the service showed signs of starting is the verdict.
+//
+// journal is the daemon's file-log path, carried in the fast-fail message:
+// a service-context wiring failure's stderr goes nowhere, so the journal is
+// the only place the exact error is written.
+func (s *WinSvcScheduler) awaitRunning(journal string) error {
+	const noReading = ^uint32(0) // no CheckPoint reading yet
+	lastCheckpoint, stale, seenPending := noReading, 0, false
 	for range s.verifyAttempts {
-		state, pid, err := s.actions.query(WinSvcName)
-		if err == nil && state == WinSvcStateRunning && pid > 0 {
-			return nil
+		state, pid, checkpoint, err := s.actions.query(WinSvcName)
+		if err == nil {
+			if state == WinSvcStateRunning && pid > 0 {
+				return nil
+			}
+			if state == WinSvcStateStopped && seenPending {
+				return errors.New(WinSvcStartExitedMessage(journal))
+			}
+			if state != WinSvcStateStopped {
+				seenPending = true
+			}
+			if checkpoint != lastCheckpoint {
+				lastCheckpoint, stale = checkpoint, 0
+			} else {
+				stale++
+			}
+			if stale >= s.staleAttempts {
+				return errors.New("install: the assay service reported StartPending but made no " +
+					fmt.Sprintf("progress for %s (CheckPoint %d never advanced) — inspect by hand: "+
+						"sc.exe query assay\n  journal:   "+journal+
+						" (the daemon's file log sink — a service's stderr goes nowhere)",
+						WinSvcStartStaleBudget, checkpoint))
+			}
 		}
 		time.Sleep(s.verifyInterval)
 	}
 	return errors.New("install: the assay service did not report Running within " +
-		fmt.Sprintf("%d×%s — inspect by hand: sc.exe query assay "+
-			"(event log: Windows Logs → Application carries a service that exited during start)",
+		fmt.Sprintf("%d×%s (the start-wiring ceiling) — inspect by hand: sc.exe query assay\n"+
+			"  journal:   "+journal+" (the daemon's file log sink — a service's stderr goes nowhere)",
 			s.verifyAttempts, s.verifyInterval))
 }
 
@@ -321,7 +380,7 @@ func (s *WinSvcScheduler) Uninstall(spec SchedulerUninstallSpec) (UninstallResul
 		res.CoreRemoved = coreRemoved
 		return res, purgePassthrough(spec.PurgeConfigPath, spec.PurgeDataDir, &res)
 	}
-	if state, pid, qerr := s.actions.query(WinSvcName); qerr == nil && state != WinSvcStateStopped {
+	if state, pid, _, qerr := s.actions.query(WinSvcName); qerr == nil && state != WinSvcStateStopped {
 		if _, serr := s.actions.controlStop(WinSvcName); serr != nil {
 			return res, fmt.Errorf("uninstall: stopping the assay service: %w\n"+
 				"(run by hand: sc.exe stop assay, then re-run `assay uninstall`)", serr)
@@ -383,7 +442,7 @@ func (s *WinSvcScheduler) Status() (SchedulerStatus, error) {
 			Note:   "service not installed (" + WinSvcName + " — run `assay install`)",
 		}, nil
 	}
-	state, pid, err := s.actions.query(WinSvcName)
+	state, pid, _, err := s.actions.query(WinSvcName)
 	if err != nil {
 		return SchedulerStatus{}, fmt.Errorf("install: query the assay service: %w", err)
 	}
@@ -528,15 +587,21 @@ func (m *mgrSvcActions) controlStop(name string) (bool, error) {
 	return true, nil
 }
 
-func (m *mgrSvcActions) query(name string) (uint32, uint32, error) {
+func (m *mgrSvcActions) query(name string) (uint32, uint32, uint32, error) {
 	if m.svc == nil {
-		return 0, 0, errors.New("install: service not open")
+		return 0, 0, 0, errors.New("install: SCM not connected")
 	}
-	st, err := m.svc.Query()
-	if err != nil {
-		return 0, 0, err
+	// QueryServiceStatusEx directly (SC_STATUS_PROCESS_INFO): the
+	// SERVICE_STATUS_PROCESS carries the CheckPoint counter the
+	// running-verify needs, which mgr.Service.Query() drops. The handle
+	// belongs to the seam (one service handle at a time — the struct doc).
+	var t windows.SERVICE_STATUS_PROCESS
+	var needed uint32
+	if err := windows.QueryServiceStatusEx(m.svc.Handle, windows.SC_STATUS_PROCESS_INFO,
+		(*byte)(unsafe.Pointer(&t)), uint32(unsafe.Sizeof(t)), &needed); err != nil {
+		return 0, 0, 0, err
 	}
-	return uint32(st.State), st.ProcessId, nil
+	return t.CurrentState, t.ProcessId, t.CheckPoint, nil
 }
 
 func (m *mgrSvcActions) deleteService(name string) error {

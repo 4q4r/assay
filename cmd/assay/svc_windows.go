@@ -41,6 +41,23 @@ const (
 	stopPendingWaitHintMs  = 1800000
 )
 
+// startPendingHeartbeat is the interval between StartPending checkpoint
+// updates while the daemon is still wiring. The SCM's SERVICE_STATUS
+// contract (dwWaitHint/dwCheckPoint): when a declared window elapses with
+// NO CheckPoint increment and NO state change, the SCM may assume an error
+// occurred and stop the service — a single silent StartPending turns the
+// declared 30s window into a hard ceiling that a slow-but-healthy wiring
+// (cold runner: SCM process creation, Defender first-run scan of a fresh
+// image) cannot survive, and gives the installer nothing to observe but a
+// stall (cycle 5, 43414096837: the full 30s elapsed with the service never
+// Running and no progress signal anywhere). The handler therefore
+// re-asserts StartPending with an incremented CheckPoint every sixth of
+// the window (5s at the production 30s hint) for as long as the wiring
+// runs — the exact "increment this value as it completes each step of its
+// initialization" pattern the SCM documentation prescribes. Package var:
+// tests shrink it.
+var startPendingHeartbeat = install.WinSvcStartPendingWaitHint / 6
+
 // serviceEntrypoint is the windows service gate (§2.2.1): a service-context
 // process (the SCM started it through the service dispatcher) runs
 // svc.Run("assay", ...) and reports handled; every other invocation reports
@@ -77,8 +94,37 @@ type watchHandler struct {
 // Execute drives the §2.2.2 state machine.
 func (h *watchHandler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
 	s <- svc.Status{State: svc.StartPending, WaitHint: startPendingWaitHintMs}
+	// The wiring heartbeat (§2.2.2 + the SCM SERVICE_STATUS contract): the
+	// StartPending CheckPoint advances while the daemon wires, so the SCM
+	// never reads the start as stalled and the running-verify has a live
+	// progress signal. stopHeartbeat drains the goroutine BEFORE the next
+	// status send — a heartbeat landing after the Running report would walk
+	// the SCM's state machine backwards.
+	heartbeatStop := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	checkpoint := uint32(0)
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(startPendingHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatStop:
+				return
+			case <-ticker.C:
+				checkpoint++
+				s <- svc.Status{State: svc.StartPending, CheckPoint: checkpoint, WaitHint: startPendingWaitHintMs}
+			}
+		}
+	}()
+	stopHeartbeat := func() {
+		close(heartbeatStop)
+		<-heartbeatDone
+	}
+
 	cfgPath, err := cli.ParseServiceArgs(args)
 	if err != nil {
+		stopHeartbeat()
 		h.failf("service argument contract refused: %v", err)
 		return true, serviceExitFailure
 	}
@@ -100,6 +146,7 @@ func (h *watchHandler) Execute(args []string, r <-chan svc.ChangeRequest, s chan
 	select {
 	case <-wired:
 	case err := <-done:
+		stopHeartbeat()
 		if err == nil {
 			h.failf("daemon exited during wiring without reporting readiness")
 		} else {
@@ -107,6 +154,7 @@ func (h *watchHandler) Execute(args []string, r <-chan svc.ChangeRequest, s chan
 		}
 		return true, serviceExitFailure
 	}
+	stopHeartbeat()
 	s <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {

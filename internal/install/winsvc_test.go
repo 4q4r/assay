@@ -53,9 +53,9 @@ type fakeWinSvcActions struct {
 	deleted      bool
 	closed       bool
 
-	// queryScript replays (state, pid) answers in order; the last one
-	// repeats forever. openErr scripts the OpenService failure.
-	queryScript [][2]uint32
+	// queryScript replays (state, pid, checkpoint) answers in order; the
+	// last one repeats forever. openErr scripts the OpenService failure.
+	queryScript [][3]uint32
 	queryIdx    int
 	openErr     error
 	connectErr  error
@@ -101,16 +101,16 @@ func (f *fakeWinSvcActions) controlStop(string) (bool, error) {
 	return true, nil
 }
 
-func (f *fakeWinSvcActions) query(string) (uint32, uint32, error) {
+func (f *fakeWinSvcActions) query(string) (uint32, uint32, uint32, error) {
 	if len(f.queryScript) == 0 {
-		return WinSvcStateStopped, 0, nil
+		return WinSvcStateStopped, 0, 0, nil
 	}
 	if f.queryIdx >= len(f.queryScript) {
 		f.queryIdx = len(f.queryScript) - 1
 	}
 	ans := f.queryScript[f.queryIdx]
 	f.queryIdx++
-	return ans[0], ans[1], nil
+	return ans[0], ans[1], ans[2], nil
 }
 
 func (f *fakeWinSvcActions) deleteService(string) error {
@@ -166,8 +166,8 @@ func TestWinSvcInstallFreshPins(t *testing.T) {
 	// the post-start Running entry is load-bearing (its absence exhausted
 	// awaitRunning on the first real windows run, 43330792666).
 	f.queryScript = append(f.queryScript,
-		[2]uint32{WinSvcStateStopped, 0},
-		[2]uint32{WinSvcStateRunning, 4242})
+		[3]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 4242})
 	s := winSvcTestScheduler(f)
 	spec, _ := winSvcSpec(t)
 
@@ -217,9 +217,9 @@ func TestWinSvcInstallUpgradeOrderingPins(t *testing.T) {
 	f := &fakeWinSvcActions{}
 	// Running (pid 4242) → Stopped → Running again after start.
 	f.queryScript = append(f.queryScript,
-		[2]uint32{WinSvcStateRunning, 4242},
-		[2]uint32{WinSvcStateStopped, 0},
-		[2]uint32{WinSvcStateRunning, 9999},
+		[3]uint32{WinSvcStateRunning, 4242},
+		[3]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 9999},
 	)
 	s := winSvcTestScheduler(f)
 	spec, _ := winSvcSpec(t)
@@ -279,9 +279,9 @@ func TestWinSvcStartAlreadyRunningNote(t *testing.T) {
 	// between — and awaitRunning must see Running for the note path). The
 	// fake holds its LAST answer forever, so every leg needs its own entry.
 	f.queryScript = append(f.queryScript,
-		[2]uint32{WinSvcStateRunning, 4242},
-		[2]uint32{WinSvcStateStopped, 0},
-		[2]uint32{WinSvcStateRunning, 4242})
+		[3]uint32{WinSvcStateRunning, 4242},
+		[3]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 4242})
 	s := winSvcTestScheduler(f)
 	spec, _ := winSvcSpec(t)
 	spec.ConfigPath = `C:\x\config.toml`
@@ -298,9 +298,9 @@ func TestWinSvcStartAlreadyRunningNote(t *testing.T) {
 func TestWinSvcUninstallOrderingPins(t *testing.T) {
 	f := &fakeWinSvcActions{}
 	f.queryScript = append(f.queryScript,
-		[2]uint32{WinSvcStateRunning, 4242},
-		[2]uint32{WinSvcStateStopPending, 4242},
-		[2]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 4242},
+		[3]uint32{WinSvcStateStopPending, 4242},
+		[3]uint32{WinSvcStateStopped, 0},
 	)
 	s := winSvcTestScheduler(f)
 	home := t.TempDir()
@@ -341,7 +341,7 @@ func TestWinSvcUninstallAbsentReports(t *testing.T) {
 // sc.exe/taskkill lines.
 func TestWinSvcUninstallStopTimeoutMessage(t *testing.T) {
 	f := &fakeWinSvcActions{}
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateStopPending, 4242})
+	f.queryScript = append(f.queryScript, [3]uint32{WinSvcStateStopPending, 4242})
 	s := winSvcTestScheduler(f).withStopPolling(time.Millisecond, 3)
 	_, err := s.Uninstall(SchedulerUninstallSpec{DataDir: filepath.Join(t.TempDir(), "assay")})
 	require.Error(t, err)
@@ -359,7 +359,7 @@ func TestWinSvcInstallStopTimeoutMessage(t *testing.T) {
 	f := &fakeWinSvcActions{}
 	// The service exists (openService succeeds) and never leaves
 	// StopPending within the bounded wait.
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateStopPending, 4242})
+	f.queryScript = append(f.queryScript, [3]uint32{WinSvcStateStopPending, 4242})
 	s := winSvcTestScheduler(f).withStopPolling(time.Millisecond, 3)
 	spec, _ := winSvcSpec(t)
 	_, err := s.Install(spec)
@@ -374,7 +374,7 @@ func TestWinSvcInstallStopTimeoutMessage(t *testing.T) {
 // ADDENDUM §1 supervision note.
 func TestWinSvcStatusPins(t *testing.T) {
 	f := &fakeWinSvcActions{}
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateRunning, 4242})
+	f.queryScript = append(f.queryScript, [3]uint32{WinSvcStateRunning, 4242})
 	s := winSvcTestScheduler(f)
 
 	st, err := s.Status()
@@ -441,8 +441,8 @@ func TestWinSvcCommandLineEscapingPins(t *testing.T) {
 func TestWinSvcMaterializesDefaultConfig(t *testing.T) {
 	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
 	f.queryScript = append(f.queryScript,
-		[2]uint32{WinSvcStateStopped, 0},
-		[2]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
+		[3]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
 	s := winSvcTestScheduler(f)
 	spec, dataDir := winSvcSpec(t)
 
@@ -455,8 +455,8 @@ func TestWinSvcMaterializesDefaultConfig(t *testing.T) {
 	// Kept: re-install over the existing file.
 	f2 := &fakeWinSvcActions{openErr: errors.New("does not exist")}
 	f2.queryScript = append(f2.queryScript,
-		[2]uint32{WinSvcStateStopped, 0},
-		[2]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
+		[3]uint32{WinSvcStateStopped, 0},
+		[3]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
 	res2, err := winSvcTestScheduler(f2).Install(spec)
 	require.NoError(t, err)
 	assert.Empty(t, res2.ConfigWritten)
@@ -487,13 +487,100 @@ func indexOf(vs []string, v string) int {
 }
 
 // TestWinSvcStartVerifyParity pins the §2.2.2 start-window parity (the run
-// 43358084471 fix): the running-verify budget (awaitRunning's default
-// pacing) waits EXACTLY the StartPending WaitHint the service handler
-// declares to the SCM — the installer may never give up before the window
-// it itself granted, and both sides share the one contract constant
-// (install.WinSvcStartPendingWaitHint, consumed by cmd/assay's handler).
+// 43358084471 fix, re-geometried for cycle 5 / 43414096837): the
+// running-verify paces against the ONE contract constant the handler also
+// declares to the SCM — its total budget is the CEILING (three declared
+// windows, survivable because the handler heartbeats the CheckPoint) and
+// its stale budget is exactly ONE window (the SCM's own wait-hint failure
+// point).
 func TestWinSvcStartVerifyParity(t *testing.T) {
 	s := NewWinSvcScheduler(&fakeWinSvcActions{})
-	assert.Equal(t, WinSvcStartPendingWaitHint, time.Duration(s.verifyAttempts)*s.verifyInterval,
-		"awaitRunning's default budget must equal the declared StartPending WaitHint")
+	assert.Equal(t, WinSvcStartVerifyCeiling, time.Duration(s.verifyAttempts)*s.verifyInterval,
+		"awaitRunning's default budget must equal the start-wiring ceiling")
+	assert.Equal(t, WinSvcStartStaleBudget, time.Duration(s.staleAttempts)*s.verifyInterval,
+		"the checkpoint-stale budget must equal ONE declared window")
+}
+
+// TestWinSvcVerifyFastFailsExitedService pins the cycle-5 fast-fail: a
+// service that fell back to Stopped after Start is a FAILED start — the
+// verify names the evidence pointers immediately instead of burning the
+// ceiling on the SCM recovery-restart loop, whose every attempt of a
+// deterministic failure ends identically. A Stopped reading BEFORE any
+// pending state is tolerated (the SCM may not have dispatched the start
+// yet) — only a Stopped AFTER the service showed signs of starting is the
+// verdict.
+func TestWinSvcVerifyFastFailsExitedService(t *testing.T) {
+	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
+	f.queryScript = append(f.queryScript,
+		[3]uint32{WinSvcStateStartPending, 0, 0},
+		[3]uint32{WinSvcStateStopped, 0, 0})
+	s := winSvcTestScheduler(f)
+	spec, dataDir := winSvcSpec(t)
+
+	_, err := s.Install(spec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exited during start")
+	assert.Contains(t, err.Error(), "sc.exe query assay")
+	assert.Contains(t, err.Error(), filepath.Join(dataDir, "logs", "watch.log"),
+		"the fast-fail names the daemon journal — the only place a service-context error is written")
+	assert.Contains(t, err.Error(), "stderr goes nowhere")
+}
+
+// TestWinSvcVerifyPrePendingStoppedKeepsPolling pins the anti-false-positive
+// half of the fast-fail: a Stopped reading before the service ever showed a
+// pending state must NOT fast-fail (the SCM may not have dispatched the
+// start yet) — the verify keeps polling and succeeds when Running arrives.
+func TestWinSvcVerifyPrePendingStoppedKeepsPolling(t *testing.T) {
+	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
+	f.queryScript = append(f.queryScript,
+		[3]uint32{WinSvcStateStopped, 0, 0},
+		[3]uint32{WinSvcStateStopped, 0, 0},
+		[3]uint32{WinSvcStateRunning, 4242, 0})
+	s := winSvcTestScheduler(f)
+	spec, _ := winSvcSpec(t)
+
+	res, err := s.Install(spec)
+	require.NoError(t, err, "a pre-pending Stopped reading is not a failed start")
+	assert.True(t, res.ServiceActive)
+}
+
+// TestWinSvcVerifyKeepsWaitingOnCheckpointProgress pins the heartbeat side
+// of the contract: a service whose CheckPoint keeps advancing is
+// PROGRESSING — the verify keeps waiting (the SCM keeps the start alive
+// too) and succeeds when Running arrives, even past one declared window.
+func TestWinSvcVerifyKeepsWaitingOnCheckpointProgress(t *testing.T) {
+	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
+	f.queryScript = append(f.queryScript,
+		[3]uint32{WinSvcStateStartPending, 0, 0},
+		[3]uint32{WinSvcStateStartPending, 0, 1},
+		[3]uint32{WinSvcStateStartPending, 0, 2},
+		[3]uint32{WinSvcStateStartPending, 0, 3},
+		[3]uint32{WinSvcStateRunning, 4242, 3})
+	s := winSvcTestScheduler(f)
+	spec, _ := winSvcSpec(t)
+
+	res, err := s.Install(spec)
+	require.NoError(t, err, "advancing checkpoints keep the verify alive")
+	assert.True(t, res.ServiceActive)
+}
+
+// TestWinSvcVerifyStaleCheckpointTimesLoud pins the stale budget: a
+// StartPending whose CheckPoint never advances for the stale budget is a
+// failed start by the SCM's own wait-hint contract — the verify gives up
+// loud at exactly that point instead of burning the ceiling.
+func TestWinSvcVerifyStaleCheckpointTimesLoud(t *testing.T) {
+	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
+	f.queryScript = append(f.queryScript,
+		[3]uint32{WinSvcStateStartPending, 0, 0})
+	s := NewWinSvcScheduler(f).
+		withStopPolling(time.Millisecond, 4).
+		withVerifyPolling(time.Millisecond, 200).
+		withStaleVerify(10)
+	spec, dataDir := winSvcSpec(t)
+
+	_, err := s.Install(spec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "made no progress")
+	assert.Contains(t, err.Error(), "CheckPoint 0 never advanced")
+	assert.Contains(t, err.Error(), filepath.Join(dataDir, "logs", "watch.log"))
 }

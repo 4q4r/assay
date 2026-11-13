@@ -241,3 +241,62 @@ func TestHandlerMalformedArgsFailLoud(t *testing.T) {
 	st := expectStatus(t, s)
 	require.Equal(t, svc.StartPending, st.State, "only StartPending was ever reported")
 }
+
+// TestHandlerStartPendingHeartbeatPins pins the SCM SERVICE_STATUS
+// checkpoint contract (the cycle-5 / 43414096837 fix): while the daemon is
+// wiring, the handler re-asserts StartPending with an INCREMENTED
+// CheckPoint on every heartbeat — a silent window lets the SCM assume an
+// error (dwWaitHint contract) and kill the start of a slow-but-healthy
+// wiring. Running is the LAST status the handler sends (the heartbeat is
+// drained first — a heartbeat landing after Running would walk the SCM's
+// state machine backwards), and Running carries CheckPoint 0 (no pending
+// operation).
+func TestHandlerStartPendingHeartbeatPins(t *testing.T) {
+	orig := startPendingHeartbeat
+	startPendingHeartbeat = 10 * time.Millisecond
+	t.Cleanup(func() { startPendingHeartbeat = orig })
+
+	s := make(chan svc.Status, 64)
+	r := make(chan svc.ChangeRequest)
+	release := make(chan struct{})
+	h := svcTestHandler(func(wired chan<- struct{}, _ <-chan struct{}) error {
+		time.Sleep(60 * time.Millisecond) // the wiring ladder — several heartbeats long
+		close(wired)
+		<-release
+		return nil
+	})
+	result := driveExecute(h, r, s)
+
+	first := expectStatus(t, s)
+	require.Equal(t, svc.StartPending, first.State)
+	require.Equal(t, uint32(0), first.CheckPoint, "the initial StartPending carries CheckPoint 0")
+
+	// The heartbeats: StartPending updates with strictly advancing
+	// checkpoints for as long as the wiring runs.
+	var lastCP uint32
+	for seen := 0; seen < 2; {
+		st := expectStatus(t, s)
+		require.Equal(t, svc.StartPending, st.State)
+		require.Greater(t, st.CheckPoint, lastCP, "each heartbeat increments the CheckPoint")
+		lastCP = st.CheckPoint
+		seen++
+	}
+
+	st := expectStatus(t, s)
+	require.Equal(t, svc.Running, st.State, "Running reported right after the wiring")
+	require.Equal(t, uint32(0), st.CheckPoint, "Running carries CheckPoint 0 — no pending operation")
+
+	// And nothing walks back: the next status can only be the StopPending
+	// the stop produces — never a late StartPending heartbeat.
+	r <- svc.ChangeRequest{Cmd: svc.Stop}
+	next := expectStatus(t, s)
+	require.Equal(t, svc.StopPending, next.State, "no heartbeat may land after Running")
+	close(release) // the daemon unwinds; the handler exits through the stop path
+	select {
+	case res := <-result:
+		require.Equal(t, uint32(0), res[0])
+		require.Equal(t, uint32(0), res[1])
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not exit after the stop completed")
+	}
+}

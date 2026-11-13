@@ -28,6 +28,13 @@
 #      a rename/copy over the running assay.exe must FAIL (the discipline
 #      the installer's stop→copy→start ordering exists for).
 #
+# Diagnostics run ALWAYS after the E2E step: the SCM service state, the
+# SCM/Application event-log tails, the data-dir tree, and the daemon's own
+# journal (watch.log). A service-context failure's stderr goes nowhere, so
+# the journal is the only place the exact wiring error lands — without this
+# capture every red cycle stayed undiagnosable (the round-4 disclosed
+# limit); with it, a red cycle carries its own root-cause evidence.
+#
 # The managed-core download during `assay install` is allowed to fail loud
 # (non-fatal by design — the waves retry): the E2E asserts the SERVICE
 # lifecycle, not the core download.
@@ -141,6 +148,46 @@ jobs:
           }
           "uninstall OK (no running service, binary kept)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
+      - name: SCM diagnostics (service state, event log, daemon journal)
+        # ALWAYS: on a red E2E this is the root-cause evidence (the
+        # round-4 disclosed limit — "cannot fully distinguish wiring-slow
+        # from daemon-failed" — persisted because every failed cycle
+        # skipped the artifact step and never captured the service side);
+        # on a green one it documents the lifecycle. Every probe is
+        # fault-tolerant: an absent service (sc.exe rc 1060) must not
+        # fail this step.
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "### SCM diagnostics" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          $sections = [ordered]@{
+            'sc query'     = { sc.exe query assay }
+            'sc qfailure'  = { sc.exe qfailure assay }
+            'event log (SCM)' = {
+              wevtutil qe System "/q:*[System[(Provider[@Name='Service Control Manager'])]]" /c:15 /rd:true /f:text
+            }
+            'event log (Application)' = {
+              wevtutil qe Application "/q:*[System[(Provider[@Name='Service Control Manager'] or Provider[@Name='Application Error'] or Provider[@Name='Windows Error Reporting'])]]" /c:15 /rd:true /f:text
+            }
+            'data dir tree' = {
+              Get-ChildItem -Recurse "$env:LOCALAPPDATA\assay" -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String
+            }
+            'daemon journal (watch.log tail)' = {
+              $log = "$env:LOCALAPPDATA\assay\logs\watch.log"
+              if (Test-Path $log) { Get-Content $log -Tail 120 } else { "(no journal — the service never opened its log sink)" }
+            }
+          }
+          foreach ($name in $sections.Keys) {
+            "## $name" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            $out = & $sections[$name] 2>&1 | Out-String
+            $out | Out-File -Append $env:GITHUB_STEP_SUMMARY
+            Write-Host "--- $name ---"
+            Write-Host $out
+          }
+          exit 0
+
       - name: Recovery actions visible (§2.2.4 parity)
         shell: pwsh
         run: |
@@ -158,6 +205,7 @@ jobs:
           .\assay.exe uninstall
 
       - name: Upload the install log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-scm-install-log

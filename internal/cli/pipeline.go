@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -2440,8 +2441,9 @@ one machine-readable JSON document (schema_version 1.1); both flags
 compose — the overlap matrix is always part of the JSON.
 
 Install detection reads the directories given via --bin-dir / --unit-dir
-(defaults identical to ` + "`install`" + `: ~/.local/bin and
-~/.config/systemd/user). An install made with custom paths is tracked by
+(defaults identical to ` + "`install`" + `: the per-GOOS §4.2 install defaults —
+~/.local/bin on unix, %LOCALAPPDATA%\\assay\\bin on windows — and
+~/.config/systemd/user for the unix unit dir). An install made with custom paths is tracked by
 passing the same values here — assay keeps no state file by design.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			res, err := resolveCommand(*cfgPath)
@@ -2451,7 +2453,7 @@ passing the same values here — assay keeps no state file by design.`,
 			return runStatus(cmd, res)
 		},
 	}
-	cmd.Flags().StringVar(&binDir, "bin-dir", "~/.local/bin",
+	cmd.Flags().StringVar(&binDir, "bin-dir", installBinDirDefault(runtime.GOOS),
 		"directory to inspect for the installed assay binary (same default as install)")
 	cmd.Flags().StringVar(&unitDir, "unit-dir", "~/.config/systemd/user",
 		"systemd user unit directory to inspect (same default as install)")
@@ -2526,7 +2528,13 @@ func runStatus(cmd *cobra.Command, res *config.Resolved) error {
 // are absent — direct runStatus callers with a bare cobra command get the
 // documented default behavior.
 func statusInstallDirs(cmd *cobra.Command) (string, string) {
-	binDir, unitDir := "~/.local/bin", "~/.config/systemd/user"
+	// The bin-dir default is the INSTALL default per GOOS (§4.2): on windows
+	// that is %LOCALAPPDATA%\assay\bin, NOT the unix ~/.local/bin — the old
+	// literal made `assay status` report "binary: not installed" on a host
+	// where install HAD installed (windows SCM E2E cycle 5, 43414096837:
+	// the log carried "C:\Users\runneradmin\.local\bin\assay.exe missing"
+	// right after a successful copyBinary to the §4.2 path).
+	binDir, unitDir := installBinDirDefault(runtime.GOOS), "~/.config/systemd/user"
 	if f := cmd.Flags().Lookup("bin-dir"); f != nil {
 		binDir = f.Value.String()
 	}

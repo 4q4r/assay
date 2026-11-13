@@ -117,9 +117,47 @@ const winSvcStopBound = 30 * time.Minute
 // bound before Running (run 43358084471).
 const WinSvcStartPendingWaitHint = 30 * time.Second
 
+// WinSvcStartVerifyCeiling is awaitRunning's TOTAL budget: three declared
+// windows. The handler heartbeats the StartPending with an incremented
+// CheckPoint while the wiring runs (cmd/assay svc handler — the SCM
+// SERVICE_STATUS contract), so the SCM keeps the start alive as long as the
+// daemon actually makes progress; the ceiling only bounds the pathological
+// case (a wiring ladder that outlives three windows is not a start, it is a
+// wedge). The old budget of exactly ONE window silently turned a slow
+// cold-runner wiring into a permanent SCM start failure (cycle 5,
+// 43414096837 — the full 30s elapsed with the service never Running).
+const WinSvcStartVerifyCeiling = 3 * WinSvcStartPendingWaitHint
+
+// WinSvcStartStaleBudget is how long the running-verify may watch a service
+// whose CheckPoint never advances: exactly ONE declared window — the SCM's
+// own wait-hint contract (SERVICE_STATUS dwWaitHint: when the hint elapses
+// with no CheckPoint increment and no state change, the SCM may assume an
+// error and stop the service). A handler that reports StartPending once and
+// then goes silent for a full window is treated as failed at the same point
+// the SCM itself gives up — never later.
+const WinSvcStartStaleBudget = WinSvcStartPendingWaitHint
+
 // WinSvcStopBound exposes the uninstall stop-poll bound for the installer
 // (§2.2.7: bounded 30 min, TimeoutStopSec=1800 parity).
 func WinSvcStopBound() time.Duration { return winSvcStopBound }
+
+// WinSvcStartExitedMessage is the fast-fail the running-verify reads when
+// the service has already fallen back to Stopped after the start request:
+// the start FAILED (the process exited during start, or the SCM refused
+// it) — the SCM recovery actions will retry it, but every retry of a
+// deterministic failure fails identically, so polling the remaining
+// ceiling only burns minutes before reporting the same verdict. The
+// message carries the EXACT evidence pointers (owner UX rule): the service
+// query, the event log, and the daemon's own journal — a service-context
+// failure's stderr goes nowhere, so the journal is where the wiring error
+// is written (the round-4 disclosed limit: "cannot fully distinguish
+// wiring-slow from daemon-failed-for-another-windows-only-reason").
+func WinSvcStartExitedMessage(journal string) string {
+	return "install: the assay service exited during start — inspect by hand:\n" +
+		"  sc.exe query assay\n" +
+		"  event log: Windows Logs → Application (Service Control Manager entries)\n" +
+		"  journal:   " + journal + " (the daemon's file log sink — a service's stderr goes nowhere)"
+}
 
 // WinSvcStopTimeoutMessage is the loud §2.2.7 expiry: the bounded wait ran
 // out, so the message carries the EXACT commands to run by hand — the

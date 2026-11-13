@@ -286,6 +286,23 @@ func TestInstallBinDirDefaultTable(t *testing.T) {
 	assert.Equal(t, "~/.local/bin", installBinDirDefault("darwin"))
 }
 
+// TestStatusInstallDirsFollowInstallDefault pins the status-side wiring
+// (cycle 5, 43414096837): the status command's bin-dir default comes from
+// installBinDirDefault — the §4.2 per-GOOS default — never the old unix
+// literal, which made `assay status` on windows report "binary: not
+// installed" for an installed binary (the log carried
+// C:\Users\runneradmin\.local\bin\assay.exe missing right after a
+// successful copyBinary). statusInstallDirs reads runtime.GOOS directly,
+// so this pin proves the call-site wiring on the host it runs on; the
+// windows VALUE of that wiring is exercised by the windows-scm CI leg,
+// which runs `assay status` against a real install.
+func TestStatusInstallDirsFollowInstallDefault(t *testing.T) {
+	cmd := newStatusCommand(new(string))
+	binDir, _ := statusInstallDirs(cmd)
+	assert.Equal(t, config.ExpandHome(installBinDirDefault(runtime.GOOS)), binDir,
+		"the status bin-dir default must be the per-GOOS install default")
+}
+
 // TestSchedulerFactoryRefusesOutsideWindows pins the loud dead-path
 // contract of the non-windows factory: the scheduler it hands out refuses
 // Available() with a windows-naming reason (never a nil scheduler — no

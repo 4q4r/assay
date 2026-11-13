@@ -58,11 +58,38 @@ func TestWinSvcRecoveryPins(t *testing.T) {
 
 // TestWinSvcStartPendingWaitHintPinned pins the §2.2.2 start window (the run
 // 43358084471 fix): the ONE contract constant the handler declares to the
-// SCM and the installer's running-verify waits. The scheduler-side parity
-// pin (budget == hint) lives in the windows-tagged suite beside the
-// constructor it pins.
+// SCM and the installer's running-verify paces against. The scheduler-side
+// parity pin (ceiling == 3×hint, stale == hint) lives in the windows-tagged
+// suite beside the constructor it pins.
 func TestWinSvcStartPendingWaitHintPinned(t *testing.T) {
 	assert.Equal(t, 30*time.Second, WinSvcStartPendingWaitHint)
+}
+
+// TestWinSvcStartVerifyGeometryPinned pins the cycle-5 (43414096837) fix
+// geometry: the running-verify ceiling is THREE declared windows — the
+// handler's checkpoint heartbeat keeps the SCM start alive while the wiring
+// makes progress, so a slow cold-runner wiring survives — and the
+// checkpoint-stale budget is exactly ONE window: the SCM's own wait-hint
+// failure point (SERVICE_STATUS dwWaitHint — a hint with no CheckPoint
+// increment and no state change means the SCM may assume an error).
+func TestWinSvcStartVerifyGeometryPinned(t *testing.T) {
+	assert.Equal(t, 3*WinSvcStartPendingWaitHint, WinSvcStartVerifyCeiling)
+	assert.Equal(t, WinSvcStartPendingWaitHint, WinSvcStartStaleBudget)
+}
+
+// TestWinSvcStartExitedMessageNamesEvidence pins the fast-fail message: a
+// service that fell back to Stopped after Start is a FAILED start, and the
+// message carries every evidence pointer — the service query, the event
+// log, and the daemon journal (a service-context wiring failure's stderr
+// goes nowhere, so the journal is the only place the exact error lands —
+// the round-4 disclosed limit's antidote).
+func TestWinSvcStartExitedMessageNamesEvidence(t *testing.T) {
+	msg := WinSvcStartExitedMessage(`C:\Users\u\AppData\Local\assay\logs\watch.log`)
+	assert.Contains(t, msg, "install: the assay service exited during start")
+	assert.Contains(t, msg, "sc.exe query assay")
+	assert.Contains(t, msg, "Windows Logs → Application")
+	assert.Contains(t, msg, `C:\Users\u\AppData\Local\assay\logs\watch.log`)
+	assert.Contains(t, msg, "stderr goes nowhere")
 }
 
 // TestWinSvcStateStrings pins the Query-state rendering (§2.2.8): the
