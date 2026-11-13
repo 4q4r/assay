@@ -114,7 +114,11 @@ func TestRenderReportGoldenNoColor(t *testing.T) {
 		require.NoError(t, os.WriteFile(goldenPath, []byte(out), 0o644), "first run materializes the golden")
 		return
 	}
-	assert.Equal(t, string(golden), out,
+	// .gitattributes pins LF checkouts; the strip is the belt to that
+	// suspenders for working trees materialized before the attribute (a
+	// windows checkout converts LF→CRLF and the CRLF bytes are checkout
+	// noise, never render content — the renderer emits \n).
+	assert.Equal(t, strings.ReplaceAll(string(golden), "\r\n", "\n"), out,
 		"rendered report diverged from the golden file — if intentional, regenerate testdata/golden-check-report.txt deliberately")
 }
 

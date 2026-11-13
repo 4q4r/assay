@@ -361,7 +361,9 @@ func TestRenderIsDeterministicForGoldenRegression(t *testing.T) {
 	goldenPath := filepath.Join("testdata", "golden-own-render.json")
 	golden, err := os.ReadFile(goldenPath)
 	if err == nil {
-		assert.Equal(t, string(golden), string(b1),
+		// LF-normalized against windows checkout noise (.gitattributes pins
+		// LF; the strip is the belt) — CRLF is never render content.
+		assert.Equal(t, strings.ReplaceAll(string(golden), "\r\n", "\n"), string(b1),
 			"rendered output diverged from the golden file — if intentional, regenerate testdata/golden-own-render.json deliberately")
 	} else {
 		t.Logf("golden file not found (%v) — write it on first run", err)

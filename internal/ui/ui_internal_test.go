@@ -141,7 +141,9 @@ func TestTablePlainGolden(t *testing.T) {
 			"first run materializes the golden")
 		return
 	}
-	require.Equal(t, string(golden), out,
+	// LF-normalized against windows checkout noise (.gitattributes pins
+	// LF; the strip is the belt) — CRLF is never render content.
+	require.Equal(t, strings.ReplaceAll(string(golden), "\r\n", "\n"), out,
 		"table diverged from testdata/golden-table-plain.txt — regenerate deliberately")
 }
 

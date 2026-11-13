@@ -1,0 +1,6 @@
+# The render goldens are byte-pinned render contracts: a windows checkout
+# with core.autocrlf=true must never turn their LF bytes into CRLF, or the
+# byte-compare in the golden tests fails with a phantom whole-file diff
+# (run 43330792666). LF in the working tree on every platform.
+**/testdata/*.txt text eol=lf
+**/testdata/*.json text eol=lf

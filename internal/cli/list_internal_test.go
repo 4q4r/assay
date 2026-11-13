@@ -270,7 +270,10 @@ func TestListColorOffGolden(t *testing.T) {
 			"first run materializes the golden")
 		return
 	}
-	require.Equal(t, string(golden), out,
+	// LF-normalized: the .gitattributes pin keeps checkouts LF; this strip
+	// is the belt for pre-attribute working trees (windows CRLF checkout
+	// noise is never render content).
+	require.Equal(t, strings.ReplaceAll(string(golden), "\r\n", "\n"), out,
 		"list output diverged from testdata/golden-list-plain.txt — regenerate deliberately")
 }
 
