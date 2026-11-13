@@ -493,7 +493,16 @@ func (m *Manager) release() {
 
 // ensureRunningLocked is EnsureRunning under mu.
 func (m *Manager) ensureRunningLocked(ctx context.Context) error {
-	if m.childAliveLocked() {
+	// childAliveLocked only means "not reaped yet": between a hard kill
+	// (SIGKILL after a manual daemon kill — the T4-I-1 shape b) and the
+	// reaper's Wait() completing, the handle is still open while the child
+	// is a zombie that will never serve. Treating that window as "alive"
+	// made the candidate-missing revive a no-op on exactly the hosts whose
+	// scheduling lost the race (darwin CI: "Condition never satisfied", run
+	// 43330792666). A live child is one that is serving (a mid-boot child
+	// is unobservable here: spawnLocked awaits readiness under m.mu, so no
+	// concurrent EnsureRunning can run during boot).
+	if m.childAliveLocked() && m.portServing() {
 		return nil
 	}
 	// A2 adoption: children are reparented, not killed, when the daemon
