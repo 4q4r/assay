@@ -105,6 +105,18 @@ func WinSvcStateString(state uint32) string {
 // the exact TimeoutStopSec=1800 parity.
 const winSvcStopBound = 30 * time.Minute
 
+// WinSvcStartPendingWaitHint is ONE definition for the start window: the
+// service handler declares it to the SCM as its StartPending WaitHint
+// (cmd/assay svc handler — "we may take this long to reach Running"), and
+// the installer's running-verify (awaitRunning) waits exactly this long —
+// the installer may never give up BEFORE the window it itself declared.
+// Wiring on the daemon side is sub-second (§5.10), but the daemon's first
+// bootstrap is best-effort-retried inside the wired path, and a cold runner
+// (SCM process creation, Defender first-run scan of a fresh image) adds
+// seconds — the live first-ever SCM E2E run hit the old arbitrary 10×500ms
+// bound before Running (run 43358084471).
+const WinSvcStartPendingWaitHint = 30 * time.Second
+
 // WinSvcStopBound exposes the uninstall stop-poll bound for the installer
 // (§2.2.7: bounded 30 min, TimeoutStopSec=1800 parity).
 func WinSvcStopBound() time.Duration { return winSvcStopBound }

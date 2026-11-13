@@ -56,6 +56,15 @@ func TestWinSvcRecoveryPins(t *testing.T) {
 	assert.Equal(t, WinSvcRecoveryRestart, WinSvcRecoveryType(1))
 }
 
+// TestWinSvcStartPendingWaitHintPinned pins the §2.2.2 start window (the run
+// 43358084471 fix): the ONE contract constant the handler declares to the
+// SCM and the installer's running-verify waits. The scheduler-side parity
+// pin (budget == hint) lives in the windows-tagged suite beside the
+// constructor it pins.
+func TestWinSvcStartPendingWaitHintPinned(t *testing.T) {
+	assert.Equal(t, 30*time.Second, WinSvcStartPendingWaitHint)
+}
+
 // TestWinSvcStateStrings pins the Query-state rendering (§2.2.8): the
 // stable Win32 SERVICE_* numbers map to honest human names; unknown values
 // render with their number (never a fake "Running").

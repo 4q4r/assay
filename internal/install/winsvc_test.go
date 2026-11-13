@@ -485,3 +485,15 @@ func indexOf(vs []string, v string) int {
 	}
 	return -1
 }
+
+// TestWinSvcStartVerifyParity pins the §2.2.2 start-window parity (the run
+// 43358084471 fix): the running-verify budget (awaitRunning's default
+// pacing) waits EXACTLY the StartPending WaitHint the service handler
+// declares to the SCM — the installer may never give up before the window
+// it itself granted, and both sides share the one contract constant
+// (install.WinSvcStartPendingWaitHint, consumed by cmd/assay's handler).
+func TestWinSvcStartVerifyParity(t *testing.T) {
+	s := NewWinSvcScheduler(&fakeWinSvcActions{})
+	assert.Equal(t, WinSvcStartPendingWaitHint, time.Duration(s.verifyAttempts)*s.verifyInterval,
+		"awaitRunning's default budget must equal the declared StartPending WaitHint")
+}

@@ -88,7 +88,13 @@ func NewWinSvcScheduler(actions winSvcActions) *WinSvcScheduler {
 		// 30 minutes — the §2.2.7 bound (TimeoutStopSec=1800 parity).
 		stopPollAttempts: 30 * 60 * 2,
 		verifyInterval:   500 * time.Millisecond,
-		verifyAttempts:   10,
+		// The running-verify waits exactly the StartPending WaitHint the
+		// service handler declares to the SCM (§2.2.2): the installer may
+		// never give up before the window it itself granted. The old
+		// arbitrary 10×500ms expired before the daemon finished wiring on
+		// the first-ever SCM E2E run (43358084471 — the daemon's best-effort
+		// bootstrap retries + a cold runner's start latency).
+		verifyAttempts: int(WinSvcStartPendingWaitHint / (500 * time.Millisecond)),
 	}
 }
 
@@ -278,7 +284,9 @@ func (s *WinSvcScheduler) awaitRunning() error {
 		time.Sleep(s.verifyInterval)
 	}
 	return errors.New("install: the assay service did not report Running within " +
-		fmt.Sprintf("%d×%s — inspect by hand: sc.exe query assay", s.verifyAttempts, s.verifyInterval))
+		fmt.Sprintf("%d×%s — inspect by hand: sc.exe query assay "+
+			"(event log: Windows Logs → Application carries a service that exited during start)",
+			s.verifyAttempts, s.verifyInterval))
 }
 
 // winSvcCommandLine renders the service command line for UpdateConfig

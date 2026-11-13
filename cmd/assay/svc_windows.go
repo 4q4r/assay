@@ -17,8 +17,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"assay/internal/cli"
+	"assay/internal/install"
 
 	"golang.org/x/sys/windows/svc"
 )
@@ -28,11 +30,14 @@ import (
 // counts it as a failure and the recovery actions restart the service.
 const serviceExitFailure uint32 = 1
 
-// StartPending/StopPending wait hints (ms): wiring is sub-second today
-// (§5.10), the stop bound mirrors the systemd TimeoutStopSec=1800 parity —
-// the SCM's own pending-expected windows, not timeouts of ours.
+// StartPending/StopPending wait hints (ms). StartPending is ONE definition
+// with the installer (install.WinSvcStartPendingWaitHint): the handler
+// declares the window to the SCM and awaitRunning waits exactly it — the
+// two sides can never drift. StopPending mirrors the systemd
+// TimeoutStopSec=1800 parity — the SCM's own pending-expected windows, not
+// timeouts of ours.
 const (
-	startPendingWaitHintMs = 30000
+	startPendingWaitHintMs = uint32(install.WinSvcStartPendingWaitHint / time.Millisecond)
 	stopPendingWaitHintMs  = 1800000
 )
 
