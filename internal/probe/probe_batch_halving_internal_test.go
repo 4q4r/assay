@@ -227,9 +227,15 @@ func TestAdaptiveBatchHalvingFloorFailsLoud(t *testing.T) {
 // NEVER trigger halving: exactly one boot, no halving lines, outcomes carry
 // their real failure class (not instance-boot).
 func TestAdaptiveBatchHandshakeFailuresDoNotHalve(t *testing.T) {
-	site := healthySite(t) // unused as upstream — the relay points at a refused endpoint
-	deadHost, deadPort := refusedEndpoint(t)
-	socks := newSocksServer(t, net.JoinHostPort(deadHost, strconv.Itoa(deadPort)))
+	site := healthySite(t) // unused as upstream — the relay points at a refused port
+	// Port 1 (tcpmux) carries no listener in any test environment and sits
+	// below the kernel ephemeral range, so nothing re-binds it: a guaranteed
+	// refused upstream without the mint-a-port churn (a minted refused
+	// endpoint followed by the socks :0 bind used to let the kernel hand the
+	// socks listener the just-freed dead port, flipping the fixture's own
+	// upstream alive). If anything EVER listens there, the Alive assertions
+	// below fail loud — the fixture verifies itself.
+	socks := newSocksServer(t, "127.0.0.1:1")
 	rec := &batchBootRecorder{socksAddr: socks.Addr()}
 	nodes := halvingNodes(t, "handshake", 40)
 
@@ -270,8 +276,13 @@ func TestAdaptiveBatchHalvingSkipsPrefilteredNodes(t *testing.T) {
 	require.NoError(t, err)
 	alivePort, err := strconv.Atoi(alivePortStr)
 	require.NoError(t, err)
-	deadHost, deadPort := refusedEndpoint(t)
+	// The socks listener is created BEFORE the refused endpoint: it binds
+	// 127.0.0.1:0 and the kernel hands a fresh :0 bind the most recently
+	// freed ephemeral port — a socks bind after refusedEndpoint used to come
+	// up ON the dead port and answer the pre-filter's dial honestly (the
+	// fixture served on its own dead endpoint).
 	socks := newSocksServer(t, site.Listener.Addr().String())
+	deadHost, deadPort := refusedEndpoint(t)
 	rec := &batchBootRecorder{
 		failFirst: 1,
 		bootErr:   errors.New("boom: temp xray instance failed to start"),

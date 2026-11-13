@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -182,7 +183,10 @@ func TestVerifyApplied(t *testing.T) {
 // rules, catch-all last, all balancers) embedded in a minimal config JSON —
 // verbatim from the gated render, never hand-assembled (plan §3.5). The
 // temp file is 0600 (the render artifact discipline) and the cleanup removes
-// it.
+// it. The 0600 pin is asserted where POSIX mode bits exist; windows has no
+// POSIX mode bits — ACLs own permissions there and os.Stat synthesizes 0666
+// for a writable file regardless of the CreateTemp/Chmod 0600 discipline
+// (run 43428880158).
 
 func TestWritePayloadFileEmbedsEntireRoutingSection(t *testing.T) {
 	routing := map[string]any{
@@ -204,7 +208,9 @@ func TestWritePayloadFileEmbedsEntireRoutingSection(t *testing.T) {
 		string(raw), "the payload carries ONLY the routing section — verbatim, nothing else")
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), st.Mode().Perm(), "payload file is 0600")
+	if runtime.GOOS != "windows" { // windows has no POSIX mode bits — ACLs own permissions there
+		assert.Equal(t, os.FileMode(0o600), st.Mode().Perm(), "payload file is 0600")
+	}
 	assert.True(t, strings.HasPrefix(filepath.Base(path), "assay-apply-payload-"), "recognizable temp name")
 
 	cleanup()
