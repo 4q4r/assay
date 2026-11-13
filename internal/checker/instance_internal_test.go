@@ -529,7 +529,7 @@ func TestFreeInstancePortSkipsOccupiedAndFailsLoud(t *testing.T) {
 	// free (skipped under a foreign holder — the skip assertions pin the rest).
 	if ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(instancePortMin))); err == nil {
 		require.NoError(t, ln.Close())
-		first, ferr := freeInstancePort(ctx)
+		first, ferr := freeInstancePort(ctx, nil)
 		require.NoError(t, ferr)
 		assert.Equal(t, instancePortMin, first, "a free range hands out its lowest port")
 	}
@@ -549,7 +549,7 @@ func TestFreeInstancePortSkipsOccupiedAndFailsLoud(t *testing.T) {
 		}
 	}()
 
-	next, err := freeInstancePort(ctx)
+	next, err := freeInstancePort(ctx, nil)
 	require.NoError(t, err)
 	assert.NotContains(t, occupied, next, "occupied ports must be skipped, never handed out")
 	assert.GreaterOrEqual(t, next, instancePortMin)
@@ -567,9 +567,38 @@ func TestFreeInstancePortSkipsOccupiedAndFailsLoud(t *testing.T) {
 			listeners = append(listeners, ln)
 		}
 	}
-	_, err = freeInstancePort(ctx)
+	_, err = freeInstancePort(ctx, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no free port")
+}
+
+// TestFreeInstancePortNeverReissuesWithinABatch pins the batch-allocation
+// contract: two consecutive scans for ONE batch must never return the same
+// port. The bind-probe closes each candidate before returning, so an
+// unconditioned second scan re-finds the just-released port free and a
+// 2-outbound batch rendered TWO inbounds on ONE port — real xray dies on the
+// second bind (EADDRINUSE) and every multi-outbound batch failed during
+// startup (diag-proved on the flaking boot-death test: every failing boot
+// carried ports=[P P]).
+func TestFreeInstancePortNeverReissuesWithinABatch(t *testing.T) {
+	ctx := context.Background()
+	used := map[int]struct{}{}
+
+	first, ferr := freeInstancePort(ctx, used)
+	require.NoError(t, ferr)
+	used[first] = struct{}{}
+
+	second, serr := freeInstancePort(ctx, used)
+	require.NoError(t, serr)
+	assert.NotEqual(t, first, second,
+		"consecutive allocations for one batch must hand out distinct ports — "+
+			"a duplicate inbound port kills the real core at bind time")
+	used[second] = struct{}{}
+
+	third, terr := freeInstancePort(ctx, used)
+	require.NoError(t, terr)
+	assert.NotEqual(t, first, third)
+	assert.NotEqual(t, second, third, "the used-set excludes every port the batch already claimed")
 }
 
 // The suite constructs temp instances ONLY inside the disjoint test band —

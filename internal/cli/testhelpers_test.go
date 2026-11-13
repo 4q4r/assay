@@ -192,8 +192,11 @@ func cliFakeBinary(t *testing.T) string {
 // disjoint: production temp instances churn 18xxx (the live watch daemon's
 // band), THIS package allocates 21800-21999 (21800 + 2n), internal/core's
 // fake cores own 22900-22999 (download/AutoUpdate fixtures 22900-2292x,
-// manager fake cores 22940-22980), the checker suite owns 28500-28799, and
-// kernel ephemerals sit above that.
+// manager fake cores 22940-22980), the checker suite owns 28500-28799, the
+// probe boot smoke owns 29500-29799 (split from the checker band: two
+// concurrent test binaries must not share a boot band — the smoke's real
+// xray bind answered a checker death-test's readiness dial), and kernel
+// ephemerals sit above that.
 //
 // Flake-protocol refinement (T6 fix round; T7 fix round 1 completed the
 // separation): internal/core's fixed test ports ORIGINALLY sat inside this

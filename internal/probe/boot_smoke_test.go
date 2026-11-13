@@ -17,20 +17,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testPortBand is the DISJOINT temp-instance scan band this smoke boots into
-// — MUST match the checker suite's band (instance_internal_test.go): both
-// binaries boot through the same StartTempXray scan, and the production
-// watch daemon churns the 18xxx band hourly on this box (full -race runs
-// used to flake against that live churn — live-ops fix).
+// testPortBand is this smoke's OWN temp-instance scan band — DISJOINT from
+// the checker suite's 28500-28799 on purpose. The old "MUST match the
+// checker band" sharing is exactly what flaked the checker boot-death tests:
+// under a full -race run both binaries are concurrent PROCESSES, this smoke
+// boots a REAL xray whose bind lands ~100ms after spawn, and the checker's
+// boot-death children BIND NOTHING — so the smoke's delayed bind answered
+// the death test's readiness dial and a startup exit was reported as a
+// successful boot (diag-proved: the failing run's ss carried
+// users:(("xray",...fd=3)) on 127.0.0.1:28500 while the checker.test child
+// was an exiting fake). Concurrent processes must not share a boot band.
+// Still below the kernel ephemeral range (32768+) and clear of the
+// production 18xxx band the live daemon churns (live-ops fix, kept).
 const (
-	testPortBandMin = 28500
-	testPortBandMax = 28799
+	testPortBandMin = 29500
+	testPortBandMax = 29799
 )
 
-// TestMain pins the smoke's temp instances to the disjoint test band BEFORE
+// TestMain pins the smoke's temp instances to its own disjoint band BEFORE
 // any test runs: real temp instances must boot OUTSIDE the production 18xxx
-// band — the live watch daemon churns it hourly on this box, and full -race
-// runs used to flake against that live churn (live-ops fix).
+// band (the live watch daemon churns it hourly) and OUTSIDE every other
+// test binary's band — cross-process band sharing is the false-ready class.
 func TestMain(m *testing.M) {
 	checker.SetTestPortBand(testPortBandMin, testPortBandMax)
 	os.Exit(m.Run())

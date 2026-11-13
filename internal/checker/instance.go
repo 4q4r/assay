@@ -214,7 +214,7 @@ func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[st
 	if err != nil {
 		return nil, err
 	}
-	port, err := freeInstancePort(ctx)
+	port, err := freeInstancePort(ctx, nil)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
@@ -289,14 +289,22 @@ func StartTempXrayBatch(
 		return nil, err
 	}
 
-	// Allocate consecutive ports for the batch
+	// Allocate DISTINCT ports for the batch: freeInstancePort re-issues the
+	// just-closed scan port when called twice in a row (bind-probe → close →
+	// the next scan finds it free again), which produced two inbounds on ONE
+	// port — real xray then dies on the second bind (EADDRINUSE) and every
+	// multi-outbound batch failed during startup (diag-proved: every
+	// 2-outbound boot logged ports=[P P]). The used-set makes the allocator
+	// skip ports this batch already took.
 	ports := make([]int, len(outbounds))
+	used := make(map[int]struct{}, len(outbounds))
 	for i := range outbounds {
-		p, err := freeInstancePort(ctx)
+		p, err := freeInstancePort(ctx, used)
 		if err != nil {
 			_ = os.RemoveAll(dir)
 			return nil, err
 		}
+		used[p] = struct{}{}
 		ports[i] = p
 	}
 
@@ -371,6 +379,32 @@ func StartTempXrayBatch(
 	return inst, nil
 }
 
+// notReadyAddrs names the batch ports that never accepted inside the boot
+// bound — the loud deadline error attributes the missing inbounds.
+func notReadyAddrs(ports []int, ready []bool) []string {
+	var out []string
+	for i, r := range ready {
+		if !r {
+			out = append(out, net.JoinHostPort("127.0.0.1", strconv.Itoa(ports[i])))
+		}
+	}
+	return out
+}
+
+// bootDeathIfGone converts a dial success into the loud boot-death error
+// when the child has already exited: a foreign binder on the scan band can
+// accept the readiness dial for a child that is gone (the false-ready class
+// the reproduced boot-death flake exposed — the accepting socket belonged to
+// another process's real xray). nil = the child still lives.
+func bootDeathIfGone(waitDone <-chan struct{}, waitErr error, stderr *limitedWriter) error {
+	select {
+	case <-waitDone:
+		return fmt.Errorf("xray exited during startup: %w\n%s", waitErr, tailStr(stderr.String(), 400))
+	default:
+		return nil
+	}
+}
+
 // awaitReadiness polls the socks inbound until it accepts (xray binds the
 // listener only after the config parses) or the boot bound expires, failing
 // fast when the child exits with its captured stderr tail.
@@ -392,6 +426,11 @@ func (x *xrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter
 			conn, err := dialer.DialContext(ctx, "tcp", x.Addr())
 			if err == nil {
 				_ = conn.Close()
+				// A successful dial is readiness only if OUR child still
+				// lives (bootDeathIfGone — the false-ready class).
+				if derr := bootDeathIfGone(x.waitDone(), x.waitErr, stderr); derr != nil {
+					return derr
+				}
 				return nil
 			}
 		}
@@ -445,15 +484,8 @@ func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedW
 		case <-ctx.Done():
 			return fmt.Errorf("instance boot canceled: %w", ctx.Err())
 		case <-deadline:
-			// Find which ports aren't ready
-			var notReady []string
-			for i, r := range ready {
-				if !r {
-					notReady = append(notReady, net.JoinHostPort("127.0.0.1", strconv.Itoa(b.ports[i])))
-				}
-			}
 			return fmt.Errorf("xray socks inbounds %v not ready within %s\n%s",
-				notReady, instanceBootBound, tailStr(stderr.String(), 400))
+				notReadyAddrs(b.ports, ready), instanceBootBound, tailStr(stderr.String(), 400))
 		case <-tick.C:
 			// Check all non-ready ports
 			for i := range b.ports {
@@ -467,6 +499,11 @@ func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedW
 					ready[i] = true
 					readyCount++
 					if readyCount == len(b.ports) {
+						// Same child-attribution rule as the single path
+						// (bootDeathIfGone — the false-ready class).
+						if derr := bootDeathIfGone(b.waitDone(), b.waitErr, stderr); derr != nil {
+							return derr
+						}
 						return nil // All ready
 					}
 				}
@@ -494,9 +531,12 @@ func socksUDPEnabled(outbound map[string]any) bool {
 	return proto == "hysteria"
 }
 
-func freeInstancePort(ctx context.Context) (int, error) {
+func freeInstancePort(ctx context.Context, used map[int]struct{}) (int, error) {
 	var lc net.ListenConfig
 	for p := instancePortMin; p <= instancePortMax; p++ {
+		if _, taken := used[p]; taken {
+			continue // this batch already claimed p — a second inbound on it is a boot defect
+		}
 		ln, err := lc.Listen(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p)))
 		if err != nil {
 			continue
