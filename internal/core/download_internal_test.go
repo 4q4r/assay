@@ -43,11 +43,17 @@ func fakeCoreReleaseServer(t *testing.T, tag, binSource, dgstOverride string, ex
 	// Mirrors internal/xrayupdate's platformAssets entries for the release
 	// host matrix; the map is unexported and its names are pinned by
 	// TestAssetForPlatform + TestReleaseFixtureServesFullReleaseMatrix.
+	// The FULL matrix the unix-gated hosts resolve (linux AND darwin): a
+	// linux-only index refused Xray-macos-arm64-v8a.zip on the darwin arm64
+	// runner with "release ships no asset" (run 43330792666) — the fixture
+	// must cover every host the suite runs on, distinct marks per entry.
 	archAssets := []struct{ name, mark string }{
 		{"Xray-linux-64.zip", "amd64"},
 		{"Xray-linux-arm64-v8a.zip", "arm64"},
 		{"Xray-linux-32.zip", "386"},
 		{"Xray-linux-arm32-v7a.zip", "arm7"},
+		{"Xray-macos-64.zip", "darwin-amd64"},
+		{"Xray-macos-arm64-v8a.zip", "darwin-arm64"},
 	}
 
 	var payload []byte
@@ -183,6 +189,8 @@ func TestCoreReleaseFixtureServesFullReleaseMatrix(t *testing.T) {
 		"Xray-linux-arm64-v8a.zip": "arm64",
 		"Xray-linux-32.zip":        "386",
 		"Xray-linux-arm32-v7a.zip": "arm7",
+		"Xray-macos-64.zip":        "darwin-amd64",
+		"Xray-macos-arm64-v8a.zip": "darwin-arm64",
 	}
 	require.Len(t, idx.Assets, len(want),
 		"the fake index carries exactly the release-matrix assets")

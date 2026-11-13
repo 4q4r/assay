@@ -87,12 +87,20 @@ func fakeXrayZipScript(t *testing.T, script, archMark string) []byte {
 // index must carry an asset for EVERY entry: production asks for the entry
 // of runtime.GOARCH (assetForPlatform), so a single-arch index makes every
 // update-path test pass on amd64 and fail on other runners.
-func releaseMatrix() []struct{ arch, arm string } {
-	return []struct{ arch, arm string }{
-		{arch: "amd64", arm: ""},
-		{arch: "arm64", arm: ""},
-		{arch: "386", arm: ""},
-		{arch: "arm", arm: "7"},
+func releaseMatrix() []struct{ plat, arch, arm string } {
+	// The FULL release matrix the unix-gated hosts resolve through
+	// assetForPlatform: linux AND darwin across the shipped arches. The
+	// original linux-only index passed on amd64 hosts and broke every other
+	// runner ("release ships no asset Xray-macos-arm64-v8a.zip") — the
+	// run-43330792666 fixture-hermeticity class: the fixture must cover
+	// every host the suite runs on, with distinct bodies per entry.
+	return []struct{ plat, arch, arm string }{
+		{plat: platLinux, arch: "amd64"},
+		{plat: platLinux, arch: "arm64"},
+		{plat: platLinux, arch: "386"},
+		{plat: platLinux, arch: "arm", arm: "7"},
+		{plat: platDarwin, arch: "amd64"},
+		{plat: platDarwin, arch: "arm64"},
 	}
 }
 
@@ -120,10 +128,10 @@ func releaseServer(t *testing.T, tag, script, checksum string) *httptest.Server 
 	assets := make(map[string]served, len(releaseMatrix()))
 	idx := release{TagName: tag}
 	for _, m := range releaseMatrix() {
-		name := assetForPlatform(platLinux, m.arch, m.arm)
+		name := assetForPlatform(m.plat, m.arch, m.arm)
 		require.NotEmpty(t, name,
-			"release-matrix arch linux/%s (arm %q) must map to a release asset", m.arch, m.arm)
-		body := fakeXrayZipScript(t, script, m.arch)
+			"release-matrix arch %s/%s (arm %q) must map to a release asset", m.plat, m.arch, m.arm)
+		body := fakeXrayZipScript(t, script, m.plat+"/"+m.arch)
 		sha := sha256Hex(body)
 		if checksum != "" {
 			sha = checksum
@@ -228,13 +236,13 @@ func TestReleaseFixtureServesFullReleaseMatrix(t *testing.T) {
 	}
 
 	for _, m := range releaseMatrix() {
-		name := assetForPlatform(platLinux, m.arch, m.arm)
+		name := assetForPlatform(m.plat, m.arch, m.arm)
 		require.NotEmpty(t, name,
-			"release-matrix arch linux/%s (arm %q) must map to a release asset", m.arch, m.arm)
+			"release-matrix arch %s/%s (arm %q) must map to a release asset", m.plat, m.arch, m.arm)
 		a, err := findAsset(&rel, name)
 		require.NoError(t, err,
-			"the fixture index must ship the linux/%s asset %q — production asks for it on that host", m.arch, name)
-		require.NotEmpty(t, bodies[a.Name], "the linux/%s asset must be downloadable", m.arch)
+			"the fixture index must ship the %s/%s asset %q — production asks for it on that host", m.plat, m.arch, name)
+		require.NotEmpty(t, bodies[a.Name], "the %s/%s asset must be downloadable", m.plat, m.arch)
 	}
 
 	seen := make(map[string]string, len(bodies))
