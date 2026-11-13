@@ -22,13 +22,24 @@ import (
 // files; the GOOS-neutral posture pins live in containment_internal_test.go
 // and the windows primitives are pinned by child_windows_test.go.
 func TestTransientManagerSkipsJobAttach(t *testing.T) {
+	// The readiness dial and the fake core's bind must be the SAME port:
+	// the manager waits on 127.0.0.1:<cfg.SocksPort> while the child binds
+	// the live.json inbound. A zero SocksPort falls back to the production
+	// default (10810) — on dev machines a REAL deployed core answers that
+	// dial and masks the mismatch as a false green (run 43396722388: every
+	// CI leg red at the 10s boot bound because nothing serves the default
+	// there). Each manager therefore carries the exact port its fixture
+	// pins, on the package's 22xxx test bands.
+	const daemonPort = 22984
+	const transientPort = 22986
+
 	log := &containmentLog{}
 
 	daemonDir := t.TempDir()
-	m := newTestManager(t, config.CoreConfig{RollbackStrikes: 3}, daemonDir, log)
+	m := newTestManager(t, config.CoreConfig{RollbackStrikes: 3, SocksPort: daemonPort}, daemonDir, log)
 	require.True(t, m.containment, "the daemon-style manager keeps the kill-on-close job containment")
 
-	cfg := config.CoreConfig{RollbackStrikes: 3}
+	cfg := config.CoreConfig{RollbackStrikes: 3, SocksPort: transientPort}
 	cfg.XrayBin = fakeBin(t)
 	transientDir := t.TempDir()
 	tm, err := NewTransientManager(cfg, transientDir, log)
@@ -50,7 +61,6 @@ func TestTransientManagerSkipsJobAttach(t *testing.T) {
 	// The daemon-shaped manager: the containment failure fails the spawn
 	// loud — a child outside the job could outlive the daemon, so the
 	// spawn refuses (the loud posture is pinned, not just the skip).
-	const daemonPort = 22984
 	writeLiveFixture(t, daemonDir, daemonPort, "")
 	err = m.EnsureRunning(context.Background())
 	require.Error(t, err, "the containment manager must refuse the spawn when the job attach fails")
@@ -61,7 +71,6 @@ func TestTransientManagerSkipsJobAttach(t *testing.T) {
 	// The transient manager: the same forced failure must be invisible —
 	// the attach primitive is never consulted, the spawn succeeds and the
 	// fake core serves (the A2 shape: the child survives this process).
-	const transientPort = 22986
 	writeLiveFixture(t, transientDir, transientPort, "")
 	require.NoError(t, tm.EnsureRunning(context.Background()))
 	require.Equal(t, 1, attaches,
