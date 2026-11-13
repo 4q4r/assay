@@ -4,3 +4,11 @@
 # (run 43330792666). LF in the working tree on every platform.
 **/testdata/*.txt text eol=lf
 **/testdata/*.json text eol=lf
+
+# The systemd templates are render sources pinned by regexp anchors
+# (`(?m)^ExecStart=...$` in internal/cli): a windows checkout with
+# core.autocrlf=true turns their LF bytes into CRLF and the `$` anchors
+# never match (runs 43330792666 + 43339290411 — the testdata pin above
+# missed the template dir). LF in the working tree on every platform.
+systemd/*.service text eol=lf
+systemd/README.md text eol=lf

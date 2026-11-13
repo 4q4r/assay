@@ -3,6 +3,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -98,20 +99,32 @@ func TestDetectSystemdFirstBeatsEverything(t *testing.T) {
 func TestDetectRunitFromRunsvdirCmdline(t *testing.T) {
 	home := t.TempDir()
 	fix := newProcFixture(t)
+	// The dir argument must read as ABSOLUTE on the RUNNING host: absoluteness
+	// is host-defined (filepath.IsAbs) — "/home/u/custom-services" is absolute
+	// on unix but a driveless RELATIVE path on windows, where the production
+	// code correctly falls to cwd resolution ("" here) and finds nothing (the
+	// windows "foreground" divergence in run 43339290411). The fixture spells
+	// the absolute dir per-host; the pin asserts through the same table.
+	svcDir := "/home/u/custom-services"
+	argv0 := "/usr/bin/runsvdir"
+	if runtime.GOOS == "windows" {
+		svcDir = `C:\Users\u\custom-services`
+		argv0 = `C:\Program Files\runit\runsvdir.exe`
+	}
 	// runsvdir with a NON-default service dir arg — the dir comes from the
 	// cmdline (§3.1.2: resolved from the process cmdline, never assumed),
 	// resolved against the process cwd when relative.
 	fix.addProc(t, 200, selfUID(), "runsvdir",
-		[]string{"/usr/bin/runsvdir", "-L", "/tmp/log", "/home/u/custom-services"}, "")
+		[]string{argv0, "-L", "/tmp/log", svcDir}, "")
 	exec := testExecutors(home)
 	exec.SvOnPath = func() bool { return true }
 	sched := Detect(fix.fs(), exec)
 	require.Equal(t, "runit", sched.Name())
 	rs, ok := sched.(*RunitScheduler)
 	require.True(t, ok, "Detect must return the concrete RunitScheduler")
-	// filepath.Clean normalizes separators per host (windows symlinks store
-	// backslash targets) — the pin spells it through the same table.
-	assert.Equal(t, filepath.FromSlash("/home/u/custom-services"), rs.ServiceDir)
+	// filepath.Clean normalizes separators per host — the pin spells the
+	// expected dir through the same table the fixture used.
+	assert.Equal(t, filepath.Clean(svcDir), rs.ServiceDir)
 }
 
 func TestDetectRunitRelativeDirResolvedAgainstProcCwd(t *testing.T) {

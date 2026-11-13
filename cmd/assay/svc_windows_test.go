@@ -131,7 +131,12 @@ func TestHandlerRunningNotGatedOnWave(t *testing.T) {
 }
 
 // TestHandlerInterrogateEchoes pins the interrogate contract: c.CurrentStatus
-// is echoed verbatim onto the status channel.
+// is echoed verbatim onto the status channel — and the handler still serves
+// a stop AFTER an interrogate. The echo alone never ends the service: the
+// handler's select loop waits for the next SCM command and the daemon double
+// waits on stopRequest, so without a Stop the exit wait below can only time
+// out (run 43339290411: the interrogate echo passed, then
+// "handler did not exit after the stop completed" — no stop had been sent).
 func TestHandlerInterrogateEchoes(t *testing.T) {
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
@@ -147,6 +152,12 @@ func TestHandlerInterrogateEchoes(t *testing.T) {
 	echo := svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	r <- svc.ChangeRequest{Cmd: svc.Interrogate, CurrentStatus: echo}
 	require.Equal(t, echo, expectStatus(t, s), "Interrogate echoes c.CurrentStatus verbatim")
+
+	// The stop that the exit wait below promises: Interrogate does not stop
+	// the service — Stop does, through the same seam as the happy path.
+	r <- svc.ChangeRequest{Cmd: svc.Stop}
+	require.Equal(t, svc.StopPending, expectStatus(t, s).State,
+		"Stop after Interrogate reports StopPending")
 
 	select {
 	case res := <-result:

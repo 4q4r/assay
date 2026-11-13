@@ -24,7 +24,14 @@ func readUnit(t *testing.T, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(systemdDir, name))
 	require.NoError(t, err, "unit template %s must exist in-repo (install renders it)", name)
-	return string(b)
+	// Checkout-noise belt: the pins below use `(?m)^...$` regexp anchors,
+	// which do not match before a `\r` — a windows checkout with
+	// core.autocrlf=true turns the template's LF bytes into CRLF and every
+	// anchored pin phantom-fails (runs 43330792666 + 43339290411; the
+	// .gitattributes LF pin is the root fix, this normalization is the belt
+	// for checkouts that predate or bypass it). Render content is never
+	// read from the working tree through this helper.
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
 
 func TestWatchUnitTemplate(t *testing.T) {

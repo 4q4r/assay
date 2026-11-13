@@ -19,7 +19,19 @@ import (
 func TestDownloadWindowCountsBytes(t *testing.T) {
 	payload := strings.Repeat("x", 128*1024) // 128 KB
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(payload))
+		// Two flushed chunks with a real gap: the sample window must be
+		// measurably long on EVERY host clock. Windows' monotonic clock has
+		// ~0.5ms granularity — an already-buffered loopback body completes
+		// within one tick and time.Since reports exactly 0 (run 43339290411:
+		// `"0s" is not positive`), so the pin needs a real measurement
+		// interval, not a lucky clock read.
+		flusher, ok := w.(http.Flusher)
+		assert.True(t, ok)
+		half := len(payload) / 2
+		_, _ = w.Write([]byte(payload[:half]))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(payload[half:]))
 	}))
 	defer site.Close()
 
