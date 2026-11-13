@@ -22,7 +22,9 @@
 #            needs pam_openrc at login → OWN item): an own-uid process
 #            named `openrc-user` (comm match) plus the real rc-update/rc-
 #            service binaries drive the detection, the script lands at
-#            ~/.config/rc/init.d/assay-watch mode 0644, passes `sh -n`, and
+#            ~/.config/rc/init.d/assay-watch mode 0755 (rc-update refuses a
+#            non-executable service — live-proved by run 43339290411), passes
+#            `sh -n`, and
 #            `rc-service --user assay-watch status` runs without a script
 #            parse error. The openrc version and ANY deviation (e.g. an
 #            image whose openrc predates 0.60 --user support) are recorded
@@ -67,7 +69,10 @@ jobs:
         with:
           go-version-file: go.mod
       - name: install runit
-        run: apt-get install -y --no-install-recommends runit
+        # procps: pgrep drives the liveness checks — the minimal trixie set
+        # omits it ("pgrep: not found", run 43339290411; the cron leg stayed
+        # green because crontab comes from the cron package).
+        run: apt-get install -y --no-install-recommends runit procps
       - name: build assay
         run: |
           set -e
@@ -124,7 +129,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: install s6
-        run: apt-get install -y --no-install-recommends s6
+        # procps: pgrep drives the liveness checks ("pgrep: not found",
+        # run 43339290411) — same reason as the runit leg.
+        run: apt-get install -y --no-install-recommends s6 procps
       - name: build assay
         run: |
           set -e
@@ -269,7 +276,7 @@ jobs:
           script=/root/.config/rc/init.d/assay-watch
           test -f "$script" || { echo "::error::openrc script missing at $script"; tail install.log; exit 1; }
           mode=$(stat -c '%a' "$script")
-          [ "$mode" = "644" ] || { echo "::error::openrc script mode is $mode, must be 644"; exit 1; }
+          [ "$mode" = "755" ] || { echo "::error::openrc script mode is $mode, must be 755 (rc-update refuses non-executable services)"; exit 1; }
           sh -n "$script" || { echo "::error::openrc script fails shell syntax check"; exit 1; }
           head -1 "$script" | grep -q openrc-run || { echo "::error::script is not an openrc-run script"; exit 1; }
           {

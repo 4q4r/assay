@@ -122,7 +122,7 @@ func TestOpenRCErrorsCarryTheExactCommandLine(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Script golden (§3.2) — 0644, openrc-run shape, supervise-daemon parity
+// Script golden (§3.2) — 0755, openrc-run shape, supervise-daemon parity
 // ---------------------------------------------------------------------------
 
 func TestOpenRCScriptGoldenExplicitConfig(t *testing.T) {
@@ -154,7 +154,7 @@ func TestOpenRCScriptRefusesShellHostilePaths(t *testing.T) {
 	}
 }
 
-func TestOpenRCInstallWritesScript0644AndActivates(t *testing.T) {
+func TestOpenRCInstallWritesScript0755AndActivates(t *testing.T) {
 	home := t.TempDir()
 	dataDir := filepath.Join(home, "data")
 	require.NoError(t, os.WriteFile(filepath.Join(home, "running-assay"), []byte("#!x\n"), 0o755))
@@ -174,7 +174,9 @@ func TestOpenRCInstallWritesScript0644AndActivates(t *testing.T) {
 	require.NoError(t, err)
 	st, err := os.Stat(scriptPath)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o644), st.Mode().Perm(), "the service script is 0644 (§3.2)")
+	assert.Equal(t, os.FileMode(0o755), st.Mode().Perm(),
+		"the service script is 0755 — rc-update refuses a non-executable service "+
+			"(live-proved by the alpine:edge leg, run 43339290411)")
 	assert.Contains(t, string(raw), "#!/sbin/openrc-run")
 	assert.Contains(t, string(raw), `command_args="watch -c `+spec.ConfigPath+`"`)
 	assert.Contains(t, string(raw), `supervisor="supervise-daemon"`)

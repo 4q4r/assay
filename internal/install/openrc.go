@@ -254,7 +254,9 @@ func openrcScriptContent(binaryPath, configPath, dataDir string) (string, error)
 }
 
 // Install runs the §3.2 flow: copyBinary → config materialize → write the
-// service script (0644) into the user init.d dir → rc-update --user add
+// service script (0755 — rc-update refuses a non-executable service: the
+// alpine:edge leg live-proved "rc-update: service `assay-watch' is not
+// executable" against the old 0644) into the user init.d dir → rc-update --user add
 // assay-watch default → rc-service --user assay-watch start → bounded
 // rc-service --user assay-watch status verify.
 func (s *OpenRCScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
@@ -294,7 +296,7 @@ func (s *OpenRCScheduler) Install(spec SchedulerInstallSpec) (Result, error) {
 		return res, fmt.Errorf("install: create OpenRC runlevel dir %s: %w", runlevelDir, err)
 	}
 	scriptPath := filepath.Join(initDir, OpenRCServiceName)
-	if err := writeFileAtomic(scriptPath, []byte(body), 0o644); err != nil {
+	if err := writeFileAtomic(scriptPath, []byte(body), 0o755); err != nil {
 		return res, err
 	}
 	res.UnitPaths = []string{scriptPath}
