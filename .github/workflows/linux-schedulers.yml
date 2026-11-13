@@ -259,21 +259,42 @@ jobs:
           cd repo
           CGO_ENABLED=0 go build -o /assay ./cmd/assay
           cd /
-      - name: plant the openrc-user comm (detection subject) + XDG runtime dir
+      - name: plant the openrc-user comm (detection subject) + user session state
         run: |
           set -e
           # Detection matches comm == "openrc-user" (the executable's
-          # basename): a copy of sleep under that name is a genuine own-uid
-          # process with the right comm — no guessing in the scanner.
-          cp /bin/sleep /tmp/openrc-user
-          /tmp/openrc-user 3600 &
-          mkdir -p /run/user/0
+          # basename). A RENAMED busybox applet refuses to run: busybox
+          # dispatches on argv[0] and "openrc-user" is not an applet — the
+          # copied sleep printed "openrc-user: applet not found" and died
+          # before the scan (run 43353073822). The subject is therefore a
+          # tiny compiled sleeper: a genuine own-uid process whose comm
+          # comes from its own filename.
+          cat > /tmp/openrc-user-sleep.go <<'EOF'
+          package main
+
+          import "time"
+
+          func main() { time.Sleep(3600 * time.Second) }
+          EOF
+          go build -o /tmp/openrc-user /tmp/openrc-user-sleep.go
+          /tmp/openrc-user &
+          # A container never ran openrc's boot, so the user-session state
+          # openrc demands is absent and rc-service --user start refuses
+          # ("openrc did not boot"). The skeleton below is the exact remedy
+          # openrc's own error message prints — softlevel marks the user
+          # runlevel active, the same state a pam_openrc login creates.
+          mkdir -p /run/user/0/openrc
+          touch /run/user/0/openrc/softlevel
           echo "XDG_RUNTIME_DIR=/run/user/0" >> "$GITHUB_ENV"
       - name: assay install detects openrc and renders the user script
         run: |
           set -e
           /assay install 2>&1 | tee install.log
-          script=/root/.config/rc/init.d/assay-watch
+          # The SAME resolution the product uses (openrcDefaultInitDir):
+          # ${XDG_CONFIG_HOME:-$HOME/.config}. A hardcoded /root desynced
+          # from the install's $HOME resolution (the runner sets HOME for
+          # container jobs) and failed the check while the script existed.
+          script="${XDG_CONFIG_HOME:-$HOME/.config}/rc/init.d/assay-watch"
           test -f "$script" || { echo "::error::openrc script missing at $script"; tail install.log; exit 1; }
           mode=$(stat -c '%a' "$script")
           [ "$mode" = "755" ] || { echo "::error::openrc script mode is $mode, must be 755 (rc-update refuses non-executable services)"; exit 1; }
@@ -316,6 +337,6 @@ jobs:
         run: |
           set -e
           /assay uninstall
-          test ! -e /root/.config/rc/init.d/assay-watch \
+          test ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/rc/init.d/assay-watch" \
             || { echo "::error::openrc script survived uninstall"; exit 1; }
           echo "openrc uninstall OK" >> "$GITHUB_STEP_SUMMARY"
