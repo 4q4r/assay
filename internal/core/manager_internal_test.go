@@ -758,6 +758,63 @@ func TestAdoptedStopTreatsGonePidAsClean(t *testing.T) {
 		"the clean-stop path must clear the stale pidfile")
 }
 
+// TestStopSessionChildReapWaitIsBounded (termination-audit P1): the
+// session-child stop's reap wait must be BOUNDED — a child that accepted
+// the kill but never completes exec.Wait (the D-state class: hung FUSE/NFS
+// I/O, stuck driver) previously left Stop() waiting on the reaper channel
+// forever, and with it the daemon's finishGraceful, the darwin miss-path
+// goroutine, and every checker teardown.
+//
+// The simulation is white-box and honest: a REAL child process is spawned
+// (its state is irrelevant — kill(2) succeeds against a live or zombie pid
+// either way) and the manager's reap signal is pre-armed with a channel
+// that NEVER closes. "Kill accepted + Wait never returned" is the exact
+// observable of an unreapable child; a real fixture that ignores signals
+// cannot reproduce the hang (SIGKILL kills it, the reap completes — the
+// linux ladder has no graceful stage to ignore). The production bound
+// (5s) is shortened through the adoptedStopPoll seam (the T2 review M-2
+// precedent) so this proof runs in milliseconds, not minutes.
+func TestStopSessionChildReapWaitIsBounded(t *testing.T) {
+	// The child: the test binary listing its tests — exits immediately,
+	// hermetically, no external binary. It is never reaped by the manager
+	// (the reaper is bypassed below); the cleanup kills and reaps it.
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.list=.*")
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	origPoll := adoptedStopPoll
+	adoptedStopPoll = 300 * time.Millisecond
+	t.Cleanup(func() { adoptedStopPoll = origPoll })
+
+	m := newTestManager(t, config.CoreConfig{SocksPort: 22978, RollbackStrikes: 3}, t.TempDir(), &syncBuffer{})
+	// White-box: install the child handle and pre-arm the reap signal with
+	// a channel that never closes — the unreapable-child state.
+	m.mu.Lock()
+	m.cmd = cmd
+	m.done = make(chan struct{}) // never closed
+	m.waitOnce.Do(func() {})     // consume the once: waitDone() returns the fake channel
+	m.mu.Unlock()
+
+	stopped := make(chan error, 1)
+	start := time.Now()
+	go func() { stopped <- m.Stop() }()
+	select {
+	case err := <-stopped:
+		require.Error(t, err, "a child the kill could not reap is NOT a clean stop")
+		require.Contains(t, err.Error(), strconv.Itoa(cmd.Process.Pid), "the error names the exact pid")
+		require.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+		require.Contains(t, err.Error(), "D-state", "the error carries the audit vocabulary (the adopted-path precedent)")
+		require.Contains(t, err.Error(), "kill -KILL", "the error carries the exact manual escalation")
+		require.Less(t, time.Since(start), 5*time.Second, "the bound returned well within the watchdog")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Stop() hung past %s on the reap wait — the session-child stop is UNBOUNDED (audit P1)",
+			time.Since(start).Round(time.Second))
+	}
+}
+
 // TestSingletonLockRefusedCrossProcess (T2 review M-5): the flock refusal is
 // kernel-guaranteed ACROSS PROCESSES — a helper process holding the lock
 // makes a manager in THIS process refuse with ErrDaemonHoldsCore.

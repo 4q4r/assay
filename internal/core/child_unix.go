@@ -30,14 +30,18 @@ func attachChildJob(*os.Process) (*childJob, error) { return nil, nil }
 // release is a no-op on unix.
 func (j *childJob) release() {}
 
-// stopSessionChildLocked is the EXACT pre-S2 session-child stop: hard kill
-// (os.ErrProcessDone tolerated) then the WaitDelay-bounded reap. Any
-// change here would be a linux behavior change — forbidden by the S2
-// binding.
+// stopSessionChildLocked is the pre-S2 session-child stop: hard kill
+// (os.ErrProcessDone tolerated) then the reap. The kill shape is the EXACT
+// pre-S2 behavior (S2 binding); the formerly-unguarded reap receive is the
+// one bounded addition (termination-audit P1): WaitDelay bounds the
+// pipe-drain legs of Wait, never the death wait itself, and a D-state
+// child left Stop() hanging forever — taking the daemon's finishGraceful
+// with it. The bound mirrors the manager's own adopted-path poll
+// (manager.go: adoptedStopPoll + the post-poll truth vocabulary).
 func (m *Manager) stopSessionChildLocked() error {
+	pid := m.cmd.Process.Pid
 	if err := m.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("core: kill child pid %d: %w", m.cmd.Process.Pid, err)
+		return fmt.Errorf("core: kill child pid %d: %w", pid, err)
 	}
-	<-m.waitDone()
-	return nil
+	return reapWaitBounded(m.waitDone, pid, adoptedStopPoll)
 }

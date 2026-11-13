@@ -70,3 +70,14 @@ func TestStopLadderChildBoundPins(t *testing.T) {
 	assert.Greater(t, childGracefulStopBound, time.Duration(0))
 	assert.LessOrEqual(t, childGracefulStopBound, 30*time.Second, "the bound stays supervision-snappy")
 }
+
+// TestStopLadderReapBoundPins pins the termination-audit P1 wiring on
+// windows: the ladder's post-kill reap bound is killWaitDelay — the same
+// WaitDelay contract value — so a child whose reap cannot complete
+// (D-state class) fails the stop loud inside a bounded deadline instead of
+// hanging the caller (the SCM WaitHint bounds the whole stop externally;
+// the caller's deadline is smaller still).
+func TestStopLadderReapBoundPins(t *testing.T) {
+	assert.Greater(t, killWaitDelay, time.Duration(0), "the reap bound exists")
+	assert.LessOrEqual(t, killWaitDelay, 30*time.Second, "the reap bound stays supervision-snappy")
+}

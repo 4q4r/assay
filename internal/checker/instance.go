@@ -51,6 +51,35 @@ const (
 	instanceLogBuffers = 8 * 1024
 )
 
+// instanceReapBound bounds the temp-instance Close reap wait (termination-
+// audit P1, production value = instanceKillDelay). A var, not a const: the
+// test seam (the internal/core adoptedStopPoll precedent) — the bounded-
+// reap proof runs in milliseconds, not on the production deadline.
+// WaitDelay bounds only the pipe-drain legs of exec.Wait, never the death
+// wait itself; a D-state child (hung FUSE/NFS I/O) accepted the kill but
+// never reaps, and one such instance used to wedge the whole wave
+// teardown.
+var instanceReapBound = instanceKillDelay
+
+// instanceReapWaitBounded waits for the instance's reaper close signal at
+// most bound long and returns the loud unreapable-truth error on expiry
+// (the internal/core reapWaitBounded twin — the checker package does not
+// import core, and one small definition per package keeps the import
+// graph flat).
+func instanceReapWaitBounded(reaped func() <-chan struct{}, pid int, bound time.Duration) error {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-reaped():
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("checker: temp instance pid %d not reaped within %s after the kill "+
+			"(unreapable — likely D-state/zombie): it was NOT confirmed stopped, the temp config dir "+
+			"is left in place; escalate manually: kill -KILL %d",
+			pid, bound, pid)
+	}
+}
+
 // Temp-instance PRODUCTION scan band: 18xxx is clear of the live client's
 // 10808/10809 inbounds and fox-proxy 9999, and the watch daemon boots its
 // own temp instances there on every hourly wave — the daemon and the live
@@ -149,15 +178,23 @@ func (b *batchXrayInstance) Addrs() []string {
 }
 
 // Close kills the instance by its EXACT captured PID (never name-based — the
-// owner runs live processes), reaps it, and removes the temp config dir.
+// owner runs live processes), reaps it (bounded — termination-audit P1: on
+// a reap that the kill cannot complete the error names the pid and the
+// exact escalation, and the temp config dir is left in place rather than
+// claiming a clean close), and removes the temp config dir.
 // Idempotent: a second Close is a no-op (the first already waited for the
 // reap and cleaned the dir).
 func (x *xrayInstance) Close() error {
 	x.closeOnce.Do(func() {
+		pid := 0
 		if x.cmd != nil && x.cmd.Process != nil {
+			pid = x.cmd.Process.Pid
 			_ = x.cmd.Process.Kill()
 		}
-		<-x.waitDone() // Wait returns after the kill; WaitDelay bounds lingering pipes
+		if err := instanceReapWaitBounded(x.waitDone, pid, instanceReapBound); err != nil {
+			x.closeErr = err
+			return
+		}
 		x.closeErr = os.RemoveAll(x.dir)
 	})
 	return x.closeErr
@@ -449,14 +486,20 @@ func (x *xrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter
 
 // batchXrayInstance methods
 
-// Close kills the batch instance by its EXACT captured PID, reaps it, and
-// removes the temp config dir. Idempotent.
+// Close kills the batch instance by its EXACT captured PID, reaps it
+// (bounded — termination-audit P1, same contract as xrayInstance.Close),
+// and removes the temp config dir. Idempotent.
 func (b *batchXrayInstance) Close() error {
 	b.closeOnce.Do(func() {
+		pid := 0
 		if b.cmd != nil && b.cmd.Process != nil {
+			pid = b.cmd.Process.Pid
 			_ = b.cmd.Process.Kill()
 		}
-		<-b.waitDone()
+		if err := instanceReapWaitBounded(b.waitDone, pid, instanceReapBound); err != nil {
+			b.closeErr = err
+			return
+		}
 		b.closeErr = os.RemoveAll(b.dir)
 	})
 	return b.closeErr

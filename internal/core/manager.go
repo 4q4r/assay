@@ -151,11 +151,11 @@ type Manager struct {
 	// start (the crash supervisor's token for "the child I was watching");
 	// deliberateStop is set by every manager-driven stop (Stop, Restart,
 	// rollback) so the supervisor never reads a deliberate exit as a crash.
-	cmd            *exec.Cmd
-	waitOnce       sync.Once
-	done           chan struct{} // closed by the wait goroutine after Wait returns
-	waitErr        error         // valid after <-done (channel close = happens-before)
-	job            *childJob     // windows containment job (ADDENDUM §2); nil on unix
+	cmd         *exec.Cmd
+	waitOnce    sync.Once
+	done        chan struct{} // closed by the wait goroutine after Wait returns
+	waitErr     error         // valid after <-done (channel close = happens-before)
+	job         *childJob     // windows containment job (ADDENDUM §2); nil on unix
 	adoptedPID     int
 	strikes        int           // consecutive failed health checks (D8)
 	generation     int           // increments on every child start (supervisor token)
@@ -219,20 +219,20 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 		strikeK = config.DefaultCoreRollbackStrikes
 	}
 	m := &Manager{
-		bin:        bin,
-		override:   cfg.XrayBin,
-		source:     classifyBinarySource(cfg.XrayBin, bin),
-		dataDir:    dataDir,
-		livePath:   filepath.Join(dataDir, "rendered", "live.json"),
-		lockPath:   filepath.Join(dataDir, coreLockName),
-		pidPath:    filepath.Join(dataDir, PIDFileName),
-		backupDir:  filepath.Join(dataDir, "backups"),
-		socksPort:  socksPort,
-		strikeK:    strikeK,
-		log:        log,
-		lockFile:   lockFile,
-		healthURL:  defaultHealthURL,
-		stderrTail: newTailWriter(log, childTailMax),
+		bin:         bin,
+		override:    cfg.XrayBin,
+		source:      classifyBinarySource(cfg.XrayBin, bin),
+		dataDir:     dataDir,
+		livePath:    filepath.Join(dataDir, "rendered", "live.json"),
+		lockPath:    filepath.Join(dataDir, coreLockName),
+		pidPath:     filepath.Join(dataDir, PIDFileName),
+		backupDir:   filepath.Join(dataDir, "backups"),
+		socksPort:   socksPort,
+		strikeK:     strikeK,
+		log:         log,
+		lockFile:    lockFile,
+		healthURL:   defaultHealthURL,
+		stderrTail:  newTailWriter(log, childTailMax),
 	}
 	// The health-state mirror: the D8 STREAK lives in the process that
 	// counts it (S3 — the lock guarantees no other manager is counting), so
@@ -554,23 +554,20 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	// fails the spawn loud (the child is killed; nothing runs uncontained).
 	job, jerr := attachChildJob(cmd.Process)
 	if jerr != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
+		m.discardChildBounded()
 		m.cmd = nil
 		return fmt.Errorf("core: attach the core child to the containment job object: %w "+
 			"(a child outside the job could outlive the daemon — refusing to run it uncontained)", jerr)
 	}
 	m.job = job
 	if err := m.writePIDFile(cmd.Process.Pid); err != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
+		m.discardChildBounded()
 		m.releaseJobLocked()
 		m.cmd = nil
 		return fmt.Errorf("core: write pidfile after spawn: %w", err)
 	}
 	if err := m.awaitBoot(ctx); err != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
+		m.discardChildBounded()
 		m.releaseJobLocked()
 		m.cmd = nil
 		m.clearPIDFile()
@@ -579,6 +576,25 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	_, _ = fmt.Fprintf(m.log, "core: spawned pid %d (%s run -c %s)\n",
 		cmd.Process.Pid, m.bin, m.livePath)
 	return nil
+}
+
+// discardChildBounded is the spawn-failure teardown leg (termination-audit
+// P1): kill the just-spawned child best-effort and BOUND the reap wait —
+// a spawn failure must return to the caller loud, never hang on a child
+// whose reap the kill cannot complete (the D-state class). The spawn leg
+// above carries the caller-facing error; the teardown's own failures log
+// loud here so the operator sees the whole truth (audit: loud errors).
+func (m *Manager) discardChildBounded() {
+	if m.cmd == nil || m.cmd.Process == nil {
+		return
+	}
+	pid := m.cmd.Process.Pid
+	if err := m.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		_, _ = fmt.Fprintf(m.log, "core: kill child pid %d during spawn-failure teardown: %v\n", pid, err)
+	}
+	if err := reapWaitBounded(m.waitDone, pid, adoptedStopPoll); err != nil {
+		_, _ = fmt.Fprintf(m.log, "WARNING: %v\n", err)
+	}
 }
 
 // awaitBoot polls the socks inbound until it accepts (the child binds only

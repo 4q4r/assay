@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -370,6 +371,84 @@ func TestConcurrentBootPortsDistinct(t *testing.T) {
 	entries, rerr := os.ReadDir(workDir)
 	require.NoError(t, rerr)
 	assert.Empty(t, entries, "every instance must clean its temp dir on Close")
+}
+
+// TestTempInstanceCloseReapWaitIsBounded (termination-audit P1): Close's
+// reap wait must be BOUNDED — a temp child that accepted the kill but never
+// completes exec.Wait (the D-state class) previously wedged the checker
+// wave teardown on one unreapable instance, exactly like the manager's
+// session-child stop. The simulation mirrors the manager test
+// (TestStopSessionChildReapWaitIsBounded in internal/core): a real child
+// plus a pre-armed reap channel that never closes — the exact observable
+// of the unreapable class. The production bound (5s) is shortened through
+// the instanceReapBound seam so the proof runs in milliseconds.
+func TestTempInstanceCloseReapWaitIsBounded(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.list=.*")
+	require.NoError(t, cmd.Start())
+	// The instance's reaper is bypassed (fake done below) — the cleanup
+	// kills and reaps the child.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	origBound := instanceReapBound
+	instanceReapBound = 200 * time.Millisecond
+	t.Cleanup(func() { instanceReapBound = origBound })
+
+	inst := &xrayInstance{cmd: cmd, port: testPortBandMin + 1, dir: t.TempDir()}
+	inst.done = make(chan struct{}) // never closed — the unreapable state
+	inst.waitOnce.Do(func() {})     // consume the once: waitDone() returns the fake channel
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- inst.Close() }()
+	select {
+	case err := <-closed:
+		require.Error(t, err, "a child the kill could not reap is NOT a clean close")
+		require.Contains(t, err.Error(), strconv.Itoa(cmd.Process.Pid), "the error names the exact pid")
+		require.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+		require.Contains(t, err.Error(), "kill -KILL", "the error carries the exact manual escalation")
+		require.Less(t, time.Since(start), 5*time.Second, "the bound returned well within the watchdog")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Close() hung past %s on the reap wait — the temp-instance close is UNBOUNDED (audit P1)",
+			time.Since(start).Round(time.Second))
+	}
+}
+
+// TestBatchInstanceCloseReapWaitIsBounded is the batch twin of
+// TestTempInstanceCloseReapWaitIsBounded: the batch Close's reap wait is
+// bounded by the same seam (audit P1 names both legs, instance.go Close
+// and batchXrayInstance.Close).
+func TestBatchInstanceCloseReapWaitIsBounded(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.list=.*")
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	origBound := instanceReapBound
+	instanceReapBound = 200 * time.Millisecond
+	t.Cleanup(func() { instanceReapBound = origBound })
+
+	inst := &batchXrayInstance{cmd: cmd, ports: []int{testPortBandMin + 2}, dir: t.TempDir()}
+	inst.done = make(chan struct{}) // never closed — the unreapable state
+	inst.waitOnce.Do(func() {})
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- inst.Close() }()
+	select {
+	case err := <-closed:
+		require.Error(t, err, "a child the kill could not reap is NOT a clean close")
+		require.Contains(t, err.Error(), strconv.Itoa(cmd.Process.Pid), "the error names the exact pid")
+		require.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+		require.Less(t, time.Since(start), 5*time.Second, "the bound returned well within the watchdog")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("batch Close() hung past %s on the reap wait — the close is UNBOUNDED (audit P1)",
+			time.Since(start).Round(time.Second))
+	}
 }
 
 // C2 invariant pin (engine-level, reviewer's repro): with a dead-outbound
