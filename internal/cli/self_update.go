@@ -175,10 +175,21 @@ func startBinarySelfWatcherWith(
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
-	go bw.loop()
+	// Eager stat baseline: the poller's reference point is the binary AS THE
+	// WATCHER STARTS, not whenever the first tick lands. The lazy first-tick
+	// capture left a start-to-first-tick blind window (up to checkInterval —
+	// 30s in production) where a binary replaced in that window became the
+	// baseline itself and was never detected by the poller — on darwin the
+	// fsnotify side can ALSO lose that event (kqueue, upstream #783), so the
+	// change was invisible to both channels until the daemon restarted.
 	if checkInterval > 0 && exePath != "" {
+		if st, serr := os.Stat(exePath); serr == nil {
+			bw.baselineSize = st.Size()
+			bw.baselineMtime = st.ModTime()
+		}
 		go bw.statLoop()
 	}
+	go bw.loop()
 	outf(log, "self-update: watching %s (binary %s)\n", dir, base)
 	return bw, nil
 }
@@ -229,6 +240,10 @@ func (bw *binarySelfWatcher) statLoop() {
 			if err != nil {
 				continue
 			}
+			// Defensive re-arm only: startBinarySelfWatcherWith captures the
+			// baseline eagerly; this branch covers a start-time stat failure
+			// (binary briefly unreadable) so the poller still gets a
+			// reference point once the binary is statable again.
 			if bw.baselineSize == 0 && bw.baselineMtime.IsZero() {
 				bw.baselineSize = st.Size()
 				bw.baselineMtime = st.ModTime()

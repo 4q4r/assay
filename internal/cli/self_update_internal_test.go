@@ -24,7 +24,44 @@ func execMagic(extra ...byte) []byte {
 	return append(slices.Clone(platform.ExecMagics(runtime.GOOS)[0]), extra...)
 }
 
+// kqueueBackend reports whether the running platform uses fsnotify's kqueue
+// backend — the one backend that can silently stop delivering events for a
+// name (upstream fsnotify #783, open against v1.10.x; the darwin CI leg hit
+// exactly that: TestSelfUpdateFsnotifyDetection failed in two consecutive
+// cycles with unchanged code, while create-path events arrived fine).
+func kqueueBackend() bool {
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "openbsd", "netbsd", "dragonfly":
+		return true
+	}
+	return false
+}
+
+// waitForPending polls the pending flag until the deadline.
+func waitForPending(t *testing.T, bw *binarySelfWatcher, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if bw.IsPending() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.True(t, bw.IsPending(), what)
+}
+
+// TestSelfUpdateFsnotifyDetection pins the fsnotify FAST path: a binary
+// write sets restartPending through the event channel alone (no stat
+// fallback). That contract is only sound where the fsnotify backend
+// delivers reliably; on kqueue platforms the strict pin asserts a channel
+// upstream documents as lossy (#783 — events for a name can stop for the
+// watcher's lifetime, no deadline fixes it), so there the strict pin is
+// skipped with the fallback pin below carrying the detection contract.
 func TestSelfUpdateFsnotifyDetection(t *testing.T) {
+	if kqueueBackend() {
+		t.Skip("kqueue fsnotify delivery is lossy (fsnotify #783); the detection " +
+			"contract on this platform is pinned by TestSelfUpdateStatFallbackDetection")
+	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "assay")
 	require.NoError(t, os.WriteFile(bin, execMagic(1, 2, 3, 4), 0o755))
@@ -38,14 +75,38 @@ func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(bin, execMagic(9, 9, 9, 9), 0o755))
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if bw.IsPending() {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	require.True(t, bw.IsPending(), "fsnotify must set restartPending on binary write")
+	waitForPending(t, bw, "fsnotify must set restartPending on binary write")
+}
+
+// TestSelfUpdateStatFallbackDetection pins the PRODUCTION detection
+// contract on every OS: the stat poller sets restartPending when the binary
+// is replaced even with the event stream dead — the darwin/BSD guarantee
+// (kqueue can drop the write event entirely, #783). The watch is silenced
+// via the public API so the pin cannot be satisfied by inotify on linux;
+// it also pins the eager start-time baseline: the write lands before the
+// first tick, which the old lazy first-tick baseline absorbed silently
+// (the poller made the post-write state its reference and never fired).
+func TestSelfUpdateStatFallbackDetection(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "assay")
+	require.NoError(t, os.WriteFile(bin, execMagic(1, 2, 3, 4), 0o755))
+
+	var pending, armed atomic.Bool
+	// 100ms test-scaled check_interval (production default 30s) — same
+	// statLoop mechanism, bounded test wall time.
+	bw, err := startBinarySelfWatcherWith(dir, "assay", &pending, &armed, io.Discard, 100*time.Millisecond, bin)
+	require.NoError(t, err)
+	defer bw.close()
+
+	// Silence the event channel after the watcher is up (and the baseline
+	// is captured): from here only the poller can detect anything.
+	require.NoError(t, bw.watcher.Remove(dir))
+
+	time.Sleep(50 * time.Millisecond)
+
+	require.NoError(t, os.WriteFile(bin, execMagic(9, 9, 9, 9), 0o755))
+
+	waitForPending(t, bw, "stat fallback must set restartPending on binary write")
 }
 
 func TestSelfUpdateStatStabilityPartialWrite(t *testing.T) {
