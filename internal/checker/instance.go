@@ -396,10 +396,18 @@ func notReadyAddrs(ports []int, ready []bool) []string {
 // accept the readiness dial for a child that is gone (the false-ready class
 // the reproduced boot-death flake exposed — the accepting socket belonged to
 // another process's real xray). nil = the child still lives.
-func bootDeathIfGone(waitDone <-chan struct{}, waitErr error, stderr *limitedWriter) error {
+//
+// waitErrFn is a deferred accessor BY CONTRACT: the child's wait result is
+// readable only after <-waitDone has fired (write waitErr → close(done) →
+// receive → read is the happens-before chain). Reading the field eagerly as
+// a plain argument would evaluate it BEFORE the receive — unordered with the
+// wait goroutine's write — a data race the darwin/arm64 build compiled into
+// a real one (the linux/windows compilers sank the branch-unused load past
+// the sync point, so the same source raced only on darwin CI).
+func bootDeathIfGone(waitDone <-chan struct{}, waitErrFn func() error, stderr *limitedWriter) error {
 	select {
 	case <-waitDone:
-		return fmt.Errorf("xray exited during startup: %w\n%s", waitErr, tailStr(stderr.String(), 400))
+		return fmt.Errorf("xray exited during startup: %w\n%s", waitErrFn(), tailStr(stderr.String(), 400))
 	default:
 		return nil
 	}
@@ -427,8 +435,10 @@ func (x *xrayInstance) awaitReadiness(ctx context.Context, stderr *limitedWriter
 			if err == nil {
 				_ = conn.Close()
 				// A successful dial is readiness only if OUR child still
-				// lives (bootDeathIfGone — the false-ready class).
-				if derr := bootDeathIfGone(x.waitDone(), x.waitErr, stderr); derr != nil {
+				// lives (bootDeathIfGone — the false-ready class). The
+				// wait-result accessor is deferred: bootDeathIfGone reads
+				// it only after the done receive.
+				if derr := bootDeathIfGone(x.waitDone(), func() error { return x.waitErr }, stderr); derr != nil {
 					return derr
 				}
 				return nil
@@ -500,8 +510,10 @@ func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedW
 					readyCount++
 					if readyCount == len(b.ports) {
 						// Same child-attribution rule as the single path
-						// (bootDeathIfGone — the false-ready class).
-						if derr := bootDeathIfGone(b.waitDone(), b.waitErr, stderr); derr != nil {
+						// (bootDeathIfGone — the false-ready class). The
+						// wait-result accessor is deferred for the same
+						// happens-before reason.
+						if derr := bootDeathIfGone(b.waitDone(), func() error { return b.waitErr }, stderr); derr != nil {
 							return derr
 						}
 						return nil // All ready

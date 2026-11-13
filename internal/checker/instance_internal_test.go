@@ -321,6 +321,16 @@ func TestBatchXrayInstanceConcurrentCloseAndCancel(t *testing.T) {
 // boot-to-bind window and BOTH instances claimed one port — the loser's
 // readiness poll then succeeded VIA THE WINNER'S socket. The delayed fake
 // bind keeps that window open deterministically.
+//
+// LIFETIME BARRIER: both instances stay OPEN until every boot has finished —
+// the Close calls run only after the port assertion. Recording the addr and
+// closing inside the boot goroutine let one instance's Close free its port
+// before the sibling's scan ran (legal for SEQUENTIAL lifetimes — the
+// allocator may re-issue a closed port), and the windows CI scheduler chose
+// exactly that order, failing the assertion with two identical addrs. With
+// the barrier, the ports must differ while BOTH instances are live: the
+// second scan runs inside the first instance's live-bind window, which is
+// precisely the geometry the boot mutex and the used-set must make safe.
 func TestConcurrentBootPortsDistinct(t *testing.T) {
 	workDir := t.TempDir()
 	t.Setenv(checkFakeDelayEnv, "150")
@@ -328,30 +338,35 @@ func TestConcurrentBootPortsDistinct(t *testing.T) {
 
 	const n = 2
 	addrs := make([]string, n)
+	insts := make([]SocksInstance, n)
 	errs := make([]error, n)
 	gate := make(chan struct{})
-	var wg sync.WaitGroup
+	var booted sync.WaitGroup
+	booted.Add(n)
 	for i := range n {
-		wg.Add(1)
 		go func(i int) {
-			defer wg.Done()
 			<-gate
 			inst, err := StartTempXray(context.Background(), bin, workDir, freedomOutbound())
 			errs[i] = err
+			insts[i] = inst
 			if inst != nil {
 				addrs[i] = inst.Addr()
-				_ = inst.Close()
 			}
+			booted.Done()
 		}(i)
 	}
 	close(gate)
-	wg.Wait()
+	booted.Wait()
 	for i := range n {
 		require.NoError(t, errs[i], "instance %d must boot", i)
+		require.NotNil(t, insts[i], "instance %d must boot", i)
 	}
 	assert.NotEqual(t, addrs[0], addrs[1],
 		"two concurrent instances must never share a socks port (wrong measurements)")
 
+	for i := range n {
+		require.NoError(t, insts[i].Close(), "instance %d must close cleanly", i)
+	}
 	entries, rerr := os.ReadDir(workDir)
 	require.NoError(t, rerr)
 	assert.Empty(t, entries, "every instance must clean its temp dir on Close")
