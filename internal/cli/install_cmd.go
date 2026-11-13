@@ -253,18 +253,39 @@ func prepareInstallPaths(cfgPath, binDir string, opts installOptions) (string, s
 	return unitDir, cfgAbs, nil
 }
 
-// materializeDataDir resolves the data dir rendered into the materialized
-// config (the configless default = the local-share layout). A nil config
-// with a materialize target is API misuse — the data dir would render empty
-// and the file would fail validation at first load.
-func materializeDataDir(cfg *config.Config, opts installOptions) (string, error) {
-	if opts.materializePath == "" {
-		return "", nil
+// resolveDataDir resolves the data dir an install anchors everything on —
+// REGARDLESS of materialization: the resolved config's data_dir whenever a
+// config resolved (explicit -c, the share/legacy re-install where nothing
+// is left to materialize, the configless built-in defaults), else the
+// platform default resolution. The previous shape (materializeDataDir)
+// returned "" for every non-materializing install, and that "" flowed
+// verbatim into SchedulerInstallSpec.DataDir — the runit/s6/openrc scripts
+// then rendered RELATIVE log/pidfile paths, so the daemon never booted
+// while `sv status`/`rc-service status` still exited 0 (docker acceptance
+// 2026-11-13). A leading ~ expands (the config convention every other
+// consumer applies); a still-relative data_dir is refused loud BEFORE
+// anything is written — the same refusal class as the ExecStart whitespace
+// check, because a script that "installs cleanly" but anchors redirects
+// relative to the service dir is the defect itself.
+func resolveDataDir(cfg *config.Config) (string, error) {
+	if cfg != nil && cfg.DataDir != "" {
+		dir := config.ExpandHome(cfg.DataDir)
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("install: data_dir %q is relative — scheduler scripts must anchor "+
+				"logs and pidfiles at an absolute path; set an absolute data_dir in the config", dir)
+		}
+		return dir, nil
 	}
-	if cfg == nil || cfg.DataDir == "" {
-		return "", errors.New("install: materializing the default config needs a resolved data dir (configless resolution)")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("install: resolve home dir: %w", err)
 	}
-	return cfg.DataDir, nil
+	dir, ok := platform.DefaultDataDir(runtime.GOOS, home)
+	if !ok {
+		return "", errors.New("install: cannot resolve the default data dir (no home directory) — " +
+			"set data_dir in the config")
+	}
+	return dir, nil
 }
 
 // installOptions carries the install flags (seam for tests).
@@ -297,7 +318,7 @@ func runInstall(w io.Writer, cfg *config.Config, cfgPath string, opts installOpt
 	if err != nil {
 		return err
 	}
-	dataDir, err := materializeDataDir(cfg, opts)
+	dataDir, err := resolveDataDir(cfg)
 	if err != nil {
 		return err
 	}
