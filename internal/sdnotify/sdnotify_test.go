@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,23 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// notifySockPath hands out the fake NOTIFY_SOCKET path. darwin caps unix
+// socket paths at 104 bytes (the kernel sockaddr storage), and the darwin
+// runner's /var/folders/... temp root already overflows it — the bind dies
+// with "invalid argument" before any datagram flies (run 43330792666). A
+// temp-root path that fits stays (unix keeps 108); an overflowing one falls
+// back to a short, pid-unique /tmp path.
+func notifySockPath(t *testing.T) string {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "notify.sock")
+	if len(sock) < 100 {
+		return sock
+	}
+	short := filepath.Join("/tmp", fmt.Sprintf("assay-sdnotify-%d.sock", os.Getpid()))
+	t.Cleanup(func() { _ = os.Remove(short) })
+	return short
+}
 
 // startFakeNotifyListener is the hermetic stand-in for systemd's
 // NOTIFY_SOCKET datagram socket: tests read the states the daemon sends.
@@ -42,7 +60,7 @@ func readState(t *testing.T, ln net.PacketConn) string {
 // reach systemd's datagram socket (path namespace) or `systemctl start` on a
 // Type=notify unit would hang and fail.
 func TestReadySendsDatagram(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "notify.sock")
+	sock := notifySockPath(t)
 	ln := startFakeNotifyListener(t, sock)
 	t.Setenv("NOTIFY_SOCKET", sock)
 
@@ -62,7 +80,7 @@ func TestReadyWithoutNotifySocketIsNoOp(t *testing.T) {
 // immediately and then every WATCHDOG_USEC/2 (systemd's recommended ping at
 // half the deadline), until stopped.
 func TestWatchdogPingsAtHalfInterval(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "notify.sock")
+	sock := notifySockPath(t)
 	ln := startFakeNotifyListener(t, sock)
 	t.Setenv("NOTIFY_SOCKET", sock)
 	t.Setenv("WATCHDOG_USEC", "1200000") // 1.2s deadline → 600ms pings

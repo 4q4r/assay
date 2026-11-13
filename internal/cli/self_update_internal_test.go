@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,10 +15,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// execMagic returns the RUNNING platform's primary exec magic (platform.
+// ExecMagics: ELF on linux, Mach-O on darwin, PE on windows). The verifier
+// judges the binary by the host's own exec format — a hard-coded ELF magic
+// passed only on linux hosts and was rejected as "not a Mach-O binary" on
+// the darwin runner (run 43330792666).
+func execMagic(extra ...byte) []byte {
+	return append(slices.Clone(platform.ExecMagics(runtime.GOOS)[0]), extra...)
+}
+
 func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "assay")
-	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F', 1, 2, 3, 4}, 0o755))
+	require.NoError(t, os.WriteFile(bin, execMagic(1, 2, 3, 4), 0o755))
 
 	var pending, armed atomic.Bool
 	bw, err := startBinarySelfWatcherWith(dir, "assay", &pending, &armed, io.Discard, 0, bin)
@@ -26,7 +36,7 @@ func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F', 9, 9, 9, 9}, 0o755))
+	require.NoError(t, os.WriteFile(bin, execMagic(9, 9, 9, 9), 0o755))
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -41,7 +51,7 @@ func TestSelfUpdateFsnotifyDetection(t *testing.T) {
 func TestSelfUpdateStatStabilityPartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "assay")
-	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F'}, 0o755))
+	require.NoError(t, os.WriteFile(bin, execMagic(), 0o755))
 
 	old := binaryStabilityDelay
 	binaryStabilityDelay = 10 * time.Millisecond
@@ -49,16 +59,16 @@ func TestSelfUpdateStatStabilityPartialWrite(t *testing.T) {
 
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		_ = os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F', 1}, 0o755)
+		_ = os.WriteFile(bin, execMagic(1), 0o755)
 	}()
 	ok, reason := verifyBinary(bin)
 	require.False(t, ok, "partial write must not arm: %s", reason)
 	require.NotEmpty(t, reason)
 
-	require.NoError(t, os.WriteFile(bin, []byte{0x7f, 'E', 'L', 'F', 2, 3}, 0o755))
+	require.NoError(t, os.WriteFile(bin, execMagic(2, 3), 0o755))
 	time.Sleep(20 * time.Millisecond)
 	ok, reason = verifyBinary(bin)
-	require.True(t, ok, "stable ELF must arm: %s", reason)
+	require.True(t, ok, "stable exec image must arm: %s", reason)
 	require.Empty(t, reason)
 }
 

@@ -67,14 +67,19 @@ func (f *fakeWinSvcCliScheduler) HeldRegistration() (bool, string) {
 }
 
 // withWindowsHost routes the CLI branches to windows for the test's
-// duration and installs the given scheduler double.
+// duration and installs the given scheduler double. darwinHost is pinned
+// FALSE alongside: runInstallPerOSScheduler checks the darwin branch FIRST,
+// so on a darwin host (the macos CI runner) an unpinned darwinHost() stole
+// the flow into the launchd branch and the windows double recorded nothing
+// (run 43330792666: "[]" should have 1 item(s), has 0).
 func withWindowsHost(t *testing.T, sched scheduler) {
 	t.Helper()
-	prevHost, prevFactory := windowsHost, winsvcSchedulerFactory
+	prevHost, prevDarwin, prevFactory := windowsHost, darwinHost, winsvcSchedulerFactory
 	windowsHost = func() bool { return true }
+	darwinHost = func() bool { return false }
 	winsvcSchedulerFactory = func() scheduler { return sched }
 	t.Cleanup(func() {
-		windowsHost, winsvcSchedulerFactory = prevHost, prevFactory
+		windowsHost, darwinHost, winsvcSchedulerFactory = prevHost, prevDarwin, prevFactory
 	})
 }
 
