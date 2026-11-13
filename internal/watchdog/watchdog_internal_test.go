@@ -290,3 +290,106 @@ func TestWatchdogConcurrentReloadAndSnapshot(t *testing.T) {
 	})
 	wg.Wait()
 }
+
+// silenceWatch stops fsnotify delivery for dir via the public API: from
+// here on NO event can reach the watchdog — the deterministic equivalent of
+// the kqueue dead-watch state (fsnotify #783: a name's events stop for the
+// watcher's lifetime), which darwin CI hit as a flaky timeout instead of a
+// reproducible setup.
+func silenceWatch(t *testing.T, w *Watchdog) {
+	t.Helper()
+	if err := w.watcher.Remove(w.dir); err != nil {
+		t.Fatalf("silence watch: %v", err)
+	}
+}
+
+// TestWatchdogReconcilePicksUpSwap pins the kqueue safety net: a rewrite
+// whose fsnotify event never arrives is still hot-swapped by the
+// reconciliation scan (stamp delta → debounced reload → registry swap). On
+// darwin this is the production recovery path (fsnotify #783 loses events
+// silently — HotModifySwap timed out there in CI cycle 2 with unchanged
+// code); silencing the watch makes the loss deterministic on every OS.
+func TestWatchdogReconcilePicksUpSwap(t *testing.T) {
+	dir := t.TempDir()
+	log := &syncBuffer{}
+	reg, w := startAt(t, dir, log)
+	path := filepath.Join(dir, "recon.lua")
+	body := `return function() return {} end`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "initial load", func() bool {
+		_, ok := reg.Get("recon")
+		return ok
+	})
+	time.Sleep(3 * debounce) // the event-driven load settles and stamps write 1
+	silenceWatch(t, w)       // the event stream dies here — exactly #783
+
+	body = `return function() return { assay.node{ raw = "vless://r@h:3" } } end`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * debounce) // even a delivered event could not act; nothing may move yet
+	if p, _ := reg.Get("recon"); strings.Contains(string(p.Code), "vless://r@h:3") {
+		t.Fatalf("swap happened without the reconciler — the loss simulation is broken")
+	}
+	w.reconcile()
+	waitFor(t, "reconciled swap", func() bool {
+		p, ok := reg.Get("recon")
+		return ok && strings.Contains(string(p.Code), "vless://r@h:3")
+	})
+	if strings.Contains(log.String(), "reconcile scan") {
+		t.Fatalf("reconcile logged a scan warning: %q", log.String())
+	}
+}
+
+// TestWatchdogReconcileRemovesVanished pins the lost-Remove half: a plugin
+// deleted while the event stream is dead is disabled by the scan.
+func TestWatchdogReconcileRemovesVanished(t *testing.T) {
+	dir := t.TempDir()
+	reg, w := startAt(t, dir, io.Discard)
+	path := filepath.Join(dir, "ghost.lua")
+	if err := os.WriteFile(path, []byte(`return function() end`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "initial load", func() bool {
+		_, ok := reg.Get("ghost")
+		return ok
+	})
+	time.Sleep(3 * debounce)
+	silenceWatch(t, w)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * debounce)
+	w.reconcile()
+	waitFor(t, "reconciled removal", func() bool {
+		_, ok := reg.Get("ghost")
+		return !ok
+	})
+}
+
+// TestWatchdogReconcileNoSpuriousReload pins the quiet side: with no change
+// since the last reload, a scan schedules nothing (stamp parity), so the
+// reconciler adds no reload noise while events flow normally.
+func TestWatchdogReconcileNoSpuriousReload(t *testing.T) {
+	dir := t.TempDir()
+	log := &syncBuffer{}
+	reg, w := startAt(t, dir, log)
+	path := filepath.Join(dir, "calm.lua")
+	if err := os.WriteFile(path, []byte(`return function() end`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "initial load", func() bool {
+		_, ok := reg.Get("calm")
+		return ok
+	})
+	time.Sleep(3 * debounce)
+	silenceWatch(t, w) // no events at all: any reload now must come from the scan
+	logTail := log.String()
+	w.reconcile()
+	time.Sleep(3 * debounce)
+	if log.String() != logTail {
+		t.Fatalf("no-change reconcile reloaded: %q", log.String())
+	}
+}
