@@ -253,7 +253,13 @@ jobs:
           $ver = $env:GITHUB_REF_NAME -replace '^v', ''
           go build -trimpath -ldflags "-s -w -X assay/internal/cli.Version=$ver" -o assay-arm64-smoke.exe ./cmd/assay
           if ($LASTEXITCODE -ne 0) { throw "windows/arm64 build failed" }
-          bash scripts/smoke.sh windows_arm64 assay-arm64-smoke.exe
+          # The ./ is load-bearing: smoke.sh execs "$bin" directly, and a
+          # slash-less name is a PATH lookup in bash — the runner's cwd is
+          # not in PATH — so the file-in-cwd check passes while the exec
+          # fails 127 "command not found", classified as a native-exec
+          # refusal (v0.2.0-rc1 dry-run, run 43404899996). The goreleaser
+          # hook never hits this: "{{ .Path }}" always carries a separator.
+          bash scripts/smoke.sh windows_arm64 ./assay-arm64-smoke.exe
           if ($LASTEXITCODE -ne 0) { throw "windows/arm64 native smoke failed" }
           New-Item -ItemType Directory -Force smoke-verdict | Out-Null
           Set-Content -Path smoke-verdict/smoke-ok-windows-arm64.md -Value @"
