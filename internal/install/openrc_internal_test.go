@@ -361,10 +361,9 @@ func TestOpenRCExecBoundReapsGrandchildPipeHolders(t *testing.T) {
 	script := fmt.Sprintf("sleep 60 & echo $! > %s; wait", pidFile)
 
 	type execResult struct {
-		err          error
-		elapsed      time.Duration
-		grandPID     int
-		grandRunning bool
+		err      error
+		elapsed  time.Duration
+		grandPID int
 	}
 	done := make(chan execResult, 1)
 	go func() {
@@ -373,19 +372,6 @@ func TestOpenRCExecBoundReapsGrandchildPipeHolders(t *testing.T) {
 		r := execResult{err: err, elapsed: time.Since(start)}
 		if raw, rerr := os.ReadFile(pidFile); rerr == nil {
 			_, _ = fmt.Sscanf(strings.TrimSpace(string(raw)), "%d", &r.grandPID)
-			if r.grandPID > 0 {
-				// The group kill is synchronous inside Cancel, before Wait
-				// returns — the grandchild must be dead or a reaped-pending
-				// zombie here (a zombie holds no pipe; the landmine is the
-				// LIVE holder). /proc state: R/S/D = still running.
-				if rawStat, serr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", r.grandPID)); serr == nil {
-					fields := strings.Fields(string(rawStat))
-					if len(fields) > 2 {
-						state := fields[2]
-						r.grandRunning = state == "R" || state == "S" || state == "D"
-					}
-				}
-			}
 		}
 		done <- r
 	}()
@@ -401,7 +387,21 @@ func TestOpenRCExecBoundReapsGrandchildPipeHolders(t *testing.T) {
 		assert.True(t, isBoundedStopError(r.err),
 			"a bound-fired failure must classify as bounded (got: %v)", r.err)
 		require.Positive(t, r.grandPID, "the grandchild must have started and written its pid")
-		assert.False(t, r.grandRunning,
+		// The group kill is synchronous inside Cancel, and Wait unblocks on
+		// EOF the moment the dying grandchild closes its inherited pipe —
+		// which happens INSIDE the kernel's exit path, while /proc can still
+		// report R for a few more scheduler ticks before the task leaves it
+		// (run 43396722388: the ubuntu-latest leg sampled exactly that
+		// window and red-flagged a kill that had in fact fired; probe-proven
+		// under CPU saturation: fds close mid-exit while the state still
+		// reads R, resolved within ~10ms). A single-shot state sample is
+		// therefore a race against do_exit — poll the state out with a
+		// bounded grace instead. A grandchild still R/S/D after the grace
+		// is the REAL landmine (it survived the group kill) and fails loud
+		// here. A missing /proc entry (reaped) passes; a zombie passes (it
+		// holds no pipe — the landmine is the LIVE holder).
+		require.Eventually(t, func() bool { return !grandchildRunning(r.grandPID) },
+			5*time.Second, 10*time.Millisecond,
 			"the pipe-holding grandchild must be reaped by the group kill (pid %d)", r.grandPID)
 		assert.Less(t, r.elapsed, 30*time.Second,
 			"the executor must return within the bound + WaitDelay, not hang on the inherited pipe")
@@ -409,6 +409,23 @@ func TestOpenRCExecBoundReapsGrandchildPipeHolders(t *testing.T) {
 		t.Fatal("the executor hung past the bound — the pipe-holder landmine is live " +
 			"(killed child's inherited pipes block Wait; run 43358084471)")
 	}
+}
+
+// grandchildRunning samples the process state from /proc: R/S/D = still
+// alive (the dying-but-not-yet-exited kernel window included). A missing or
+// unreadable entry counts as not running (exited-and-reaped, or a non-linux
+// /proc — the darwin CI leg then passes vacuously, as before).
+func grandchildRunning(pid int) bool {
+	rawStat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(rawStat))
+	if len(fields) <= 2 {
+		return false
+	}
+	state := fields[2]
+	return state == "R" || state == "S" || state == "D"
 }
 
 func TestOpenRCUninstallStoppedSkipsStopCall(t *testing.T) {
