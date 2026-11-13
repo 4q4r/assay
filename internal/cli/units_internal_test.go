@@ -92,7 +92,10 @@ func TestNoSystemdInvocationInMaintainSource(t *testing.T) {
 	t.Run("guard covers EXACTLY the eight W4 files", func(t *testing.T) {
 		guarded := map[string]bool{}
 		for _, f := range w4MaintainSources {
-			guarded[filepath.Join(filepath.Base(filepath.Dir(f)), filepath.Base(f))] = true
+			// ToSlash: the pinned W4 surface spells repo-relative paths with
+			// forward slashes; filepath.Join emits backslashes on windows
+			// and the set-equality pin fell apart (run 43330792666).
+			guarded[filepath.ToSlash(filepath.Join(filepath.Base(filepath.Dir(f)), filepath.Base(f)))] = true
 		}
 		want := map[string]bool{
 			"cli/pipeline.go": true, "cli/root.go": true,

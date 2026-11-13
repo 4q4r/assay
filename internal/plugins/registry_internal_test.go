@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -53,6 +54,9 @@ func TestEnsureDefaults(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dir, "sample.lua")); err != nil {
 			t.Fatalf("tracked sample.lua did not materialize: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			return // windows has no POSIX mode bits — ACLs own permissions there
 		}
 		for _, entry := range entries {
 			info, err := entry.Info()

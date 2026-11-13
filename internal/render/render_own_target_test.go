@@ -338,7 +338,11 @@ func pipelineOwnFixture(t *testing.T, dir string) string {
   ]}
 }`), 0o644))
 	tomlPath := filepath.Join(dir, "config.toml")
-	content := "data_dir = \"" + dir + "\"\n\n[render]\ntemplate = \"" + tmpl + "\"\n"
+	// TOML literal strings (single quotes): windows temp paths carry
+	// backslashes, and inside a basic string \U is a unicode escape — the
+	// config parse died with "invalid hexadecimal digit" on the windows runner
+	// (run 43330792666). Literal strings carry the path verbatim.
+	content := "data_dir = '" + dir + "'\n\n[render]\ntemplate = '" + tmpl + "'\n"
 	require.NoError(t, os.WriteFile(tomlPath, []byte(content), 0o644))
 	require.NoError(t, store.WriteSelection(filepath.Join(dir, "selection.json"), &model.Selection{}))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "filtered.jsonl"), []byte(""), 0o600))

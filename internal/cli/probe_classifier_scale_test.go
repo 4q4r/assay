@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -397,6 +398,17 @@ func TestClassifierScaleParity1000NodeBatch(t *testing.T) {
 func TestClassifierScaleParityCrossBatchOverlap(t *testing.T) {
 	if testing.Short() {
 		t.Skip("production-scale parity wave — skipped in -short")
+	}
+	if runtime.GOOS == "windows" {
+		// The overlap envelope (1500 slow tunnels + the battery riding the
+		// same relay WHILE batch 1000 still probes) exceeds the windows CI
+		// runner's capacity under -race: the relay's shared egress starves
+		// honest probes past the deadline and the parity comparison reads
+		// runner slowness as the collapse it hunts (run 43330792666 — every
+		// "must be byte-parity" cell flipped at once). The starvation repro
+		// stays pinned on linux + darwin; a REAL regression there is a
+		// structural starvation, not a windows-only shape.
+		t.Skip("cross-batch load envelope exceeds windows CI runner capacity; pinned on linux+darwin")
 	}
 	const n = 1500 // 1000-node batch + 500-node sibling at Threads=2
 	slow := scaleUpstream(t, 60*time.Millisecond)

@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -153,6 +154,17 @@ func TestServiceDefaultDirRefusalPins(t *testing.T) {
 // stdout goes nowhere; darwin has launchd redirects, linux journald). The
 // non-windows build refuses loudly rather than silently succeeding.
 func TestServiceLogSinkRefusesOutsideWindows(t *testing.T) {
+	// GOOS split: on windows the file sink OPENS for real (§2.2.6 — service
+	// stdout goes nowhere); everywhere else the build refuses loudly. The
+	// windows run expected an error and got a working sink (run
+	// 43330792666) — both halves are real pins, per host.
+	if runtime.GOOS == "windows" {
+		sink, err := serviceLogSink(t.TempDir())
+		require.NoError(t, err, "on windows the service file sink opens for real")
+		require.NotNil(t, sink)
+		_ = sink.Close()
+		return
+	}
 	_, err := serviceLogSink(t.TempDir())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "windows")

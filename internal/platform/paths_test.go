@@ -2,6 +2,7 @@ package platform
 
 import (
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,6 +17,15 @@ import (
 // stay byte-identical through the S0 delegation.
 func TestDefaultDataDirTable(t *testing.T) {
 	t.Run("linux absolute XDG_DATA_HOME wins", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			// The linux branch's absolute-path check IS the host's
+			// filepath.IsAbs: "/custom/xdg-data" is not absolute under
+			// windows path semantics, so the linux golden row cannot run on
+			// a windows host — the linux + darwin gates pin it (the table's
+			// goos parameter drives the branch, but filepath semantics are
+			// host-defined; run 43330792666).
+			t.Skip("linux absolute-path semantics are host-defined; the linux/darwin gates pin this row")
+		}
 		t.Setenv("XDG_DATA_HOME", "/custom/xdg-data")
 		dir, ok := DefaultDataDir("linux", "/home/tester")
 		require.True(t, ok)

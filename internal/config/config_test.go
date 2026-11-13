@@ -59,7 +59,10 @@ test_timeout = "20s"
 	require.NoError(t, err)
 
 	assert.Equal(t, "/tmp/assay-test-data", cfg.DataDir)
-	assert.Equal(t, "/tmp/assay-test-data/plugins", cfg.Plugins.Dir, "plugins dir defaults under data_dir")
+	// The derivation joins with host separators (filepath.Join) — the pin
+	// spells the contract, not one platform's spelling.
+	assert.Equal(t, filepath.Join("/tmp/assay-test-data", "plugins"), cfg.Plugins.Dir,
+		"plugins dir defaults under data_dir")
 
 	assert.Equal(t, 20*time.Second, cfg.Fetch.Timeout.Duration)
 	assert.Equal(t, 2, cfg.Fetch.Retries)

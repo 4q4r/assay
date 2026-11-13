@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -513,7 +514,9 @@ func TestCacheSidecarModeIs0600(t *testing.T) {
 	meta := filepath.Join(cacheDir, "src", "vless.txt.meta.json")
 	st, err := os.Stat(meta)
 	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o600), st.Mode().Perm(), "cache sidecar must be 0600")
+	if runtime.GOOS != "windows" { // windows has no POSIX mode bits — ACLs own permissions there
+		assert.Equal(t, fs.FileMode(0o600), st.Mode().Perm(), "cache sidecar must be 0600")
+	}
 }
 
 // TestCacheFutureMtimeIsStaleAndRefetches pins the clock-skew clamp (M-1): a

@@ -28,7 +28,11 @@ func TestConfigureChildSpawnPins(t *testing.T) {
 	cmd := &exec.Cmd{}
 	configureChildSpawn(cmd)
 	require.NotNil(t, cmd.SysProcAttr, "the spawn must carry windows SysProcAttr")
-	assert.Equal(t, windows.CREATE_NEW_PROCESS_GROUP, cmd.SysProcAttr.CreationFlags,
+	// testify's Equal is type-strict: the flag literal must carry the
+	// uint32 type of CreationFlags (an untyped 512 compared against the
+	// windows.Errno-typed constant read as uint32(0x200) vs int(512) and
+	// failed the first real windows run, 43330792666).
+	assert.Equal(t, uint32(windows.CREATE_NEW_PROCESS_GROUP), cmd.SysProcAttr.CreationFlags,
 		"the child must sit in its own process group (ADDENDUM §2)")
 }
 

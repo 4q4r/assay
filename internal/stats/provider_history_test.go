@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -460,7 +461,9 @@ func TestProviderHistoryAtomicNoTmpLeftovers(t *testing.T) {
 	assert.Len(t, entries, 1, "tmp file is renamed away — only the artifact remains")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "state files are owner-private 0600")
+	if runtime.GOOS != "windows" { // windows has no POSIX mode bits — ACLs own permissions there
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "state files are owner-private 0600")
+	}
 }
 
 func TestProviderHistorySizeBudget(t *testing.T) {

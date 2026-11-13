@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -195,5 +196,7 @@ template = %q
 	run("render")
 	rendered, err := os.Stat(filepath.Join(dir, "rendered", "live.json"))
 	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o600), rendered.Mode().Perm(), "the own live config must be 0600")
+	if runtime.GOOS != "windows" { // windows has no POSIX mode bits — ACLs own permissions there
+		assert.Equal(t, fs.FileMode(0o600), rendered.Mode().Perm(), "the own live config must be 0600")
+	}
 }

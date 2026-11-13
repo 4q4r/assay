@@ -112,7 +112,7 @@ func TestRunParseSourceOrderIsDeterministic(t *testing.T) {
 func TestPluginRunTimeoutAbandonsHangingPlugin(t *testing.T) {
 	dir := t.TempDir()
 	tomlPath := filepath.Join(dir, "config.toml")
-	content := "data_dir = \"" + dir + "\"\n\n[plugins]\nrun_timeout = \"1s\"\n"
+	content := "data_dir = '" + dir + "'\n\n[plugins]\nrun_timeout = \"1s\"\n"
 	require.NoError(t, os.WriteFile(tomlPath, []byte(content), 0o600))
 	cfg, err := config.Load(tomlPath)
 	require.NoError(t, err)
@@ -175,7 +175,7 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	tomlPath := filepath.Join(dir, "config.toml")
 
 	// Test 1: MaxDuplicatePercent threshold violation
-	content := "data_dir = \"" + dir + "\"\n\n[plugins]\nmax_duplicate_percent = 50.0\n"
+	content := "data_dir = '" + dir + "'\n\n[plugins]\nmax_duplicate_percent = 50.0\n"
 	require.NoError(t, os.WriteFile(tomlPath, []byte(content), 0o600))
 	cfg, err := config.Load(tomlPath)
 	require.NoError(t, err)
@@ -251,7 +251,7 @@ func TestPluginThresholdAutoDisable(t *testing.T) {
 	require.NotContains(t, text, "lowdup DISABLED", "lowdup should not be disabled:\n"+text)
 
 	// Test 2: MinLivePercent threshold violation
-	content = "data_dir = \"" + dir + "\"\n\n[plugins]\nmin_live_percent = 60.0\n"
+	content = "data_dir = '" + dir + "'\n\n[plugins]\nmin_live_percent = 60.0\n"
 	require.NoError(t, os.WriteFile(tomlPath, []byte(content), 0o600))
 	cfg, err = config.Load(tomlPath)
 	require.NoError(t, err)
@@ -314,7 +314,7 @@ func TestRenderKnobsReachRenderedOutputEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	tomlPath := filepath.Join(dir, "config.toml")
 	content := `
-data_dir = "` + dir + `"
+data_dir = '` + dir + `'
 
 [render]
 observatory_interval = "45s"
