@@ -4,10 +4,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"assay/internal/platform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -149,8 +151,12 @@ func TestCronInstallAppendsMarkedLine(t *testing.T) {
 	written := f.stdins[1]
 	assert.Contains(t, written, "*/5 * * * * /usr/bin/something", "foreign lines are preserved verbatim")
 	assert.Contains(t, written, "# assay-watch")
-	assert.Contains(t, written, `@reboot "`+filepath.Join(binDir, "assay")+`" watch -c "`+spec.ConfigPath+`" >> "`+
-		filepath.Join(dataDir, "logs", "watch.out.log")+`" 2>&1 # assay-watch`)
+	// Pinned through the production construction: the binary name is the
+	// GOOS table's (assay.exe on windows), and the log path is the literal
+	// forward-slash join cronLineData renders (the line runs under sh, where
+	// a backslash is an escape — the / separators are load-bearing bytes).
+	assert.Contains(t, written, `@reboot "`+filepath.Join(binDir, platform.AssayBinaryName(runtime.GOOS))+`" watch -c "`+spec.ConfigPath+`" >> "`+
+		dataDir+`/logs/watch.out.log" 2>&1 # assay-watch`)
 	// Log dir pre-created.
 	_, err = os.Stat(filepath.Join(dataDir, "logs"))
 	require.NoError(t, err)

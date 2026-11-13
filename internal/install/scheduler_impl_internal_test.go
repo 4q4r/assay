@@ -3,8 +3,10 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"assay/internal/platform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,8 +102,8 @@ func TestForegroundInstallCopiesBinaryAndMaterializes(t *testing.T) {
 		DataDir:           dataDir,
 	})
 	require.NoError(t, err)
-	_, err = os.Stat(filepath.Join(home, "bin", "assay"))
-	require.NoError(t, err, "the binary is still copied — §3.1.6")
+	_, err = os.Stat(filepath.Join(home, "bin", platform.AssayBinaryName(runtime.GOOS)))
+	require.NoError(t, err, "the binary is still copied — §3.1.6 (the installed name is the GOOS table's)")
 	_, err = os.Stat(filepath.Join(dataDir, "config.toml"))
 	require.NoError(t, err, "the default config is still materialized — §3.1.6")
 	assert.False(t, res.ServiceActive, "nothing is activated — there is no scheduler")

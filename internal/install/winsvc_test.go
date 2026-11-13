@@ -161,7 +161,13 @@ func winSvcSpec(t *testing.T) (SchedulerInstallSpec, string) {
 // <bin>\assay.exe (the §4.2 table name) BEFORE the service exists.
 func TestWinSvcInstallFreshPins(t *testing.T) {
 	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateStopped, 0})
+	// Fresh install: the service starts Stopped and the verify loop must see
+	// it RUNNING after Start — the fake holds its last scripted answer, so
+	// the post-start Running entry is load-bearing (its absence exhausted
+	// awaitRunning on the first real windows run, 43330792666).
+	f.queryScript = append(f.queryScript,
+		[2]uint32{WinSvcStateStopped, 0},
+		[2]uint32{WinSvcStateRunning, 4242})
 	s := winSvcTestScheduler(f)
 	spec, _ := winSvcSpec(t)
 
@@ -267,8 +273,15 @@ func TestWinSvcInstallAlwaysEmbedsConfig(t *testing.T) {
 func TestWinSvcStartAlreadyRunningNote(t *testing.T) {
 	f := &fakeWinSvcActions{}
 	f.startErr = windows.ERROR_SERVICE_ALREADY_RUNNING
-	// Already running after the "start": the verify loop sees Running.
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateRunning, 4242})
+	// Script: Running (the install's exists-probe sees the live service and
+	// Control-Stops it per §2.2.9) → Stopped (awaitStopped) → Running again
+	// (start returns ERROR_SERVICE_ALREADY_RUNNING — someone started it in
+	// between — and awaitRunning must see Running for the note path). The
+	// fake holds its LAST answer forever, so every leg needs its own entry.
+	f.queryScript = append(f.queryScript,
+		[2]uint32{WinSvcStateRunning, 4242},
+		[2]uint32{WinSvcStateStopped, 0},
+		[2]uint32{WinSvcStateRunning, 4242})
 	s := winSvcTestScheduler(f)
 	spec, _ := winSvcSpec(t)
 	spec.ConfigPath = `C:\x\config.toml`
@@ -368,8 +381,9 @@ func TestWinSvcStatusPins(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, st.Active)
 	assert.Equal(t, 4242, st.PID)
-	assert.Contains(t, st.Note, "Recovery actions")
+	assert.Contains(t, st.Note, "recovery: ServiceRestart after 5s")
 	assert.Contains(t, st.Note, "self-watchdog")
+	assert.Contains(t, st.Note, "SCM recovery-actions restart")
 
 	// Not installed → an honest inactive status, never an error.
 	f2 := &fakeWinSvcActions{openErr: errors.New("does not exist")}
@@ -426,7 +440,9 @@ func TestWinSvcCommandLineEscapingPins(t *testing.T) {
 // and embedded as -c; an existing file is kept and still embedded.
 func TestWinSvcMaterializesDefaultConfig(t *testing.T) {
 	f := &fakeWinSvcActions{openErr: errors.New("does not exist")}
-	f.queryScript = append(f.queryScript, [2]uint32{WinSvcStateStopped, 0})
+	f.queryScript = append(f.queryScript,
+		[2]uint32{WinSvcStateStopped, 0},
+		[2]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
 	s := winSvcTestScheduler(f)
 	spec, dataDir := winSvcSpec(t)
 
@@ -438,7 +454,9 @@ func TestWinSvcMaterializesDefaultConfig(t *testing.T) {
 
 	// Kept: re-install over the existing file.
 	f2 := &fakeWinSvcActions{openErr: errors.New("does not exist")}
-	f2.queryScript = append(f2.queryScript, [2]uint32{WinSvcStateStopped, 0})
+	f2.queryScript = append(f2.queryScript,
+		[2]uint32{WinSvcStateStopped, 0},
+		[2]uint32{WinSvcStateRunning, 4242}) // the post-start verify leg
 	res2, err := winSvcTestScheduler(f2).Install(spec)
 	require.NoError(t, err)
 	assert.Empty(t, res2.ConfigWritten)

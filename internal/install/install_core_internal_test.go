@@ -3,17 +3,21 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"assay/internal/platform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// managedCoreLayout plants the D4 managed-core layout inside a data dir.
+// managedCoreLayout plants the D4 managed-core layout inside a data dir —
+// the binary under the GOOS table's name (xray.exe on windows: the windows
+// run removed share/xray while bin/xray never existed, run 43330792666).
 func managedCoreLayout(t *testing.T, dataDir string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "bin"), 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "bin", "xray"), []byte("CORE"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS)), []byte("CORE"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "share", "xray"), 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "share", "xray", "geoip.dat"), []byte("GEOIP"), 0o644))
 }
@@ -36,14 +40,14 @@ func TestUninstallRemovesManagedCoreArtifacts(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = os.Stat(filepath.Join(dataDir, "bin", "xray"))
+	_, err = os.Stat(filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS)))
 	assert.True(t, os.IsNotExist(err), "the managed core binary is removed")
 	_, err = os.Stat(filepath.Join(dataDir, "share", "xray"))
 	assert.True(t, os.IsNotExist(err), "the managed asset dir is removed")
 	_, err = os.Stat(filepath.Join(dataDir, "nodes.jsonl"))
 	require.NoError(t, err, "user pipeline data is untouched by the core removal")
 
-	assert.Contains(t, res.CoreRemoved, filepath.Join(dataDir, "bin", "xray"))
+	assert.Contains(t, res.CoreRemoved, filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS)))
 	assert.Contains(t, res.CoreRemoved, filepath.Join(dataDir, "share", "xray"))
 }
 
