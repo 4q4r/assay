@@ -240,8 +240,13 @@ func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time
 		if err := KeepNewestBackups(filepath.Dir(path), filepath.Base(path), keep); err != nil {
 			return "", fmt.Errorf("prune backup retention (prune_backup_keep=%d): %w", keep, err)
 		}
-	case os.IsNotExist(statErr):
+	case os.IsNotExist(statErr) && parentUsable(filepath.Dir(path)):
 		// A missing store has nothing to back up: only the write happens.
+		// parentUsable guards the windows semantics: a store path UNDER A
+		// REGULAR FILE stats as path-not-found there (linux answers ENOTDIR,
+		// which IsNotExist leaves loud) — treating it as "missing store"
+		// would mask the broken layout and silently skip the backup (the F10
+		// class) on windows.
 	default:
 		// Any OTHER stat error (permissions, ENOTDIR, ...) must not be read
 		// as "nothing to back up" — that would silently reduce the rollback
@@ -254,6 +259,18 @@ func RewriteGeoWithBackup(path string, records []*model.GeoRecord, now time.Time
 		return "", err
 	}
 	return backupPath, nil
+}
+
+// parentUsable reports whether the store's parent is a viable directory
+// context: present AS A DIRECTORY, or absent entirely (the bootstrap case —
+// WriteGeo creates it). A parent that exists as a regular file poisons the
+// path; see RewriteGeoWithBackup's missing-store branch.
+func parentUsable(dir string) bool {
+	fi, err := os.Stat(dir)
+	if err == nil {
+		return fi.IsDir()
+	}
+	return os.IsNotExist(err)
 }
 
 // KeepNewestBackups retains only the keep newest <prefix>.bak-<ts> files in
@@ -563,24 +580,28 @@ func ReadWaveState(path string) (WaveState, error) {
 	if err != nil {
 		return WaveState{}, err
 	}
-	defer func() { _ = f.Close() }()
 	var st WaveState
 	dec := json.NewDecoder(f)
-	if err := dec.Decode(&st); err != nil {
-		// corrupt → back the damaged file up, warn loud, reset to 0.
-		backup := path + ".corrupt-" + strconv.FormatInt(time.Now().Unix(), 10)
-		if rerr := os.Rename(path, backup); rerr != nil {
-			fmt.Fprintf(os.Stderr,
-				"WARNING: wave state %s is corrupt and the corrupt-file backup failed (%v) — resetting to 0\n",
-				path, rerr)
-		} else {
-			fmt.Fprintf(os.Stderr,
-				"WARNING: wave state %s is corrupt — backed up to %s, resetting the sequence to 0\n",
-				path, backup)
-		}
-		return WaveState{}, nil
+	if err := dec.Decode(&st); err == nil {
+		_ = f.Close()
+		return st, nil
 	}
-	return st, nil
+	// corrupt → back the damaged file up, warn loud, reset to 0. The handle
+	// closes BEFORE the rename: windows refuses to rename an open file ("The
+	// process cannot access the file..."), which silently lost the corrupt
+	// backup on the windows runner (run 43330792666).
+	_ = f.Close()
+	backup := path + ".corrupt-" + strconv.FormatInt(time.Now().Unix(), 10)
+	if rerr := os.Rename(path, backup); rerr != nil {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: wave state %s is corrupt and the corrupt-file backup failed (%v) — resetting to 0\n",
+			path, rerr)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: wave state %s is corrupt — backed up to %s, resetting the sequence to 0\n",
+			path, backup)
+	}
+	return WaveState{}, nil
 }
 
 // ReadWaveSeq is a convenience returning just the sequence number.

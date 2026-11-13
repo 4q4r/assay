@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -215,13 +216,17 @@ func TestJSONLArtifactsAreExplicitly0600(t *testing.T) {
 
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o600), st.Mode().Perm(), "state artifacts must be 0600")
+	if runtime.GOOS != "windows" { // windows has no POSIX mode bits — ACLs own permissions there
+		assert.Equal(t, fs.FileMode(0o600), st.Mode().Perm(), "state artifacts must be 0600")
+	}
 
 	manifest := filepath.Join(dir, "cache", "manifest.json")
 	require.NoError(t, store.WriteManifest(manifest, []byte(`{"fetched_at":"2026-10-28T00:00:00Z","sources":{}}`)))
 	ms, err := os.Stat(manifest)
 	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o600), ms.Mode().Perm(), "fetch manifest must be 0600")
+	if runtime.GOOS != "windows" {
+		assert.Equal(t, fs.FileMode(0o600), ms.Mode().Perm(), "fetch manifest must be 0600")
+	}
 }
 
 // writeFakeBackup drops a <prefix>.bak-<stamp> file with distinct stamps.
