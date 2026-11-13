@@ -4,9 +4,12 @@ package core
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
+
+	"assay/internal/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,4 +72,36 @@ func TestAttachChildJobAssignsKillOnClose(t *testing.T) {
 func TestStopLadderChildBoundPins(t *testing.T) {
 	assert.Greater(t, childGracefulStopBound, time.Duration(0))
 	assert.LessOrEqual(t, childGracefulStopBound, 30*time.Second, "the bound stays supervision-snappy")
+}
+
+// TestStopLadderReapBoundPins pins the termination-audit P1 wiring on
+// windows: the ladder's post-kill reap bound is killWaitDelay — the same
+// WaitDelay contract value — so a child whose reap cannot complete
+// (D-state class) fails the stop loud inside a bounded deadline instead of
+// hanging the caller (the SCM WaitHint bounds the whole stop externally;
+// the caller's deadline is smaller still).
+func TestStopLadderReapBoundPins(t *testing.T) {
+	assert.Greater(t, killWaitDelay, time.Duration(0), "the reap bound exists")
+	assert.LessOrEqual(t, killWaitDelay, 30*time.Second, "the reap bound stays supervision-snappy")
+}
+
+// TestTransientManagerHasNoJobHandle pins the audit P2-1 constructor split
+// on windows (the behavioral seam-record twin lives GOOS-neutral in
+// containment_internal_test.go and runs on this CI leg too): the daemon
+// constructor keeps containment, the transient one-shot constructor
+// carries none — a one-shot activate's spawned core must survive the
+// CLI's process exit (closing a KILL_ON_JOB_CLOSE handle would kill it).
+func TestTransientManagerHasNoJobHandle(t *testing.T) {
+	log := &strings.Builder{}
+	cfg := config.CoreConfig{RollbackStrikes: 3}
+	m, err := NewManager(cfg, t.TempDir(), log)
+	require.NoError(t, err)
+	t.Cleanup(func() { m.release() })
+	assert.True(t, m.containment, "the daemon manager assigns spawned children to the job")
+
+	tm, err := NewTransientManager(cfg, t.TempDir(), log)
+	require.NoError(t, err)
+	t.Cleanup(func() { tm.release() })
+	assert.False(t, tm.containment, "the transient manager skips the job attach (audit P2-1)")
+	assert.Nil(t, tm.job, "no containment job handle exists before any spawn")
 }

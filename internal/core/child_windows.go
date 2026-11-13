@@ -91,12 +91,16 @@ func (j *childJob) release() {
 // stopSessionChildLocked is the windows ladder (ADDENDUM §2) over the
 // neutral driver: CTRL_BREAK to the child's process group (xray's
 // registered console ctrl handler shuts it down gracefully) → bounded
-// wait → TerminateProcess last resort. A failing ctrl-event (e.g. the
-// service context has no console attached) is logged loud by the driver
-// and escalates immediately — the containment never depends on it.
+// wait → TerminateProcess last resort → bounded reap (audit P1:
+// killWaitDelay — the same WaitDelay contract value; the SCM WaitHint
+// bounds the whole stop externally, but the caller still never hangs
+// past the reap deadline). A failing ctrl-event (e.g. the service
+// context has no console attached) is logged loud by the driver and
+// escalates immediately — the containment never depends on it.
 func (m *Manager) stopSessionChildLocked() error {
 	pid := m.cmd.Process.Pid
 	err := stopChildWithLadder(childStopPrimitives{
+		pid: pid,
 		graceful: func() error {
 			return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
 		},
@@ -107,7 +111,7 @@ func (m *Manager) stopSessionChildLocked() error {
 			}
 			return nil
 		},
-	}, childGracefulStopBound, func(f string, a ...any) {
+	}, childGracefulStopBound, killWaitDelay, func(f string, a ...any) {
 		_, _ = fmt.Fprintf(m.log, "core: "+f+"\n", a...)
 	})
 	m.releaseJobLocked()

@@ -93,7 +93,10 @@ type watchDeps struct {
 	startWatchdog func(dir string, log io.Writer) (*plugins.Registry, io.Closer, error)
 	signals       <-chan os.Signal
 	now           func() time.Time
-	after         func(time.Duration) <-chan time.Time
+	// after arms the scheduler wait and returns the timer channel plus a
+	// stop func — the re-arm path must stop the superseded timer (audit
+	// P3-10: a lingering time.After timer is GC-immune until it fires).
+	after func(d time.Duration) (<-chan time.Time, func())
 	// sdNotify runs the sd_notify(3) handshake: READY=1 plus the watchdog
 	// pinger when NOTIFY_SOCKET/WATCHDOG_USEC are present (systemd
 	// Type=notify + WatchdogSec), a logged no-op otherwise. Returns the stop
@@ -141,7 +144,10 @@ func defaultWatchDeps() watchDeps {
 		},
 		signals: signalChannel(),
 		now:     time.Now,
-		after:   time.After,
+		after: func(d time.Duration) (<-chan time.Time, func()) {
+			t := time.NewTimer(d)
+			return t.C, func() { t.Stop() }
+		},
 		sdNotify: func(out io.Writer) func() {
 			return sdnotify.Watch(context.Background(), out)
 		},
@@ -286,17 +292,20 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 			due = nextSpeedtest
 		}
 		wait := max(due.Sub(s.deps.now()), 0)
-		timer := s.deps.after(wait)
+		timerC, stopTimer := s.deps.after(wait)
 		select {
 		case <-stop:
+			stopTimer()
 			return ran
-		case <-timer:
+		case <-timerC:
 			if s.beat != nil {
 				s.beat() // the loop woke for a due wave
 			}
 		case <-s.heartbeatTick:
 			// Idle tick: the loop reached its select — the strongest idle
-			// heartbeat there is. Re-arm and keep waiting.
+			// heartbeat there is. Stop the superseded timer and re-arm
+			// (P3-10: the old timer must not linger armed until it fires).
+			stopTimer()
 			if s.beat != nil {
 				s.beat()
 			}
@@ -573,8 +582,10 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// The self-watchdog transport (ADDENDUM §1): on darwin the supervisor
 	// paces at threshold/2; a missed threshold fires the miss action — the
 	// SAME graceful-stop seam SIGTERM uses (requestStop), a best-effort core
-	// stop (a wedged loop must never orphan the child), a bounded wait for
-	// the unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
+	// stop (a wedged loop never BLOCKS the exit on the child stop — the
+	// child is stopped best-effort and answered by pidfile adoption (A2) on
+	// unix / Job Object containment on windows), a bounded wait for the
+	// unwind, and a CLEAN exit 0 that launchd KeepAlive answers with a
 	// restart. The mechanism is named loudly — status output states it the
 	// same way.
 	// The transport wiring happens HERE (after sched exists) — the wave
@@ -589,6 +600,11 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// the SCM right AFTER the wiring — before the scheduler goroutine (and
 	// its immediate first wave) starts, never gated on it. Nil on unix.
 	closeServiceWired(deps)
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
 	go func() {
 		_ = sched.run(stop, between)
 		close(schedDone)
@@ -608,10 +624,13 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	}
 	// finishGraceful is the shared shutdown sequence (§2.2.3 — ONE seam,
 	// three feeds land here with the same unwinding): reason line →
-	// requestStop → scheduler unwind → explicit core stop → clean shutdown.
+	// requestStop → armed second-signal force exit (P3-11) → scheduler
+	// unwind → explicit core stop → clean shutdown.
 	finishGraceful := func(reason string) error {
 		outln(out, reason)
 		requestStop()
+		releaseForceExit := armSecondSignalForceExit(out, deps.signals, deps.selfExit)
+		defer releaseForceExit()
 		<-schedDone
 		stopCore()
 		outln(out, "watch: clean shutdown")
@@ -629,6 +648,31 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	case sig := <-deps.signals:
 		return finishGraceful(fmt.Sprintf("watch: %v — finishing the current stage, then exiting", sig))
 	}
+}
+
+// armSecondSignalForceExit arms the second-signal force exit (audit P3-11)
+// for the duration of a graceful stop: during finishGraceful's wait for
+// the unwind — hours on a legitimately finishing mid-stage stop — a second
+// SIGTERM/SIGINT previously buffered unread (signalChannel cap 1) and a
+// supervisor-less `assay watch` was interruptible only by SIGKILL. From
+// the moment this arms, the next signal (including one already buffered
+// during the stage) forces the exit loud. Safe mid-stage by the A2
+// contract: adoption + last-good semantics recover on the next start. The
+// exit goes through the deps.selfExit seam — the production os.Exit rides
+// it, and tests record instead of exiting. release() disarms without
+// forcing (the normal unwind completed).
+func armSecondSignalForceExit(out io.Writer, signals <-chan os.Signal, selfExit func(int)) func() {
+	force := make(chan struct{})
+	go func() {
+		select {
+		case <-force:
+		case sig := <-signals:
+			outf(out, "watch: %v — forcing exit (a graceful stop is already in flight; "+
+				"adoption (A2) / last-good semantics recover on the next start)\n", sig)
+			selfExit(1)
+		}
+	}()
+	return func() { close(force) }
 }
 
 // startSelfWatchTransport wires the self-watchdog transport (ADDENDUM §1):
@@ -670,10 +714,14 @@ func startSelfWatchTransport(
 
 // selfWatchMiss builds the miss action of the self-watchdog transport
 // (ADDENDUM §1): the SAME graceful-stop seam SIGTERM uses (requestStop), a
-// best-effort core stop (a wedged loop must never orphan the child), a
-// bounded wait for the unwind, and a CLEAN exit 0 that the platform's
-// supervisor answers with a restart (launchd KeepAlive / the Windows SCM
-// recovery actions — restartNote names the mechanism loudly).
+// best-effort core stop (a wedged loop never BLOCKS the exit on the child
+// stop — the child is stopped best-effort and answered by pidfile adoption
+// (A2) on unix / Job Object containment on windows; audit P3-7: the child
+// CAN briefly outlive the daemon — that is the design, the old wording
+// promised too much), a bounded wait for the unwind, and a CLEAN exit 0
+// that the platform's supervisor answers with a restart (launchd KeepAlive
+// / the Windows SCM recovery actions — restartNote names the mechanism
+// loudly).
 func selfWatchMiss(
 	out io.Writer, schedDone <-chan struct{}, requestStop, stopCore func(), selfExit func(int), restartNote string,
 ) func() {
@@ -681,7 +729,13 @@ func selfWatchMiss(
 		outf(out, "watch: self-watchdog: no daemon progress for %s — clean self-exit "+
 			"(%s)\n", selfwatchdog.Threshold, restartNote)
 		requestStop()
-		go stopCore() // best-effort child stop — never block the exit on a wedged unwind
+		// Best-effort child stop — never block the exit on a wedged unwind.
+		// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+		// process loudly — Go semantics — and every deployment transport answers a
+		// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+		// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+		// corrupted-state crash-loop the supervisor surfaces honestly.
+		go stopCore()
 		select {
 		case <-schedDone:
 		case <-time.After(selfExitGrace):

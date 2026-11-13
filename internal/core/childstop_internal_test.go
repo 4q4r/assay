@@ -25,6 +25,7 @@ import (
 func TestStopLadderNilGracefulIsPlainKill(t *testing.T) {
 	killed, reaped := 0, 0
 	prims := childStopPrimitives{
+		pid: 22991,
 		reaped: func() <-chan struct{} {
 			ch := make(chan struct{})
 			close(ch)
@@ -32,7 +33,7 @@ func TestStopLadderNilGracefulIsPlainKill(t *testing.T) {
 		},
 		kill: func() error { killed++; reaped++; return nil },
 	}
-	err := stopChildWithLadder(prims, time.Minute, func(string, ...any) {})
+	err := stopChildWithLadder(prims, time.Minute, time.Minute, func(string, ...any) {})
 	require.NoError(t, err)
 	assert.Equal(t, 1, killed, "exactly one kill")
 	assert.Equal(t, 1, reaped, "the kill path reaps too")
@@ -50,7 +51,7 @@ func TestStopLadderNilGracefulPropagatesKillError(t *testing.T) {
 		},
 		kill: func() error { return errors.New("kill failed loudly") },
 	}
-	err := stopChildWithLadder(prims, time.Minute, func(string, ...any) {})
+	err := stopChildWithLadder(prims, time.Minute, time.Minute, func(string, ...any) {})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "kill failed loudly")
 }
@@ -62,11 +63,12 @@ func TestStopLadderGracefulExitSkipsKill(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	prims := childStopPrimitives{
+		pid:      22992,
 		graceful: func() error { gracefulCalled++; return nil },
 		reaped:   func() <-chan struct{} { return done },
 		kill:     func() error { killed++; return nil },
 	}
-	err := stopChildWithLadder(prims, time.Minute, func(string, ...any) {})
+	err := stopChildWithLadder(prims, time.Minute, time.Minute, func(string, ...any) {})
 	require.NoError(t, err)
 	assert.Equal(t, 1, gracefulCalled)
 	assert.Zero(t, killed, "a graceful exit never escalates to Kill")
@@ -91,7 +93,7 @@ func TestStopLadderGracefulTimeoutEscalatesToKill(t *testing.T) {
 	}
 	logs := &[]string{}
 	start := time.Now()
-	err := stopChildWithLadder(prims, 20*time.Millisecond, func(f string, _ ...any) {
+	err := stopChildWithLadder(prims, 20*time.Millisecond, time.Minute, func(f string, _ ...any) {
 		*logs = append(*logs, f)
 	})
 	require.NoError(t, err)
@@ -118,7 +120,7 @@ func TestStopLadderGracefulErrorEscalatesToKill(t *testing.T) {
 		},
 	}
 	logs := &[]string{}
-	err := stopChildWithLadder(prims, time.Minute, func(f string, a ...any) {
+	err := stopChildWithLadder(prims, time.Minute, time.Minute, func(f string, a ...any) {
 		*logs = append(*logs, fmt.Sprintf(f, a...))
 	})
 	require.NoError(t, err)
@@ -138,7 +140,31 @@ func TestStopLadderKillErrorSurfaces(t *testing.T) {
 		reaped:   func() <-chan struct{} { return reaped },
 		kill:     func() error { return errors.New("terminate refused") },
 	}
-	err := stopChildWithLadder(prims, 5*time.Millisecond, func(string, ...any) {})
+	err := stopChildWithLadder(prims, 5*time.Millisecond, time.Minute, func(string, ...any) {})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "terminate refused")
+}
+
+// TestStopLadderKillReapIsBounded pins the termination-audit P1 shape on
+// the ladder's terminal act: a child that accepted the kill but whose
+// reap never completes (the D-state class — WaitDelay bounds the
+// pipe-drain legs of Wait, never the death wait) produces the LOUD
+// unreapable error within the reap bound, never an unbounded hang. The
+// never-closing reaped channel is the exact observable of that class.
+func TestStopLadderKillReapIsBounded(t *testing.T) {
+	never := make(chan struct{})
+	killed := 0
+	prims := childStopPrimitives{
+		pid:    4242,
+		reaped: func() <-chan struct{} { return never },
+		kill:   func() error { killed++; return nil },
+	}
+	start := time.Now()
+	err := stopChildWithLadder(prims, 10*time.Millisecond, 50*time.Millisecond, func(string, ...any) {})
+	require.Error(t, err, "an unreapable child is NOT a clean stop")
+	assert.Equal(t, 1, killed, "exactly one kill before the bounded reap")
+	assert.Contains(t, err.Error(), "4242", "the error names the exact pid")
+	assert.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+	assert.Contains(t, err.Error(), "kill -KILL", "the error carries the exact manual escalation")
+	assert.Less(t, time.Since(start), 5*time.Second, "the reap bound returned well within the watchdog")
 }

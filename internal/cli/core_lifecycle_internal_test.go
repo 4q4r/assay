@@ -160,7 +160,8 @@ func TestCoreAutoUpdateStageInertWhenOverridden(t *testing.T) {
 func TestCoreAutoUpdateStageRefusesUnderFlock(t *testing.T) {
 	f := newOwnFixture(t)
 	f.writeOwnLive(t, "gen-0")
-	_ = f.ownManager(t) // the daemon-style holder
+	holder := f.ownManager(t) // the daemon-style holder
+	t.Cleanup(holder.Release) // the lock handle must not outlive the test (no child is spawned here)
 
 	err := runCoreAutoUpdateStage(f.cmd, f.cfg)
 	require.Error(t, err)
@@ -226,7 +227,9 @@ func TestOneShotWaveSharedManagerCompletesCoreStages(t *testing.T) {
 		// The runOneShotMaintainWave composition with the data stages
 		// no-op'd for hermeticity — activate + coreAutoUpdate stay the REAL
 		// runners (the I-1 subjects), and they SHARE the wave's one manager.
-		mgr, merr := core.NewManager(f.cfg.Core, f.p.dataDir, f.log)
+		// NewTransientManager mirrors the production composition 1:1 (the
+		// audit P2-1 constructor: lock-only release, no job containment).
+		mgr, merr := core.NewTransientManager(f.cfg.Core, f.p.dataDir, f.log)
 		if merr != nil {
 			return merr
 		}

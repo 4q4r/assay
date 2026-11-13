@@ -24,10 +24,11 @@ import (
 // fires the timer channel the scheduler armed. All access is mutex-guarded —
 // the scheduler goroutine reads now/arms while the test mutates them.
 type fakeClock struct {
-	mu    sync.Mutex
-	now   time.Time
-	armed []time.Duration
-	tick  chan time.Time
+	mu      sync.Mutex
+	now     time.Time
+	armed   []time.Duration
+	stopped int
+	tick    chan time.Time
 }
 
 func newFakeClock() *fakeClock {
@@ -43,11 +44,24 @@ func (c *fakeClock) Now() time.Time {
 	return c.now
 }
 
-func (c *fakeClock) After(d time.Duration) <-chan time.Time {
+// After matches the P3-10 seam: (timer channel, stop func). Every stop is
+// counted so tests can pin that the scheduler stops its superseded timers.
+func (c *fakeClock) After(d time.Duration) (<-chan time.Time, func()) {
 	c.mu.Lock()
 	c.armed = append(c.armed, d)
 	c.mu.Unlock()
-	return c.tick
+	return c.tick, func() {
+		c.mu.Lock()
+		c.stopped++
+		c.mu.Unlock()
+	}
+}
+
+// stoppedCount reports how many armed timers the scheduler has stopped.
+func (c *fakeClock) stoppedCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopped
 }
 
 // armedCount reports how many timers the scheduler has armed so far.
@@ -297,8 +311,8 @@ func TestRunWatchGracefulShutdown(t *testing.T) {
 		},
 		signals: sigs,
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires — only the signal ends it
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires — only the signal ends it
 		},
 		sdNotify: func(io.Writer) func() {
 			close(sdStarted)
@@ -407,4 +421,41 @@ func TestWatchFetchContinuesWithBrokenPlugin(t *testing.T) {
 	require.Equal(t, 2, strings.Count(string(nodes), `"source":"healthy`),
 		"healthy nodes must reach the pipeline: %s", nodes)
 	require.NotContains(t, string(nodes), "broken", "broken plugin output must not leak")
+}
+
+// TestSchedulerStopsArmedTimersOnReArm (termination-audit P3-10): the
+// re-arm path stops the superseded timer — a heartbeat-tick continue used
+// to leave the previous timer armed until it fired (a lingering timer is
+// GC-immune until it fires; with a 1h refresh and 60s idle ticks the old
+// code accumulated up to ~60 live timers).
+func TestSchedulerStopsArmedTimersOnReArm(t *testing.T) {
+	clock := newFakeClock()
+	waves := &waveRecorder{}
+	sched := newTestScheduler(clock, waves, false)
+	heartbeat := make(chan time.Time, 1)
+	sched.heartbeatTick = heartbeat
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = sched.run(stop, nil)
+		close(done)
+	}()
+
+	waitArmed(t, clock, 1) // the initial wave ran, the schedule re-armed
+	require.Zero(t, clock.stoppedCount(), "nothing to stop yet — one live timer")
+
+	// Two idle heartbeat ticks: each re-arm must stop the timer it
+	// supersedes.
+	heartbeat <- time.Now()
+	waitArmed(t, clock, 2)
+	heartbeat <- time.Now()
+	waitArmed(t, clock, 3)
+	require.Equal(t, 2, clock.stoppedCount(),
+		"every re-arm must stop the superseded timer (P3-10)")
+
+	// The stop branch stops the live timer too, then the loop exits.
+	close(stop)
+	<-done
+	require.Equal(t, 3, clock.stoppedCount(),
+		"the stop path must not leave an armed timer behind")
 }

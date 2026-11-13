@@ -151,11 +151,13 @@ type Manager struct {
 	// start (the crash supervisor's token for "the child I was watching");
 	// deliberateStop is set by every manager-driven stop (Stop, Restart,
 	// rollback) so the supervisor never reads a deliberate exit as a crash.
-	cmd            *exec.Cmd
-	waitOnce       sync.Once
-	done           chan struct{} // closed by the wait goroutine after Wait returns
-	waitErr        error         // valid after <-done (channel close = happens-before)
-	job            *childJob     // windows containment job (ADDENDUM §2); nil on unix
+	cmd         *exec.Cmd
+	waitOnce    sync.Once
+	done        chan struct{} // closed by the wait goroutine after Wait returns
+	waitErr     error         // valid after <-done (channel close = happens-before)
+	job         *childJob     // windows containment job (ADDENDUM §2); nil on unix
+	containment bool          // assign spawned children to the kill-on-close job (windows):
+	// ON for the daemon, OFF for transient one-shot managers (audit P2-1)
 	adoptedPID     int
 	strikes        int           // consecutive failed health checks (D8)
 	generation     int           // increments on every child start (supervisor token)
@@ -192,6 +194,35 @@ type Manager struct {
 // AutoUpdate's reattach. A nil log defaults to os.Stdout (the daemon's
 // stdout IS the journal).
 func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager, error) {
+	return newManager(cfg, dataDir, log, true)
+}
+
+// NewTransientManager is the one-shot wave's constructor (audit P2-1):
+// identical to NewManager in every respect except child containment — the
+// manager does NOT assign its spawned child to the windows kill-on-close
+// Job Object. Under KILL_ON_JOB_CLOSE, the one-shot CLI's process exit
+// closes the job handle and the kernel kills every job process: a one-shot
+// activate would kill the freshly activated core it must leave running
+// (the A2 divergence — on unix the child survives the CLI's exit and is
+// adopted by the next daemon). A transient manager's PROCESS LIFETIME IS
+// the containment scope, matching the unix semantics exactly; the
+// daemon's supervised child keeps the full job containment (attachChildJob
+// stays ON there, with today's loud spawn-failure posture). Unix is
+// byte-identical either way (the attach primitive is a no-op).
+func NewTransientManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager, error) {
+	return newManager(cfg, dataDir, log, false)
+}
+
+// attachChildJobFn is the containment seam (the recorded-actions pattern of
+// lock_internal_test.go): a var over the per-GOOS attachChildJob primitive
+// so tests can record consultations or force containment outcomes.
+// Production never reassigns it.
+var attachChildJobFn = attachChildJob
+
+// newManager is the shared constructor body: singleton flock, binary-knob
+// resolution, health-state mirror, binding probe — everything but the
+// containment posture, which is the daemon/transient distinction (P2-1).
+func newManager(cfg config.CoreConfig, dataDir string, log io.Writer, containment bool) (*Manager, error) {
 	if dataDir == "" {
 		return nil, errors.New("core: dataDir is empty — the manager cannot take its singleton lock")
 	}
@@ -219,20 +250,21 @@ func NewManager(cfg config.CoreConfig, dataDir string, log io.Writer) (*Manager,
 		strikeK = config.DefaultCoreRollbackStrikes
 	}
 	m := &Manager{
-		bin:        bin,
-		override:   cfg.XrayBin,
-		source:     classifyBinarySource(cfg.XrayBin, bin),
-		dataDir:    dataDir,
-		livePath:   filepath.Join(dataDir, "rendered", "live.json"),
-		lockPath:   filepath.Join(dataDir, coreLockName),
-		pidPath:    filepath.Join(dataDir, PIDFileName),
-		backupDir:  filepath.Join(dataDir, "backups"),
-		socksPort:  socksPort,
-		strikeK:    strikeK,
-		log:        log,
-		lockFile:   lockFile,
-		healthURL:  defaultHealthURL,
-		stderrTail: newTailWriter(log, childTailMax),
+		bin:         bin,
+		override:    cfg.XrayBin,
+		source:      classifyBinarySource(cfg.XrayBin, bin),
+		dataDir:     dataDir,
+		livePath:    filepath.Join(dataDir, "rendered", "live.json"),
+		lockPath:    filepath.Join(dataDir, coreLockName),
+		pidPath:     filepath.Join(dataDir, PIDFileName),
+		backupDir:   filepath.Join(dataDir, "backups"),
+		socksPort:   socksPort,
+		strikeK:     strikeK,
+		log:         log,
+		lockFile:    lockFile,
+		healthURL:   defaultHealthURL,
+		stderrTail:  newTailWriter(log, childTailMax),
+		containment: containment,
 	}
 	// The health-state mirror: the D8 STREAK lives in the process that
 	// counts it (S3 — the lock guarantees no other manager is counting), so
@@ -309,6 +341,11 @@ func (m *Manager) Stop() error {
 // Idempotent: the first call wins, later calls are no-ops.
 func (m *Manager) Supervise(stop <-chan struct{}) {
 	m.superviseOnce.Do(func() {
+		// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+		// process loudly — Go semantics — and every deployment transport answers a
+		// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+		// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+		// corrupted-state crash-loop the supervisor surfaces honestly.
 		go m.superviseLoop(stop)
 	})
 }
@@ -468,6 +505,14 @@ func (m *Manager) Alive() bool {
 // for its whole lifetime (S3) and stops the child explicitly on shutdown.
 // (This is the exported lock-surrender seam the T2 review's M-4 flagged.)
 //
+// The A2 contract holds on BOTH GOOSes since audit P2-1: a manager from
+// NewTransientManager carries no job handle, so the CLI's exit cannot kill
+// the surviving core through KILL_ON_JOB_CLOSE — the divergence where a
+// one-shot activate killed the core it just spawned is closed. Only a
+// NewTransientManager manager may call this while a spawned child lives;
+// a containment (daemon) manager must stop the child first (Stop), then
+// Release or release.
+//
 // Contrast with the unexported release(): that one STOPS the child first
 // (full teardown); Release is deliberately lock-only.
 func (m *Manager) Release() {
@@ -552,25 +597,30 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	// ADDENDUM §2 (windows): assign the child to the kill-on-close Job
 	// Object — daemon death never orphans the child. A containment failure
 	// fails the spawn loud (the child is killed; nothing runs uncontained).
-	job, jerr := attachChildJob(cmd.Process)
-	if jerr != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
-		m.cmd = nil
-		return fmt.Errorf("core: attach the core child to the containment job object: %w "+
-			"(a child outside the job could outlive the daemon — refusing to run it uncontained)", jerr)
+	// Transient (one-shot) managers skip the attach (audit P2-1): their
+	// process lifetime IS the containment scope — under KILL_ON_JOB_CLOSE
+	// the CLI's exit would close the job handle and kill the freshly
+	// activated core the wave must leave running (A2).
+	var job *childJob
+	if m.containment {
+		j, jerr := attachChildJobFn(cmd.Process)
+		if jerr != nil {
+			m.discardChildBounded()
+			m.cmd = nil
+			return fmt.Errorf("core: attach the core child to the containment job object: %w "+
+				"(a child outside the job could outlive the daemon — refusing to run it uncontained)", jerr)
+		}
+		job = j
 	}
 	m.job = job
 	if err := m.writePIDFile(cmd.Process.Pid); err != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
+		m.discardChildBounded()
 		m.releaseJobLocked()
 		m.cmd = nil
 		return fmt.Errorf("core: write pidfile after spawn: %w", err)
 	}
 	if err := m.awaitBoot(ctx); err != nil {
-		_ = m.cmd.Process.Kill()
-		<-m.waitDone()
+		m.discardChildBounded()
 		m.releaseJobLocked()
 		m.cmd = nil
 		m.clearPIDFile()
@@ -579,6 +629,25 @@ func (m *Manager) spawnLocked(ctx context.Context) error {
 	_, _ = fmt.Fprintf(m.log, "core: spawned pid %d (%s run -c %s)\n",
 		cmd.Process.Pid, m.bin, m.livePath)
 	return nil
+}
+
+// discardChildBounded is the spawn-failure teardown leg (termination-audit
+// P1): kill the just-spawned child best-effort and BOUND the reap wait —
+// a spawn failure must return to the caller loud, never hang on a child
+// whose reap the kill cannot complete (the D-state class). The spawn leg
+// above carries the caller-facing error; the teardown's own failures log
+// loud here so the operator sees the whole truth (audit: loud errors).
+func (m *Manager) discardChildBounded() {
+	if m.cmd == nil || m.cmd.Process == nil {
+		return
+	}
+	pid := m.cmd.Process.Pid
+	if err := m.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		_, _ = fmt.Fprintf(m.log, "core: kill child pid %d during spawn-failure teardown: %v\n", pid, err)
+	}
+	if err := reapWaitBounded(m.waitDone, pid, adoptedStopPoll); err != nil {
+		_, _ = fmt.Fprintf(m.log, "WARNING: %v\n", err)
+	}
 }
 
 // awaitBoot polls the socks inbound until it accepts (the child binds only
@@ -689,6 +758,11 @@ func (m *Manager) childAliveLocked() bool {
 func (m *Manager) waitDone() <-chan struct{} {
 	m.waitOnce.Do(func() {
 		m.done = make(chan struct{})
+		// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+		// process loudly — Go semantics — and every deployment transport answers a
+		// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+		// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+		// corrupted-state crash-loop the supervisor surfaces honestly.
 		go func() {
 			if m.cmd != nil {
 				m.waitErr = m.cmd.Wait()

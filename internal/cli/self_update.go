@@ -132,9 +132,10 @@ type binarySelfWatcher struct {
 	baselineSize  int64
 	baselineMtime time.Time
 
-	watcher *fsnotify.Watcher
-	stop    chan struct{}
-	done    chan struct{}
+	watcher  *fsnotify.Watcher
+	stop     chan struct{}
+	done     chan struct{} // closed by loop() on exit
+	statDone chan struct{} // closed by statLoop() on exit (audit P3-8 teardown symmetry)
 }
 
 func startBinarySelfWatcherWith(
@@ -174,6 +175,7 @@ func startBinarySelfWatcherWith(
 		watcher:       w,
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
+		statDone:      make(chan struct{}),
 	}
 	// Eager stat baseline: the poller's reference point is the binary AS THE
 	// WATCHER STARTS, not whenever the first tick lands. The lazy first-tick
@@ -187,8 +189,18 @@ func startBinarySelfWatcherWith(
 			bw.baselineSize = st.Size()
 			bw.baselineMtime = st.ModTime()
 		}
-		go bw.statLoop()
 	}
+	// statLoop starts unconditionally: it exits immediately when the poller
+	// is disabled (checkInterval <= 0) and close() waits for it — the P3-8
+	// teardown-symmetry contract (close used to wait only for loop(),
+	// leaving statLoop possibly mid os.Stat+log iteration after close
+	// returned).
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
+	go bw.statLoop()
 	go bw.loop()
 	outf(log, "self-update: watching %s (binary %s)\n", dir, base)
 	return bw, nil
@@ -223,6 +235,7 @@ func (bw *binarySelfWatcher) loop() {
 }
 
 func (bw *binarySelfWatcher) statLoop() {
+	defer close(bw.statDone)
 	if bw.checkInterval <= 0 {
 		return
 	}
@@ -260,6 +273,7 @@ func (bw *binarySelfWatcher) statLoop() {
 func (bw *binarySelfWatcher) close() {
 	close(bw.stop)
 	<-bw.done
+	<-bw.statDone // P3-8: wait for statLoop too — the watchdog's stopped-channel discipline
 	_ = bw.watcher.Close()
 }
 

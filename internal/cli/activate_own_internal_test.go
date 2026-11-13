@@ -103,7 +103,8 @@ func TestOneShotActivateRefusesUnderFlock(t *testing.T) {
 	// The daemon-style holder: a live manager keeps the flock for its
 	// lifetime (the kernel releases it only at process death) — its mere
 	// existence is the "daemon holds the core" state.
-	_ = f.ownManager(t)
+	holder := f.ownManager(t)
+	t.Cleanup(holder.Release) // the lock handle must not outlive the test (no child is spawned here)
 
 	// The one-shot entry (nil manager = the stage creates its own transient
 	// one, which must refuse).
@@ -154,8 +155,8 @@ func TestWatchBootstrapsCoreAtStart(t *testing.T) {
 		},
 		signals: sigs,
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires — only the signal ends it
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires — only the signal ends it
 		},
 		sdNotify: func(io.Writer) func() {
 			// THE S2 ordering proof: at READY time the bootstrap core must

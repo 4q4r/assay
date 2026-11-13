@@ -47,6 +47,7 @@ func TestLiveXrayTempInstanceEndToEnd(t *testing.T) {
 	})
 	require.NoError(t, err)
 	defer func() { _ = inst.Close() }()
+	t.Cleanup(func() { _ = inst.Close() }) // P2-2 layer 1: Close is idempotent; the belt survives aborts
 
 	dialer, err := proxy.SOCKS5("tcp", inst.Addr(), nil, proxy.Direct)
 	require.NoError(t, err)

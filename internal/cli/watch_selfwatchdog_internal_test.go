@@ -102,8 +102,8 @@ func selfWatchTestDeps(rec *selfWatchRecord, probe *selfWatchProbe) (watchDeps, 
 		},
 		signals: sigs,
 		now:     time.Now,
-		after: func(time.Duration) <-chan time.Time {
-			return make(chan time.Time) // never fires — only stop/miss end it
+		after: func(time.Duration) (<-chan time.Time, func()) {
+			return make(chan time.Time), func() {} // never fires — only stop/miss end it
 		},
 		sdNotify: func(io.Writer) func() {
 			close(rec.sdOn)
@@ -236,4 +236,51 @@ func TestSelfWatchConstantsAreCodeOwned(t *testing.T) {
 	assert.Equal(t, time.Hour, selfwatchdog.Threshold, "the miss threshold is the code-owned hour")
 	assert.Equal(t, 60*time.Second, selfWatchTickInterval, "the idle tick is 60s — far under threshold/2 pacing")
 	assert.Equal(t, 30*time.Second, selfExitGrace, "the graceful-unwind grace is the code-owned 30s")
+}
+
+// TestSecondSignalForceExit (termination-audit P3-11): from the moment a
+// graceful stop arms the force-exit watcher, the next signal — including
+// one already buffered during the stage — forces the exit through the
+// selfExit seam; a released watcher (normal unwind completed) never
+// forces anything, exactly the end-of-shutdown state.
+func TestSecondSignalForceExit(t *testing.T) {
+	rec := &selfWatchRecord{exited: make(chan struct{})}
+	sigs := make(chan os.Signal, 1)
+	// The second signal arrives (and buffers) DURING the mid-stage stop —
+	// before the watcher arms.
+	sigs <- os.Interrupt
+
+	armSecondSignalForceExit(io.Discard, sigs, func(code int) {
+		rec.mu.Lock()
+		rec.exitCode = code
+		close(rec.exited)
+		rec.mu.Unlock()
+	})
+	select {
+	case <-rec.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the buffered second signal must force the exit the moment the watcher arms (P3-11)")
+	}
+	require.Equal(t, 1, rec.code(), "the forced exit is loud and abnormal (code 1)")
+}
+
+func TestSecondSignalForceExitReleasedWatchesNothing(t *testing.T) {
+	rec := &selfWatchRecord{exited: make(chan struct{})}
+	sigs := make(chan os.Signal, 1)
+	release := armSecondSignalForceExit(io.Discard, sigs, func(code int) {
+		rec.mu.Lock()
+		rec.exitCode = code
+		close(rec.exited)
+		rec.mu.Unlock()
+	})
+	release()
+	// The buffered signal has no listener after release — the watcher must
+	// have exited with the disarm, never acting on a late signal.
+	sigs <- os.Interrupt
+	select {
+	case <-rec.exited:
+		t.Fatal("a released watcher forced an exit on a late signal")
+	case <-time.After(150 * time.Millisecond):
+		require.Zero(t, rec.code(), "no forced exit after release (the normal-unwind contract)")
+	}
 }

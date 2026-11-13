@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"assay/internal/model"
 	"assay/internal/render"
+	"assay/internal/testproc"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,6 +83,10 @@ const (
 // CHECKFAKE_DEAD_MARKER simulates a dead outbound (every CONNECT is refused
 // with reply 0x05), everything else forwards to the upstream test servers.
 func runCheckFakeServe() {
+	// Parent-death containment (termination-audit P2-2): a hard-killed or
+	// wedged parent test binary must leave NO serve child holding the test
+	// band — the orphan exits the moment its parent dies.
+	testproc.WatchParent()
 	cfgPath := ""
 	for i, a := range os.Args {
 		if a == "-c" && i+1 < len(os.Args) {
@@ -220,6 +226,23 @@ func freedomOutbound() map[string]any {
 	return map[string]any{"protocol": "freedom", "tag": tempOutboundTag}
 }
 
+// mustBoot boots a temp instance and registers its exact-PID Close with
+// t.Cleanup (termination-audit P2-2, layer 1): the kill survives ANY later
+// abort — an assertion firing between boot and the end of the test can no
+// longer leak the serve child (Cleanup runs on panic/Fatalf paths per the
+// testing contract; on a hard process kill the testproc belt inside the
+// fake's serve loop is the second layer). Idempotent with an explicit
+// Close call (Close is closeOnce-guarded).
+//
+//nolint:ireturn // SocksInstance is the seam (the StartTempXray contract); tests stay implementation-agnostic
+func mustBoot(ctx context.Context, t *testing.T, bin, workDir string, outbound map[string]any) SocksInstance {
+	t.Helper()
+	inst, err := StartTempXray(ctx, bin, workDir, outbound)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inst.Close() })
+	return inst
+}
+
 // C1: a child that dies during boot must surface as a LOUD, BOUNDED error —
 // never a hang — and Close must reap it and remove the temp config dir.
 // Regression pin for the drained one-shot wait channel: awaitReadiness'
@@ -289,6 +312,10 @@ func TestBatchXrayInstanceConcurrentCloseAndCancel(t *testing.T) {
 			cancel()
 			continue
 		}
+		// P2-2 layer 1: a failure in the race body below can no longer leak
+		// the serve child — the exact-PID Close rides t.Cleanup.
+		batch := inst
+		t.Cleanup(func() { _ = batch.Close() })
 
 		// Fire concurrent Close() calls and context cancellation
 		const workers = 10
@@ -357,6 +384,18 @@ func TestConcurrentBootPortsDistinct(t *testing.T) {
 	}
 	close(gate)
 	booted.Wait()
+	// P2-2 layer 1 (the audit's named site): register the exact-PID Close
+	// for EVERY booted instance BEFORE the first require — the audit's
+	// orphan shape was exactly a require between boot and Close (a boot
+	// failure Fatalf'd with both live serve children spawned and no
+	// cleanup reference). The explicit Close loop below stays: Close is
+	// closeOnce-guarded, so cleanup + explicit close is redundant-safe.
+	for i := range n {
+		if insts[i] != nil {
+			inst := insts[i]
+			t.Cleanup(func() { _ = inst.Close() })
+		}
+	}
 	for i := range n {
 		require.NoError(t, errs[i], "instance %d must boot", i)
 		require.NotNil(t, insts[i], "instance %d must boot", i)
@@ -370,6 +409,84 @@ func TestConcurrentBootPortsDistinct(t *testing.T) {
 	entries, rerr := os.ReadDir(workDir)
 	require.NoError(t, rerr)
 	assert.Empty(t, entries, "every instance must clean its temp dir on Close")
+}
+
+// TestTempInstanceCloseReapWaitIsBounded (termination-audit P1): Close's
+// reap wait must be BOUNDED — a temp child that accepted the kill but never
+// completes exec.Wait (the D-state class) previously wedged the checker
+// wave teardown on one unreapable instance, exactly like the manager's
+// session-child stop. The simulation mirrors the manager test
+// (TestStopSessionChildReapWaitIsBounded in internal/core): a real child
+// plus a pre-armed reap channel that never closes — the exact observable
+// of the unreapable class. The production bound (5s) is shortened through
+// the instanceReapBound seam so the proof runs in milliseconds.
+func TestTempInstanceCloseReapWaitIsBounded(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.list=.*")
+	require.NoError(t, cmd.Start())
+	// The instance's reaper is bypassed (fake done below) — the cleanup
+	// kills and reaps the child.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	origBound := instanceReapBound
+	instanceReapBound = 200 * time.Millisecond
+	t.Cleanup(func() { instanceReapBound = origBound })
+
+	inst := &xrayInstance{cmd: cmd, port: testPortBandMin + 1, dir: t.TempDir()}
+	inst.done = make(chan struct{}) // never closed — the unreapable state
+	inst.waitOnce.Do(func() {})     // consume the once: waitDone() returns the fake channel
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- inst.Close() }()
+	select {
+	case err := <-closed:
+		require.Error(t, err, "a child the kill could not reap is NOT a clean close")
+		require.Contains(t, err.Error(), strconv.Itoa(cmd.Process.Pid), "the error names the exact pid")
+		require.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+		require.Contains(t, err.Error(), "kill -KILL", "the error carries the exact manual escalation")
+		require.Less(t, time.Since(start), 5*time.Second, "the bound returned well within the watchdog")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Close() hung past %s on the reap wait — the temp-instance close is UNBOUNDED (audit P1)",
+			time.Since(start).Round(time.Second))
+	}
+}
+
+// TestBatchInstanceCloseReapWaitIsBounded is the batch twin of
+// TestTempInstanceCloseReapWaitIsBounded: the batch Close's reap wait is
+// bounded by the same seam (audit P1 names both legs, instance.go Close
+// and batchXrayInstance.Close).
+func TestBatchInstanceCloseReapWaitIsBounded(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.list=.*")
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	origBound := instanceReapBound
+	instanceReapBound = 200 * time.Millisecond
+	t.Cleanup(func() { instanceReapBound = origBound })
+
+	inst := &batchXrayInstance{cmd: cmd, ports: []int{testPortBandMin + 2}, dir: t.TempDir()}
+	inst.done = make(chan struct{}) // never closed — the unreapable state
+	inst.waitOnce.Do(func() {})
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- inst.Close() }()
+	select {
+	case err := <-closed:
+		require.Error(t, err, "a child the kill could not reap is NOT a clean close")
+		require.Contains(t, err.Error(), strconv.Itoa(cmd.Process.Pid), "the error names the exact pid")
+		require.Contains(t, err.Error(), "not reaped", "the error says what did not happen")
+		require.Less(t, time.Since(start), 5*time.Second, "the bound returned well within the watchdog")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("batch Close() hung past %s on the reap wait — the close is UNBOUNDED (audit P1)",
+			time.Since(start).Round(time.Second))
+	}
 }
 
 // C2 invariant pin (engine-level, reviewer's repro): with a dead-outbound
@@ -513,6 +630,7 @@ func TestStartTempXrayStripsProxyEnv(t *testing.T) {
 	inst, err := StartTempXray(context.Background(), fakeBin(t, checkFakeModeServe), workDir, freedomOutbound())
 	require.NoError(t, err)
 	require.NotNil(t, inst)
+	t.Cleanup(func() { _ = inst.Close() }) // P2-2 layer 1: survives any abort below
 	childEnv, rerr := os.ReadFile(dump)
 	require.NoError(t, rerr, "the fake must dump the child env")
 	require.NoError(t, inst.Close())
@@ -625,9 +743,7 @@ func TestSuiteInstancesUseDisjointPortBand(t *testing.T) {
 	// test band inside this binary.
 	require.Greater(t, testPortBandMin, 18799, "the test band must sit entirely above the production 18xxx band")
 
-	inst, err := StartTempXray(context.Background(), fakeBin(t, checkFakeModeServe), t.TempDir(), freedomOutbound())
-	require.NoError(t, err)
-	defer func() { _ = inst.Close() }()
+	inst := mustBoot(context.Background(), t, fakeBin(t, checkFakeModeServe), t.TempDir(), freedomOutbound())
 
 	_, portStr, perr := net.SplitHostPort(inst.Addr())
 	require.NoError(t, perr)

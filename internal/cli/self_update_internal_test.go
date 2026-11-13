@@ -185,3 +185,43 @@ func TestMagicRejectionSkipsOversizedMagic(t *testing.T) {
 			"the ExecMagics table must stay within the verifier's 4-byte read")
 	}
 }
+
+// TestSelfWatcherCloseWaitsStatLoop (termination-audit P3-8): close() may
+// only return once BOTH watcher goroutines have exited — the statLoop used
+// to be unwaited, so one os.Stat+log iteration could still be in flight
+// after close returned. The pin reads the statLoop exit channel directly
+// (structural: the channel is the fix; with the pre-fix shape this file
+// does not compile, which is the RED).
+func TestSelfWatcherCloseWaitsStatLoop(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "assay")
+	require.NoError(t, os.WriteFile(bin, []byte("placeholder"), 0o755))
+	var pending, armed atomic.Bool
+	bw, err := startBinarySelfWatcherWith(dir, "assay", &pending, &armed, io.Discard, time.Hour, bin)
+	require.NoError(t, err)
+	bw.close() // must return only after loop() AND statLoop() exited
+	select {
+	case <-bw.statDone:
+	default:
+		t.Fatal("close() returned with statLoop still running (audit P3-8)")
+	}
+}
+
+// TestSelfWatcherCloseWithPollerDisabled covers the disabled-poller shape:
+// statLoop starts unconditionally and exits immediately; close() must not
+// hang waiting on it.
+func TestSelfWatcherCloseWithPollerDisabled(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "assay")
+	require.NoError(t, os.WriteFile(bin, []byte("placeholder"), 0o755))
+	var pending, armed atomic.Bool
+	bw, err := startBinarySelfWatcherWith(dir, "assay", &pending, &armed, io.Discard, 0, bin)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { bw.close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("close() hung on the disabled-poller statDone")
+	}
+}

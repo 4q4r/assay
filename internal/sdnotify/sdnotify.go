@@ -66,6 +66,11 @@ func Watch(ctx context.Context, log io.Writer) func() {
 	_, _ = fmt.Fprintf(log, "sd_notify: READY=1 sent; watchdog pings every %s (WatchdogSec/2)\n", interval)
 
 	pingCtx, cancel := context.WithCancel(ctx)
+	// PANIC POLICY (audit P3-9): a panic in this goroutine crashes the whole
+	// process loudly — Go semantics — and every deployment transport answers a
+	// crash with a restart (systemd Restart=always / launchd KeepAlive / the
+	// SCM recovery actions) BY DESIGN. No recover here: a recover could mask a
+	// corrupted-state crash-loop the supervisor surfaces honestly.
 	go pingLoop(pingCtx, sock, interval, log)
 	return cancel
 }
