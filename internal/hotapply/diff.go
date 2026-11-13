@@ -1,6 +1,9 @@
 package hotapply
 
-import "reflect"
+import (
+	"errors"
+	"reflect"
+)
 
 // Diff is the apply-vs-restart verdict for a live/candidate pair (plan T3).
 //
@@ -76,4 +79,27 @@ func mergeKeys(a, b map[string]any) []string {
 		}
 	}
 	return keys
+}
+
+// ExpectedFromRouting extracts the verification contract from a rendered
+// routing section: the ruleTags to expect on the running core after the
+// replace (only the explicitly tagged rules — api rule and catch-all stay
+// untagged by design) and the total rule count the ListRules snapshot must
+// show.
+func ExpectedFromRouting(routing map[string]any) ([]string, int, error) {
+	raw, ok := routing["rules"].([]any)
+	if !ok {
+		return nil, 0, errors.New("routing section has no rules array — cannot build the verification contract")
+	}
+	var tags []string
+	for _, r := range raw {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tag, ok := rm["ruleTag"].(string); ok && tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+	return tags, len(raw), nil
 }

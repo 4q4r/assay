@@ -449,6 +449,7 @@ func TestDaemonCoreExecSurfaceIsPinned(t *testing.T) {
 		"internal/install/cron.go",          // crontab allowlist executor (S3, its own guard)
 		"internal/activate/activate.go",     // the -test gate child (WaitDelay-safe)
 		"internal/checker/instance.go",      // probe/check temp-instance fleets
+		"internal/hotapply/client.go",       // the hot-apply API client: `api lsrules/adrules` on the RESOLVED core binary (S1)
 		"internal/core/manager.go",          // core spawn/kill (the daemon's own child)
 		"internal/core/rollback.go",         // rollback -test gate child
 		"internal/stats/stats.go",           // xray api statsquery poll

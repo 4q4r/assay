@@ -266,3 +266,18 @@ func TestApplyVsRestartClassificationTable(t *testing.T) {
 		assert.True(t, d.HotCapable, "an identical render is hot/no-op — the BINARY is what changed, which apply does not touch")
 	})
 }
+
+// ExpectedFromRouting extracts the verification contract from a rendered
+// routing section: every ruleTag (in rule order) and the total rule count —
+// what VerifyApplied checks the running core against after the replace.
+
+func TestExpectedFromRouting(t *testing.T) {
+	routing := baseConfig()["routing"].(map[string]any)
+	tags, count, err := ExpectedFromRouting(routing)
+	require.NoError(t, err)
+	assert.Equal(t, 3, count, "api rule + pool route + catch-all")
+	assert.Equal(t, []string{"pool-route-0"}, tags, "only explicitly tagged rules are verifiable")
+
+	_, _, err = ExpectedFromRouting(map[string]any{})
+	require.Error(t, err, "a routing section without rules is a programming error — fail loud")
+}
