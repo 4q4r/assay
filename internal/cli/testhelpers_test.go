@@ -25,6 +25,7 @@ import (
 
 	"assay/internal/config"
 	"assay/internal/core"
+	"assay/internal/testproc"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -112,6 +113,10 @@ func runCliFakeCore() {
 // CONNECT is refused with reply 0x05 (connection refused) — the always-dead
 // outbound class described above.
 func cliFakeServe(raw []byte) {
+	// Parent-death containment (termination-audit P2-2): see the checker
+	// fake's identical belt — a hard-killed parent must not leave a serve
+	// child holding the test band.
+	testproc.WatchParent()
 	var cfg struct {
 		Inbounds []struct {
 			Port int `json:"port"`

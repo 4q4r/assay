@@ -90,6 +90,11 @@ func TestBootSmokeEveryProtocolFamily(t *testing.T) {
 			defer cancel()
 			inst, err := factory(ctx, n)
 			require.NoError(t, err, "family %s: the core must boot the rendered outbound", fam.name)
+			// P2-2 layer 1: a REAL xray child — the exact-PID Close rides
+			// t.Cleanup so a failed band/probe assertion below can never
+			// leak it (the hard-kill class is answered by the unix
+			// PDEATHSIG belt at the instance spawn seam).
+			t.Cleanup(func() { _ = inst.Close() })
 
 			// The smoke boots through the SAME scan as the suite: the port
 			// must land in the disjoint test band, never the production

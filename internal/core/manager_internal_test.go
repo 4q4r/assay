@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"assay/internal/config"
+	"assay/internal/testproc"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,6 +66,11 @@ func TestMain(m *testing.M) {
 
 // runCoreLockHelper takes the singleton flock (NewManager) and blocks.
 func runCoreLockHelper(dataDir string) {
+	// Parent-death containment (termination-audit P2-2): this helper holds
+	// the singleton flock and blocks until killed — a dead parent must
+	// never leave the lock held forever (a leaked flock wedges every later
+	// manager on that data dir).
+	testproc.WatchParent()
 	port, err := strconv.Atoi(os.Getenv("CORELOCK_HELPER_PORT"))
 	if err != nil || port <= 0 {
 		os.Exit(2)
@@ -131,6 +137,10 @@ func runFakeCore() {
 // carrying fakeDeadMarker refuses every CONNECT; anything else forwards to
 // the dialed target.
 func fakeServe(raw []byte) {
+	// Parent-death containment (termination-audit P2-2): see the checker
+	// fake's identical belt — a hard-killed parent must not leave a serve
+	// child holding the test band.
+	testproc.WatchParent()
 	var cfg struct {
 		Inbounds []struct {
 			Port int `json:"port"`

@@ -160,7 +160,8 @@ func TestCoreAutoUpdateStageInertWhenOverridden(t *testing.T) {
 func TestCoreAutoUpdateStageRefusesUnderFlock(t *testing.T) {
 	f := newOwnFixture(t)
 	f.writeOwnLive(t, "gen-0")
-	_ = f.ownManager(t) // the daemon-style holder
+	holder := f.ownManager(t) // the daemon-style holder
+	t.Cleanup(holder.Release) // the lock handle must not outlive the test (no child is spawned here)
 
 	err := runCoreAutoUpdateStage(f.cmd, f.cfg)
 	require.Error(t, err)

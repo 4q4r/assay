@@ -280,13 +280,14 @@ func StartTempXray(ctx context.Context, xrayBin, workDir string, outbound map[st
 	}
 	//nolint:gosec // the binary comes from the owner's config.toml — the config file IS the trust root
 	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", cfgPath)
+	configureTempSpawn(cmd) // parent-death containment belt (P2-2; unix PDEATHSIG)
 	cmd.Env = dropProxyEnv(os.Environ())
 	cmd.WaitDelay = instanceKillDelay
 	stderr := &limitedWriter{max: instanceLogBuffers}
 	cmd.Stderr = stderr
 
 	inst := &xrayInstance{cmd: cmd, port: port, dir: dir}
-	if err := cmd.Start(); err != nil {
+	if err := startTempChild(cmd); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("start %s: %w", xrayBin, err)
 	}
@@ -398,13 +399,14 @@ func StartTempXrayBatch(
 	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", cfgPath)
 	// The child must not inherit a proxy environment (L5 hygiene), and Wait
 	// must never block forever on inherited pipes (M-3 landmine).
+	configureTempSpawn(cmd) // parent-death containment belt (P2-2; unix PDEATHSIG)
 	cmd.Env = dropProxyEnv(os.Environ())
 	cmd.WaitDelay = instanceKillDelay
 	stderr := &limitedWriter{max: instanceLogBuffers}
 	cmd.Stderr = stderr
 
 	inst := &batchXrayInstance{cmd: cmd, ports: ports, dir: dir}
-	if err := cmd.Start(); err != nil {
+	if err := startTempChild(cmd); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("start %s: %w", xrayBin, err)
 	}
