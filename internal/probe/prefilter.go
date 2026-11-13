@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"assay/internal/model"
@@ -267,32 +268,86 @@ func dialEndpoint(ctx context.Context, dial dialFunc, endpoint string, timeout t
 	return classifyDialFailure(err), true
 }
 
+// The REAL windows WSA socket errnos. Go's syscall.ECONN* constants on
+// windows are invented APPLICATION_ERROR offsets that never equal a live
+// socket error (verified in $GOROOT/src/syscall/zerrors_windows.go), so the
+// errno table below carries the Winsock2 values explicitly (WSAECONNREFUSED
+// 10061, WSAECONNRESET 10054, WSAETIMEDOUT 10060, WSAEHOSTUNREACH 10065,
+// WSAENETUNREACH 10051). The windows error TEXT never contains "connection
+// refused" — a windows refusal classified by string landed in "other" and
+// poisoned the drop report (run 43330792666).
+const (
+	wsaConnRefused = 10061
+	wsaConnReset   = 10054
+	wsaTimedOut    = 10060
+	wsaHostUnreach = 10065
+	wsaNetUnreach  = 10051
+)
+
+// The drop-reason classes the stage report counts — one spelling each,
+// defined once (the scheduler-name constants pattern). The stage report and
+// the aggregation read them back verbatim.
+const (
+	dialClassRefused     = "refused"
+	dialClassTimeout     = "timeout"
+	dialClassDNS         = "dns"
+	dialClassUnreachable = "unreachable"
+	dialClassReset       = "reset"
+	dialClassOther       = "other"
+)
+
+// errnoDialClasses maps a wrapped OS errno to its drop-reason class. The
+// unix and windows families carry the same classes as DIFFERENT numeric
+// values, so both tables live side by side; no collision is possible — the
+// windows syscall constants start above APPLICATION_ERROR (1<<29) and the
+// WSA values sit in an unassigned band of the linux errno range.
+var errnoDialClasses = map[syscall.Errno]string{
+	syscall.ECONNREFUSED: dialClassRefused,
+	syscall.ECONNRESET:   dialClassReset,
+	syscall.ETIMEDOUT:    dialClassTimeout,
+	syscall.EHOSTUNREACH: dialClassUnreachable,
+	syscall.ENETUNREACH:  dialClassUnreachable,
+	wsaConnRefused:       dialClassRefused,
+	wsaConnReset:         dialClassReset,
+	wsaTimedOut:          dialClassTimeout,
+	wsaHostUnreach:       dialClassUnreachable,
+	wsaNetUnreach:        dialClassUnreachable,
+}
+
 // classifyDialFailure buckets a dial error into the drop-reason classes the
 // stage report counts (the filter-policy drop-report pattern: classes, not
-// raw error strings).
+// raw error strings). Errno identity comes first — every platform carries
+// the class in the wrapped errno while the TEXT spellings diverge (windows
+// refusals never say "connection refused") — and the string table stays as
+// the fallback for exotic unwrapped shapes.
 func classifyDialFailure(err error) string {
 	if _, ok := errors.AsType[*net.DNSError](err); ok {
-		return "dns"
+		return dialClassDNS
 	}
 	if opErr, ok := errors.AsType[*net.OpError](err); ok && errors.Is(opErr.Err, os.ErrDeadlineExceeded) {
-		return "timeout"
+		return dialClassTimeout
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
-		return "timeout"
+		return dialClassTimeout
+	}
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+		if class, mapped := errnoDialClasses[errno]; mapped {
+			return class
+		}
 	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "connection refused"):
-		return "refused"
+		return dialClassRefused
 	case strings.Contains(msg, "no such host"), strings.Contains(msg, "DNS"):
-		return "dns"
+		return dialClassDNS
 	case strings.Contains(msg, "i/o timeout"):
-		return "timeout"
+		return dialClassTimeout
 	case strings.Contains(msg, "unreachable"):
-		return "unreachable"
+		return dialClassUnreachable
 	case strings.Contains(msg, "connection reset"):
-		return "reset"
+		return dialClassReset
 	default:
-		return "other"
+		return dialClassOther
 	}
 }

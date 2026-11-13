@@ -25,7 +25,7 @@ func AggregateProbeResults(results []store.ProbeResult) OutcomeAggregation {
 		if r.Alive {
 			agg.ObservedRTTMs = append(agg.ObservedRTTMs, r.RTTMs)
 		}
-		if r.FailureKind == "timeout" {
+		if r.FailureKind == dialClassTimeout {
 			agg.TimedOutCount++
 		}
 	}

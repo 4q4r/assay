@@ -187,7 +187,17 @@ func node(t *testing.T, name string) *model.Node {
 // blockpage markers.
 func healthySite(t *testing.T) *httptest.Server {
 	t.Helper()
-	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /speed serves a multi-MB sample: the speedtest must measure a
+		// window the OS clock can actually resolve and a slow CI runner can
+		// actually complete. The 34-byte first draft fit inside a single
+		// scheduling slice on the windows runner — the sample returned
+		// before the measurement could tick, SpeedBPS landed as 0, and both
+		// engine speedtests failed ("0 is not positive", run 43330792666).
+		if r.URL.Path == "/speed" {
+			_, _ = w.Write(make([]byte, 4*1024*1024))
+			return
+		}
 		_, _ = w.Write([]byte("OK — the tunnel reached the target."))
 	}))
 	t.Cleanup(site.Close)
@@ -230,7 +240,10 @@ func TestEngineAliveMapping(t *testing.T) {
 	n := node(t, "alive")
 
 	opts := baseOpts(site.URL, echoURL)
-	opts.SpeedtestURL = site.URL // tiny but real sample: bytes/time > 0
+	opts.SpeedtestURL = site.URL + "/speed" // big-but-real sample: bytes/time > 0
+	// A full window, not a scrape: the sample rides the tunnel + the relay,
+	// and a slow runner must not turn the measurement into a timeout-0.
+	opts.SpeedtestTimeout = 5 * time.Second
 	opts.Speedtest = true
 	out, err := Run(context.Background(), []*model.Node{n}, tunnelFactory(socks.Addr()), opts, "")
 	require.NoError(t, err)
@@ -420,7 +433,8 @@ func TestEngineSpeedtestOnlyOnAlive(t *testing.T) {
 
 	opts := baseOpts(site.URL, echoURL)
 	opts.Speedtest = true
-	opts.SpeedtestURL = site.URL
+	opts.SpeedtestURL = site.URL + "/speed"
+	opts.SpeedtestTimeout = 5 * time.Second
 	// Routing factory: the alive node rides the working relay, the dead node
 	// gets a socks endpoint whose upstream refuses (a dead tunnel).
 	factory := Factory(func(_ context.Context, n *model.Node) (SocksInstance, error) {
