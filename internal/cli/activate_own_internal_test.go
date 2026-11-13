@@ -19,6 +19,7 @@ import (
 	"assay/internal/checker"
 	"assay/internal/config"
 	"assay/internal/model"
+	"assay/internal/platform"
 	"assay/internal/plugins"
 
 	"github.com/stretchr/testify/assert"
@@ -455,12 +456,37 @@ func TestDaemonCoreExecSurfaceIsPinned(t *testing.T) {
 	}, offenders, "the daemon's complete child-process surface changed — widen this pin deliberately, never silently")
 }
 
-// cliCorePortRefused polls until the socks port stops answering (the
-// external-kill helper for the revive tests).
-func cliCorePortRefused(t *testing.T, port int) {
+// cliCoreKillSettled is the deterministic external-kill gate for the revive
+// tests: it returns only once the SIGKILLed child is provably FULLY gone —
+// signal-0 says ESRCH (the pid is reaped; a killed-but-unreaped zombie
+// still answers signal-0, which is exactly the round-1 zombie window the
+// manager had to learn to see through) — AND the socks port is released.
+//
+// A single port-dial observation is NOT a proof of death and must never
+// gate the revive stage: under CI load the userspace-enforced dial deadline
+// can fire on a loopback connect to a STILL-LISTENING socket (starved
+// dialer goroutine, -race + concurrent package runs), so "not serving" can
+// be observed for a live child. The stage then ran against a not-yet-dead
+// core — either the manager healthy-no-opped on the alive-and-serving child
+// (which died right after; nothing ever revived it: darwin, run
+// 43330792666, "Condition never satisfied" at 6.93s) or it cleared the
+// still-valid pidfile and double-spawned onto the still-bound port (bind
+// collision → loud boot error ~1.9s; the ubuntu-24.04-arm failure shape).
+// Both signatures are one root cause; the fix-round mechanism probe proved
+// the window live: after SIGKILL delivery, alive-AND-serving observations
+// occur on every run (unloaded host: 1 of 2-3 signal-0 samples), and ESRCH
+// is monotone — after it, the port never serves again (500 samples, 0
+// violations).
+//
+// The pid is the test's own child (the manager reaps it in-process), so
+// ESRCH lands deterministically; the pid-reuse hazard is confined to the
+// 15s window and fails LOUD (a timeout), never silently.
+func cliCoreKillSettled(t *testing.T, pid, port int) {
 	t.Helper()
-	require.Eventually(t, func() bool { return !coreServing(port) },
-		5*time.Second, 50*time.Millisecond, "the killed core must stop serving")
+	require.Eventually(t, func() bool {
+		return !platform.ProcessAlive(pid) && !coreServing(port)
+	}, 15*time.Second, 50*time.Millisecond,
+		"the SIGKILLed core child must be fully reaped (signal-0 ESRCH) with its socks port released — the revive stage must never run against a not-yet-dead core")
 }
 
 // cliPIDFromPidFile reads <data>/core.pid and returns its pid.
@@ -514,10 +540,14 @@ func TestActivateNoCandidateRevivesDeadCoreOnLastGood(t *testing.T) {
 	require.NoError(t, mgr.EnsureRunning(context.Background()))
 
 	// The daemon restarted after a manual kill: the child is dead, the
-	// last-good live config is still on disk.
+	// last-good live config is still on disk. The kill must be SETTLED
+	// (reaped + port released — cliCoreKillSettled) before the stage: a
+	// not-yet-dead child turns this shape-b test into either the manager's
+	// healthy no-op (nothing revives — the darwin CI failure) or a
+	// double-spawn bind collision (the arm failure shape).
 	pid := cliPIDFromPidFile(t, f.p.dataDir)
 	require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
-	cliCorePortRefused(t, f.cfg.Core.SocksPort)
+	cliCoreKillSettled(t, pid, f.cfg.Core.SocksPort)
 
 	require.NoError(t, runActivateStageWithManager(f.cmd, f.cfg, mgr))
 
