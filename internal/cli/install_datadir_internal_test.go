@@ -95,6 +95,95 @@ func TestInstallRunitReinstallRunScriptCarriesAbsoluteLogPaths(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Status surfacing (acceptance §4): the failure mode is SILENT — `sv status`
+// exits 0 with "down, want up", openrc reports "started" with no child.
+// A held registration whose boot artifact is missing or not executable is
+// surfaced LOUD in `assay status`.
+// ---------------------------------------------------------------------------
+
+// TestStatusRunitSurfacesNonExecutableRunScript pins the not-bootable class:
+// runsv execs ./run — a 0644 run script never boots while sv status still
+// exits 0.
+func TestStatusRunitSurfacesNonExecutableRunScript(t *testing.T) {
+	home := t.TempDir()
+	svcDir := filepath.Join(home, "service", install.WatchDirName)
+	require.NoError(t, os.MkdirAll(svcDir, 0o750))
+	run := filepath.Join(svcDir, "run")
+	require.NoError(t, os.WriteFile(run, []byte("#!/bin/sh\nexec true\n"), 0o644))
+	f := &fakeScheduler{name: install.SchedulerRunit, held: true, heldWhere: svcDir}
+	buf := &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, f, filepath.Join(home, "bin"), false)
+	out := buf.String()
+	assert.Contains(t, out, "not executable", "the not-bootable artifact must be loud")
+	assert.Contains(t, out, run, "the warning names the exact artifact")
+}
+
+// TestStatusRunitSurfacesMissingRunScript: a held service dir whose run
+// script is gone cannot boot — loud, not a silent note.
+func TestStatusRunitSurfacesMissingRunScript(t *testing.T) {
+	home := t.TempDir()
+	svcDir := filepath.Join(home, "service", install.WatchDirName)
+	require.NoError(t, os.MkdirAll(svcDir, 0o750))
+	f := &fakeScheduler{name: install.SchedulerRunit, held: true, heldWhere: svcDir}
+	buf := &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, f, filepath.Join(home, "bin"), false)
+	out := buf.String()
+	assert.Contains(t, out, "boot script missing", "the missing boot script must be loud")
+	assert.Contains(t, out, filepath.Join(svcDir, "run"))
+}
+
+// TestStatusOpenRCSurfacesNonExecutableServiceScript pins the openrc shape:
+// the init.d script IS the boot artifact (rc-update refuses non-executable
+// services — the alpine leg live-proved the class).
+func TestStatusOpenRCSurfacesNonExecutableServiceScript(t *testing.T) {
+	home := t.TempDir()
+	script := filepath.Join(home, ".config", "rc", "init.d", install.WatchDirName)
+	require.NoError(t, os.MkdirAll(filepath.Dir(script), 0o750))
+	require.NoError(t, os.WriteFile(script, []byte("#!/sbin/openrc-run\n"), 0o644))
+	f := &fakeScheduler{name: install.SchedulerOpenRC, held: true, heldWhere: script}
+	buf := &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, f, filepath.Join(home, "bin"), false)
+	assert.Contains(t, buf.String(), "not executable")
+}
+
+// TestStatusHealthyRunScriptPrintsNoBootWarning: an executable run script
+// keeps the section byte-identical — no noise on healthy hosts.
+func TestStatusHealthyRunScriptPrintsNoBootWarning(t *testing.T) {
+	home := t.TempDir()
+	svcDir := filepath.Join(home, "service", install.WatchDirName)
+	require.NoError(t, os.MkdirAll(svcDir, 0o750))
+	run := filepath.Join(svcDir, "run")
+	require.NoError(t, os.WriteFile(run, []byte("#!/bin/sh\nexec true\n"), 0o755))
+	f := &fakeScheduler{name: install.SchedulerRunit, held: true, heldWhere: svcDir}
+	buf := &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, f, filepath.Join(home, "bin"), false)
+	out := buf.String()
+	assert.NotContains(t, out, "not executable")
+	assert.NotContains(t, out, "boot script missing")
+}
+
+// TestStatusCronAndUnheldSchedulersPrintNoBootWarning: cron boots from a
+// crontab entry (no run script to stat) and an unheld scheduler has no
+// registration — neither carries the boot-artifact check.
+func TestStatusCronAndUnheldSchedulersPrintNoBootWarning(t *testing.T) {
+	home := t.TempDir()
+	cron := &fakeScheduler{
+		name: install.SchedulerCron, held: true,
+		heldWhere: "user crontab (@reboot assay-watch)",
+	}
+	buf := &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, cron, filepath.Join(home, "bin"), false)
+	out := buf.String()
+	assert.NotContains(t, out, "not executable")
+	assert.NotContains(t, out, "boot script missing")
+
+	unheld := &fakeScheduler{name: install.SchedulerRunit}
+	buf = &bytes.Buffer{}
+	printLinuxSchedulerStatus(buf, unheld, filepath.Join(home, "bin"), false)
+	assert.NotContains(t, buf.String(), "not executable")
+}
+
+// ---------------------------------------------------------------------------
 // resolveDataDir semantics — direct pins on the helper the behavioral tests
 // above exercise end-to-end through the real runit renderer.
 // ---------------------------------------------------------------------------

@@ -1072,7 +1072,10 @@ func printInstalledBinary(out io.Writer, binDir string, color bool) {
 // generic section also carries, then the holding scheduler's Status answer —
 // the honest probe note verbatim (the raw sv/s6-svstat/rc-service line where
 // one exists, the supervision posture, the no-supervision caveat for cron).
-// A Status ERROR renders as a loud warning line, never a silent skip.
+// A Status ERROR renders as a loud warning line, never a silent skip. A held
+// registration whose boot artifact is missing or not executable is ALSO
+// loud: that is the silent class where the scheduler's own status still
+// exits 0 while the daemon can never boot (docker acceptance 2026-11-13).
 func printLinuxSchedulerStatus(out io.Writer, sched scheduler, binDir string, color bool) {
 	printInstalledBinary(out, binDir, color)
 	st, err := sched.Status()
@@ -1082,9 +1085,45 @@ func printLinuxSchedulerStatus(out io.Writer, sched scheduler, binDir string, co
 	}
 	if st.Active {
 		outf(out, "%s\n", ui.ChipKV("  scheduler: ", sched.Name()+" — "+st.Note, color))
-		return
+	} else {
+		outf(out, "%s\n", ui.ChipKV("  scheduler: ", st.Note, color))
 	}
-	outf(out, "%s\n", ui.ChipKV("  scheduler: ", st.Note, color))
+	if warning := linuxSchedulerBootWarning(sched); warning != "" {
+		outf(out, "%s\n", ui.Warn("  NOT BOOTABLE: "+warning, ui.Red, color))
+	}
+}
+
+// linuxSchedulerBootWarning inspects the holder's boot artifact purely on
+// the filesystem (no scheduler-output parsing): runit and s6 boot from
+// <service dir>/run (runsv/s6-supervise exec it), OpenRC from the init.d
+// script itself (rc-update refuses non-executable services). A held
+// registration with the artifact missing or lacking execute bits means the
+// daemon cannot boot while scheduler status may still exit 0 — the exact
+// silent failure the acceptance run recorded. "" = healthy or not
+// checkable (cron boots from a crontab entry, not a script file).
+func linuxSchedulerBootWarning(sched scheduler) string {
+	held, loc := sched.HeldRegistration()
+	if !held || loc == "" {
+		return ""
+	}
+	var script string
+	switch sched.Name() {
+	case install.SchedulerRunit, install.SchedulerS6:
+		script = filepath.Join(loc, "run")
+	case install.SchedulerOpenRC:
+		script = loc
+	default:
+		return ""
+	}
+	st, err := os.Stat(script)
+	if err != nil {
+		return "boot script missing: " + script + " — the scheduler cannot start the daemon; re-run `assay install`"
+	}
+	if st.Mode()&0o111 == 0 {
+		return "boot script not executable: " + script +
+			" — the scheduler cannot start the daemon (chmod 755 " + script + ", or re-run `assay install`)"
+	}
+	return ""
 }
 
 // printLaunchdStatus is the darwin install-status section (§1.2.8): the
