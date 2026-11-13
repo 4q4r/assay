@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -192,4 +193,35 @@ func TestDaemonNeverTouchesSystemd(t *testing.T) {
 		assert.NotContains(t, s, "Systemctl(", "the daemon must never invoke systemctl")
 		assert.NotContains(t, s, "systemd/", "the daemon must not import the unit package")
 	}
+}
+
+// TestSystemctlStopVerbCeilingParity (termination-audit P3-5): the
+// stop-carrying verbs (`disable --now`) get a client ceiling ABOVE the
+// unit's TimeoutStopSec=1800 stop budget — the client must outlive the
+// longest legal stop job, not abort at 10 min while systemd's stop job
+// keeps running to 30 min; the instant verbs keep the 10-minute ceiling.
+// The executor wiring is source-pinned (the executor never runs in tests).
+func TestSystemctlStopVerbCeilingParity(t *testing.T) {
+	stop := []string{userFlag, "disable", nowFlag, WatchService}
+	assert.Equal(t, systemctlStopCeiling, systemctlCeiling(stop),
+		"the watch disable --now verb carries the stop ceiling")
+	legacy := []string{userFlag, "disable", nowFlag, RefreshTimer, SpeedtestTimer}
+	assert.Equal(t, systemctlStopCeiling, systemctlCeiling(legacy),
+		"the legacy-timer disable carries the stop ceiling")
+	for _, args := range [][]string{
+		{userFlag, "daemon-reload"},
+		{userFlag, "enable", nowFlag, WatchService},
+	} {
+		assert.Equal(t, 10*time.Minute, systemctlCeiling(args),
+			"%v stays at the instant ceiling", args)
+	}
+	assert.Greater(t, systemctlStopCeiling, 30*time.Minute,
+		"the client must outlive the TimeoutStopSec=1800 stop job, never tie it")
+	assert.LessOrEqual(t, systemctlStopCeiling, 35*time.Minute,
+		"the client margin stays sane")
+
+	src, err := os.ReadFile(filepath.Join(".", "install.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(src), "context.WithTimeout(context.Background(), systemctlCeiling(args))",
+		"the executor must derive its ceiling from the verb (P3-5 wiring)")
 }

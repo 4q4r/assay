@@ -90,19 +90,44 @@ func equalArgs(a, b []string) bool {
 	return true
 }
 
+// systemctlStopCeiling bounds the stop-carrying verbs (`disable --now`):
+// the watch unit's stop budget is TimeoutStopSec=1800 — 30 min, the same
+// parity winsvc's awaitStopped uses — because a `disable --now` against a
+// mid-stage daemon legitimately waits for the stage to finish. The CLIENT
+// ceiling must OUTLIVE the longest legal stop job (termination-audit P3-5):
+// at the old shared 10-minute ceiling the CLI aborted while systemd's stop
+// job kept running to 30 min — a loud error with the stop still in flight.
+// One minute of client margin sits on top of the 30-minute parity.
+const systemctlStopCeiling = 31 * time.Minute
+
+// systemctlCeiling maps an allowlist-validated invocation to its client
+// ceiling: the disable --now verbs carry a stop job (systemctlStopCeiling
+// — the TimeoutStopSec=1800 parity plus margin); daemon-reload and enable
+// --now are instant and keep the original 10-minute ceiling (a hung
+// systemctl still fails loud, never hangs the wave).
+func systemctlCeiling(args []string) time.Duration {
+	if len(args) >= 2 && args[0] == userFlag && args[1] == "disable" {
+		return systemctlStopCeiling
+	}
+	return 10 * time.Minute
+}
+
 // SystemctlExecutor is the production Executor: allowlist-checked
 // `systemctl ...` invocations. A refused command is a loud error — the
 // executor never falls back, never widens its scope.
 type SystemctlExecutor struct{}
 
 // Systemctl validates args against the allowlist and executes systemctl.
-// The 10-minute ceiling matches the repo's golangci run timeout; a hung
-// systemctl fails the install loud instead of hanging the wave.
+// The ceiling is per-verb (systemctlCeiling — the audit P3-5 wiring):
+// stop-carrying `disable --now` invocations outlive the unit's
+// TimeoutStopSec=1800 budget; the instant verbs keep the 10-minute
+// ceiling. A hung systemctl fails the install loud instead of hanging the
+// wave.
 func (SystemctlExecutor) Systemctl(args ...string) error {
 	if err := validateArgs(args); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlCeiling(args))
 	defer cancel()
 	// args are allowlist-checked above (exact pinned command set); the binary
 	// name is the constant "systemctl" — G204's variable-args warning is the
