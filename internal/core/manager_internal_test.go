@@ -717,6 +717,68 @@ func TestRollbackGateRefusesCorruptBackupLoud(t *testing.T) {
 		"the refusal must be the CONTENT class — the extension must never be the reason a gate fails")
 }
 
+// TestRefusedRollbackResetsAndReattempts (production 2026-11-14 shape):
+// a refused rollback leaves the streak AT K and the next failure
+// re-attempts (never wedged without rollback attempts); a healthy check
+// resets the counter — so after a refused cycle the mirror reads 3, a
+// healthy record drops it to 0, and a second full failure cycle reaches
+// 3/3 and re-attempts the rollback AGAIN. That is the live production
+// shape (journal 15:52:03 and 17:36:24: strikes 3/3 twice, rollback
+// refused both times, a healthy check between the cycles).
+func TestRefusedRollbackResetsAndReattempts(t *testing.T) {
+	dataDir := t.TempDir()
+	const port = 22988
+	writeLiveFixture(t, dataDir, port, fakeDeadMarker)
+	writeBackupFixture(t, dataDir, port, "20261114-143624", fakeGateFailMarker)
+
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer site.Close()
+
+	log := &syncBuffer{}
+	m := newTestManager(t, config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dataDir, log)
+	m.healthURL = site.URL
+	require.NoError(t, m.EnsureRunning(context.Background()))
+
+	ctx := context.Background()
+	refuseCycle := func(label string) {
+		for strike := 1; strike <= 3; strike++ {
+			err := m.Healthy(ctx)
+			require.Error(t, err, "%s: the dead-outbound core must fail health (strike %d)", label, strike)
+			//nolint:contextcheck // RecordHealth is the daemon's context-free D8 entry point (production signature; the gate child carries its own testGateTimeout budget)
+			assert.False(t, m.RecordHealth(err), "%s strike %d: the refused rollback keeps attempting", label, strike)
+		}
+		h, herr := ReadHealthState(dataDir)
+		require.NoError(t, herr)
+		require.NotNil(t, h)
+		assert.Equal(t, 3, h.Strikes, "%s: the refused cycle leaves the mirror clamped at K", label)
+	}
+
+	// Cycle 1 — refused at strike 3.
+	refuseCycle("cycle 1")
+	// A healthy record resets the counter after the refused cycle.
+	assert.False(t, m.RecordHealth(nil), "a healthy record never rolls back")
+	h, herr := ReadHealthState(dataDir)
+	require.NoError(t, herr)
+	require.NotNil(t, h)
+	assert.Equal(t, 0, h.Strikes, "the healthy reset after a refused cycle persists")
+	// Cycle 2 — reaches 3/3 again and re-attempts the rollback.
+	refuseCycle("cycle 2")
+
+	live, rerr := os.ReadFile(filepath.Join(dataDir, "rendered", "live.json"))
+	require.NoError(t, rerr)
+	assert.Contains(t, string(live), fakeDeadMarker,
+		"both refused cycles must keep the previous live config")
+	assert.True(t, m.Alive(), "both refused cycles must keep the core running")
+
+	logs := log.String()
+	assert.Equal(t, 2, strings.Count(logs, "rollback refused"),
+		"exactly two refusal lines — the second cycle re-attempted the rollback, not wedged")
+	assert.Equal(t, 2, strings.Count(logs, "health failure 3/3"),
+		"both cycles display the streak at K")
+}
+
 // TestManagerBinResolutionMatchesCoreXrayBin pins the S1 single-knob mirror:
 // NewManager receives CoreConfig + dataDir (not the whole Config), so it
 // resolves the managed default and the explicit override ITSELF — that
