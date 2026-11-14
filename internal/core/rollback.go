@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -316,19 +317,78 @@ func newestBackup(dir string) (string, error) {
 // runTestGate gates a candidate config with the managed binary:
 // `xray run -test -c <path>` — the same validate-and-exit shape the
 // activation gate uses (L10: a bad config never reaches the live path).
-// The gate runs on the BACKUP file itself (a standalone candidate, never
-// the live one).
+// The gate never touches the live config: the candidate here is always the
+// standalone backup.
+//
+// xray detects the config format by FILE EXTENSION (production 2026-11-14:
+// `run -test -c <data>/backups/config.json.bak-<ts>` failed with
+// "Failed to get format of …", exit 23, identically on 26.3.27 and
+// 26.11.9; `xray run` has no -format flag), so a candidate NOT named
+// *.json is first copied to a hidden .gate-*.json temp file in the SAME
+// directory (0600 — the config carries pool credentials) and the gate runs
+// on the copy, removed when the gate returns. The copy changes the NAME
+// only, never the content: a corrupt backup still fails the gate loud
+// (the D8 remedy's corruption detection), as a content error instead of a
+// format error.
 func (m *Manager) runTestGate(path string) error {
+	gatePath := path
+	if filepath.Ext(path) != ".json" {
+		copied, cerr := m.stageGateCopy(path)
+		if cerr != nil {
+			return fmt.Errorf("xray run -test -c %s: staging the .json gate copy failed: %w", path, cerr)
+		}
+		gatePath = copied
+		defer func() {
+			if rerr := os.Remove(copied); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				_, _ = fmt.Fprintf(m.log, "WARNING: core: gate copy %s cleanup failed: %v\n", copied, rerr)
+			}
+		}()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), testGateTimeout)
 	defer cancel()
 	//nolint:gosec // the binary comes from the owner's [core].xray_bin — the config file IS the trust root
-	cmd := exec.CommandContext(ctx, m.bin, "run", "-test", "-c", path)
+	cmd := exec.CommandContext(ctx, m.bin, "run", "-test", "-c", gatePath)
 	cmd.WaitDelay = testGateTimeout // M-3: a killed gate's pipes must never block Wait past the deadline
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("xray run -test -c %s: %w\n%s", path, err, out.String())
+		// The error names the executed command AND, when a gate copy was
+		// staged, the backup that copy stands for — the operator must see
+		// both the exact command line and the candidate it gated.
+		subject := path
+		if gatePath != path {
+			subject = fmt.Sprintf("%s (gated through the .json copy %s)", path, gatePath)
+		}
+		return fmt.Errorf("xray run -test -c %s: %w\n%s", subject, err, out.String())
 	}
 	return nil
+}
+
+// stageGateCopy copies path into a hidden .gate-*.json temp file in the
+// SAME directory — the name is the only thing that changes, so xray's
+// extension-keyed format detection accepts the candidate. os.CreateTemp
+// creates the file 0600 with an O_EXCL-unique name that can never match
+// the config.json.bak-* backup glob (newestBackup) or the retention prefix
+// (store.KeepNewestBackups), so a crash-orphaned copy can never be
+// mistaken for a rollback source.
+func (m *Manager) stageGateCopy(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".gate-*.json")
+	if err != nil {
+		return "", err
+	}
+	if _, werr := tmp.Write(raw); werr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", werr
+	}
+	if serr := tmp.Close(); serr != nil {
+		_ = os.Remove(tmp.Name())
+		return "", serr
+	}
+	return tmp.Name(), nil
 }
