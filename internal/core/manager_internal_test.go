@@ -122,6 +122,25 @@ func runFakeCore() {
 	}
 	for _, a := range os.Args {
 		if a == "-test" {
+			// The REAL binary detects the config format by FILE EXTENSION
+			// and refuses anything it cannot name BEFORE reading content
+			// (production 2026-11-14: "Failed to get format of
+			// .../config.json.bak-20261114-143624", exit 23, identical on
+			// 26.3.27 and 26.11.9; `xray run` has no -format flag). The fake
+			// models that contract: a non-.json gated path is a format
+			// refusal regardless of content (exit 23 mirrors production).
+			if filepath.Ext(cfgPath) != ".json" {
+				_, _ = fmt.Fprintf(os.Stderr, "COREFAKE: Failed to get format of %s\n", cfgPath)
+				os.Exit(23)
+			}
+			// Corruption detection, the D8 remedy contract: a .json-named
+			// gate file with unparseable content fails loud (content class,
+			// AFTER the format check — the real binary's discrimination
+			// order).
+			if !json.Valid(raw) {
+				_, _ = fmt.Fprintln(os.Stderr, "COREFAKE: gate refused — invalid JSON content")
+				os.Exit(1)
+			}
 			if strings.Contains(string(raw), fakeGateFailMarker) {
 				_, _ = fmt.Fprintln(os.Stderr, "COREFAKE: gate refused — "+fakeGateFailMarker)
 				os.Exit(1)
@@ -597,6 +616,105 @@ func TestRollbackRunsTestGate(t *testing.T) {
 	logs := log.String()
 	require.Contains(t, logs, "rollback refused", "the refusal must be loud")
 	require.Contains(t, logs, bakPath, "the refusal must name the failed backup")
+}
+
+// TestRollbackGateSurvivesBakTimestampSuffix (production defect 2026-11-14):
+// xray detects the config format by FILE EXTENSION, and the D8 rollback
+// gates the backup under its on-disk name config.json.bak-<ts> — the real
+// binary refuses it BEFORE reading any content ("Failed to get format of
+// ...", exit 23, identical on 26.3.27 and 26.11.9; `xray run` has no
+// -format flag), so every rollback was refused and the D8 remedy was
+// structurally dead. The gate must hand the binary a .json-named copy of
+// the backup: a VALID backup named .bak-<ts> must pass the gate and the
+// strike-3 rollback must proceed.
+func TestRollbackGateSurvivesBakTimestampSuffix(t *testing.T) {
+	dataDir := t.TempDir()
+	const port = 22964
+	writeLiveFixture(t, dataDir, port, fakeDeadMarker)
+	// The production stamp of the refused backup (journal 15:52:03/17:36:24).
+	bakPath := writeBackupFixture(t, dataDir, port, "20261114-143624", "restored-from-bak-ts")
+
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer site.Close()
+
+	log := &syncBuffer{}
+	m := newTestManager(t, config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dataDir, log)
+	m.healthURL = site.URL
+	require.NoError(t, m.EnsureRunning(context.Background()))
+
+	ctx := context.Background()
+	for strike := 1; strike <= 3; strike++ {
+		err := m.Healthy(ctx)
+		require.Error(t, err, "the dead-outbound core must fail health (strike %d)", strike)
+		rolledBack := m.RecordHealth(err)
+		if strike < 3 {
+			assert.False(t, rolledBack, "strike %d must not roll back yet", strike)
+		} else {
+			require.True(t, rolledBack,
+				"strike 3 must roll back — a valid .bak-<ts> backup must pass the gate")
+		}
+	}
+
+	restored, rerr := os.ReadFile(filepath.Join(dataDir, "rendered", "live.json"))
+	require.NoError(t, rerr)
+	backup, berr := os.ReadFile(bakPath)
+	require.NoError(t, berr)
+	assert.Equal(t, string(backup), string(restored), "rollback must restore the backup byte-identically")
+
+	logs := log.String()
+	require.Contains(t, logs, "ROLLBACK", "the loud D8 line must name the rollback")
+	assert.NotContains(t, logs, "Failed to get format",
+		"the gate must never expose a non-.json candidate to xray's extension-keyed format detection")
+}
+
+// TestRollbackGateRefusesCorruptBackupLoud pins the OTHER half of the
+// format-fix contract: routing the gate through a .json copy must not
+// weaken the remedy's corruption detection. A .bak-<ts> backup with
+// unparseable content must STILL refuse the rollback loud — the refusal
+// names the CONTENT failure, never the extension — and keeps the previous
+// live config and the running core untouched.
+func TestRollbackGateRefusesCorruptBackupLoud(t *testing.T) {
+	dataDir := t.TempDir()
+	const port = 22984
+	writeLiveFixture(t, dataDir, port, fakeDeadMarker)
+	bakDir := filepath.Join(dataDir, "backups")
+	require.NoError(t, os.MkdirAll(bakDir, 0o750))
+	bakPath := filepath.Join(bakDir, "config.json.bak-20261114-143624")
+	require.NoError(t, os.WriteFile(bakPath, []byte("{CORRUPT — not json"), 0o600))
+
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer site.Close()
+
+	log := &syncBuffer{}
+	m := newTestManager(t, config.CoreConfig{SocksPort: port, RollbackStrikes: 3}, dataDir, log)
+	m.healthURL = site.URL
+	require.NoError(t, m.EnsureRunning(context.Background()))
+
+	ctx := context.Background()
+	for strike := 1; strike <= 3; strike++ {
+		err := m.Healthy(ctx)
+		require.Error(t, err, "the dead-outbound core must fail health (strike %d)", strike)
+		assert.False(t, m.RecordHealth(err),
+			"strike %d: a corrupt backup must refuse the rollback", strike)
+	}
+
+	live, rerr := os.ReadFile(filepath.Join(dataDir, "rendered", "live.json"))
+	require.NoError(t, rerr)
+	assert.Contains(t, string(live), fakeDeadMarker,
+		"the refused rollback must keep the previous live config")
+	assert.True(t, m.Alive(), "the refused rollback must keep the core running")
+	require.NoError(t, waitPortAccepted(port))
+
+	logs := log.String()
+	require.Contains(t, logs, "rollback refused", "the corruption refusal must be loud")
+	require.Contains(t, logs, "invalid JSON",
+		"the refusal must name the CONTENT failure — corruption detection survived the format fix")
+	assert.NotContains(t, logs, "Failed to get format",
+		"the refusal must be the CONTENT class — the extension must never be the reason a gate fails")
 }
 
 // TestManagerBinResolutionMatchesCoreXrayBin pins the S1 single-knob mirror:
