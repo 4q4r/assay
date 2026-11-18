@@ -347,6 +347,7 @@ func TestInstallDefaultLocationMaterializesConfig(t *testing.T) {
 	orig := installExecutor
 	installExecutor = func() install.Executor { return ex }
 	t.Cleanup(func() { installExecutor = orig })
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	unitDir := filepath.Join(env.home, ".config", "systemd", "user")
 	binDir := filepath.Join(env.home, ".local", "bin")
@@ -417,6 +418,7 @@ func TestInstallLegacyHomeLocationWinsWithWarning(t *testing.T) {
 	orig := installExecutor
 	installExecutor = func() install.Executor { return ex }
 	t.Cleanup(func() { installExecutor = orig })
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	unitDir := filepath.Join(env.home, ".config", "systemd", "user")
 	root := newTestRoot()
@@ -456,6 +458,7 @@ func TestInstallShareDefaultUnitCarriesResolvedPath(t *testing.T) {
 	orig := installExecutor
 	installExecutor = func() install.Executor { return ex }
 	t.Cleanup(func() { installExecutor = orig })
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	root := newTestRoot()
 	buf := &bytes.Buffer{}

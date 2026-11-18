@@ -363,6 +363,25 @@ func mustLoad(t *testing.T, path string) *config.Config {
 	return cfg
 }
 
+// stubInstallBootstrap no-ops the D4 install core bootstrap (the
+// ensureCoreBinary seam) for the duration of one test, restoring the real
+// wiring through t.Cleanup. Every install-driving test in this package
+// MUST stub it (install_linux's stubCoreBootstrap is the counting variant
+// of the same seam): the bootstrap with an empty [core].xray_bin resolves
+// the REAL user-local spot and, when neither it nor a system xray exists
+// (a fresh CI runner), downloads the release from the REAL GitHub API and
+// installs it there with no cleanup — the stray orphan CI 44418066006
+// carried (the install_launchd tests fire the same darwin-branch bootstrap
+// on every OS via the faked darwinHost seam). The download machinery's own
+// coverage lives in internal/core with seam-injected fixture servers; the
+// CLI-level tests pin orchestration, not downloads.
+func stubInstallBootstrap(t *testing.T) {
+	t.Helper()
+	orig := ensureCoreBinary
+	ensureCoreBinary = func(context.Context, config.CoreConfig, string, io.Writer) error { return nil }
+	t.Cleanup(func() { ensureCoreBinary = orig })
+}
+
 // newTestRoot builds a fresh root command (each call gets its own flag
 // state).
 func newTestRoot() *cobra.Command { return New() }

@@ -31,6 +31,7 @@ func TestRunInstallEndToEnd(t *testing.T) {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	cfgPath := writeWaveConfig(t, home, 8*time.Hour, 240*time.Hour)
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
@@ -122,6 +123,7 @@ func TestRunInstallAcceptsWhitespaceUnitDir(t *testing.T) {
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	unitDir := filepath.Join(home, "my units dir") // SPACE and no I-1 refusal
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
@@ -149,6 +151,7 @@ func TestRunInstallNoSystemdSkipsUnits(t *testing.T) {
 	home := t.TempDir()
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, installOptions{
 		binDir:       filepath.Join(home, "bin"),
@@ -165,6 +168,7 @@ func TestRunUninstallDisablesAndRemoves(t *testing.T) {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
 		installOptions{binDir: filepath.Join(home, "bin"), unitDir: unitDir, exec: ex, embedsConfig: true}))
 
@@ -250,6 +254,7 @@ func TestStatusFlagsStaleInstalledBinary(t *testing.T) {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
 		installOptions{binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true}))
 
@@ -291,6 +296,7 @@ func TestStatusShowsInstallState(t *testing.T) {
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	cfgPath := writeWaveConfig(t, home, 6*time.Hour, 168*time.Hour)
 	ex := &fakeCtl{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	require.NoError(t, runInstall(&bytes.Buffer{}, mustLoad(t, cfgPath), cfgPath,
 		installOptions{binDir: binDir, unitDir: unitDir, exec: ex, embedsConfig: true}))
 

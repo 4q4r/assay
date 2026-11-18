@@ -57,6 +57,7 @@ func TestInstallRunitExplicitConfigRunScriptCarriesAbsoluteLogPaths(t *testing.T
 	sv := &recordedSv{}
 	runit := install.NewRunitScheduler(sv, filepath.Join(home, "service"))
 	withLinuxScheduler(t, func(string) (install.Scheduler, string, string) { return runit, "", "" })
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath, func() installOptions {
 		o := linuxOpts(binDir, filepath.Join(home, "units"))
@@ -84,6 +85,7 @@ func TestInstallRunitReinstallRunScriptCarriesAbsoluteLogPaths(t *testing.T) {
 	sv := &recordedSv{}
 	runit := install.NewRunitScheduler(sv, filepath.Join(home, "service"))
 	withLinuxScheduler(t, func(string) (install.Scheduler, string, string) { return runit, "", "" })
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 	buf := &bytes.Buffer{}
 	require.NoError(t, runInstall(buf, mustLoad(t, cfgPath), cfgPath,
 		linuxOpts(binDir, filepath.Join(home, "units"))))

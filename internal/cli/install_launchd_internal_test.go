@@ -87,6 +87,7 @@ func TestInstallDarwinBranchUsesLaunchdScheduler(t *testing.T) {
 	withDarwinScheduler(t, f)
 	cfg, dir := launchdTestConfig(t)
 	out := &bytes.Buffer{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	opts := installOptions{
 		binDir:          filepath.Join(dir, "bin"),
@@ -119,6 +120,7 @@ func TestInstallDarwinExplicitConfigSpec(t *testing.T) {
 	withDarwinScheduler(t, f)
 	cfg, dir := launchdTestConfig(t)
 	out := &bytes.Buffer{}
+	stubInstallBootstrap(t) // the D4 bootstrap never reaches the real user-local spot or the network
 
 	custom := filepath.Join(dir, "custom", "config.toml")
 	opts := installOptions{

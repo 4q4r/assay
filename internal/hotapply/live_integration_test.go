@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"assay/internal/config"
+	"assay/internal/platform"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,14 +29,28 @@ import (
 // stderr vocabulary behind ProbeFailureKind.
 //
 // Every present binary in the dialect matrix runs; absent ones skip. The
-// pinned pair: /usr/bin/xray (26.3.27, the plan's primary) and
-// ~/.local/bin/xray (26.11.9, the managed current).
+// candidates: /usr/bin/xray (the plan's pinned system primary) and the
+// managed core resolved through the user-local spot — which this suite
+// reads ONLY through the production config.UserLocalBinDir seam redirected
+// at a t.TempDir() (the stray-orphan rule: a test never stats, execs, or
+// seeds the real $HOME/.local tree; CI 44418066006 proved a runner can
+// carry an unrelated binary there and the suite must stay indifferent).
+// The seam dir starts empty, so the managed leg participates only when a
+// test seeds the temp dir through the same seam BEFORE calling this
+// matrix; otherwise it skips like any absent candidate.
 
 func coreBinaryMatrix(t *testing.T) []string {
 	t.Helper()
-	bins := []string{"/usr/bin/xray", filepath.Join(homeDir(), ".local", "bin", "xray")}
+	userBin := filepath.Join(t.TempDir(), "bin")
+	origDirFn := config.UserLocalBinDir
+	config.UserLocalBinDir = func() string { return userBin }
+	t.Cleanup(func() { config.UserLocalBinDir = origDirFn })
+	bins := []string{"/usr/bin/xray", config.UserLocalXrayBin()}
 	var present []string
 	for _, bin := range bins {
+		if bin == "" {
+			continue
+		}
 		if _, err := os.Stat(bin); err == nil {
 			present = append(present, bin)
 		}
@@ -42,14 +59,6 @@ func coreBinaryMatrix(t *testing.T) []string {
 		t.Skipf("no xray binary present at the pinned paths (%v)", bins)
 	}
 	return present
-}
-
-func homeDir() string {
-	h, err := os.UserHomeDir()
-	if err != nil {
-		return "/root"
-	}
-	return h
 }
 
 // limitedBuffer keeps the last N bytes of the child's stderr for failure
@@ -183,10 +192,16 @@ func assertSamePid(t *testing.T, inst *tempAPIInstance, stage string) {
 	t.Helper()
 	// The pid is captured from the same Process handle — the load-bearing
 	// assertion is that the child NEVER exited and was re-spawned (a hot
-	// apply must not restart the core). Read /proc for the honest check.
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", inst.pid))
-	require.NoErrorf(t, err, "%s: the core process must stay alive (no restart) — pid %d gone", stage, inst.pid)
-	assert.Contains(t, string(raw), "xray", "%s: the live pid still is the core", stage)
+	// apply must not restart the core). The liveness probe is the
+	// cross-platform platform.ProcessAlive (signal-0 on unix, OpenProcess
+	// on windows): the /proc cmdline read this check replaced is a
+	// linux-only pseudo-filesystem and LIED on darwin — CI 44418066006
+	// failed "pid gone" while the core was alive and serving every API
+	// call of the same subtest. The gRPC leg of each step is the primary
+	// liveness evidence (a dead core fails the next client call loudly);
+	// this pin is the no-respawn net over that same handle.
+	require.Truef(t, platform.ProcessAlive(inst.pid),
+		"%s: the core process must stay alive (no restart) — pid %d is not alive", stage, inst.pid)
 }
 
 func TestLiveHotApplyClientRoundTrip(t *testing.T) {

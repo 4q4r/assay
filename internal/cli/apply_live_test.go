@@ -12,7 +12,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +22,7 @@ import (
 
 	"assay/internal/config"
 	"assay/internal/model"
+	"assay/internal/platform"
 	"assay/internal/render"
 	"assay/internal/store"
 
@@ -31,11 +31,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// applyLiveBinaries mirrors the hotapply matrix's hermetic resolution (the
+// stray-orphan rule): the managed core is read ONLY through the production
+// config.UserLocalBinDir seam redirected at a t.TempDir() — the real
+// $HOME/.local tree is never stat'ed or exec'ed by a test. The seam dir
+// starts empty, so the managed leg participates only when a test seeds it
+// through the same seam BEFORE this helper runs; otherwise it skips like
+// any absent candidate.
 func applyLiveBinaries(t *testing.T) []string {
 	t.Helper()
-	bins := []string{"/usr/bin/xray", filepath.Join(homeDirForApply(), ".local", "bin", "xray")}
+	userBin := filepath.Join(t.TempDir(), "bin")
+	origDirFn := config.UserLocalBinDir
+	config.UserLocalBinDir = func() string { return userBin }
+	t.Cleanup(func() { config.UserLocalBinDir = origDirFn })
+	bins := []string{"/usr/bin/xray", config.UserLocalXrayBin()}
 	var present []string
 	for _, bin := range bins {
+		if bin == "" {
+			continue
+		}
 		if _, err := os.Stat(bin); err == nil {
 			present = append(present, bin)
 		}
@@ -44,14 +58,6 @@ func applyLiveBinaries(t *testing.T) []string {
 		t.Skipf("no xray binary present at the pinned paths (%v)", bins)
 	}
 	return present
-}
-
-func homeDirForApply() string {
-	h, err := os.UserHomeDir()
-	if err != nil {
-		return "/root"
-	}
-	return h
 }
 
 func TestLiveApplyEndToEndAddsAndRevertsRule(t *testing.T) {
@@ -177,9 +183,15 @@ func renderBytesForApply(
 
 func assertCoreAlive(t *testing.T, pid int, stage string) {
 	t.Helper()
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	require.NoErrorf(t, err, "%s: the core process must stay alive (no restart) — pid %d gone", stage, pid)
-	assert.Contains(t, string(raw), "xray", "%s: the live pid still is the core", stage)
+	// Cross-platform liveness probe (platform.ProcessAlive: signal-0 on
+	// unix, OpenProcess on windows) — the /proc cmdline read this check
+	// replaced is a linux-only pseudo-filesystem and LIED on darwin (CI
+	// 44418066006: "pid gone" while the core served every API call of the
+	// same subtest). The apply leg's own gRPC verification is the primary
+	// liveness evidence; this pin is the no-respawn net over the boot
+	// handle's pid.
+	require.Truef(t, platform.ProcessAlive(pid),
+		"%s: the core process must stay alive (no restart) — pid %d is not alive", stage, pid)
 }
 
 func waitForApplyAPI(t *testing.T, port int) {
