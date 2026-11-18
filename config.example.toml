@@ -347,6 +347,23 @@ speedtest_interval = "168h"  # speedtest wave recheck (default 168h = weekly). "
                              # Positive values below the 5m floor still fail validation loud.
 stats_timeout = "10s"        # bounds one `xray api statsquery` exec
 prune_backup_keep = 0        # retain only the N newest geo-base .bak-<ts> backups (0 = unlimited)
+# The memory gate (after the 2026-11-18 swap-thrash incident): a maintain
+# wave's heavy-alloc stages (fetch/parse/filter — the incident's parse stage
+# handled 148,084 nodes, daemon RSS 686M-1.6G, swap peaks 284-686M on a 15G
+# host) can drive host MemAvailable low enough that host-wide swap thrash
+# kills every TLS handshake on the box until the wave's heavy phases pass.
+# Before each heavy stage the daemon now samples MemAvailable and, under the
+# floor, WAITS in a bounded loop (one loud journal line per wait) instead of
+# pushing the box into thrash; when the wait budget expires the wave skips
+# its remaining heavy stages for the cycle — the next wave is scheduled
+# normally and the last-good config keeps serving. The gate never applies at
+# the probe entry (probe is dial-bound and already adaptive).
+memory_gate_min_avail = "1.5Gi"  # hold a heavy stage while MemAvailable is below this (binary
+                                 # units: Ki/Mi/Gi/Ti, 1024-based; bare value = bytes). Absent or
+                                 # 0 = this default.
+memory_gate_max_wait = "30m"     # per-stage wait budget; budget expired under the floor = the wave
+                                 # skips its remaining heavy stages loudly. "0s" DISABLES the gate
+                                 # entirely (the escape hatch). Negative values fail validation.
 # Core restarts are the core manager's job (D3) — there is no auto_restart
 # knob. After a gated activation the daemon restarts the OWN core on the
 # replaced live config and health-checks it (D8 rollback strikes).

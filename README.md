@@ -382,6 +382,8 @@ Activation drives the own core: `-test` gate → dated backup → atomic replace
 | `speedtest_interval` | `168h` | weekly speedtest wave; `"0s"` disables the wave entirely |
 | `stats_timeout` | `10s` | bounds one `xray api statsquery` exec |
 | `prune_dead_after` | `48h` | dead records older than this are pruned (with a backup) |
+| `memory_gate_min_avail` | `1.5Gi` | heavy stages (fetch/parse/filter) hold while host `MemAvailable` is below this — the anti-swap-thrash gate |
+| `memory_gate_max_wait` | `30m` | per-stage gate wait budget; expired under the floor = the wave skips its remaining heavy stages loudly; `"0s"` disables the gate |
 
 ## 🔒 Security
 
