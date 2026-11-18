@@ -209,22 +209,30 @@ const (
 
 // blockOutboundTag is the blackhole outbound (present in every own config).
 //
-// SECURITY INVARIANT (owner ruling, W9): every pool_* balancer emitted by the
-// renderer is pinned to fallbackTag "block", and this is deliberately NOT a
-// configuration knob. Semantics, verified against the tagged xray-core
-// v26.3.27 source: app/router/balancing.go — Balancer.PickOutbound returns
-// the fallbackTag WITHOUT error when the strategy yields an empty pick (log
-// line "fallback to [<tag>], due to empty tag returned"); strategy_leastload.go
+// SECURITY INVARIANT (owner ruling, W9; amended by the owner contract
+// 2026-11-18 «балансиры никогда не пустуют»): no pool_* balancer ever falls
+// back to direct, and this is deliberately NOT a configuration knob. The
+// balancer fallback is a CHAIN to the parent live set — a clean/city/service
+// variant falls back to its parent country balancer, a country balancer to
+// pool_all, and pool_all (the ROOT) to block — so an emptied variant serves
+// from the wider live set above it instead of instant-rejecting (the
+// production 2026-11-18 v0.app outage: empty pool_us_clean → block →
+// instant rejects). Chained fallback resolves through real balancers:
+// verified live on the production core version 26.11.9 (config accepted AND
+// a runtime probe through an empty balancer exited via its parent's
+// member). Semantics, verified against the tagged xray-core source:
+// app/router/balancing.go — Balancer.PickOutbound returns the fallbackTag
+// WITHOUT error when the strategy yields an empty pick; strategy_leastload.go
 // qualifies only nodes that are Alive, within maxRTT, and covered by the
-// observatory — zero qualified nodes (all pool nodes down or uncovered) means
-// an empty pick. The picked "block" outbound (proxy/blackhole) interrupts the
-// link, so the connection dies in place and nothing exits the machine. There
-// is no error loop: one deterministic pick per routed connection, and the
-// empty-tag error branch is only reachable without a fallbackTag. A
-// configurable fallback could be set to direct (or removed) and reopen the
-// naked-exit hole — traffic routed to a location silently leaving from the
-// machine's real IP — so the value is hard-coded here, never plumbed from
-// config.
+// observatory — zero qualified nodes (all pool nodes down or uncovered)
+// means an empty pick and the parent chain takes over; the whole chain dead
+// ends at block. The picked "block" outbound (proxy/blackhole) interrupts
+// the link, so a fully dead pool still blackholes in place and nothing
+// exits the machine naked — a fallback to direct would reopen the
+// naked-exit hole (traffic silently leaving from the machine's real IP),
+// so the chain is hard-coded here, never plumbed from config. D7 is
+// preserved at the root: pool_all → block, and the bootstrap/empty-pool
+// posture (no balancers at all, catch-all → block) is untouched.
 const blockOutboundTag = "block"
 
 // normalizeKnobs applies the W6 default fallbacks: a zero knob value means
@@ -389,6 +397,35 @@ func leastLoad(tolerance float64) map[string]any {
 	}
 }
 
+// balancerPlan carries the render-scoped context the balancer tree needs
+// beyond the selection: the route-targeted pool_ balancer tags (the widening
+// trigger for city/service variants) and the warnings accumulator (the loud
+// never-empty widening disclosures; owner contract 2026-11-18).
+type balancerPlan struct {
+	targeted map[string]bool
+	warnings *[]string
+}
+
+// widenWarning emits the loud never-empty widening line (owner contract
+// 2026-11-18): the balancer whose strict subset came out empty is named
+// together with the parent live set it inherited, so the journal shows
+// exactly which route surfaces degraded-from-strict coverage every wave.
+func widenWarning(w *[]string, tag, parent string, n int) {
+	*w = append(*w, fmt.Sprintf(
+		"balancer %s empty in selection — widened to %s live set (%d nodes)", tag, parent, n))
+}
+
+// parentCountryTag resolves the balancer-fallback parent of a country-scoped
+// variant: the country balancer, or pool_unknown for the xx pseudo-location.
+// Never direct (W9) — the chain always stays inside the balancer tree and
+// dead-ends at pool_all → block (see blockOutboundTag).
+func parentCountryTag(cc string) string {
+	if cc == "" {
+		return model.UnknownBalancerTag
+	}
+	return model.CountryBalancerTag(cc)
+}
+
 // addBalancers renders pool_<cc> for every country in the selection and
 // pool_<cc>_<city-slug> for cities with >= 2 live nodes (D5; the city
 // grouping folds case variants through model.CityKey, M-b). The clean set
@@ -409,15 +446,26 @@ func leastLoad(tolerance float64) map[string]any {
 //   - pool_all — the pool-wide balancer («общий балансир»): selector over
 //     the whole pool- namespace, rendered whenever ≥1 pool node exists.
 //
+// Owner contract 2026-11-18 («балансиры никогда не пустуют») adds the
+// never-empty layer: a clean/service variant whose strict subset is empty
+// while its parent live set exists renders WIDENED to the parent live set —
+// country-clean tiers and the global clean tiers widen unconditionally
+// (outside only-clean mode, where the base pools already ARE the clean
+// sets), city-clean and service tiers widen when a pool_route targets them —
+// each with the loud widenWarning line, so a routed variant never degrades
+// to block while its parent country has live nodes.
+//
 // Phase 3 appends the service-quality tree via addServiceBalancers: the
 // global pools pool_clean/pool_chatgpt/pool_netflix/pool_youtube plus the
-// country and city chatgpt/netflix variants — each rendered ONLY when ≥1
+// country and city chatgpt/netflix variants — each rendered when ≥1
 // selected node qualifies under the Phase-1 evidence joined through
-// geoByKey (fail-closed: no evidence, no membership).
+// geoByKey, widened per the never-empty contract when the strict subset is
+// empty and the tier is route-targeted.
 //
-// Every balancer here — including the new ones — is pinned to fallbackTag
-// blockOutboundTag (see that const for the security invariant and the
-// verified xray semantics). L2 coverage holds for all of them: the Plan A
+// Balancer fallback is a CHAIN to the parent live set (clean/city/service
+// variant → parent country balancer; country → pool_all; pool_all → block
+// at the root — see blockOutboundTag for the security invariant and the
+// verified chaining semantics). L2 coverage holds for all of them: the Plan A
 // observatory's subjectSelector is the pool- prefix, which covers every
 // pool outbound exactly like the country outbounds, and leastLoad only picks
 // observatory-covered nodes. tolerance is the [render].balancer_tolerance
@@ -426,7 +474,7 @@ func leastLoad(tolerance float64) map[string]any {
 //nolint:gocognit,gocyclo,cyclop,funlen,maintidx // inherently branchy clean/all separation.
 func addBalancers(
 	m map[string]any, sel *model.Selection, nodesByKey map[string]*model.Node,
-	geoByKey map[string]*model.GeoRecord, tolerance float64,
+	geoByKey map[string]*model.GeoRecord, tolerance float64, plan balancerPlan,
 ) []string {
 	routing, _ := m["routing"].(map[string]any)
 	if routing == nil {
@@ -487,15 +535,21 @@ func addBalancers(
 
 	var rendered []string
 	for _, cc := range countries {
-		// Clean country balancer (clean nodes only, >= 1): mirrors the ALL
-		// country rule so a country whose only node is clean keeps its balancer.
+		// Clean country balancer: the strict set (clean-family nodes, >= 1),
+		// or — never-empty contract — WIDENED to the country's live set when
+		// the strict subset is empty and the parent country has live nodes.
+		// Outside only-clean mode the widening is unconditional (the owner's
+		// «балансиры никогда не пустуют»); inside it the base pools already
+		// are the clean sets, so only a route-targeted variant widens.
 		cleanNodes := byCountryClean[cc]
-		if !onlyCleanMode && len(cleanNodes) >= 1 {
-			tag := model.CleanCountryBalancerTag(cc)
-			if cc == "" {
-				tag = "pool_unknown_clean"
-			}
-			// Build selector from clean node tags
+		allNodes := byCountryAll[cc]
+		tag := model.CleanCountryBalancerTag(cc)
+		if cc == "" {
+			tag = "pool_unknown_clean"
+		}
+		switch {
+		case !onlyCleanMode && len(cleanNodes) >= 1:
+			// Strict: build selector from clean node tags.
 			selectors := make([]any, len(cleanNodes))
 			for i, sn := range cleanNodes {
 				selectors[i] = sn.Tag
@@ -503,17 +557,30 @@ func addBalancers(
 			existing = append(existing, map[string]any{
 				keyTag:         tag,
 				keySelector:    selectors,
-				keyFallbackTag: blockOutboundTag,
+				keyFallbackTag: parentCountryTag(cc),
 				keyStrategy:    leastLoad(tolerance),
 			})
+			rendered = append(rendered, tag)
+		case len(cleanNodes) == 0 && len(allNodes) > 0 && (!onlyCleanMode || plan.targeted[tag]):
+			selectors := make([]any, len(allNodes))
+			for i, sn := range allNodes {
+				selectors[i] = sn.Tag
+			}
+			existing = append(existing, map[string]any{
+				keyTag:         tag,
+				keySelector:    selectors,
+				keyFallbackTag: parentCountryTag(cc),
+				keyStrategy:    leastLoad(tolerance),
+			})
+			widenWarning(plan.warnings, tag, parentCountryTag(cc), len(allNodes))
 			rendered = append(rendered, tag)
 		}
 
 		// All country balancer (all nodes, >= 1): the owner requirement is
 		// «1 балансир для clean … и 1 для всех (как сейчас)» — every country
 		// with at least one node keeps its country balancer, including the
-		// unknown-geo pseudo-location (W16).
-		allNodes := byCountryAll[cc]
+		// unknown-geo pseudo-location (W16). Its fallback is the pool-wide
+		// live set (pool_all) — one step up the never-empty chain.
 		if len(allNodes) >= 1 {
 			tag := model.CountryBalancerTag(cc)
 			selector := poolOutboundPrefix + cc + "-"
@@ -524,7 +591,7 @@ func addBalancers(
 			existing = append(existing, map[string]any{
 				keyTag:         tag,
 				keySelector:    []any{selector},
-				keyFallbackTag: blockOutboundTag,
+				keyFallbackTag: model.PoolAllBalancerTag,
 				keyStrategy:    leastLoad(tolerance),
 			})
 			rendered = append(rendered, tag)
@@ -561,54 +628,84 @@ func addBalancers(
 				continue
 			}
 
-			// Clean city balancer (clean nodes only, >= 2)
+			// Clean city balancer: the strict set (clean nodes, >= 2), or —
+			// never-empty contract — WIDENED to the parent country's live set
+			// when the strict subset is empty and a pool_route targets this
+			// city tier (an unreferenced widened tier would be config bloat).
 			cleanCityNodes := byCityClean[cityKey]
+			allCityNodes := byCityAll[cityKey]
+			// Deterministic display spelling across the bucket (the strict
+			// branch folds over clean nodes; the widened one over all of them
+			// — CityDisplay is order-insensitive and idempotent).
+			displayCity := allCityNodes[0].City
+			for _, sn := range allCityNodes[1:] {
+				displayCity = model.CityDisplay(displayCity, sn.City)
+			}
+			ctag := model.CleanCityBalancerTag(cc, displayCity)
+			strictRendered := false
 			if !onlyCleanMode && len(cleanCityNodes) >= 2 {
+				// The strict tier's tag folds the display spelling over the
+				// CLEAN nodes only — the exact pre-widening semantics, so the
+				// strict tag never drifts (the widened tag below folds over
+				// the whole bucket; the two never coexist for one city).
+				strictDisplay := cleanCityNodes[0].City
+				for _, sn := range cleanCityNodes[1:] {
+					strictDisplay = model.CityDisplay(strictDisplay, sn.City)
+				}
 				selectors := make([]any, len(cleanCityNodes))
 				for i, sn := range cleanCityNodes {
 					selectors[i] = sn.Tag
 				}
-				// Use the display spelling from the first clean node for the tag
-				displayCity := cleanCityNodes[0].City
-				// Find the deterministic display spelling across all clean nodes in this city
-				for _, sn := range cleanCityNodes[1:] {
-					displayCity = model.CityDisplay(displayCity, sn.City)
+				existing = append(existing, map[string]any{
+					keyTag:         model.CleanCityBalancerTag(cc, strictDisplay),
+					keySelector:    selectors,
+					keyFallbackTag: parentCountryTag(cc),
+					keyStrategy:    leastLoad(tolerance),
+				})
+				rendered = append(rendered, model.CleanCityBalancerTag(cc, strictDisplay))
+				strictRendered = true
+			}
+			if !strictRendered && len(allNodes) > 0 && plan.targeted[ctag] {
+				// The strict branch did not render (empty subset, a single
+				// clean node below the >= 2 tier minimum, or only-clean mode):
+				// a route-targeted tag must never degrade to block while the
+				// parent country has live nodes — widen to the country's live
+				// set. Untargeted unrendered tiers stay absent (no bloat).
+				selectors := make([]any, len(allNodes))
+				for i, sn := range allNodes {
+					selectors[i] = sn.Tag
 				}
-				ctag := model.CleanCityBalancerTag(cc, displayCity)
 				existing = append(existing, map[string]any{
 					keyTag:         ctag,
 					keySelector:    selectors,
-					keyFallbackTag: blockOutboundTag,
+					keyFallbackTag: parentCountryTag(cc),
 					keyStrategy:    leastLoad(tolerance),
 				})
+				widenWarning(plan.warnings, ctag, parentCountryTag(cc), len(allNodes))
 				rendered = append(rendered, ctag)
 			}
 
 			// All city balancer (all nodes, >= 2)
-			allCityNodes := byCityAll[cityKey]
 			if len(allCityNodes) >= 2 {
 				selectors := make([]any, len(allCityNodes))
 				for i, sn := range allCityNodes {
 					selectors[i] = sn.Tag
 				}
-				// Use the display spelling from the first node for the tag
-				displayCity := allCityNodes[0].City
-				for _, sn := range allCityNodes[1:] {
-					displayCity = model.CityDisplay(displayCity, sn.City)
-				}
-				ctag := model.CityBalancerTag(cc, displayCity)
+				atag := model.CityBalancerTag(cc, displayCity)
 				existing = append(existing, map[string]any{
-					keyTag:         ctag,
+					keyTag:         atag,
 					keySelector:    selectors,
-					keyFallbackTag: blockOutboundTag,
+					keyFallbackTag: parentCountryTag(cc),
 					keyStrategy:    leastLoad(tolerance),
 				})
-				rendered = append(rendered, ctag)
+				rendered = append(rendered, atag)
 			}
 		}
 	}
 
 	// pool_all — the pool-wide balancer over ALL pool outbounds: always rendered when ≥1 pool node exists.
+	// The chain ROOT: its fallback stays block (D7 at the root; see
+	// blockOutboundTag — the whole pool dead ends in the blackhole).
 	if len(sel.Nodes) > 0 {
 		existing = append(existing, map[string]any{
 			keyTag:         model.PoolAllBalancerTag,
@@ -624,14 +721,17 @@ func addBalancers(
 	// («ENTIRE clean family»): the fourth tier qualifies through the SAME
 	// cleanServicePoolQualifies predicate as the global/country/city tiers
 	// (flags + RiskScore <= cleanRiskBand when checked); unchecked evidence
-	// keeps flags-only membership.
+	// keeps flags-only membership. Never-empty contract: an empty strict set
+	// widens to the pool-wide live set (same unconditional/targeted split as
+	// the country tiers).
 	cleanCount := 0
 	for _, sn := range sel.Nodes {
 		if cleanServicePoolQualifies(sn, serviceGeoRecord(nodesByKey, geoByKey, sn)) {
 			cleanCount++
 		}
 	}
-	if !onlyCleanMode && cleanCount > 0 {
+	switch {
+	case !onlyCleanMode && cleanCount > 0:
 		// Build selector from clean-family node tags
 		cleanSelectors := make([]any, 0, cleanCount)
 		for _, sn := range sel.Nodes {
@@ -642,9 +742,22 @@ func addBalancers(
 		existing = append(existing, map[string]any{
 			keyTag:         model.CleanPoolAllBalancerTag,
 			keySelector:    cleanSelectors,
-			keyFallbackTag: blockOutboundTag,
+			keyFallbackTag: model.PoolAllBalancerTag,
 			keyStrategy:    leastLoad(tolerance),
 		})
+		rendered = append(rendered, model.CleanPoolAllBalancerTag)
+	case cleanCount == 0 && len(sel.Nodes) > 0 && (!onlyCleanMode || plan.targeted[model.CleanPoolAllBalancerTag]):
+		allSelectors := make([]any, 0, len(sel.Nodes))
+		for _, sn := range sel.Nodes {
+			allSelectors = append(allSelectors, sn.Tag)
+		}
+		existing = append(existing, map[string]any{
+			keyTag:         model.CleanPoolAllBalancerTag,
+			keySelector:    allSelectors,
+			keyFallbackTag: model.PoolAllBalancerTag,
+			keyStrategy:    leastLoad(tolerance),
+		})
+		widenWarning(plan.warnings, model.CleanPoolAllBalancerTag, model.PoolAllBalancerTag, len(sel.Nodes))
 		rendered = append(rendered, model.CleanPoolAllBalancerTag)
 	}
 
@@ -652,7 +765,7 @@ func addBalancers(
 	// list, so pool_routes may target service pools exactly like country
 	// pools (validation and graceful degradation are shared machinery).
 	existing, serviceTags := addServiceBalancers(
-		existing, sel, nodesByKey, geoByKey, tolerance, onlyCleanMode)
+		existing, sel, nodesByKey, geoByKey, tolerance, onlyCleanMode, plan)
 	rendered = append(rendered, serviceTags...)
 
 	routing["balancers"] = existing
@@ -668,12 +781,15 @@ type serviceScope struct {
 	kind    serviceKind
 }
 
-// servicePool is one service balancer ready for emission: its tag and the
+// servicePool is one service balancer ready for emission: its tag, the
 // explicit outbound-tag selector list (selection order — the same convention
-// the clean/city balancers use; leastLoad needs no further ordering).
+// the clean/city balancers use; leastLoad needs no further ordering), and
+// the parent fallback tag it chains to when its pick empties (the
+// never-empty fallback chain; global tiers chain to pool_all).
 type servicePool struct {
 	tag       string
 	selectors []string
+	fallback  string
 }
 
 // cityGroupKey identifies a folded city bucket for display-spelling folding.
@@ -685,7 +801,8 @@ type cityGroupKey struct {
 // addServiceBalancers renders the Phase-3 service-quality pool tree and
 // returns the extended balancer list plus the tags it rendered (pool_routes
 // validation consumes the latter like any other balancer target). Tier and
-// membership rules (owner-approved 2026-11-04):
+// membership rules (owner-approved 2026-11-04, amended owner contract
+// 2026-11-18):
 //
 //   - pool_clean (GLOBAL only): sn.IsClean && (RiskScore unchecked ||
 //     RiskScore <= cleanRiskBand) — the same cleanServicePoolQualifies
@@ -694,28 +811,43 @@ type cityGroupKey struct {
 //     when every
 //     selected node is clean its selector is identical to pool_all's, and
 //     the owner's only-clean ruling («балансиры только общие») already
-//     suppresses the redundant clean-* layer there.
+//     suppresses the redundant clean-* layer there. Never-empty contract:
+//     an empty strict set widens to the pool-wide live set (unconditional
+//     outside only-clean mode, route-targeted inside it) with the loud
+//     widenWarning line.
 //   - pool_chatgpt / pool_netflix: GLOBAL + country (pool_<cc>_<svc>) +
 //     city (pool_<cc>_<city>_<svc>) tiers, >= 1 qualifying node each (the
 //     >= 2 minimum stays ONLY on the pre-existing base city pools).
-//     Membership is the exact vocabulary verdict: ChatGPT == "yes"
-//     (webonly/apponly excluded), Netflix == "full" (originals excluded).
+//     Membership is NOT-CONFIRMED-DIRTY (owner contract 2026-11-18
+//     «unknown на медиа чеке раскидать какие куда разрезолвило»): a CHECKED
+//     verdict qualifies unless it is exactly "blocked" — unknown and the
+//     partial passes (webonly/apponly, originals) ride the spread;
+//     unchecked stays out (fail-closed evidence classes unchanged).
 //   - pool_youtube: GLOBAL only; membership is a CHECKED, non-blocked
 //     region (the engine stores ISO-2, "blocked" or "unknown").
 //
+// Never-empty widening for the service tiers: a route-targeted tier whose
+// strict subset is empty widens to its parent live set (country tiers and
+// city tiers → the parent country's live set; global tiers → the pool-wide
+// live set) with the loud widenWarning line. Untargeted empty tiers stay
+// absent, and the xx pseudo-location never forms widened service tiers
+// (pool_unknown_<svc> is not a formed tier grammar).
+//
 // Unknown-geo nodes (empty country) qualify for the GLOBAL tiers only —
 // there is no pool__<svc> country tag for the xx pseudo-location.
-// Everything is fail-closed: a node whose geo record is missing, or whose
-// verdict is unchecked/unknown, never enters an unlock pool. Emission is
+// Everything else stays fail-closed: a node whose geo record is missing, or
+// whose verdict is unchecked, never enters an unlock pool. Emission is
 // deterministic: qualifying pools are sorted by tag (the tag embeds
 // cc → city-slug → kind, so the order mirrors the existing country/city
-// sort scheme), and each balancer is pinned to fallbackTag block with the
-// shared leastLoad strategy.
+// sort scheme), and each balancer chains its fallbackTag to the parent live
+// set (country/city variants → parent country balancer; global tiers →
+// pool_all) with the shared leastLoad strategy.
 func addServiceBalancers(
 	existing []any, sel *model.Selection, nodesByKey map[string]*model.Node,
 	geoByKey map[string]*model.GeoRecord, tolerance float64, onlyClean bool,
+	plan balancerPlan,
 ) ([]any, []string) {
-	pools := collectServicePools(sel, nodesByKey, geoByKey, onlyClean)
+	pools := collectServicePools(sel, nodesByKey, geoByKey, onlyClean, plan)
 
 	rendered := make([]string, 0, len(pools))
 	for _, p := range pools {
@@ -726,7 +858,7 @@ func addServiceBalancers(
 		existing = append(existing, map[string]any{
 			keyTag:         p.tag,
 			keySelector:    selectors,
-			keyFallbackTag: blockOutboundTag,
+			keyFallbackTag: p.fallback,
 			keyStrategy:    leastLoad(tolerance),
 		})
 		rendered = append(rendered, p.tag)
@@ -734,20 +866,46 @@ func addServiceBalancers(
 	return existing, rendered
 }
 
-// collectServicePools buckets the qualifying nodes per tier and returns the
-// qualifying service pools sorted by tag (the emission order; tags are
-// unique across tiers by grammar, so the sort is the determinism).
-func collectServicePools(
+// serviceBuckets is the evidence-shaped grouping the service tiers emit
+// from: qualifying tags per tier, the parent live sets for widening, and
+// the display spellings (strict tiers fold over QUALIFYING nodes; widened
+// tiers over the whole bucket).
+type serviceBuckets struct {
+	global        map[serviceKind][]string
+	scoped        map[serviceScope][]string
+	display       map[cityGroupKey]string
+	bucketDisplay map[cityGroupKey]string
+	byCountryAll  map[string][]string
+	allTags       []string
+}
+
+// bucketServiceEvidence groups the selection into serviceBuckets: every
+// live tag lands in its country's parent set and the pool-wide set;
+// qualifying UNLOCK verdicts land in their tiers. Everything is
+// selection-derived (the stale-corpses guard: no other source feeds
+// membership).
+func bucketServiceEvidence(
 	sel *model.Selection, nodesByKey map[string]*model.Node,
 	geoByKey map[string]*model.GeoRecord, onlyClean bool,
-) []servicePool {
-	global := map[serviceKind][]string{}  // kind -> qualifying outbound tags
-	scoped := map[serviceScope][]string{} // country/city tier buckets
-	display := map[cityGroupKey]string{}  // folded city -> display spelling
+) serviceBuckets {
+	b := serviceBuckets{
+		global:        map[serviceKind][]string{},
+		scoped:        map[serviceScope][]string{},
+		display:       map[cityGroupKey]string{},
+		bucketDisplay: map[cityGroupKey]string{},
+		byCountryAll:  map[string][]string{},
+		allTags:       make([]string, 0, len(sel.Nodes)),
+	}
 	for _, sn := range sel.Nodes {
+		b.allTags = append(b.allTags, sn.Tag)
+		if sn.Country != "" {
+			b.byCountryAll[sn.Country] = append(b.byCountryAll[sn.Country], sn.Tag)
+		}
+		gk := cityGroupKey{cc: sn.Country, cityKey: model.CityKey(sn.City)}
+		b.bucketDisplay[gk] = model.CityDisplay(b.bucketDisplay[gk], sn.City)
 		gr := serviceGeoRecord(nodesByKey, geoByKey, sn)
 		if !onlyClean && cleanServicePoolQualifies(sn, gr) {
-			global[serviceClean] = append(global[serviceClean], sn.Tag)
+			b.global[serviceClean] = append(b.global[serviceClean], sn.Tag)
 		}
 		if gr == nil {
 			continue // no unlock evidence: every unlock pool stays closed
@@ -758,7 +916,7 @@ func collectServicePools(
 			if !serviceKindQualifies(kind, gr.MediaUnlocks) {
 				continue
 			}
-			global[kind] = append(global[kind], sn.Tag)
+			b.global[kind] = append(b.global[kind], sn.Tag)
 			if sn.Country == "" {
 				continue // the xx pseudo-location has no country/city tier
 			}
@@ -766,47 +924,112 @@ func collectServicePools(
 			// separate buckets of the same map; the empty cityKey marks the
 			// country tier at emission time.
 			countryScope := serviceScope{cc: sn.Country, kind: kind}
-			scoped[countryScope] = append(scoped[countryScope], sn.Tag)
+			b.scoped[countryScope] = append(b.scoped[countryScope], sn.Tag)
 			cityKey := model.CityKey(sn.City)
 			if cityKey == "" {
 				continue
 			}
-			cityScope := serviceScope{cc: sn.Country, cityKey: cityKey, kind: kind}
-			scoped[cityScope] = append(scoped[cityScope], sn.Tag)
+			scope := serviceScope{cc: sn.Country, cityKey: cityKey, kind: kind}
+			b.scoped[scope] = append(b.scoped[scope], sn.Tag)
 			gk := cityGroupKey{cc: sn.Country, cityKey: cityKey}
-			display[gk] = model.CityDisplay(display[gk], sn.City)
+			b.display[gk] = model.CityDisplay(b.display[gk], sn.City)
 		}
 		if serviceKindQualifies(serviceYouTube, gr.MediaUnlocks) {
-			global[serviceYouTube] = append(global[serviceYouTube], sn.Tag)
+			b.global[serviceYouTube] = append(b.global[serviceYouTube], sn.Tag)
 		}
 	}
+	return b
+}
 
-	var pools []servicePool
-	for kind, tags := range global {
-		if len(tags) > 0 {
-			pools = append(pools, servicePool{tag: globalServiceTag(kind), selectors: tags})
-		}
-	}
-	for scope, tags := range scoped {
-		if len(tags) == 0 {
-			continue
-		}
-		if scope.cityKey == "" {
-			pools = append(pools, servicePool{
-				tag:       model.CountryBalancerTag(scope.cc) + "_" + string(scope.kind),
-				selectors: tags,
-			})
-			continue
-		}
-		city := display[cityGroupKey{cc: scope.cc, cityKey: scope.cityKey}]
-		pools = append(pools, servicePool{
-			tag:       model.CityBalancerTag(scope.cc, city) + "_" + string(scope.kind),
-			selectors: tags,
-		})
-	}
+// collectServicePools buckets the qualifying nodes per tier and returns the
+// qualifying service pools sorted by tag (the emission order; tags are
+// unique across tiers by grammar, so the sort is the determinism). Each
+// pool carries its parent fallback (the never-empty chain): country/city
+// variants → the parent country balancer, global tiers → pool_all.
+func collectServicePools(
+	sel *model.Selection, nodesByKey map[string]*model.Node,
+	geoByKey map[string]*model.GeoRecord, onlyClean bool, plan balancerPlan,
+) []servicePool {
+	b := bucketServiceEvidence(sel, nodesByKey, geoByKey, onlyClean)
+	pools := appendGlobalServicePools(b, onlyClean, plan)
+	pools = append(pools, appendScopedServicePools(sel, b, plan)...)
 	// Map iteration order is nondeterministic; the tag sort restores the
 	// byte-deterministic output (tags are unique across tiers by grammar).
 	sort.Slice(pools, func(i, j int) bool { return pools[i].tag < pools[j].tag })
+	return pools
+}
+
+// appendGlobalServicePools emits the global service tiers: strict subset
+// first; a route-targeted empty subset widens to the pool-wide live set
+// (pool_clean also widens unconditionally outside only-clean mode,
+// mirroring the country clean tiers).
+func appendGlobalServicePools(b serviceBuckets, onlyClean bool, plan balancerPlan) []servicePool {
+	pools := make([]servicePool, 0, len(b.global))
+	for _, kind := range []serviceKind{serviceClean, serviceChatGPT, serviceNetflix, serviceYouTube} {
+		tags := b.global[kind]
+		tag := globalServiceTag(kind)
+		switch {
+		case len(tags) > 0 && (kind != serviceClean || !onlyClean):
+			pools = append(pools, servicePool{tag: tag, selectors: tags, fallback: model.PoolAllBalancerTag})
+		case len(tags) == 0 && len(b.allTags) > 0 &&
+			(kind != serviceClean && plan.targeted[tag] ||
+				kind == serviceClean && (!onlyClean || plan.targeted[tag])):
+			pools = append(pools, servicePool{tag: tag, selectors: b.allTags, fallback: model.PoolAllBalancerTag})
+			widenWarning(plan.warnings, tag, model.PoolAllBalancerTag, len(b.allTags))
+		}
+	}
+	return pools
+}
+
+// appendScopedServicePools emits the country/city chatgpt/netflix tiers.
+// It iterates the EXPECTED scopes (every country/city bucket of the
+// selection × the two kinds), not the qualifying map — an all-dirty bucket
+// never creates a qualifying entry, but its targeted tier must still widen.
+// The strict tier's tag folds the display spelling over the QUALIFYING
+// nodes (the exact pre-widening semantics); the widened tier's tag folds
+// over the whole bucket.
+func appendScopedServicePools(sel *model.Selection, b serviceBuckets, plan balancerPlan) []servicePool {
+	expected := map[serviceScope]bool{}
+	for _, sn := range sel.Nodes {
+		if sn.Country == "" {
+			continue // the xx pseudo-location has no country/city tier
+		}
+		ck := model.CityKey(sn.City)
+		for _, kind := range []serviceKind{serviceChatGPT, serviceNetflix} {
+			expected[serviceScope{cc: sn.Country, kind: kind}] = true
+			if ck != "" {
+				expected[serviceScope{cc: sn.Country, cityKey: ck, kind: kind}] = true
+			}
+		}
+	}
+	pools := make([]servicePool, 0, len(expected))
+	for scope := range expected {
+		tags := b.scoped[scope]
+		parent := parentCountryTag(scope.cc)
+		var tag string
+		if scope.cityKey == "" {
+			tag = model.CountryBalancerTag(scope.cc) + "_" + string(scope.kind)
+		} else {
+			city := b.display[cityGroupKey{cc: scope.cc, cityKey: scope.cityKey}]
+			if city == "" {
+				city = b.bucketDisplay[cityGroupKey{cc: scope.cc, cityKey: scope.cityKey}]
+			}
+			tag = model.CityBalancerTag(scope.cc, city) + "_" + string(scope.kind)
+		}
+		switch {
+		case len(tags) > 0:
+			pools = append(pools, servicePool{tag: tag, selectors: tags, fallback: parent})
+		case len(b.byCountryAll[scope.cc]) > 0 && plan.targeted[tag]:
+			// Route-targeted tier with an empty strict subset: widen to the
+			// parent country's live set (never-empty contract).
+			pools = append(pools, servicePool{
+				tag:       tag,
+				selectors: b.byCountryAll[scope.cc],
+				fallback:  parent,
+			})
+			widenWarning(plan.warnings, tag, parent, len(b.byCountryAll[scope.cc]))
+		}
+	}
 	return pools
 }
 
@@ -844,11 +1067,19 @@ func cleanServicePoolQualifies(sn model.SelectedNode, gr *model.GeoRecord) bool 
 	return gr.RiskScore <= cleanRiskBand
 }
 
-// serviceKindQualifies maps one unlock pool family onto its exact
-// MediaUnlocks verdict. Everything except the exact positive verdict fails
-// closed: webonly/apponly are NOT chatgpt unlocks (owner ruling
-// 2026-11-04), originals are NOT netflix full, and a checked-but-unknown or
-// blocked region is not a youtube unlock.
+// serviceKindQualifies maps one unlock pool family onto its
+// not-confirmed-dirty membership rule (owner contract 2026-11-18
+// «мертвые удалить, а живчиков unknown на медиа чеке раскидать»: live nodes
+// are spread by their RESOLVED attributes; a media verdict excludes a node
+// ONLY where the check CONFIRMED it dirty). A CHECKED verdict enters the
+// service's variants unless it is exactly "blocked" — unknown and the
+// partial passes (webonly/apponly, originals) are живчики that ride the
+// spread. UNCHECKED ("" — the battery never ran for this dimension, e.g.
+// unlock_probes off) stays out: fail-closed evidence classes are unchanged,
+// and the never-empty guarantee for empty strict subsets is the widening +
+// fallback chain, not fabricated membership. The TLS-intercept gate
+// (MediaUnlocks.Hijack) stays selection-level: a hijacked exit never reaches
+// any pool at all.
 func serviceKindQualifies(kind serviceKind, mu model.MediaUnlockStatus) bool {
 	switch kind {
 	case serviceClean:
@@ -857,13 +1088,11 @@ func serviceKindQualifies(kind serviceKind, mu model.MediaUnlockStatus) bool {
 		// exhaustively mapped and can never silently fall to the default.
 		return false
 	case serviceChatGPT:
-		return mu.ChatGPT == model.UnlockYes
+		return mu.ChatGPT != "" && mu.ChatGPT != model.UnlockBlocked
 	case serviceNetflix:
-		return mu.Netflix == model.UnlockNetflixFull
+		return mu.Netflix != "" && mu.Netflix != model.UnlockBlocked
 	case serviceYouTube:
-		return mu.YouTubeRegion != "" &&
-			mu.YouTubeRegion != model.UnlockBlocked &&
-			mu.YouTubeRegion != model.UnlockUnknown
+		return mu.YouTubeRegion != "" && mu.YouTubeRegion != model.UnlockBlocked
 	default:
 		return false
 	}
@@ -1792,9 +2021,18 @@ func RenderOwnConfig(
 
 	var renderedBalancers []string
 	if poolCount > 0 {
-		// The shared balancer tree renders exactly as the pool layer always did
-		// (country/city/all/clean/service tiers) — balancers as today.
-		renderedBalancers = addBalancers(m, sel, nodes, geoByKey, cfg.BalancerTolerance)
+		// The balancer tree renders from the effective selection (balancers
+		// as today), with the never-empty layer: route-targeted tags drive
+		// the city/service widening, and the widening disclosures ride the
+		// same warnings channel as the route degradations.
+		targeted := make(map[string]bool, len(poolRoutes))
+		for _, r := range poolRoutes {
+			if strings.HasPrefix(r.Balancer, poolBalancerPrefix) {
+				targeted[r.Balancer] = true
+			}
+		}
+		plan := balancerPlan{targeted: targeted, warnings: &droppedWarnings}
+		renderedBalancers = addBalancers(m, sel, nodes, geoByKey, cfg.BalancerTolerance, plan)
 		m["observatory"] = map[string]any{
 			"subjectSelector":   []any{poolOutboundPrefix},
 			"probeInterval":     observatoryInterval(cfg.ObservatoryInterval, poolCount),

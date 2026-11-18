@@ -137,7 +137,22 @@
   "routing": {
     "balancers": [
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-de-"
         ],
@@ -151,7 +166,7 @@
         "tag": "pool_de"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-01",
           "pool-de-02"
@@ -178,6 +193,36 @@
           "type": "leastLoad"
         },
         "tag": "pool_all"
+      },
+      {
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_all_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_clean"
       }
     ],
     "rules": [

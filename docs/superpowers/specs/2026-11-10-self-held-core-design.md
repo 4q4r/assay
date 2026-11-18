@@ -95,6 +95,26 @@ primary client and consumes the pool through ONE forwarded proxy outbound.
   at least once, an empty-pool wave KEEPS the last-good live config (loud
   per-wave line naming the state; core keeps running on it). The pool never
   becomes unreachable-by-regression.
+  - AMENDED (owner contract 2026-11-18 «балансиры никогда не пустуют»,
+    balancer-fallback case ONLY — the bootstrap/empty-pool posture above is
+    untouched): balancer emptiness at RUNTIME no longer falls back straight
+    to `block`. Every pool_* balancer chains its `fallbackTag` to its PARENT
+    live set — clean/city/service variants → the parent country balancer,
+    country balancers → `pool_all` — and only the ROOT `pool_all` keeps
+    `block`. An emptied variant therefore serves from the wider live set
+    above it (the production 2026-11-18 v0.app outage class: stale
+    `pool_us_clean` members died at observatory runtime → empty pick →
+    `block` → instant rejects for routed domains). Chained fallback resolves
+    through real balancers (verified live on the production core version
+    26.11.9: config accepted AND a runtime probe through an empty balancer
+    exited via its parent's member). The chain still never routes `direct`
+    (W9 naked-exit invariant intact) and dead-ends at `block` only when the
+    whole pool is dead. Render-time companion: a clean/service variant whose
+    strict subset is empty while its parent live set exists renders WIDENED
+    to that live set with a loud warning line
+    (`balancer <tag> empty in selection — widened to <parent> live set
+    (N nodes)`), so a routed variant never degrades to the block rule while
+    its parent country has live nodes.
 - D8 (round-2 Q-B): self-healing rollback — `[core].rollback_strikes`
   (default 3, configurable): K consecutive failed post-activation health
   checks → auto-restore the newest pre-activate dated backup → `-test` gate →
