@@ -1412,10 +1412,10 @@ func defaultMaintainStages(opts maintainOptions, mgr *core.Manager) *maintainSta
 	}
 }
 
-// runMaintain executes one maintenance wave (no shutdown checkpoints) over
-// the given stage set.
+// runMaintain executes one maintenance wave (no shutdown checkpoints, no
+// memory gate) over the given stage set.
 func runMaintain(w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages) error {
-	return runMaintainGraceful(w, cfg, opts, stages, nil)
+	return runMaintainGraceful(w, cfg, opts, stages, nil, nil)
 }
 
 // runOneShotMaintainWave is the one-shot maintain entry (fix I-1): ONE
@@ -1437,7 +1437,10 @@ func runOneShotMaintainWave(w io.Writer, cfg *config.Config, opts maintainOption
 		return fmt.Errorf("maintain: core manager: %w", err)
 	}
 	defer mgr.Release()
-	return runMaintain(w, cfg, opts, defaultMaintainStages(opts, mgr))
+	// The one-shot wave carries the memory gate too (config-driven; the CLI
+	// process has no stop channel — a signal kills it mid-hold exactly as it
+	// would mid-stage).
+	return runMaintainGraceful(w, cfg, opts, defaultMaintainStages(opts, mgr), nil, newMemoryGate(cfg, w, nil))
 }
 
 // errWavePaused is internal: between() fired — the wave stops after the
@@ -1445,14 +1448,26 @@ func runOneShotMaintainWave(w io.Writer, cfg *config.Config, opts maintainOption
 // already flushed by the completed stages).
 var errWavePaused = errors.New("shutdown requested between stages")
 
+// errWaveGateSkipped is internal: the memory gate's wait budget expired
+// below the floor — the wave stops BEFORE the gated stage with the same
+// clean-checkpoint discipline as a pause (completed stages are flushed),
+// but the loud line names the skip and its consequence: no activation this
+// cycle, the last-good config keeps serving (D7), and the next wave is
+// scheduled normally.
+var errWaveGateSkipped = errors.New("memory gate skipped the wave")
+
 // runMaintainGraceful executes one maintenance wave with an optional
 // between-stage shutdown checkpoint: between() is checked BEFORE each stage;
 // when it fires, the wave returns nil (clean pause — the caller decides what
 // graceful means) after finishing the current stage. A nil between never
-// fires. Stage failures still fail the wave loud, except the stats poll,
-// which is accounting, not correctness (classified by reportStatsFailure).
+// fires. The memory gate (nil = disabled) is sampled at the heavy-alloc
+// stage entries (fetch/parse/filter) — never at probe (dial-bound, already
+// adaptive). Stage failures still fail the wave loud, except the stats
+// poll, which is accounting, not correctness (classified by
+// reportStatsFailure).
 func runMaintainGraceful(
 	w io.Writer, cfg *config.Config, opts maintainOptions, stages *maintainStages, between func() bool,
+	gate *memoryGate,
 ) error {
 	// The wave's stages print through their own writer; give them a command
 	// shim bound to w so the seam stays signature-compatible with the W1–W3
@@ -1470,15 +1485,24 @@ func runMaintainGraceful(
 		!opts.skipProbe, opts.speedtest, !opts.noActivate)
 
 	wave := &waveRunState{
-		w: w, cmd: cmd, cfg: cfg, stages: stages, between: between,
+		w: w, cmd: cmd, cfg: cfg, stages: stages, between: between, gate: gate,
 	}
 	run := func(name string, stage func(*cobra.Command, *config.Config) error) bool {
 		return wave.runStage(name, stage)
 	}
+	if !wave.gateHold("fetch") {
+		return wave.pauseOrErr()
+	}
 	if !run("fetch", stages.fetch) {
 		return wave.pauseOrErr()
 	}
+	if !wave.gateHold("parse") {
+		return wave.pauseOrErr()
+	}
 	if !run("parse", stages.parse) {
+		return wave.pauseOrErr()
+	}
+	if !wave.gateHold("filter") {
 		return wave.pauseOrErr()
 	}
 	if !run("filter", stages.filter) {
@@ -1493,14 +1517,44 @@ func runMaintainGraceful(
 }
 
 // waveRunState carries one wave's mutable run state through the stage
-// closures (writers, the current stage error, and the shutdown checkpoint).
+// closures (writers, the current stage error, the shutdown checkpoint, and
+// the memory gate).
 type waveRunState struct {
 	w       io.Writer
 	cmd     *cobra.Command
 	cfg     *config.Config
 	stages  *maintainStages
 	between func() bool
+	gate    *memoryGate
 	waveErr error
+}
+
+// gateHold runs the memory gate at one heavy stage entry. A true result
+// means the stage may run; false means the wave stops (waveErr carries the
+// skip sentinel — a clean checkpoint abort, nil to the caller — or the
+// pause sentinel), after one loud line naming the consequence.
+func (s *waveRunState) gateHold(stage string) bool {
+	if s.gate == nil {
+		return true
+	}
+	switch s.gate.allow(stage) {
+	case gateProceed:
+		return true
+	case gateStop:
+		outf(s.w, "maintain: shutdown requested while holding at the memory gate before %s — "+
+			"wave paused (completed stages are flushed)\n", stage)
+		s.waveErr = errWavePaused
+		return false
+	case gateSkip:
+		outf(s.w, "memory gate: MemAvailable stayed below floor %s for the full %s wait budget — "+
+			"SKIPPING the wave before %s (remaining stages skipped this cycle; the next wave runs "+
+			"on schedule; the last-good config keeps serving)\n",
+			config.FormatByteSize(s.gate.floor), s.gate.maxWait, stage)
+		s.waveErr = errWaveGateSkipped
+		return false
+	default:
+		return true
+	}
 }
 
 // runStage checks the shutdown checkpoint, then runs one stage; a false
@@ -1536,7 +1590,7 @@ func (s *waveRunState) runStage(name string, stage func(*cobra.Command, *config.
 }
 
 func (s *waveRunState) pauseOrErr() error {
-	if errors.Is(s.waveErr, errWavePaused) {
+	if errors.Is(s.waveErr, errWavePaused) || errors.Is(s.waveErr, errWaveGateSkipped) {
 		return nil
 	}
 	return s.waveErr

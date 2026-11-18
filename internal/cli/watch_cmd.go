@@ -510,6 +510,17 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 	// capture by reference, so the runners pick the transport up once it is
 	// wired.
 	beat := func() {}
+	// The memory gate (the 2026-11-18 swap-thrash incident): one gate per
+	// daemon, resolved from the config, bound to the daemon's stop channel —
+	// a SIGTERM during a gate hold finishes PROMPTLY (the wait loop selects
+	// on it). The beat feed is captured by reference exactly like the wave
+	// runners' beat: the gate picks the transport up once it is wired. A nil
+	// gate (memory_gate_max_wait = "0s") means the gate is disabled — no
+	// wiring at all, byte-identical to the pre-gate daemon.
+	gate := newMemoryGate(cfg, out, stop)
+	if gate != nil {
+		gate.beat = func() { beat() }
+	}
 	runWave := func(cfg *config.Config, opts maintainOptions, between func() bool) error {
 		// The daemon's ONE manager flows into every core-touching stage via
 		// defaultMaintainStages (fix I-1): the D8 strike counter accumulates
@@ -528,7 +539,7 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		stages.probe = func(c *cobra.Command, cc *config.Config) error {
 			return runProbe(c, cc, 0, opts.speedtest, beat)
 		}
-		return runMaintainGraceful(out, cfg, opts, stages, between)
+		return runMaintainGraceful(out, cfg, opts, stages, between, gate)
 	}
 
 	var shutdown atomic.Bool

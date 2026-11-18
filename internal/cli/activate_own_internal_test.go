@@ -441,19 +441,20 @@ func TestDaemonCoreExecSurfaceIsPinned(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{
-		"internal/install/install.go",       // systemctl allowlist executor (its own guard)
-		"internal/install/launchd.go",       // launchctl allowlist executor (S1, its own guard)
-		"internal/install/runit.go",         // sv allowlist executor (S3, its own guard)
-		"internal/install/openrc.go",        // rc-update/rc-service + rc-status probe (S3, its own guard)
-		"internal/install/s6.go",            // s6-svc/s6-svscanctl/s6-svstat executor (S3, its own guard)
-		"internal/install/cron.go",          // crontab allowlist executor (S3, its own guard)
-		"internal/activate/activate.go",     // the -test gate child (WaitDelay-safe)
-		"internal/checker/instance.go",      // probe/check temp-instance fleets
-		"internal/hotapply/client.go",       // the hot-apply API client: `api lsrules/adrules` on the RESOLVED core binary (S1)
-		"internal/core/manager.go",          // core spawn/kill (the daemon's own child)
-		"internal/core/rollback.go",         // rollback -test gate child
-		"internal/stats/stats.go",           // xray api statsquery poll
-		"internal/xrayupdate/xrayupdate.go", // staged-gate updater
+		"internal/install/install.go",          // systemctl allowlist executor (its own guard)
+		"internal/install/launchd.go",          // launchctl allowlist executor (S1, its own guard)
+		"internal/install/runit.go",            // sv allowlist executor (S3, its own guard)
+		"internal/install/openrc.go",           // rc-update/rc-service + rc-status probe (S3, its own guard)
+		"internal/install/s6.go",               // s6-svc/s6-svscanctl/s6-svstat executor (S3, its own guard)
+		"internal/install/cron.go",             // crontab allowlist executor (S3, its own guard)
+		"internal/activate/activate.go",        // the -test gate child (WaitDelay-safe)
+		"internal/checker/instance.go",         // probe/check temp-instance fleets
+		"internal/hotapply/client.go",          // the hot-apply API client: `api lsrules/adrules` on the RESOLVED core binary (S1)
+		"internal/core/manager.go",             // core spawn/kill (the daemon's own child)
+		"internal/core/rollback.go",            // rollback -test gate child
+		"internal/stats/stats.go",              // xray api statsquery poll
+		"internal/xrayupdate/xrayupdate.go",    // staged-gate updater
+		"internal/platform/memavail_darwin.go", // the memory gate's darwin reader: /usr/bin/vm_stat (read-only report, no core child)
 	}, offenders, "the daemon's complete child-process surface changed — widen this pin deliberately, never silently")
 }
 
