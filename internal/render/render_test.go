@@ -231,8 +231,13 @@ func TestCountryAndCityBalancers(t *testing.T) {
 		switch {
 		case tag == "pool_nl":
 			nl = bm
-		case strings.HasPrefix(tag, "pool_") && strings.Count(tag, "_") >= 2:
-			cities = append(cities, bm) // pool_<cc>_<city-slug>
+		case strings.HasPrefix(tag, "pool_") && strings.Count(tag, "_") >= 2 &&
+			!strings.HasSuffix(tag, "_clean"):
+			// pool_<cc>_<city-slug> (the _clean suffix would also pass the
+			// underscore count — pool_<cc>_clean tiers are country-scoped,
+			// not cities; since the never-empty widening they render even
+			// with empty strict clean subsets and must not count here).
+			cities = append(cities, bm)
 		}
 	}
 	require.NotNil(t, nl, "country balancer pool_nl rendered")
@@ -743,10 +748,15 @@ func TestCleanAndAllBalancers(t *testing.T) {
 		}
 	}
 
-	// Clean country balancers (>=1 clean node per country)
+	// Clean country balancers (>=1 clean node per country); since the
+	// never-empty widening (owner contract 2026-11-18) a country with ZERO
+	// clean nodes still renders its clean tier WIDENED to the country live
+	// set (pool_us_clean = [pool-us-01], the only live US node — flags-dirty
+	// but alive), so a route into it never degrades to block.
 	assert.True(t, balancerTags["pool_nl_clean"], "clean country balancer for NL (2 clean nodes)")
 	assert.True(t, balancerTags["pool_de_clean"], "clean country balancer for DE (2 clean nodes)")
-	assert.False(t, balancerTags["pool_us_clean"], "no clean country balancer for US (0 clean nodes)")
+	assert.True(t, balancerTags["pool_us_clean"],
+		"US clean tier widens to the live set (0 clean nodes, 1 live node)")
 
 	// All country balancers (>=1 all nodes per country — restored: every
 	// country with at least one node keeps its country balancer)
@@ -768,11 +778,15 @@ func TestCleanAndAllBalancers(t *testing.T) {
 	// pool_all_clean renders when clean nodes exist
 	assert.True(t, balancerTags["pool_all_clean"], "pool_all_clean renders when clean nodes exist")
 
-	// Verify clean balancer selectors only contain clean node tags
+	// Verify clean balancer selectors only contain clean node tags — STRICT
+	// tiers only. The widened pool_us_clean is exempt by contract: its strict
+	// subset was empty, so it inherits the country's live set (the dirty
+	// pool-us-01 included) rather than degrading to block.
+	widenedTiers := map[string]bool{"pool_us_clean": true}
 	for _, b := range balancers {
 		bm := b.(map[string]any)
 		tag, _ := bm["tag"].(string)
-		if strings.HasSuffix(tag, "_clean") && tag != "pool_all_clean" {
+		if strings.HasSuffix(tag, "_clean") && !widenedTiers[tag] {
 			selectors := bm["selector"].([]any)
 			for _, s := range selectors {
 				stag := s.(string)
@@ -783,6 +797,14 @@ func TestCleanAndAllBalancers(t *testing.T) {
 					strings.HasPrefix(stag, "pool-de-02"),
 					"clean balancer %s should only select clean nodes, got %s", tag, stag)
 			}
+		}
+	}
+	// The widened tier carries exactly the parent country's live set.
+	for _, b := range balancers {
+		bm := b.(map[string]any)
+		if tag, _ := bm["tag"].(string); tag == "pool_us_clean" {
+			assert.Equal(t, []any{"pool-us-01"}, bm["selector"],
+				"widened pool_us_clean = the pool_us live set")
 		}
 	}
 }

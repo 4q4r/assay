@@ -362,7 +362,29 @@
   "routing": {
     "balancers": [
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_nl",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02",
+          "pool-nl-03",
+          "pool-nl-04",
+          "pool-nl-05",
+          "pool-nl-06",
+          "pool-nl-07",
+          "pool-nl-08",
+          "pool-nl-09"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_nl_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-nl-"
         ],
@@ -376,7 +398,7 @@
         "tag": "pool_nl"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_nl",
         "selector": [
           "pool-nl-01",
           "pool-nl-02",
@@ -410,6 +432,50 @@
           "type": "leastLoad"
         },
         "tag": "pool_all"
+      },
+      {
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02",
+          "pool-nl-03",
+          "pool-nl-04",
+          "pool-nl-05",
+          "pool-nl-06",
+          "pool-nl-07",
+          "pool-nl-08",
+          "pool-nl-09"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_all_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-nl-01",
+          "pool-nl-02",
+          "pool-nl-03",
+          "pool-nl-04",
+          "pool-nl-05",
+          "pool-nl-06",
+          "pool-nl-07",
+          "pool-nl-08",
+          "pool-nl-09"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_clean"
       }
     ],
     "rules": [

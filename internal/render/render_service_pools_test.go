@@ -17,12 +17,6 @@ import (
 // D5 preserved), absence-when-unchecked (fail-closed), the clean risk band,
 // the only-clean skip, and pool_routes targeting service pools.
 
-// globalServicePoolTags is the global-tier service inventory the absence
-// asserts iterate.
-var globalServicePoolTags = []string{
-	"pool_clean", "pool_chatgpt", "pool_netflix", "pool_youtube",
-}
-
 // geoEvidence builds an Input.GeoByKey map for the given nodes: evidence is
 // keyed by node host (unique in every fixture) and joined through
 // model.GeoIdentity — the same join the renderer performs against the
@@ -93,10 +87,15 @@ func mkUnlocked(
 	return n, sn, gr
 }
 
-// TestServicePoolVerdictMatrix pins the exact-vocabulary membership rules
-// through the full render: one node, one verdict dimension per subtest (the
-// other dimensions stay unchecked so they cannot qualify), the service
-// balancer present iff the verdict is the exact positive one.
+// TestServicePoolVerdictMatrix pins the not-confirmed-dirty membership rules
+// through the full render (owner contract 2026-11-18, superseding the
+// 2026-11-04 exact-positive ruling for membership breadth): one node, one
+// verdict dimension per subtest (the other dimensions stay unchecked so
+// they cannot qualify), the service balancer present for every CHECKED
+// verdict except "blocked" — unknown and the partial passes are live
+// живчики that ride the spread — and absent for unchecked (fail-closed
+// evidence classes unchanged; the never-empty guarantee for that case is
+// the widening + fallback chain, not fabricated membership).
 func TestServicePoolVerdictMatrix(t *testing.T) {
 	type verdictCase struct {
 		verdict string
@@ -104,24 +103,24 @@ func TestServicePoolVerdictMatrix(t *testing.T) {
 	}
 	chatgptCases := []verdictCase{
 		{model.UnlockYes, true},
-		{model.UnlockWebOnly, false}, // owner ruling 2026-11-04: webonly excluded
-		{model.UnlockAppOnly, false},
-		{model.UnlockBlocked, false},
-		{model.UnlockUnknown, false},
-		{"", false}, // unchecked = probes off = absent
+		{model.UnlockWebOnly, true},  // semi unlock — живчик rides the spread
+		{model.UnlockAppOnly, true},  // ditto
+		{model.UnlockBlocked, false}, // confirmed dirty for chatgpt only
+		{model.UnlockUnknown, true},  // checked-unknown — never confirmed dirty
+		{"", false},                  // unchecked = probes off = absent
 	}
 	netflixCases := []verdictCase{
 		{model.UnlockNetflixFull, true},
-		{model.UnlockNetflixOriginals, false}, // owner ruling: originals excluded
-		{model.UnlockBlocked, false},
-		{model.UnlockUnknown, false},
+		{model.UnlockNetflixOriginals, true}, // semi unlock — rides the spread
+		{model.UnlockBlocked, false},         // confirmed dirty for netflix only
+		{model.UnlockUnknown, true},          // checked-unknown — never confirmed dirty
 		{"", false},
 	}
 	youtubeCases := []verdictCase{
 		{"US", true},
 		{"de", true}, // any checked region the engine emits (ISO-2)
 		{model.UnlockBlocked, false},
-		{model.UnlockUnknown, false},
+		{model.UnlockUnknown, true}, // checked-unknown region rides the spread
 		{"", false},
 	}
 	run := func(t *testing.T, kind string, cases []verdictCase) {
@@ -234,45 +233,52 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 	sel := &model.Selection{Nodes: selNodes}
 	m := doRenderGeo(t, nodes, sel, geoEvidence(nodes, byHost))
 
-	// Global tier: exact selector contents (selection order).
+	// Global tier: exact selector contents (selection order). Membership is
+	// not-confirmed-dirty (owner contract 2026-11-18): checked-unknown and
+	// the partial passes ride the spread; only "blocked" and unchecked stay
+	// out.
 	assert.Equal(t, []any{"pool-de-01", "pool-xx-01"},
 		serviceSelector(t, m, "pool_clean"), "pool_clean = flags-clean ∩ risk band (30 rejected, -1 flags-only)")
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03", "pool-xx-01"},
+		serviceSelector(t, m, "pool_chatgpt"), "pool_chatgpt = checked, not blocked (yes + webonly semi)")
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03"},
+		serviceSelector(t, m, "pool_netflix"), "pool_netflix = checked, not blocked (full + originals semi)")
 	assert.Equal(t, []any{"pool-de-01", "pool-xx-01"},
-		serviceSelector(t, m, "pool_chatgpt"), "pool_chatgpt = ChatGPT yes only")
-	assert.Equal(t, []any{"pool-de-01"},
-		serviceSelector(t, m, "pool_netflix"), "pool_netflix = Netflix full only")
-	assert.Equal(t, []any{"pool-de-01", "pool-xx-01"},
-		serviceSelector(t, m, "pool_youtube"), "pool_youtube = checked non-blocked regions")
+		serviceSelector(t, m, "pool_youtube"), "pool_youtube = checked non-blocked regions (de-03 blocked out)")
 
 	// Country tier (chatgpt/netflix only — no country youtube, none for nl).
-	assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_de_chatgpt"))
-	assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_de_netflix"))
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03"}, serviceSelector(t, m, "pool_de_chatgpt"))
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03"}, serviceSelector(t, m, "pool_de_netflix"))
 
 	// Clean family (owner ruling 2026-11-04, option 2): the country/city
 	// clean tiers run the SAME predicate as pool_clean. Risk-30 de-02 drops
 	// out of the country tier, flags-dirty de-03 stays out despite its
 	// in-band score 0, and the Frankfurt city tier falls below its >= 2
 	// minimum with only de-01 qualifying. The xx pseudo-location's country
-	// tier rides the same predicate (unchecked -1 → flags-only).
+	// tier rides the same predicate (unchecked -1 → flags-only). The
+	// never-empty widening: nl has zero clean nodes but a live node — its
+	// clean tier renders WIDENED to the nl live set (loud warning line).
 	assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_de_clean"),
 		"pool_de_clean shares the pool_clean predicate (risk-30 de-02 rejected)")
 	assert.Nil(t, balancerByTag(t, m, "pool_de_frankfurt_clean"),
-		"only one qualifying clean node left in Frankfurt: the >= 2 city rule holds")
+		"only one qualifying clean node left in Frankfurt: untargeted, stays absent")
 	assert.Equal(t, []any{"pool-xx-01"}, serviceSelector(t, m, "pool_unknown_clean"),
 		"the xx clean country tier qualifies through the same predicate")
-	assert.Nil(t, balancerByTag(t, m, "pool_nl_clean"), "no clean nl nodes — absent")
+	assert.Equal(t, []any{"pool-nl-01"}, serviceSelector(t, m, "pool_nl_clean"),
+		"nl clean tier widens to the nl live set (zero clean nodes, one live node)")
 
 	for _, absent := range []string{
 		"pool_de_youtube", "pool_nl_chatgpt", "pool_nl_netflix",
 		"pool_nl_amsterdam_chatgpt", "pool_nl_amsterdam_netflix",
 		"pool_de_frankfurt_youtube",
 	} {
-		assert.Nil(t, balancerByTag(t, m, absent), "%s must not render", absent)
+		assert.Nil(t, balancerByTag(t, m, absent),
+			"%s must not render (empty strict subset, untargeted — no widening)", absent)
 	}
 
 	// City tier.
-	assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_de_frankfurt_chatgpt"))
-	assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_de_frankfurt_netflix"))
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03"}, serviceSelector(t, m, "pool_de_frankfurt_chatgpt"))
+	assert.Equal(t, []any{"pool-de-01", "pool-de-03"}, serviceSelector(t, m, "pool_de_frankfurt_netflix"))
 
 	// The unknown-geo node carries NO country/city service tier: the xx
 	// pseudo-location never forms pool_<cc>_<svc> variants.
@@ -282,14 +288,23 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 	}
 
 	// Security invariant extends to the service layer: every pool balancer
-	// (base and service) pins fallbackTag block.
+	// (base and service) chains its fallback to the parent live set — never
+	// direct — and only the ROOT pool_all pins block (owner contract
+	// 2026-11-18; D7 preserved at the root).
 	for _, b := range balancersOf(t, m) {
 		tag, _ := b["tag"].(string)
 		if len(tag) > 5 && tag[:5] == "pool_" {
-			assert.Equal(t, "block", b["fallbackTag"], "balancer %s must pin the block fallback", tag)
 			strategy, ok := b["strategy"].(map[string]any)
 			require.True(t, ok, "balancer %s must carry a strategy", tag)
 			assert.Equal(t, "leastLoad", strategy["type"])
+			fb, _ := b["fallbackTag"].(string)
+			assert.NotEqual(t, "direct", fb, "balancer %s must never fall back to direct", tag)
+			if tag == model.PoolAllBalancerTag {
+				assert.Equal(t, "block", fb, "pool_all is the chain root — block")
+				continue
+			}
+			assert.Contains(t, []string{"pool_all", "pool_de", "pool_nl", "pool_unknown"}, fb,
+				"balancer %s must chain to a parent live set (got %q)", tag, fb)
 		}
 	}
 
@@ -308,7 +323,7 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 		for _, want := range []string{
 			"pool_clean", "pool_chatgpt", "pool_netflix", "pool_youtube",
 			"pool_de_chatgpt", "pool_de_netflix", "pool_de_frankfurt_chatgpt", "pool_de_frankfurt_netflix",
-			"pool_de_clean", "pool_unknown_clean",
+			"pool_de_clean", "pool_unknown_clean", "pool_nl_clean",
 		} {
 			if tag == want {
 				serviceTags[tag]++
@@ -319,7 +334,7 @@ func TestServicePoolMembershipMatrix(t *testing.T) {
 		"pool_clean": 1, "pool_chatgpt": 1, "pool_netflix": 1, "pool_youtube": 1,
 		"pool_de_chatgpt": 1, "pool_de_netflix": 1,
 		"pool_de_frankfurt_chatgpt": 1, "pool_de_frankfurt_netflix": 1,
-		"pool_de_clean": 1, "pool_unknown_clean": 1,
+		"pool_de_clean": 1, "pool_unknown_clean": 1, "pool_nl_clean": 1,
 	}, serviceTags, "every service balancer renders exactly once per render")
 }
 
@@ -378,34 +393,54 @@ func TestServicePoolTiersMinimums(t *testing.T) {
 }
 
 // TestServicePoolsAbsentWithoutEvidence pins the fail-closed contract: with
-// no evidence map (nil GeoByKey) or all-unchecked records, none of the
-// service pools render — ABSENT, not empty.
+// no evidence map (nil GeoByKey) or all-unchecked records, the UNLOCK pools
+// (chatgpt/netflix/youtube and their country/city variants) render — ABSENT,
+// not empty. pool_clean is the exception since the never-empty widening
+// (owner contract 2026-11-18): its strict subset rides flags only, and an
+// empty strict subset widens to the pool-wide live set rather than going
+// absent — availability never fabricates unlock membership, the widening is
+// loud (warning line) and the fallback chain covers runtime death.
 func TestServicePoolsAbsentWithoutEvidence(t *testing.T) {
 	nodes, sel := twoCountrySelection(t)
+	unlockPoolTags := []string{"pool_chatgpt", "pool_netflix", "pool_youtube"}
 
 	// nil map = the knob-off pipeline state.
 	mNil := doRenderGeo(t, nodes, sel, nil)
-	for _, tag := range globalServicePoolTags {
+	for _, tag := range unlockPoolTags {
 		assert.Nil(t, balancerByTag(t, mNil, tag), "%s must be absent without geo evidence", tag)
 	}
 	assert.Nil(t, balancerByTag(t, mNil, "pool_nl_chatgpt"))
 	assert.Nil(t, balancerByTag(t, mNil, "pool_de_frankfurt_netflix"))
 
 	// Evidence present but every record unchecked (-1 / empty verdicts):
-	// identical absence — unlock pools need CHECKED positive verdicts.
+	// identical absence for the unlock pools — they need CHECKED verdicts.
 	byHost := map[string]model.GeoRecord{}
 	for _, n := range nodes {
 		byHost[n.Host] = model.GeoRecord{RiskScore: -1}
 	}
 	mUnchecked := doRenderGeo(t, nodes, sel, geoEvidence(nodes, byHost))
-	for _, tag := range globalServicePoolTags {
+	for _, tag := range unlockPoolTags {
 		assert.Nil(t, balancerByTag(t, mUnchecked, tag), "%s must be absent when unchecked", tag)
 	}
+
+	// pool_clean in both states: every node is flags-dirty in this fixture
+	// (mkSelected leaves IsClean false), so the strict subset is empty and
+	// the never-empty widening renders it with the pool-wide live set.
+	allTags := make([]any, 0, len(sel.Nodes))
+	for _, sn := range sel.Nodes {
+		allTags = append(allTags, sn.Tag)
+	}
+	assert.Equal(t, allTags, serviceSelector(t, mNil, "pool_clean"),
+		"pool_clean widens to the pool-wide live set when the strict subset is empty")
+	assert.Equal(t, allTags, serviceSelector(t, mUnchecked, "pool_clean"),
+		"unchecked evidence changes nothing: pool_clean widened in both states")
 }
 
-// TestPoolCleanRiskBandAndOnlyCleanSkip pins pool_clean's two special rules:
-// the checked risk must sit in the approved 0-25 band, and the pool is
-// skipped in only-clean mode (identical selector to pool_all — the owner's
+// TestPoolCleanRiskBandAndOnlyCleanSkip pins pool_clean's rules: the checked
+// risk must sit in the approved 0-25 band for STRICT membership (out-of-band
+// risk empties the strict subset → the never-empty widening renders the
+// tier with the live set, loud warning), and the pool is skipped in
+// only-clean mode (identical selector to pool_all — the owner's
 // «балансиры только общие» ruling).
 func TestPoolCleanRiskBandAndOnlyCleanSkip(t *testing.T) {
 	bandCases := []struct {
@@ -435,8 +470,12 @@ func TestPoolCleanRiskBandAndOnlyCleanSkip(t *testing.T) {
 			if tc.want {
 				assert.Equal(t, []any{"pool-de-01"}, serviceSelector(t, m, "pool_clean"))
 			} else {
-				assert.Nil(t, balancerByTag(t, m, "pool_clean"),
-					"risk %d is outside the approved clean band", tc.risk)
+				// Out-of-band risk empties the STRICT subset; since the
+				// never-empty widening (owner contract 2026-11-18) the tier
+				// renders WIDENED to the live set (loud warning) instead of
+				// going absent — a routed pool_clean never dead-ends.
+				assert.Equal(t, []any{"pool-de-01", "pool-de-02"}, serviceSelector(t, m, "pool_clean"),
+					"risk %d empties the strict subset — pool_clean widens to the live set", tc.risk)
 			}
 		})
 	}
@@ -507,20 +546,28 @@ func TestCleanFamilyRiskBandUnified(t *testing.T) {
 				assert.Equal(t, cleanSelector, serviceSelector(t, m, "pool_all_clean"),
 					"pool_all_clean (pool-wide tier) admits checked risk %d under the SAME predicate", tc.risk)
 			} else {
-				assert.Nil(t, balancerByTag(t, m, "pool_clean"),
-					"risk %d is outside the clean band (global tier)", tc.risk)
-				assert.Nil(t, balancerByTag(t, m, "pool_de_clean"),
-					"risk %d is outside the clean band (country tier)", tc.risk)
+				// Out-of-band risk empties the strict subsets; since the
+				// never-empty widening (owner contract 2026-11-18) the
+				// global/country/pool-wide clean tiers render WIDENED to the
+				// live set (loud warning) instead of going absent. The city
+				// tier is untargeted here — it stays absent.
+				widened := []any{"pool-de-01", "pool-de-02", "pool-de-03"}
+				assert.Equal(t, widened, serviceSelector(t, m, "pool_clean"),
+					"risk %d empties the strict subset — pool_clean widens to the live set", tc.risk)
+				assert.Equal(t, widened, serviceSelector(t, m, "pool_de_clean"),
+					"risk %d empties the strict subset — pool_de_clean widens to the live set", tc.risk)
+				assert.Equal(t, widened, serviceSelector(t, m, "pool_all_clean"),
+					"risk %d empties the strict subset — pool_all_clean widens to the live set", tc.risk)
 				assert.Nil(t, balancerByTag(t, m, "pool_de_frankfurt_clean"),
-					"risk %d is outside the clean band (city tier)", tc.risk)
-				assert.Nil(t, balancerByTag(t, m, "pool_all_clean"),
-					"risk %d is outside the clean band (pool-wide tier)", tc.risk)
+					"untargeted city clean tier with an empty strict subset stays absent")
 			}
-			// The dirty node stays out of every clean tier at any score.
+			// The dirty node stays out of every STRICT clean tier at any
+			// score; in the widened case it rides the widened live set by
+			// contract (it is alive — availability beats strictness).
 			for _, tag := range []string{"pool_clean", "pool_de_clean", "pool_de_frankfurt_clean", "pool_all_clean"} {
-				if bal := balancerByTag(t, m, tag); bal != nil {
+				if bal := balancerByTag(t, m, tag); bal != nil && tc.want {
 					assert.NotContains(t, bal["selector"], "pool-de-03",
-						"flags-dirty node must never enter %s", tag)
+						"flags-dirty node must never enter strict %s", tag)
 				}
 			}
 			// The base (all) tiers are untouched by the clean gate.
@@ -617,8 +664,11 @@ func TestPoolRoutesServicePoolTargets(t *testing.T) {
 		assert.Equal(t, []any{"in", "in-http"}, rule["inboundTag"])
 	}
 
-	// Unrendered service targets degrade to block, each with a warning.
-	require.Len(t, res, 2, "typo and absent-tier targets must be reported")
+	// Unrendered service targets degrade to block, each with a warning. The
+	// never-empty widening disclosures ride the same channel (this fixture's
+	// single-node country yields empty strict clean tiers → 3 widening lines),
+	// so the two degradation lines are asserted by content.
+	require.Len(t, res, 5, "2 degradation lines + 3 never-empty widening disclosures")
 	assert.Contains(t, res, `pool route balancer "pool_chatgptt" not rendered -> block`)
 	assert.Contains(t, res, `pool route balancer "pool_unknown_chatgpt" not rendered -> block`)
 	// The degraded rules keep their route domains (they blackhole exactly

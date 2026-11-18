@@ -72,7 +72,8 @@ func TestPoolUnknownBalancerRendersForUnknownGeoNodes(t *testing.T) {
 	bal := balancerByTag(t, m, "pool_unknown")
 	require.NotNil(t, bal, "pool_unknown renders when unknown-geo nodes exist")
 	assert.Equal(t, []any{"pool-xx-"}, bal["selector"], "the selector is the xx pseudo-code prefix")
-	assert.Equal(t, "block", bal["fallbackTag"], "security invariant: pool_unknown is a pool balancer")
+	assert.Equal(t, model.PoolAllBalancerTag, bal["fallbackTag"],
+		"pool_unknown chains its fallback to the pool-wide live set (never direct)")
 	strategy, ok := bal["strategy"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "leastLoad", strategy["type"])
@@ -137,10 +138,11 @@ func TestPoolAllAbsentOnEmptyPool(t *testing.T) {
 	}
 }
 
-// TestPoolBalancersCarryBlockFallbackOnNewBalancers pins the W9 invariant
-// extended to the W16 balancers: pool_unknown and pool_all carry
-// fallbackTag block, and every balancer renders EXACTLY ONCE per render
-// (the emission contract; the own render regenerates from scratch each wave).
+// TestPoolBalancersCarryBlockFallbackOnNewBalancers pins the never-empty
+// fallback chain on the W16 balancers: pool_unknown chains to pool_all,
+// pool_all (the chain ROOT) stays on block, and every balancer renders
+// EXACTLY ONCE per render (the emission contract; the own render regenerates
+// from scratch each wave).
 func TestPoolBalancersCarryBlockFallbackOnNewBalancers(t *testing.T) {
 	nodes, sel := unknownSelection(t)
 	m, _ := doOwnRender(t, nodes, sel, []render.PoolRoute{
@@ -153,11 +155,32 @@ func TestPoolBalancersCarryBlockFallbackOnNewBalancers(t *testing.T) {
 		tag, _ := b["tag"].(string)
 		if strings.HasPrefix(tag, "pool_") {
 			counts[tag]++
-			assert.Equal(t, "block", b["fallbackTag"], "pool balancer %s must carry the block fallback", tag)
+			switch tag {
+			case model.PoolAllBalancerTag:
+				assert.Equal(t, "block", b["fallbackTag"], "pool_all is the chain root — block (D7)")
+			case "pool_clean", model.CleanPoolAllBalancerTag:
+				assert.Equal(t, model.PoolAllBalancerTag, b["fallbackTag"],
+					"balancer %s: global tier chains to pool_all", tag)
+			case model.CountryBalancerTag("de"), model.UnknownBalancerTag:
+				assert.Equal(t, model.PoolAllBalancerTag, b["fallbackTag"],
+					"balancer %s: country tier chains to pool_all", tag)
+			case model.CleanCountryBalancerTag("de"):
+				assert.Equal(t, model.CountryBalancerTag("de"), b["fallbackTag"],
+					"clean country chains to its parent")
+			case model.UnknownBalancerTag + "_clean":
+				assert.Equal(t, model.UnknownBalancerTag, b["fallbackTag"], "xx clean tier chains to pool_unknown")
+			default:
+				assert.Equal(t, model.CountryBalancerTag("de"), b["fallbackTag"],
+					"city variants chain to their parent country balancer")
+			}
 		}
 	}
-	assert.Equal(t, map[string]int{"pool_unknown": 1, "pool_all": 1, "pool_de": 1, "pool_de_frankfurt": 1},
-		counts, "every balancer renders exactly once per render")
+	// The fixture's nodes are all flags-dirty: the clean tiers render WIDENED
+	// (never-empty contract) — 4 base + 4 clean tiers, each exactly once.
+	assert.Equal(t, map[string]int{
+		"pool_unknown": 1, "pool_all": 1, "pool_de": 1, "pool_de_frankfurt": 1,
+		"pool_unknown_clean": 1, "pool_de_clean": 1, "pool_clean": 1, "pool_all_clean": 1,
+	}, counts, "every balancer renders exactly once per render")
 }
 
 // TestUnknownAndAllGoldenPassesXrayTest materializes (first run) and
@@ -238,12 +261,17 @@ func TestCityBalancerFoldsCaseVariants(t *testing.T) {
 	require.NotNil(t, bal, "case-variant pair forms ONE city bucket; the >=2-node city balancer must form")
 	assert.Equal(t, []any{"pool-de-01", "pool-de-02"}, bal["selector"],
 		"the folded bucket carries both variants' outbounds")
-	assert.Equal(t, "block", bal["fallbackTag"], "security invariant: city balancer keeps the block fallback")
+	assert.Equal(t, "pool_de", bal["fallbackTag"],
+		"security invariant: city balancer chains to its parent country (never direct)")
 
 	// One bucket, not two: exactly one city balancer exists for the group.
+	// (The _clean suffix is excluded: since the never-empty widening the
+	// country-scoped pool_de_clean tier renders here too — its strict subset
+	// is empty on this flags-dirty fixture — but it is not a city bucket.)
 	cityBalancers := 0
 	for _, b := range balancersOf(t, m) {
-		if tag, _ := b["tag"].(string); strings.HasPrefix(tag, "pool_de_") {
+		if tag, _ := b["tag"].(string); strings.HasPrefix(tag, "pool_de_") &&
+			!strings.HasSuffix(tag, "_clean") {
 			cityBalancers++
 		}
 	}

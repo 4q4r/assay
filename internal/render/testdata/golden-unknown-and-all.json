@@ -169,7 +169,21 @@
   "routing": {
     "balancers": [
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_unknown",
+        "selector": [
+          "pool-xx-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_unknown_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-xx-"
         ],
@@ -183,7 +197,22 @@
         "tag": "pool_unknown"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-de-"
         ],
@@ -197,7 +226,7 @@
         "tag": "pool_de"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-01",
           "pool-de-02"
@@ -226,7 +255,23 @@
         "tag": "pool_all"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-xx-01",
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_all_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-xx-01",
           "pool-de-02"
@@ -241,7 +286,23 @@
         "tag": "pool_chatgpt"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
+        "selector": [
+          "pool-xx-01",
+          "pool-de-01",
+          "pool-de-02"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_clean"
+      },
+      {
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-02"
         ],
@@ -255,7 +316,7 @@
         "tag": "pool_de_chatgpt"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-02"
         ],
@@ -269,7 +330,7 @@
         "tag": "pool_de_frankfurt_chatgpt"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-01"
         ],
@@ -283,7 +344,7 @@
         "tag": "pool_de_frankfurt_netflix"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-01"
         ],
@@ -297,7 +358,7 @@
         "tag": "pool_de_netflix"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-de-01"
         ],
@@ -311,7 +372,7 @@
         "tag": "pool_netflix"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-xx-01",
           "pool-de-01"

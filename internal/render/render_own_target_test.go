@@ -299,8 +299,12 @@ func TestRenderOwnDegradesRoutesLoud(t *testing.T) {
 		[]render.RouteRule{{Balancer: "pool_fr", Domains: []string{"geosite:netflix"}}},
 		ownByKey(nodes), nil, render.Config{})
 	require.NoError(t, err)
-	require.Len(t, warnings, 1, "the degraded route is reported, not swallowed")
-	assert.Contains(t, warnings[0], `pool route balancer "pool_fr" not rendered -> block`)
+	// The degraded route is reported, not swallowed. Since the never-empty
+	// contract (2026-11-18) the warnings slice ALSO carries the loud
+	// balancer-widening disclosures (this fixture has no clean-qualifying
+	// nodes, so the clean tiers widen) — the degradation line must be among
+	// them, verbatim.
+	assert.Contains(t, warnings, `pool route balancer "pool_fr" not rendered -> block`)
 
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(b, &m))
