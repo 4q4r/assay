@@ -276,7 +276,23 @@
   "routing": {
     "balancers": [
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
+        "selector": [
+          "pool-de-01",
+          "pool-de-02",
+          "pool-de-03"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_de_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-de-"
         ],
@@ -290,7 +306,7 @@
         "tag": "pool_de"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_de",
         "selector": [
           "pool-de-01",
           "pool-de-03"
@@ -305,7 +321,21 @@
         "tag": "pool_de_frankfurt_am_main"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_fr",
+        "selector": [
+          "pool-fr-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_fr_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-fr-"
         ],
@@ -319,7 +349,21 @@
         "tag": "pool_fr"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_it",
+        "selector": [
+          "pool-it-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_it_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-it-"
         ],
@@ -333,7 +377,7 @@
         "tag": "pool_it"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_nl",
         "selector": [
           "pool-nl-01"
         ],
@@ -347,7 +391,7 @@
         "tag": "pool_nl_clean"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-nl-"
         ],
@@ -361,7 +405,21 @@
         "tag": "pool_nl"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_us",
+        "selector": [
+          "pool-us-01"
+        ],
+        "strategy": {
+          "settings": {
+            "expected": 1,
+            "tolerance": 0.2
+          },
+          "type": "leastLoad"
+        },
+        "tag": "pool_us_clean"
+      },
+      {
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-us-"
         ],
@@ -389,7 +447,7 @@
         "tag": "pool_all"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-nl-01"
         ],
@@ -403,7 +461,7 @@
         "tag": "pool_all_clean"
       },
       {
-        "fallbackTag": "block",
+        "fallbackTag": "pool_all",
         "selector": [
           "pool-nl-01"
         ],

@@ -320,12 +320,28 @@ func TestWaveRecordCacheWriteInvalidation(t *testing.T) {
 
 // TestAllocWaveParityAgainstPreChangeGoldens pins the refactor's observable
 // contract: the wave's store outputs are BYTE-IDENTICAL to the pre-change
-// tree's outputs (goldens generated on the base commit a70c40d) on this
-// fixture corpus, and the cache path matches the legacy direct-read path
-// byte for byte. selection.json is compared with generated_at normalized
-// (the one wall-clock field rank stamps); provider-history.json and the
-// prune backup name carry wall-clock stamps and are excluded (asserted for
-// existence instead).
+// tree's outputs on this fixture corpus, and the cache path matches the
+// legacy direct-read path byte for byte.
+//
+// Golden provenance: originally generated on the base commit a70c40d
+// (pre-alloc12, pre-balancer-never-empty) to prove the alloc12 read-once
+// refactor changed no observable output; DELIBERATELY REGENERATED on
+// integration/mem-alloc-bal after the balancer-never-empty contract wave
+// (fix/render d3fabeb) changed the RENDERED candidate's balancer section by
+// design — runtime fallback chain (variant → country → pool_all → block at
+// the root) and widened empty clean/service tiers. Every candidate delta was
+// classified against that contract before regeneration: 12 fallbackTag
+// re-parentings + 4 widened country-clean tiers, all intended; the six
+// actual store files (filtered/geo-base/selection/manifest/probe-results/
+// known-alive) remain byte-identical to the a70c40d goldens. The test's
+// purpose is unchanged: any future change to the read/cache paths or to a
+// store artifact's content that is not accompanied by a deliberate golden
+// regeneration fails here.
+//
+// selection.json is compared with generated_at normalized (the one
+// wall-clock field rank stamps); provider-history.json and the prune backup
+// name carry wall-clock stamps and are excluded (asserted for existence
+// instead).
 func TestAllocWaveParityAgainstPreChangeGoldens(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
