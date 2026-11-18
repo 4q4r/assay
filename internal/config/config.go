@@ -6,9 +6,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -394,10 +396,49 @@ type MaintainConfig struct {
 	// activate.backup_keep caps activation backups (0 = unlimited, the
 	// default; deletion failures are loud). Resolves parked item M3.
 	PruneBackupKeep int `toml:"prune_backup_keep"`
+	// MemoryGateMinAvail is the host-memory floor for the wave's heavy-alloc
+	// stages (fetch/parse/filter): when MemAvailable is below it, the stage
+	// WAITS in a bounded loop instead of pushing the box into swap thrash
+	// (the 2026-11-18 incident: a maintain wave drove MemAvailable low
+	// enough that host-wide swap thrash killed every TLS handshake on the
+	// box until the wave's heavy phases passed). TRI-STATE pointer: absent
+	// (nil) → DefaultMemoryGateMinAvail (1.5Gi); an explicit zero means
+	// unset (the W6 zero-means-default convention, never "off" — the gate's
+	// off switch is memory_gate_max_wait = "0s"). Binary units only
+	// (Ki/Mi/Gi/Ti, 1024-based; see ByteSize).
+	MemoryGateMinAvail *ByteSize `toml:"memory_gate_min_avail"`
+	// MemoryGateMaxWait bounds one stage's memory-gate wait: when the floor
+	// is not met within this budget, the wave SKIPS its remaining heavy
+	// stages loudly for this cycle (the next wave is scheduled normally;
+	// the last-good config keeps serving — D7). TRI-STATE pointer: absent
+	// (nil) → DefaultMemoryGateMaxWait (30m); an explicit "0s" → 0 = the
+	// gate is DISABLED entirely (the owner's escape hatch, the same
+	// schedule-level «выключи» semantics as speedtest_interval). Negative
+	// values are structurally invalid.
+	MemoryGateMaxWait *Duration `toml:"memory_gate_max_wait"`
 }
 
 // DefaultSpeedtestInterval is the speedtest-wave default: weekly (168h).
 const DefaultSpeedtestInterval = 168 * time.Hour
+
+// Memory-gate defaults (the 2026-11-18 swap-thrash incident): during a
+// maintain wave the host dipped low enough on available memory that
+// host-wide swap thrash killed every TLS handshake on the box until the
+// wave's heavy phases passed. The gate holds a heavy stage (fetch/parse/
+// filter) while MemAvailable is under the floor, waiting up to the wait
+// budget before skipping the wave's remaining heavy stages for the cycle.
+const (
+	// DefaultMemoryGateMinAvail is the [maintain].memory_gate_min_avail
+	// default: 1.5 GiB (3 << 29 bytes). Sized under the incident's observed
+	// thrash window (daemon RSS 686M-1.6G + swap peaks 284-686M on a 15G
+	// host already loaded by browsers/VMs).
+	DefaultMemoryGateMinAvail uint64 = 3 << 29
+	// DefaultMemoryGateMaxWait is the [maintain].memory_gate_max_wait
+	// default: 30 minutes of bounded waiting per stage before the wave
+	// skips its remaining heavy stages for this cycle. An explicit "0s"
+	// disables the gate entirely (the escape hatch).
+	DefaultMemoryGateMaxWait = 30 * time.Minute
+)
 
 // SpeedtestWavePeriod resolves the schedule-level speedtest-wave period:
 // nil (unset — a hand-built struct without defaults) and an explicit "0s"
@@ -738,6 +779,130 @@ func (d *Duration) UnmarshalText(b []byte) error {
 // MarshalText renders the duration back to a TOML string.
 func (d *Duration) MarshalText() ([]byte, error) {
 	return []byte(d.String()), nil
+}
+
+// ByteSize wraps a byte count for TOML string values like "1.5Gi", "512Mi",
+// "64Ki", or a bare byte count ("4096"). The accepted units are binary
+// (1024-based) only — Ki/Mi/Gi/Ti/Pi/Ei with an optional trailing "B" —
+// plus bare bytes; decimal SI units (KB/MB/GB) are deliberately rejected so
+// a decimal/binary unit mix-up can never gate on a lie. Values in this repo
+// gate REAL host memory (the memory gate's MemAvailable floor), where the
+// kernel reports binary-magnitude quantities.
+type ByteSize struct {
+	Bytes uint64
+}
+
+// UnmarshalText parses a binary-unit byte-size string; anything else fails
+// loud (structural check — bad values refuse the load, missing keys take
+// the defaults).
+func (b *ByteSize) UnmarshalText(text []byte) error {
+	v, err := parseByteSize(string(text))
+	if err != nil {
+		return err
+	}
+	b.Bytes = v
+	return nil
+}
+
+// MarshalText renders the byte count back to a compact TOML string.
+func (b ByteSize) MarshalText() ([]byte, error) {
+	return []byte(FormatByteSize(b.Bytes)), nil
+}
+
+// byteSizeUnits is the binary-unit suffix table (1024-based). The "GiB"
+// spelling (an optional trailing "B") folds onto the same entries via the
+// suffix scan below.
+var byteSizeUnits = map[string]uint64{
+	"Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40, "Pi": 1 << 50, "Ei": 1 << 60,
+}
+
+// byteSizeSuffixes lists the accepted suffixes, longest first so the scan
+// prefers "GiB" over "i"-less cuts ("B" alone must not swallow "KiB").
+var byteSizeSuffixes = []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "B"}
+
+// maxFloatExactByteSize bounds the fractional-mantissa path: float64
+// represents integers exactly only up to 2^53, so a fractional byte-size
+// resolving above this must use an integer mantissa (loud, not lossy).
+const maxFloatExactByteSize = uint64(1) << 53
+
+// parseByteSize parses one byte-size value: a non-negative decimal mantissa
+// with an optional binary unit suffix, or a bare byte count. Fractional
+// mantissas are allowed ("0.5Gi") and must resolve to whole bytes. Parse
+// errors are structural — the caller fails the load loud.
+func parseByteSize(s string) (uint64, error) {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return 0, errors.New("empty byte-size value")
+	}
+	mult := uint64(1)
+	mantissa := v
+	for _, suffix := range byteSizeSuffixes {
+		if rest, ok := strings.CutSuffix(v, suffix); ok {
+			mantissa = strings.TrimSpace(rest)
+			if suffix != "B" {
+				key := suffix
+				if strings.HasSuffix(suffix, "B") {
+					key = suffix[:len(suffix)-1] // the "KiB" spelling → the "Ki" table entry
+				}
+				mult = byteSizeUnits[key]
+			}
+			break
+		}
+	}
+	if mantissa == "" {
+		return 0, fmt.Errorf("byte-size %q: missing numeric value", s)
+	}
+	return scaleByteMantissa(mantissa, mult, s)
+}
+
+// scaleByteMantissa parses the numeric mantissa and scales it by the unit
+// multiplier: whole numbers parse exactly through ParseUint; fractions
+// resolve through float64 and must land on whole bytes within float64's
+// exact-integer range (louder than silently rounding a memory floor).
+func scaleByteMantissa(mantissa string, mult uint64, orig string) (uint64, error) {
+	if strings.ContainsRune(mantissa, '.') || strings.ContainsAny(mantissa, "eE") {
+		f, err := strconv.ParseFloat(mantissa, 64)
+		if err != nil || f < 0 {
+			return 0, fmt.Errorf("byte-size %q: invalid numeric value", orig)
+		}
+		bytes := f * float64(mult)
+		if bytes != math.Trunc(bytes) {
+			return 0, fmt.Errorf("byte-size %q: fractional value does not resolve to whole bytes", orig)
+		}
+		if bytes > math.MaxUint64 {
+			return 0, fmt.Errorf("byte-size %q: value overflows uint64", orig)
+		}
+		if bytes > float64(maxFloatExactByteSize) {
+			return 0, fmt.Errorf("byte-size %q: fractional mantissa exceeds exact float64 range — use an integer value", orig)
+		}
+		return uint64(bytes), nil
+	}
+	whole, err := strconv.ParseUint(mantissa, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("byte-size %q: invalid numeric value", orig)
+	}
+	if mult > 1 && whole > math.MaxUint64/mult {
+		return 0, fmt.Errorf("byte-size %q: value overflows uint64", orig)
+	}
+	return whole * mult, nil
+}
+
+// FormatByteSize renders a byte count in the largest binary unit that keeps
+// at least one significant digit. ONE formatter owns the knob spelling in
+// both the TOML marshal and the memory gate's loud lines ("1.5Gi",
+// "512.0Mi", "64Ki", "4096B") so a log line and the config value can never
+// drift apart.
+func FormatByteSize(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return strconv.FormatFloat(float64(b)/(1<<30), 'f', 1, 64) + "Gi"
+	case b >= 1<<20:
+		return strconv.FormatFloat(float64(b)/(1<<20), 'f', 1, 64) + "Mi"
+	case b >= 1<<10:
+		return strconv.FormatUint(b/(1<<10), 10) + "Ki"
+	default:
+		return strconv.FormatUint(b, 10) + "B"
+	}
 }
 
 // Load reads, migration-checks, strict-decodes, defaults, and validates the
@@ -1290,6 +1455,18 @@ func applyMaintainDefaults(m *MaintainConfig) {
 	if m.StatsTimeout.Duration == 0 {
 		m.StatsTimeout.Duration = DefaultStatsTimeout
 	}
+	// Memory gate (the 2026-11-18 swap-thrash incident): an absent OR zero
+	// floor materializes the 1.5Gi default (the W6 zero-means-unset
+	// convention — the gate's off switch is max_wait = "0s", not a zero
+	// floor); an absent max_wait materializes 30m, an explicit "0s" STAYS 0
+	// = the gate is disabled entirely (the same schedule-level escape hatch
+	// as speedtest_interval).
+	if m.MemoryGateMinAvail == nil || m.MemoryGateMinAvail.Bytes == 0 {
+		m.MemoryGateMinAvail = &ByteSize{Bytes: DefaultMemoryGateMinAvail}
+	}
+	if m.MemoryGateMaxWait == nil {
+		m.MemoryGateMaxWait = &Duration{Duration: DefaultMemoryGateMaxWait}
+	}
 	// PruneBackupKeep: no default application — 0 IS the default (unlimited).
 }
 
@@ -1505,6 +1682,14 @@ func validateMaintain(m MaintainConfig) error {
 	// ONLY to refresh_interval/speedtest_interval (W5, owner-approved).
 	if err := validateNonNegative("maintain.stats_timeout", m.StatsTimeout.Duration); err != nil {
 		return err
+	}
+	// Memory gate: memory_gate_max_wait is sign-checked (negative = invalid,
+	// 0 = the gate disabled entirely); memory_gate_min_avail is a uint64 and
+	// cannot carry a sign — its parse already rejects negatives loud.
+	if m.MemoryGateMaxWait != nil {
+		if err := validateNonNegative("maintain.memory_gate_max_wait", m.MemoryGateMaxWait.Duration); err != nil {
+			return err
+		}
 	}
 	return validateNonNegative("maintain.prune_backup_keep", m.PruneBackupKeep)
 }
