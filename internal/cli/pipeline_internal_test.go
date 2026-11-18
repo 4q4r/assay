@@ -433,6 +433,192 @@ func TestConfigReconciliationWarnsStaleBalancer(t *testing.T) {
 	assert.Contains(t, buf.String(), `"us"`)
 }
 
+// selSyncRealityNode builds one renderable reality node for the
+// selection-store sync fixtures (same shape the knobs E2E test uses).
+func selSyncRealityNode(t *testing.T, uuid, host string, sid string) *model.Node {
+	t.Helper()
+	return model.NewNode("src", "vless", uuid, host, 443, map[string]string{
+		"security": "reality", "type": "tcp",
+		"pbk": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", "sid": sid,
+	})
+}
+
+// selSyncGeo builds the alive cold-base record matching a fixture node's
+// identity (the join rank's candidate lookup performs).
+func selSyncGeo(n *model.Node, cc string, alive bool, lastProbe time.Time) *model.GeoRecord {
+	rec := &model.GeoRecord{
+		Tag: n.Key[:12], Source: "test", Scheme: n.Scheme, Host: n.Host, Port: n.Port,
+		Country: cc, City: "Berlin",
+		Alive:     alive,
+		LastProbe: lastProbe.UTC().Format(time.RFC3339),
+	}
+	return rec
+}
+
+// TestRenderSkipsSelectionKeysAbsentFromStore pins the production desync of
+// 2026-11-18 end to end at the CLI boundary: selection.json carries keys the
+// store (filtered.jsonl) no longer has, and `assay render` must NOT fail with
+// "render: selected node <key> (tag <tag>) has no node record" anymore — it
+// skips the ghost loud, renders the rest, and writes the candidate. The D6
+// fail-loud contract for balancer/rule targets is pinned elsewhere and is a
+// different class (missing NODE ≠ missing balancer).
+func TestRenderSkipsSelectionKeysAbsentFromStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DataDir: dir}
+	p := newPaths(cfg)
+	n1 := selSyncRealityNode(t, "00000000-0000-0000-0000-000000000001", "Se1.Example.com", "AA")
+	b1, err := json.Marshal(n1)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p.filtered, []byte(string(b1)+"\n"), 0o600))
+	sel := &model.Selection{Nodes: []model.SelectedNode{
+		{Tag: "pool-de-01", Key: n1.Key, Country: "de"},
+		// The production ghost keys (the wave rewrote the store and aborted
+		// before select re-ranked).
+		{Tag: "pool-us-36", Key: "3471fd449fa5614b", Country: "us"},
+		{Tag: "pool-us-37", Key: "7e1b73a8feb459eb", Country: "us"},
+	}}
+	require.NoError(t, store.WriteSelection(p.selection, sel))
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	require.NoError(t, runRender(cmd, cfg),
+		"a stale selection entry must be skipped loud, not fail the render")
+
+	assert.Contains(t, buf.String(),
+		"WARNING: render: selected node 3471fd449fa5614b (tag pool-us-36) dropped from candidate: store record missing — run assay select")
+	assert.Contains(t, buf.String(),
+		"WARNING: render: selected node 7e1b73a8feb459eb (tag pool-us-37) dropped from candidate: store record missing — run assay select")
+
+	raw, err := os.ReadFile(ownCandidatePath(p))
+	require.NoError(t, err, "the render writes the activation candidate")
+	assert.NotContains(t, string(raw), "pool-us-36", "the ghost tag must not reach the artifact")
+	assert.NotContains(t, string(raw), "pool-us-37")
+	assert.Contains(t, string(raw), "pool-de-01", "the real member still renders")
+}
+
+// TestSelectDropsAndWarnsPriorSelectionKeysAbsentFromStore pins the
+// authoritative invariant at the source: the select stage is selection.json's
+// ONLY writer, and re-ranking over a store that lacks a prior-selection key
+// must drop it AND say so loud (key + tag) — the same healing the production
+// workaround used, but visible in the journal instead of discovered at render.
+func TestSelectDropsAndWarnsPriorSelectionKeysAbsentFromStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DataDir: dir}
+	cfg.Geo.TTL.Duration = time.Hour
+	p := newPaths(cfg)
+	n1 := selSyncRealityNode(t, "00000000-0000-0000-0000-000000000001", "Se1.Example.com", "AA")
+	b1, err := json.Marshal(n1)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p.filtered, []byte(string(b1)+"\n"), 0o600))
+	require.NoError(t, store.WriteGeo(p.geoBase, []*model.GeoRecord{
+		selSyncGeo(n1, "de", true, time.Now()),
+	}))
+	prior := &model.Selection{Nodes: []model.SelectedNode{
+		{Tag: "pool-de-01", Key: n1.Key, Country: "de"},
+		{Tag: "pool-us-36", Key: "3471fd449fa5614b", Country: "us"},
+	}}
+	require.NoError(t, store.WriteSelection(p.selection, prior))
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	require.NoError(t, runSelect(cmd, cfg))
+
+	assert.Contains(t, buf.String(),
+		"select: prior selection node 3471fd449fa5614b (tag pool-us-36) dropped: store record missing — healed by this re-rank")
+
+	healed, err := store.ReadSelection(p.selection)
+	require.NoError(t, err)
+	require.NotNil(t, healed)
+	for _, sn := range healed.Nodes {
+		assert.NotEqual(t, "3471fd449fa5614b", sn.Key,
+			"the healed selection must not carry a key the store lacks")
+	}
+	found := false
+	for _, sn := range healed.Nodes {
+		if sn.Key == n1.Key {
+			found = true
+		}
+	}
+	assert.True(t, found, "the in-store member stays selected")
+}
+
+// TestPruneThenSelectKeepsSelectionWithinStore pins the invariant between the
+// prune stage and the selection at its ONE authoritative point (the select
+// stage — selection.json's single writer): prune removes cold-base records and
+// deliberately does NOT touch selection.json (single-writer discipline; the
+// wave tail runs select immediately after prune, so the authoritative refresh
+// lands in the same wave). After prune+select the on-disk selection contains
+// only keys present in the store, and the pruned record's drop is NOT the
+// store-missing desync class (the key is still in the store — it left on
+// evidence).
+func TestPruneThenSelectKeepsSelectionWithinStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DataDir: dir}
+	cfg.Geo.TTL.Duration = time.Hour
+	cfg.Maintain.PruneDeadAfter.Duration = 48 * time.Hour
+	p := newPaths(cfg)
+	n1 := selSyncRealityNode(t, "00000000-0000-0000-0000-000000000001", "Se1.Example.com", "AA")
+	n2 := selSyncRealityNode(t, "00000000-0000-0000-0000-000000000002", "Se2.Example.com", "BB")
+	var lines []byte
+	for _, n := range []*model.Node{n1, n2} {
+		b, err := json.Marshal(n)
+		require.NoError(t, err)
+		lines = append(lines, append(b, '\n')...)
+	}
+	require.NoError(t, os.WriteFile(p.filtered, lines, 0o600))
+	require.NoError(t, store.WriteGeo(p.geoBase, []*model.GeoRecord{
+		selSyncGeo(n1, "de", true, time.Now()),
+		selSyncGeo(n2, "de", false, time.Now().Add(-72*time.Hour)), // prune-dead: dead_after 48h
+	}))
+	prior := &model.Selection{Nodes: []model.SelectedNode{
+		{Tag: "pool-de-01", Key: n1.Key, Country: "de"},
+		{Tag: "pool-de-02", Key: n2.Key, Country: "de"},
+	}}
+	require.NoError(t, store.WriteSelection(p.selection, prior))
+
+	// Prune removes the dead record and leaves selection.json untouched.
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	require.NoError(t, runPruneStage(cmd, cfg))
+	assert.Contains(t, buf.String(), "prune: removed 1 records")
+	afterPrune, err := store.ReadSelection(p.selection)
+	require.NoError(t, err)
+	require.Len(t, afterPrune.Nodes, 2,
+		"prune is not a selection writer — the single authoritative point is select")
+
+	// Select re-ranks: the evidence-dead member leaves the selection, the
+	// invariant holds, and no store-missing desync warning fires (the key is
+	// still in the store — it left on prune evidence, not by store churn).
+	buf2 := &bytes.Buffer{}
+	cmd2 := &cobra.Command{}
+	cmd2.SetOut(buf2)
+	require.NoError(t, runSelect(cmd2, cfg))
+	assert.NotContains(t, buf2.String(), "store record missing",
+		"an evidence-based drop is not the desync class — no store-missing warning")
+
+	healed, err := store.ReadSelection(p.selection)
+	require.NoError(t, err)
+	storeKeys := map[string]bool{}
+	for _, n := range []*model.Node{n1, n2} {
+		storeKeys[n.Key] = true
+	}
+	require.NotEmpty(t, healed.Nodes)
+	for _, sn := range healed.Nodes {
+		assert.True(t, storeKeys[sn.Key],
+			"invariant: every written selection key must exist in the store")
+	}
+	found2 := false
+	for _, sn := range healed.Nodes {
+		if sn.Key == n2.Key {
+			found2 = true
+		}
+	}
+	assert.False(t, found2, "the prune-dead member must leave the selection at the authoritative point")
+}
+
 // TestCheckMinLivePercentEnforcesOnWaveRegistry pins F1: the MinLivePercent
 // enforcement lands on the WAVE's real registry — the watchdog-maintained
 // one in the daemon — so RecordFailure actually disables the plugin for

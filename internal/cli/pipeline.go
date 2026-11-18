@@ -1005,6 +1005,22 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 		ka = map[string]store.KnownAliveRecord{}
 	}
 	sel := rank.Select(nodes, geoRecs, probeByKey, cfg.Select, cfg.Geo.TTL.Duration, ka)
+	// Authoritative point of the selection-store sync fix: selection.json has
+	// exactly ONE writer — this stage — and rank only emits keys present in
+	// the store it was handed, so after this write every selected key exists
+	// in the store. The PRIOR manifest may still reference keys the store
+	// dropped (a wave rewrote the filtered set and aborted before this
+	// re-rank — probe/prune failure or the shutdown checkpoint; production
+	// evidence 2026-11-18): each such key is named loud here, so the healing
+	// is visible in the journal instead of being discovered at render time.
+	// Prune deliberately does NOT refresh selection.json: single-writer
+	// discipline, and the wave tail runs select immediately after prune, so
+	// the authoritative refresh lands in the same wave.
+	storeKeys := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		storeKeys[n.Key] = true
+	}
+	discloseStaleSelectionEntries(cmd.OutOrStdout(), p.selection, storeKeys)
 	if err := store.WriteSelection(p.selection, sel); err != nil {
 		return err
 	}
@@ -1029,6 +1045,33 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 			sel.HijackExcluded)
 	}
 	return nil
+}
+
+// discloseStaleSelectionEntries is the loud healing disclosure of the
+// selection-store sync fix: every prior-selection key absent from the store
+// (the desync class — a wave rewrote the filtered set and aborted before this
+// re-rank) is named with its key + tag so the drop is visible in the journal
+// instead of surfacing as a render failure. A prior-selection key that is
+// still in the store but left the new selection is normal rank churn (dead,
+// stale, hijack-gated) — deliberately NOT reported here.
+func discloseStaleSelectionEntries(w io.Writer, path string, storeKeys map[string]bool) {
+	prior, err := store.ReadSelection(path)
+	if err != nil {
+		outf(w,
+			"WARNING: select: failed to read the prior selection (%s): %v — stale-entry disclosure skipped\n",
+			path, err)
+		return
+	}
+	if prior == nil {
+		return
+	}
+	for _, sn := range prior.Nodes {
+		if !storeKeys[sn.Key] {
+			outf(w,
+				"select: prior selection node %s (tag %s) dropped: store record missing — healed by this re-rank\n",
+				sn.Key, sn.Tag)
+		}
+	}
 }
 
 func newRenderCommand(cfgPath *string) *cobra.Command {

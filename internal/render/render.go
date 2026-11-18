@@ -1690,12 +1690,16 @@ func addPerCountryInbounds(
 // consumes (SelectedNode carries no link params — the outbounds and the
 // evidence join runs through them); knobs carries the surviving [render]
 // knobs (tcp_max_seg, tls_fingerprint, balancer_tolerance,
-// observatory_interval). A pool route whose target balancer/outbound was not
-// rendered (no live nodes there) degrades to the block outbound — the same
-// graceful fail-closed semantics of the pool-route layer — and is REPORTED
-// through the returned warnings slice (the T4 report-channel widening of
-// the T3 review's M1: fail-closed stays, the loudness is back); a target
-// outside the pool_/pool- namespace still fails loud (D6).
+// observatory_interval). A selected node with NO node record is skipped
+// with a loud warning line (the selection-store sync fix: a healable
+// desync must not fail the whole render) and the effective selection the
+// downstream layers see carries only rendered members; a pool route whose
+// target balancer/outbound was not rendered (no live nodes there) degrades
+// to the block outbound — the same graceful fail-closed semantics of the
+// pool-route layer — and is REPORTED through the returned warnings slice
+// (the T4 report-channel widening of the T3 review's M1: fail-closed
+// stays, the loudness is back); a target outside the pool_/pool-
+// namespace still fails loud (D6).
 //
 //nolint:revive // the plan's binding name (RenderOwnConfig sel,core,poolRoutes) — the stutter is the contract.
 func RenderOwnConfig(
@@ -1711,8 +1715,6 @@ func RenderOwnConfig(
 		// function never panics on its exported seam (review I-1).
 		sel = &model.Selection{}
 	}
-	poolCount := len(sel.Nodes)
-
 	outbounds := []any{
 		map[string]any{keyTag: "direct", "protocol": "freedom"},
 		map[string]any{keyTag: blockOutboundTag, "protocol": "blackhole"},
@@ -1725,11 +1727,30 @@ func RenderOwnConfig(
 	// grammar the pool-route degradations use. Material params keep
 	// failing the render loud (L9) — this carries only the remainder.
 	droppedWarnings := make([]string, 0)
+	// Consumer-side defensive layer of the selection-store sync fix
+	// (production 2026-11-18): selection.json can reference keys the store
+	// no longer has — a wave rewrites the filtered set and, when it aborts
+	// before the select stage re-ranks (probe/prune failure, shutdown
+	// checkpoint), the stale selection meets the fresh store at this join.
+	// A missing NODE record is a healable desync — the pool has hundreds of
+	// other members — so the node is SKIPPED with a loud warning line naming
+	// tag + key + the remedy, instead of failing the whole render. This is
+	// NOT a weakening of D6: unknown balancer/rule targets are a different
+	// class (a misconfigured route can never render) and still fail loud.
+	// renderable carries ONLY the nodes that rendered: every downstream
+	// layer (the city/clean/service balancer selector lists name explicit
+	// outbound tags) must see the same filtered set, or a skipped outbound
+	// leaves a dangling selector behind and breaks the -test gate.
+	renderable := make([]model.SelectedNode, 0, len(sel.Nodes))
 	for _, sn := range sel.Nodes {
 		n, ok := nodes[sn.Key]
 		if !ok {
-			return nil, nil, fmt.Errorf("render: selected node %s (tag %s) has no node record", sn.Key, sn.Tag)
+			droppedWarnings = append(droppedWarnings, fmt.Sprintf(
+				"render: selected node %s (tag %s) dropped from candidate: store record missing — run assay select",
+				sn.Key, sn.Tag))
+			continue
 		}
+		renderable = append(renderable, sn)
 		ob, dropped, err := buildOutbound(n, sn.Tag, cfg)
 		if err != nil {
 			return nil, nil, err
@@ -1746,6 +1767,15 @@ func RenderOwnConfig(
 		outbounds = append(outbounds, ob)
 		renderedOutbounds[sn.Tag] = true
 	}
+	// effSel is the EFFECTIVE selection: the selection metadata is preserved
+	// and Nodes becomes the rendered subset. Everything downstream (balancer
+	// tree, per-country inbounds, observatory sizing, the D7 empty-pool
+	// posture) consumes the effective set — poolCount is computed from it,
+	// not from the raw manifest.
+	effSel := *sel
+	effSel.Nodes = renderable
+	sel = &effSel
+	poolCount := len(sel.Nodes)
 
 	m := map[string]any{
 		"log": map[string]any{
