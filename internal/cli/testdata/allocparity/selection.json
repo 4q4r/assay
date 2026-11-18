@@ -1,0 +1,84 @@
+{
+  "generated_at": "0001-01-01T00:00:00Z",
+  "cap_applied": 7,
+  "cities_alive": 6,
+  "nodes": [
+    {
+      "tag": "pool-de-01",
+      "key": "ec39064a1f9a05a1",
+      "country": "de",
+      "city": "Frankfurt am Main",
+      "rtt_ms": 90,
+      "speed": 6000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": false
+    },
+    {
+      "tag": "pool-us-01",
+      "key": "1e02aff582eed465",
+      "country": "us",
+      "city": "Ashburn",
+      "rtt_ms": 180,
+      "speed": 5000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": false
+    },
+    {
+      "tag": "pool-fr-01",
+      "key": "3c2f6d9408bc861f",
+      "country": "fr",
+      "city": "Paris",
+      "rtt_ms": 200,
+      "speed": 4000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": false
+    },
+    {
+      "tag": "pool-nl-01",
+      "key": "99962a85260fa803",
+      "country": "nl",
+      "city": "Amsterdam",
+      "rtt_ms": 100,
+      "speed": 3000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": true
+    },
+    {
+      "tag": "pool-de-02",
+      "key": "8d90f3f0bbcc58d6",
+      "country": "de",
+      "city": "Berlin",
+      "rtt_ms": 140,
+      "speed": 2000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": false
+    },
+    {
+      "tag": "pool-de-03",
+      "key": "c3781ca3be5e5e2b",
+      "country": "de",
+      "city": "Frankfurt am Main",
+      "rtt_ms": 120,
+      "speed": 1000000,
+      "checks": 3,
+      "total_checks": 3,
+      "is_clean": false
+    },
+    {
+      "tag": "pool-it-01",
+      "key": "9c5a8d3bf2ea40e1",
+      "country": "it",
+      "city": "Rome",
+      "rtt_ms": 160,
+      "speed": 7000000,
+      "checks": 1,
+      "total_checks": 1,
+      "is_clean": false
+    }
+  ]
+}

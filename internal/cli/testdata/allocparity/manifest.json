@@ -1,0 +1,51 @@
+{
+  "fetched_at": "2026-06-01T00:00:00Z",
+  "sources": {
+    "plug-a": [],
+    "plug-b": []
+  },
+  "plugin_stats": [
+    {
+      "PluginID": "plug-a",
+      "TotalNodes": 6,
+      "LiveNodes": 5,
+      "DuplicateCount": 0,
+      "HostingCount": 4,
+      "ProxyCount": 1,
+      "CleanCount": 1,
+      "ClassifiedCount": 6,
+      "UnlockCount": 0,
+      "UniqueYield": 100,
+      "TopOverlaps": null
+    },
+    {
+      "PluginID": "plug-b",
+      "TotalNodes": 5,
+      "LiveNodes": 1,
+      "DuplicateCount": 0,
+      "HostingCount": 2,
+      "ProxyCount": 0,
+      "CleanCount": 2,
+      "ClassifiedCount": 4,
+      "UnlockCount": 0,
+      "UniqueYield": 100,
+      "TopOverlaps": null
+    }
+  ],
+  "plugin_overlap": {
+    "sets": {
+      "plug-a": 6,
+      "plug-b": 4
+    },
+    "cells": {
+      "plug-a": {
+        "plug-a": 100,
+        "plug-b": 0
+      },
+      "plug-b": {
+        "plug-a": 0,
+        "plug-b": 100
+      }
+    }
+  }
+}

@@ -85,7 +85,7 @@ func TestPruneToEmptyPoolRenderRefusesObservatory(t *testing.T) {
 	// it (still referenced by the filter set — a future probe can refresh
 	// it); rank refuses it; the selection is empty; the render is L1-safe.
 	cfg := maintainStateFixture(t, true, 72*time.Hour)
-	out := runMaintainStagesDirectly(t, cfg, runPruneStage, runSelect, runRender)
+	out := runMaintainStagesDirectly(t, cfg, nilReaderStage(runPruneStage), nilReaderStage(runSelect), nilReaderStage(runRender))
 	assert.Contains(t, out, "render bootstrap: empty pool fail-closed (catch-all → block)",
 		"the empty-pool wave renders the D7 bootstrap posture")
 
@@ -119,7 +119,7 @@ func TestPruneDeadNodeThenSelectFailsLoudOnEmptyBase(t *testing.T) {
 	// dead (alive=false) with last_probe 72h old: beyond dead_after (48h) →
 	// physically removed even though the source still references it.
 	cfg := maintainStateFixture(t, false, 72*time.Hour)
-	runMaintainStagesDirectly(t, cfg, runPruneStage)
+	runMaintainStagesDirectly(t, cfg, nilReaderStage(runPruneStage))
 
 	p := newPaths(cfg)
 	recs, err := os.ReadFile(p.geoBase)
@@ -128,7 +128,7 @@ func TestPruneDeadNodeThenSelectFailsLoudOnEmptyBase(t *testing.T) {
 
 	cmd := &cobra.Command{}
 	cmd.SetOut(&bytes.Buffer{})
-	err = runSelect(cmd, cfg)
+	err = runSelect(cmd, cfg, nil)
 	require.Error(t, err, "an empty cold base must fail the wave loud, not render an empty pool")
 	assert.Contains(t, err.Error(), "geo base empty")
 }
@@ -168,7 +168,7 @@ func TestSelectStageReportsHijackExclusionLoud(t *testing.T) {
 	require.NoError(t, err)
 	appendLine(p.geoBase, hrb)
 
-	out := runMaintainStagesDirectly(t, cfg, runSelect)
+	out := runMaintainStagesDirectly(t, cfg, nilReaderStage(runSelect))
 
 	assert.Contains(t, out,
 		"select: 1 candidate(s) excluded — TLS-intercepting exit (hijack=true on own geo evidence): not rendered, not active",
@@ -197,7 +197,7 @@ func TestSelectStageReportsHijackExclusionLoud(t *testing.T) {
 // omits the count (omitempty).
 func TestSelectStageSilentWhenNoHijackEvidence(t *testing.T) {
 	cfg := maintainStateFixture(t, true, 0)
-	out := runMaintainStagesDirectly(t, cfg, runSelect)
+	out := runMaintainStagesDirectly(t, cfg, nilReaderStage(runSelect))
 	assert.NotContains(t, out, "excluded — TLS-intercepting exit")
 	assert.Contains(t, out, "select complete:")
 	sel, err := storeReadSelectionForTest(t, cfg)
@@ -206,4 +206,10 @@ func TestSelectStageSilentWhenNoHijackEvidence(t *testing.T) {
 	raw, err := os.ReadFile(newPaths(cfg).selection)
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw), "hijack_excluded", "zero-count stays omitted (schema-compatible with legacy readers)")
+}
+
+// nilReaderStage adapts a reader-threaded stage to the legacy stage shape
+// (nil cache = direct store reads) for the direct-invocation helpers.
+func nilReaderStage(stage func(*cobra.Command, *config.Config, *waveRecordCache) error) func(*cobra.Command, *config.Config) error {
+	return func(c *cobra.Command, cc *config.Config) error { return stage(c, cc, nil) }
 }

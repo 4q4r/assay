@@ -152,7 +152,7 @@ func runApply(cmd *cobra.Command, cfg *config.Config, dryRun bool) error {
 	// Step 1: the render leg — the wave's own artifact, never a parallel
 	// render. An empty selection removes the candidate; the read below
 	// refuses loud.
-	if err := renderLeg(cmd, cfg); err != nil {
+	if err := renderLeg(cmd, cfg, nil); err != nil {
 		return fmt.Errorf("apply: render leg: %w", err)
 	}
 

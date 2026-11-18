@@ -531,13 +531,13 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 			return err
 		}
 		stages.pluginStatsEnrich = func(c *cobra.Command, cc *config.Config) error {
-			return runPluginStatsEnrichment(c, cc, reg)
+			return runPluginStatsEnrichment(c, cc, reg, stages.cache)
 		}
 		// The probe stage carries the same beat feed (per batch / per
 		// single-node job) — the probe stage is the longest legitimate
 		// in-wave beat gap.
 		stages.probe = func(c *cobra.Command, cc *config.Config) error {
-			return runProbe(c, cc, 0, opts.speedtest, beat)
+			return runProbe(c, cc, 0, opts.speedtest, beat, stages.cache)
 		}
 		return runMaintainGraceful(out, cfg, opts, stages, between, gate)
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,28 @@ func WriteNodes(path string, nodes []*model.Node) error {
 	})
 }
 
+// countLines is the cheap hint pre-pass for the JSONL readers (allocation
+// audit F1): one scan that materializes no lines and allocates only the
+// scanner buffer, so the parse pass can preallocate its sink slice to the
+// file's exact line count instead of growing a nil slice through ~20 full
+// backing-array copies at incident scale (148k-line nodes.jsonl).
+func countLines(f *os.File) (int, error) {
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	n := 0
+	for sc.Scan() {
+		n++
+	}
+	return n, sc.Err()
+}
+
+// rewind seeks an opened reader back to its start (the hint pre-pass ran
+// it to EOF).
+func rewind(f *os.File) error {
+	_, err := f.Seek(0, io.SeekStart)
+	return err
+}
+
 // ReadNodes loads the working node set; a missing file is an empty set.
 func ReadNodes(path string) ([]*model.Node, error) {
 	f, err := os.Open(path)
@@ -55,7 +78,14 @@ func ReadNodes(path string) ([]*model.Node, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	var nodes []*model.Node
+	hint, err := countLines(f)
+	if err != nil {
+		return nil, err
+	}
+	if err := rewind(f); err != nil {
+		return nil, err
+	}
+	nodes := make([]*model.Node, 0, hint)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -191,7 +221,14 @@ func ReadGeo(path string) ([]*model.GeoRecord, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	var recs []*model.GeoRecord
+	hint, err := countLines(f)
+	if err != nil {
+		return nil, err
+	}
+	if err := rewind(f); err != nil {
+		return nil, err
+	}
+	recs := make([]*model.GeoRecord, 0, hint)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -422,7 +459,14 @@ func ReadProbeResults(path string) ([]ProbeResult, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	var out []ProbeResult
+	hint, err := countLines(f)
+	if err != nil {
+		return nil, err
+	}
+	if err := rewind(f); err != nil {
+		return nil, err
+	}
+	out := make([]ProbeResult, 0, hint)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
 	for sc.Scan() {

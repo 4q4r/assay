@@ -105,7 +105,7 @@ func statsOnlyStages(order *[]string) *maintainStages {
 		parse:    noopStage("parse", order),
 		filter:   noopStage("filter", order),
 		probe:    noopStage("probe", order),
-		stats:    runStatsStage,
+		stats:    func(c *cobra.Command, cc *config.Config) error { return runStatsStage(c, cc, nil) },
 		prune:    noopStage("prune", order),
 		selectS:  noopStage("select", order),
 		render:   noopStage("render", order),

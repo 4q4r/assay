@@ -357,7 +357,7 @@ domains = ["geosite:netflix"]
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runRender(cmd, cfg))
+	require.NoError(t, runRender(cmd, cfg, nil))
 
 	raw, err := os.ReadFile(ownCandidatePath(p))
 	require.NoError(t, err, "the own render writes the activation candidate")
@@ -482,7 +482,7 @@ func TestRenderSkipsSelectionKeysAbsentFromStore(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runRender(cmd, cfg),
+	require.NoError(t, runRender(cmd, cfg, nil),
 		"a stale selection entry must be skipped loud, not fail the render")
 
 	assert.Contains(t, buf.String(),
@@ -523,7 +523,7 @@ func TestSelectDropsAndWarnsPriorSelectionKeysAbsentFromStore(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runSelect(cmd, cfg))
+	require.NoError(t, runSelect(cmd, cfg, nil))
 
 	assert.Contains(t, buf.String(),
 		"select: prior selection node 3471fd449fa5614b (tag pool-us-36) dropped: store record missing — healed by this re-rank")
@@ -582,7 +582,7 @@ func TestPruneThenSelectKeepsSelectionWithinStore(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runPruneStage(cmd, cfg))
+	require.NoError(t, runPruneStage(cmd, cfg, nil))
 	assert.Contains(t, buf.String(), "prune: removed 1 records")
 	afterPrune, err := store.ReadSelection(p.selection)
 	require.NoError(t, err)
@@ -595,7 +595,7 @@ func TestPruneThenSelectKeepsSelectionWithinStore(t *testing.T) {
 	buf2 := &bytes.Buffer{}
 	cmd2 := &cobra.Command{}
 	cmd2.SetOut(buf2)
-	require.NoError(t, runSelect(cmd2, cfg))
+	require.NoError(t, runSelect(cmd2, cfg, nil))
 	assert.NotContains(t, buf2.String(), "store record missing",
 		"an evidence-based drop is not the desync class — no store-missing warning")
 
@@ -636,7 +636,7 @@ func TestCheckMinLivePercentEnforcesOnWaveRegistry(t *testing.T) {
 	cmd.SetOut(buf)
 
 	reg := plugins.NewRegistry()
-	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, reg))
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, reg, nil))
 
 	disabled := reg.DisabledPlugins()
 	assert.Contains(t, disabled, "alpha", "the breach must disable the plugin on the WAVE's registry")
@@ -656,7 +656,7 @@ func TestCheckMinLivePercentNilRegistrySkips(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil))
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil, nil))
 	assert.NotContains(t, buf.String(), "DISABLED",
 		"no registry — no enforcement, and no throwaway reload")
 }
@@ -761,7 +761,7 @@ func TestRunPluginStatsEnrichmentFullCycle(t *testing.T) {
 	enrichFixture(t, dir)
 	cfg := &config.Config{DataDir: dir}
 
-	require.NoError(t, runPluginStatsEnrichment(enrichmentCommand(), cfg, nil))
+	require.NoError(t, runPluginStatsEnrichment(enrichmentCommand(), cfg, nil, nil))
 
 	var manifest fetchManifest
 	b, err := os.ReadFile(newPaths(cfg).manifest)
@@ -834,7 +834,7 @@ func TestRunPluginStatsEnrichmentHistoryFailureNonFatal(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd := &cobra.Command{}
 	cmd.SetOut(buf)
-	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil),
+	require.NoError(t, runPluginStatsEnrichment(cmd, cfg, nil, nil),
 		"history failure must not fail the enrichment stage")
 	assert.Contains(t, buf.String(), "WARNING: provider history update failed",
 		"the failure surfaces loud before the wave continues")

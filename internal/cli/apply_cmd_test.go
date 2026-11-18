@@ -55,7 +55,7 @@ func newApplyFixture(t *testing.T) *applyFixture {
 
 	// The render-leg seam: the candidate above IS the render product (the
 	// leg itself is covered by the render tests and the live e2e).
-	restoreRenderLeg(t, func(*cobra.Command, *config.Config) error { return nil })
+	restoreRenderLeg(t, func(*cobra.Command, *config.Config, *waveRecordCache) error { return nil })
 
 	// The restart-fallback seam: recorded — unit tests script its outcome.
 	f.fallback = &recordedFallback{}
@@ -197,7 +197,7 @@ func setApplyClient(t *testing.T, fn func(*config.Config) *hotapply.Client) {
 	t.Cleanup(func() { newApplyClient = old })
 }
 
-func restoreRenderLeg(t *testing.T, fn func(*cobra.Command, *config.Config) error) {
+func restoreRenderLeg(t *testing.T, fn func(*cobra.Command, *config.Config, *waveRecordCache) error) {
 	t.Helper()
 	old := renderLeg
 	renderLeg = fn

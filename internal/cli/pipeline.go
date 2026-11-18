@@ -657,7 +657,7 @@ func newProbeCommand(cfgPath *string) *cobra.Command {
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runProbe(cmd, res.Config, limit, speedtest, nil)
+			return runProbe(cmd, res.Config, limit, speedtest, nil, nil)
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "probe only the first N filtered nodes (0 = all)")
@@ -740,7 +740,9 @@ func coreXrayBin(cfg *config.Config) string {
 	return config.ExpandHome(cfg.CoreXrayBin())
 }
 
-func loadKnownAliveForProbe(p paths, opts probe.Options) (map[string]store.KnownAliveRecord, probe.Options, error) {
+func loadKnownAliveForProbe(
+	p paths, opts probe.Options, r *waveRecordCache,
+) (map[string]store.KnownAliveRecord, probe.Options, error) {
 	ka, err := store.ReadKnownAlive(p.knownAlive)
 	if err != nil {
 		return nil, opts, err
@@ -750,7 +752,7 @@ func loadKnownAliveForProbe(p paths, opts probe.Options) (map[string]store.Known
 		opts.KnownAliveTTL = 2 * time.Hour
 	}
 	if opts.SkipFreshWithin > 0 {
-		latest, err := store.LatestProbeByKey(p.probeResults)
+		latest, err := r.ReadLatestProbe(p.probeResults)
 		if err != nil {
 			return nil, opts, err
 		}
@@ -779,9 +781,14 @@ func classifierFor(cfg *config.Config, p paths, progress io.Writer) *geo.Classif
 // after probe.Run persisted the wave's outcomes: the same merge-and-upsert
 // contract the old separate geo stage had (probe outcomes on every probed
 // record, classification where it ran), minus the freshness gates. Failures
-// are loud but never fail the wave (the probe outcomes stand).
-func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*model.Node, started time.Time) {
-	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+// are loud but never fail the wave (the probe outcomes stand). A successful
+// flush REWRITES geo-base outside the wave cache's Set discipline, so the
+// cache's geo entry is invalidated: later consumers re-read the written
+// file (audit F1 write-invalidation contract).
+func flushClassifier(
+	clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*model.Node, started time.Time, r *waveRecordCache,
+) {
+	probeByKey, err := r.ReadLatestProbe(p.probeResults)
 	if err != nil {
 		outf(cmd.OutOrStdout(), "ERROR: classification flush skipped — probe store read failed: %v\n", err)
 		return
@@ -792,7 +799,9 @@ func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*
 	}
 	if _, _, ferr := clf.Flush(cmd.OutOrStdout(), nodes, probeByKey, wave, started); ferr != nil {
 		outf(cmd.OutOrStdout(), "ERROR: classification flush failed: %v\n", ferr)
+		return
 	}
+	r.InvalidateGeo()
 }
 
 // runProbe runs the probe stage. heartbeat feeds the daemon's self-watchdog
@@ -800,7 +809,9 @@ func flushClassifier(clf *geo.Classifier, cmd *cobra.Command, p paths, nodes []*
 // CLI runs).
 //
 //nolint:cyclop // runProbe orchestrates the whole probe stage (probe + merged classification)
-func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool, heartbeat func()) error {
+func runProbe(
+	cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool, heartbeat func(), r *waveRecordCache,
+) error {
 	classifyStart := time.Now()
 	p := newPaths(cfg)
 	// Probe work lives on tmpfs and is ephemeral: clean it up after the wave.
@@ -815,7 +826,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 			}
 		}
 	}
-	nodes, err := store.ReadNodes(p.filtered)
+	nodes, err := r.ReadNodes(p.filtered)
 	if err != nil {
 		return err
 	}
@@ -850,7 +861,7 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 		}
 	}
 	opts.Progress = cmd.OutOrStdout()
-	ka, opts, err := loadKnownAliveForProbe(p, opts)
+	ka, opts, err := loadKnownAliveForProbe(p, opts, r)
 	if err != nil {
 		return err
 	}
@@ -861,12 +872,17 @@ func runProbe(cmd *cobra.Command, cfg *config.Config, limit int, speedtest bool,
 	// explicit-off escape hatch: false = probe-only wave (no classification).
 	if clf := classifierFor(cfg, p, cmd.OutOrStdout()); clf != nil {
 		opts.Classifier = clf.ClassifyNode
-		defer flushClassifier(clf, cmd, p, nodes, classifyStart)
+		defer flushClassifier(clf, cmd, p, nodes, classifyStart, r)
 	}
 	results, err := probe.RunWithBatchFactory(context.Background(), nodes, factory, batchFactory, opts, p.probeResults)
 	if err != nil {
 		return err
 	}
+	// probe.Run rewrote the probe journal inside the store layer
+	// (AppendProbeResults): any journal entry the wave cached before the
+	// write is stale — drop it so the deferred flush (and every later
+	// consumer) reads the post-write truth (audit F1 write-invalidation).
+	r.InvalidateProbe()
 	alive := 0
 	for _, r := range results {
 		if r.Alive {
@@ -965,21 +981,21 @@ func newSelectCommand(cfgPath *string) *cobra.Command {
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runSelect(cmd, res.Config)
+			return runSelect(cmd, res.Config, nil)
 		},
 	}
 }
 
-func runSelect(cmd *cobra.Command, cfg *config.Config) error {
+func runSelect(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) error {
 	p := newPaths(cfg)
-	nodes, err := store.ReadNodes(p.filtered)
+	nodes, err := r.ReadNodes(p.filtered)
 	if err != nil {
 		return err
 	}
 	if len(nodes) == 0 {
 		return fmt.Errorf("no filtered nodes (%s) — run `assay filter` first", p.filtered)
 	}
-	geoRecs, err := store.ReadGeo(p.geoBase)
+	geoRecs, err := r.ReadGeo(p.geoBase)
 	if err != nil {
 		return err
 	}
@@ -988,7 +1004,7 @@ func runSelect(cmd *cobra.Command, cfg *config.Config) error {
 			"geo base empty (%s) — run `assay probe` first — classification is "+
 				"merged into the probe pass and writes the cold base", p.geoBase)
 	}
-	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+	probeByKey, err := r.ReadLatestProbe(p.probeResults)
 	if err != nil {
 		return err
 	}
@@ -1089,12 +1105,12 @@ core lifecycle belongs to a configured deployment.`,
 				return err
 			}
 			reportConfigSource(cmd.OutOrStdout(), res)
-			return runRender(cmd, res.Config)
+			return runRender(cmd, res.Config, nil)
 		},
 	}
 }
 
-func runRender(cmd *cobra.Command, cfg *config.Config) error {
+func runRender(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) error {
 	// Loud stage boundary (W12, keyed on the Configless marker since the
 	// external mode died): the core lifecycle belongs to a configured
 	// deployment — a configless run refuses before touching any artifact.
@@ -1109,7 +1125,7 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	if sel == nil {
 		return fmt.Errorf("no selection (%s) — run `assay select` first", p.selection)
 	}
-	filtered, err := store.ReadNodes(p.filtered)
+	filtered, err := r.ReadNodes(p.filtered)
 	if err != nil {
 		return err
 	}
@@ -1122,7 +1138,7 @@ func runRender(cmd *cobra.Command, cfg *config.Config) error {
 	// (model.GeoIdentity). A missing geo base is the documented empty state
 	// (unlock pools render absent, pool_clean falls back to flags-only); a
 	// corrupt one fails the render loud.
-	geoRecords, err := store.ReadGeo(p.geoBase)
+	geoRecords, err := r.ReadGeo(p.geoBase)
 	if err != nil {
 		return fmt.Errorf("read geo records for render: %w", err)
 	}
@@ -1369,6 +1385,12 @@ type maintainStages struct {
 	// coreAutoUpdate is the managed-core auto-update check (T5, D4/S5):
 	// optional (nil = the wave skips it — injected stage sets may omit it).
 	coreAutoUpdate func(*cobra.Command, *config.Config) error
+	// cache is the wave's read-once store cache (allocation audit F1),
+	// shared by the stage runners this set wires. Callers that REPLACE a
+	// runner (the daemon re-binds fetch/probe/pluginStatsEnrich for its own
+	// beat feed) MUST thread stages.cache into the replacement so the wave
+	// keeps reading each store file from disk exactly once.
+	cache *waveRecordCache
 }
 
 // defaultMaintainStages wires the real runners. filter runs with the config
@@ -1381,10 +1403,15 @@ type maintainStages struct {
 // flag persist across waves); in the one-shot wave it is the wave's shared
 // transient, created once by runOneShotMaintainWave and released after the
 // wave. A nil mgr keeps the per-stage transient semantics (each stage then
-// creates its own — the single-stage one-shot entries and tests).
+// creates its own — the single-stage one-shot entries and tests). The wave
+// also owns ONE store-read cache (allocation audit F1): every store file is
+// read from disk once per wave and the stage closures share it — the stage
+// set is used by exactly one wave, so the closure capture has wave scope.
 func defaultMaintainStages(opts maintainOptions, mgr *core.Manager) *maintainStages {
 	var waveReg *plugins.Registry
+	cache := newWaveRecordCache()
 	return &maintainStages{
+		cache: cache,
 		fetch: func(c *cobra.Command, cc *config.Config) error {
 			reg, err := runFetchWith(c, cc, nil, nil)
 			waveReg = reg
@@ -1392,14 +1419,16 @@ func defaultMaintainStages(opts maintainOptions, mgr *core.Manager) *maintainSta
 		},
 		parse:  runParse,
 		filter: func(c *cobra.Command, cfg *config.Config) error { return runFilter(c, cfg, 0) },
-		probe:  func(c *cobra.Command, cfg *config.Config) error { return runProbe(c, cfg, 0, opts.speedtest, nil) },
-		pluginStatsEnrich: func(c *cobra.Command, cc *config.Config) error {
-			return runPluginStatsEnrichment(c, cc, waveReg)
+		probe: func(c *cobra.Command, cfg *config.Config) error {
+			return runProbe(c, cfg, 0, opts.speedtest, nil, cache)
 		},
-		stats:   runStatsStage,
-		prune:   runPruneStage,
-		selectS: runSelect,
-		render:  runRender,
+		pluginStatsEnrich: func(c *cobra.Command, cc *config.Config) error {
+			return runPluginStatsEnrichment(c, cc, waveReg, cache)
+		},
+		stats:   func(c *cobra.Command, cc *config.Config) error { return runStatsStage(c, cc, cache) },
+		prune:   func(c *cobra.Command, cc *config.Config) error { return runPruneStage(c, cc, cache) },
+		selectS: func(c *cobra.Command, cc *config.Config) error { return runSelect(c, cc, cache) },
+		render:  func(c *cobra.Command, cc *config.Config) error { return runRender(c, cc, cache) },
 		// The core lifecycle stages share the ONE manager (fix I-1 — two
 		// nil-managed stages each took the singleton flock; the second
 		// refused on the first's unreleased lock and aborted the wave).
@@ -1841,14 +1870,14 @@ func reportStatsFailure(w io.Writer, err error) error {
 //     error (not a warning) retires the old behavior where the generic
 //     "stats poll unavailable" line masked write failures — traffic data
 //     loss never passes silently.
-func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
+func runStatsStage(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) error {
 	p := newPaths(cfg)
 	// Deliberate asymmetry: a geo-base READ failure is a WARNING (accounting
 	// skips this wave, destroys nothing), while the WRITE failure below is
 	// LOUD because freshly polled deltas would be discarded — never flip
 	// this read arm to LOUD and block node refresh on a transient store
 	// hiccup.
-	records, err := store.ReadGeo(p.geoBase)
+	records, err := r.ReadGeo(p.geoBase)
 	if err != nil {
 		return stats.NewClassified(stats.ClassWarning,
 			fmt.Errorf("read geo-base for stats folding: %w", err))
@@ -1894,6 +1923,10 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 			return stats.NewClassified(stats.ClassLoud,
 				fmt.Errorf("fold stats deltas into %s: %w — traffic accounting data would be lost", p.geoBase, err))
 		}
+		// The write is authoritative and the fold mutated the cached records
+		// in place: publish the written set so the cache carries exactly the
+		// file's new content (audit F1 write contract).
+		r.SetGeo(records)
 	}
 	outf(cmd.OutOrStdout(), "stats: polled at %s — %d pool counters, %d records updated (+%d up / +%d down bytes)\n",
 		res.PolledAt, res.RawCounters, updated, totalUp, totalDown)
@@ -1909,7 +1942,7 @@ func runStatsStage(cmd *cobra.Command, cfg *config.Config) error {
 // plugin stays disabled across waves. The wave always has a registry (the
 // fetch stage loads or receives one and fails loud on load errors — no
 // silent reload-and-discard path here, adversarial review F1).
-func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry) error {
+func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugins.Registry, r *waveRecordCache) error {
 	p := newPaths(cfg)
 
 	// Read the fetch manifest to get existing plugin stats
@@ -1932,7 +1965,7 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 	}
 
 	// Read probe results for liveness
-	probeByKey, err := store.LatestProbeByKey(p.probeResults)
+	probeByKey, err := r.ReadLatestProbe(p.probeResults)
 	if err != nil {
 		return fmt.Errorf("read probe results for plugin stats: %w", err)
 	}
@@ -1946,7 +1979,7 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 	// Read geo records once: the plugins-package projection feeds the
 	// collector; the model records carry the Phase-1 unlock evidence the
 	// counts need.
-	modelGeoRecords, pluginGeoRecords, err := readGeoRecords(p)
+	modelGeoRecords, pluginGeoRecords, err := readGeoRecords(p, r)
 	if err != nil {
 		return err
 	}
@@ -1963,7 +1996,7 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 	}
 
 	// Read filtered nodes to get keys for matching
-	filtered, err := store.ReadNodes(p.filtered)
+	filtered, err := r.ReadNodes(p.filtered)
 	if err != nil {
 		return fmt.Errorf("read filtered nodes for plugin stats enrichment: %w", err)
 	}
@@ -2016,8 +2049,8 @@ func runPluginStatsEnrichment(cmd *cobra.Command, cfg *config.Config, reg *plugi
 // readGeoRecords reads the geo base once and returns both views: the model
 // records (the Phase-1 unlock evidence source) and the plugins-package
 // projection the stats collector consumes.
-func readGeoRecords(p paths) ([]*model.GeoRecord, []*plugins.GeoRecord, error) {
-	geoRecords, err := store.ReadGeo(p.geoBase)
+func readGeoRecords(p paths, r *waveRecordCache) ([]*model.GeoRecord, []*plugins.GeoRecord, error) {
+	geoRecords, err := r.ReadGeo(p.geoBase)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read geo records for plugin stats: %w", err)
 	}
@@ -2280,13 +2313,13 @@ func checkMinLivePercent(
 // reports the wave's filter set as "still referenced" (package prune owns the
 // rules). A pruning pass that removes anything leaves a .bak-<ts> backup of
 // the pre-prune store next to it.
-func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
+func runPruneStage(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) error {
 	p := newPaths(cfg)
-	records, err := store.ReadGeo(p.geoBase)
+	records, err := r.ReadGeo(p.geoBase)
 	if err != nil {
 		return err
 	}
-	filtered, err := store.ReadNodes(p.filtered)
+	filtered, err := r.ReadNodes(p.filtered)
 	if err != nil {
 		return err
 	}
@@ -2308,6 +2341,10 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	// The prune rewrite is authoritative: the cache must carry exactly the
+	// pruned set the file now holds (select and render read it next — audit
+	// F1 write contract).
+	r.SetGeo(kept)
 	outf(cmd.OutOrStdout(), "prune: removed %d records (%d dead_after, %d ttl-stale orphans), %d kept → backup %s\n",
 		len(removed), report.RemovedDead, report.RemovedStale, report.Kept, orNone(backupPath))
 	return nil

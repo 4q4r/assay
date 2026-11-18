@@ -243,7 +243,7 @@ func TestConfiglessWaveDataStagesWorkThenRenderLoud(t *testing.T) {
 	require.NoError(t, runParse(cmd, cfg), "configless parse must work")
 	require.NoError(t, runFilter(cmd, cfg, 0), "configless filter must work")
 
-	err = runRender(cmd, cfg)
+	err = runRender(cmd, cfg, nil)
 	require.Error(t, err, "configless render fails loud at the stage boundary")
 	assert.Contains(t, err.Error(), "configless mode cannot render")
 }
@@ -257,7 +257,7 @@ func TestConfiglessStatsSkipsINFO(t *testing.T) {
 	require.NoError(t, err)
 	cmd := &cobra.Command{}
 	cmd.SetOut(&bytes.Buffer{})
-	err = runStatsStage(cmd, res.Config)
+	err = runStatsStage(cmd, res.Config, nil)
 	require.Error(t, err, "the stage returns a CLASSIFIED error")
 	var ce *stats.ClassifiedError
 	require.ErrorAs(t, err, &ce, "the failure must carry a stats classification")

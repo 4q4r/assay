@@ -1,0 +1,9 @@
+{"key":"c3781ca3be5e5e2b","host":"de1.example.com","alive":true,"status":"passed","rtt_ms":999,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-05-31T23:00:00Z"}
+{"key":"c3781ca3be5e5e2b","host":"de1.example.com","alive":true,"status":"passed","rtt_ms":120,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"8d90f3f0bbcc58d6","host":"de2.example.com","alive":true,"status":"passed","rtt_ms":140,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"99962a85260fa803","host":"nl1.example.com","alive":true,"status":"passed","rtt_ms":100,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"3c2f6d9408bc861f","host":"fr1.example.com","alive":true,"status":"passed","rtt_ms":200,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"1e02aff582eed465","host":"us1.example.com","alive":true,"status":"passed","rtt_ms":180,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"ec39064a1f9a05a1","host":"de3.example.com","alive":true,"status":"passed","rtt_ms":90,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"270d1e74f0a0608d","host":"pl1.example.com","alive":false,"status":"timeout","rtt_ms":0,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
+{"key":"cfabb661a26585fa","host":"us2.example.com","alive":false,"status":"timeout","rtt_ms":0,"speed_bps":0,"checks":3,"total_checks":3,"checked_at":"2026-06-01T00:00:00Z"}
