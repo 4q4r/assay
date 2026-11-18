@@ -504,10 +504,103 @@ func TestNonPoolBalancerRouteRejected(t *testing.T) {
 	}
 }
 
-func TestSelectionNodeMissingIsLoud(t *testing.T) {
-	sel := &model.Selection{Nodes: []model.SelectedNode{{Tag: "pool-de-01", Key: "ghost"}}}
-	err := doRenderErr(t, nil, sel)
-	require.Error(t, err, "a selected node without node data cannot be rendered — fail loud")
+// TestSelectionNodeMissingDroppedLoud pins the consumer-side defensive layer
+// of the selection-store sync fix. Production evidence 2026-11-18: selection.json
+// carried keys the store no longer had (a wave rewrote the filtered set and
+// aborted before the select stage re-ranked) and every CLI render failed loud
+// with "render: selected node <key> (tag <tag>) has no node record" while the
+// daemon kept serving. A missing NODE is a healable desync — the pool has
+// hundreds of other members — so the render SKIPS the node with a loud warning
+// line instead of failing the whole render. The D6 fail-loud contract for
+// balancer/rule targets is a different class and stays untouched (pinned by
+// TestNonPoolBalancerRouteRejected).
+func TestSelectionNodeMissingDroppedLoud(t *testing.T) {
+	de1, sn1 := mkSelected(t, "pool-de-01", "de", "Frankfurt", "de1.example.com", 2053,
+		nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	de2, sn2 := mkSelected(t, "pool-de-02", "de", "Frankfurt", "de2.example.com", 2053,
+		nodeOpts{network: "tcp", extra: map[string]string{"flow": "xtls-rprx-vision"}})
+	// The exact production desync shape: a selected key the store lacks.
+	ghost := model.SelectedNode{Tag: "pool-us-36", Key: "3471fd449fa5614b", Country: "us", City: "Seattle"}
+	sel := &model.Selection{Nodes: []model.SelectedNode{sn1, ghost, sn2}}
+	byKey := map[string]*model.Node{de1.Key: de1, de2.Key: de2}
+
+	b, warnings, err := render.RenderOwnConfig(sel, ownCore(), nil, byKey, nil, render.Config{})
+	require.NoError(t, err, "a missing store record must be skipped loud, not fail the render")
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(b, &m))
+
+	// Loud drop line: tag + key + the mandated remedy phrase.
+	dropLine := ""
+	for _, w := range warnings {
+		if strings.Contains(w, "3471fd449fa5614b") {
+			dropLine = w
+		}
+	}
+	require.NotEmpty(t, dropLine, "the dropped node must be named loud, never silently skipped")
+	assert.Contains(t, dropLine, "pool-us-36")
+	assert.Contains(t, dropLine, "3471fd449fa5614b")
+	assert.Contains(t, dropLine, "dropped from candidate: store record missing")
+	assert.Contains(t, dropLine, "run assay select")
+
+	// The dropped node renders NO outbound; the real members keep theirs.
+	tags := map[string]bool{}
+	for _, o := range outboundsOf(t, m) {
+		tag, _ := o["tag"].(string)
+		tags[tag] = true
+	}
+	assert.False(t, tags["pool-us-36"], "the dropped node must not render an outbound")
+	assert.True(t, tags["pool-de-01"] && tags["pool-de-02"], "real members still render")
+
+	// The effective selection reaches every downstream layer: the Frankfurt
+	// city balancer names EXPLICIT outbound tags, so a skipped node left in
+	// the selection would dangle the selector and break the -test gate.
+	frankfurt := cityBalancer(t, m, "pool_de_frankfurt")
+	assert.ElementsMatch(t, []any{"pool-de-01", "pool-de-02"}, frankfurt["selector"],
+		"city balancer selectors must carry only rendered outbounds (no dangling tag)")
+}
+
+// TestSelectionAllRecordsMissingFailsClosed pins the D7 posture when the
+// desync drops EVERY selected member: the render succeeds (loud warnings),
+// but the artifact is the fail-closed empty-pool shape — catch-all → block,
+// no balancers, no observatory. Empty never routes to direct (A4).
+func TestSelectionAllRecordsMissingFailsClosed(t *testing.T) {
+	ghost1 := model.SelectedNode{Tag: "pool-us-36", Key: "3471fd449fa5614b", Country: "us"}
+	ghost2 := model.SelectedNode{Tag: "pool-us-37", Key: "7e1b73a8feb459eb", Country: "us"}
+	sel := &model.Selection{Nodes: []model.SelectedNode{ghost1, ghost2}}
+
+	b, warnings, err := render.RenderOwnConfig(sel, ownCore(), nil,
+		map[string]*model.Node{}, nil, render.Config{})
+	require.NoError(t, err, "an all-dropped selection still renders — fail-closed, not fail-loud")
+	require.Len(t, warnings, 2, "each dropped member gets its own loud line")
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(b, &m))
+
+	assert.Len(t, outboundsOf(t, m), 2, "only direct+block when nothing is renderable")
+	routing := m["routing"].(map[string]any)
+	_, hasBalancers := routing["balancers"]
+	assert.False(t, hasBalancers, "no balancers when nothing is renderable")
+	_, hasObs := m["observatory"]
+	assert.False(t, hasObs, "no observatory when nothing is renderable (L1)")
+	rules := routing["rules"].([]any)
+	catchAll := rules[len(rules)-1].(map[string]any)
+	assert.Equal(t, "block", catchAll["outboundTag"], "catch-all must fail closed to block")
+	_, hasBalancerTag := catchAll["balancerTag"]
+	assert.False(t, hasBalancerTag, "catch-all must not reference a balancer that did not render")
+}
+
+// cityBalancer finds one rendered balancer by tag (test helper for the
+// selector-consistency pins).
+func cityBalancer(t *testing.T, m map[string]any, tag string) map[string]any {
+	t.Helper()
+	balancers := m["routing"].(map[string]any)["balancers"].([]any)
+	for _, b := range balancers {
+		bm := b.(map[string]any)
+		if bm["tag"] == tag {
+			return bm
+		}
+	}
+	t.Fatalf("balancer %q not found", tag)
+	return nil
 }
 
 // TestGoldenOwnRenderPassesXrayTest is the real-binary verdict: the xray core
