@@ -228,13 +228,19 @@ func summarize(reports []NodeReport, eligible int) Summary {
 	return s
 }
 
+// mergeGeoRecords reads the cold store ONCE (through the classifier's read
+// seam) and folds the wave's probe outcomes into the existing records.
+// Alongside the wave's records it returns the existing set, so the flush's
+// write can merge WITHOUT a second read (allocation audit F2 — the old path
+// re-read the same file inside store.UpsertGeo).
 func mergeGeoRecords(
+	readGeo func(string) ([]*model.GeoRecord, error),
 	dataDir string, nodes []*model.Node, probeByKey map[string]store.ProbeResult, waveSeq uint64,
 	reports map[string]*NodeReport,
-) ([]*model.GeoRecord, error) {
-	existing, err := store.ReadGeo(filepath.Join(dataDir, "geo-base.jsonl"))
+) ([]*model.GeoRecord, []*model.GeoRecord, error) {
+	existing, err := readGeo(filepath.Join(dataDir, "geo-base.jsonl"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	prevByKey := map[string]*model.GeoRecord{}
 	for _, e := range existing {
@@ -299,7 +305,7 @@ func mergeGeoRecords(
 		}
 		records = append(records, rec)
 	}
-	return records, nil
+	return records, existing, nil
 }
 
 // applyReport folds one node's ladder outcome into its cold record.

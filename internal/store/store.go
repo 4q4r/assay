@@ -103,37 +103,92 @@ func ReadNodes(path string) ([]*model.Node, error) {
 	return nodes, sc.Err()
 }
 
-// UpsertGeo merges records into the cold store by identity. Existing fields
-// that later waves leave empty survive; first_seen and a previously assigned
-// tag are never clobbered. The merged set is written sorted by identity, so
-// two runs over identical logical data produce a byte-identical file (Go map
-// iteration order must never reach the disk).
-func UpsertGeo(path string, records []*model.GeoRecord) error {
-	existing, err := ReadGeo(path)
-	if err != nil {
-		return err
+// sortedGeoRecords is the keyed sort carrier (allocation audit F2): each
+// record's model.GeoIdentity is extracted ONCE before sorting, so the
+// comparator compares pre-computed strings directly instead of recomputing
+// two fmt.Sprintf identities per comparison (~25k·log₂(25k)·2 short-lived
+// strings per sort at geo-base scale).
+type sortedGeoRecords struct {
+	recs []*model.GeoRecord
+	keys []string
+}
+
+func (s sortedGeoRecords) Len() int { return len(s.recs) }
+func (s sortedGeoRecords) Less(i, j int) bool {
+	return s.keys[i] < s.keys[j]
+}
+
+func (s sortedGeoRecords) Swap(i, j int) {
+	s.recs[i], s.recs[j] = s.recs[j], s.recs[i]
+	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
+}
+
+// sortGeoByIdentity sorts records by their identity key, extracting each
+// key exactly once. The resulting order is identical to sorting by repeated
+// model.GeoIdentity comparisons (the pre-change comparator) — the sort
+// golden pins it byte-for-byte.
+func sortGeoByIdentity(records []*model.GeoRecord) {
+	s := sortedGeoRecords{
+		recs: records,
+		keys: make([]string, len(records)),
 	}
-	byIdentity := make(map[string]*model.GeoRecord, len(existing))
+	for i, r := range records {
+		s.keys[i] = model.GeoIdentity(r)
+	}
+	sort.Sort(s)
+}
+
+// MergeGeoRecords folds the incoming records into the existing set by
+// identity — the UpsertGeo merge contract (existing fields later waves leave
+// empty survive; first_seen and an assigned tag are never clobbered; the
+// blank-fold matrix runs exactly ONCE per incoming record) — and returns the
+// merged set sorted by identity with keys extracted once. Callers that
+// already read the cold store (the classification flush, audit F2) merge
+// against the records they hold instead of re-reading the file.
+func MergeGeoRecords(existing, incoming []*model.GeoRecord) []*model.GeoRecord {
+	byIdentity := make(map[string]*model.GeoRecord, len(existing)+len(incoming))
 	for _, e := range existing {
 		byIdentity[model.GeoIdentity(e)] = e
 	}
-	for _, r := range records {
+	for _, r := range incoming {
 		byIdentity[model.GeoIdentity(r)] = mergeGeoRecord(byIdentity, r)
 	}
 	merged := make([]*model.GeoRecord, 0, len(byIdentity))
 	for _, v := range byIdentity {
 		merged = append(merged, v)
 	}
-	sort.Slice(merged, func(i, j int) bool {
-		return model.GeoIdentity(merged[i]) < model.GeoIdentity(merged[j])
-	})
-	if err := writeJSONL(path, len(merged), true, func(i int) (any, error) {
-		return merged[i], nil
+	sortGeoByIdentity(merged)
+	return merged
+}
+
+// WriteGeoSorted atomically writes the records sorted by identity (keys
+// extracted once per record). The write carries the same durability contract
+// as UpsertGeo's (atomic 0600 temp+rename with fsync; large-write page cache
+// dropped afterwards) and performs NO read of the target file.
+func WriteGeoSorted(path string, records []*model.GeoRecord) error {
+	sortGeoByIdentity(records)
+	if err := writeJSONL(path, len(records), true, func(i int) (any, error) {
+		return records[i], nil
 	}); err != nil {
 		return err
 	}
 	fadviseDontNeed(path)
 	return nil
+}
+
+// UpsertGeo merges records into the cold store by identity. Existing fields
+// that later waves leave empty survive; first_seen and a previously assigned
+// tag are never clobbered. The merged set is written sorted by identity, so
+// two runs over identical logical data produce a byte-identical file (Go map
+// iteration order must never reach the disk). Composed of the same pieces
+// the classification flush uses (ReadGeo once → MergeGeoRecords →
+// WriteGeoSorted) — byte-identical output pinned by the sort golden.
+func UpsertGeo(path string, records []*model.GeoRecord) error {
+	existing, err := ReadGeo(path)
+	if err != nil {
+		return err
+	}
+	return WriteGeoSorted(path, MergeGeoRecords(existing, records))
 }
 
 // mergeGeoRecord folds the incoming record into the previous one: fresh

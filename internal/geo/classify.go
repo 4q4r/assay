@@ -125,14 +125,24 @@ type Classifier struct {
 	mu      sync.Mutex
 	reports map[string]NodeReport
 	nodes   map[string]*model.Node
+	// readGeo is the cold-store read seam (allocation audit F2): production
+	// leaves it at store.ReadGeo; tests count reads through it.
+	readGeo func(string) ([]*model.GeoRecord, error)
+	// writeGeo is the cold-store write seam (allocation audit F2): the
+	// flush must write through the fused one-pass writer
+	// (store.WriteGeoSorted — performs NO read) instead of the re-reading
+	// UpsertGeo; tests assert the fused writer is the one used.
+	writeGeo func(string, []*model.GeoRecord) error
 }
 
 // NewClassifier builds an empty wave accumulator.
 func NewClassifier(in ClassifyInput) *Classifier {
 	return &Classifier{
-		in:      in,
-		reports: map[string]NodeReport{},
-		nodes:   map[string]*model.Node{},
+		in:       in,
+		reports:  map[string]NodeReport{},
+		nodes:    map[string]*model.Node{},
+		readGeo:  store.ReadGeo,
+		writeGeo: store.WriteGeoSorted,
 	}
 }
 
@@ -235,6 +245,13 @@ func (c *Classifier) classifyNode(ctx context.Context, n *model.Node, addr strin
 // it ran, previous geo/unlock fields survive where this wave has none) and
 // prints the wave-level classification summary. started timestamps the
 // pass for the wave-duration visibility.
+//
+// One read-merge-write pass (allocation audit F2): the cold store is read
+// once, the wave's records fold against it through
+// store.MergeGeoRecords (the blank-fold matrix runs exactly once — the old
+// path re-read the file and re-merged inside store.UpsertGeo), and the
+// merged set is written through store.WriteGeoSorted, which sorts with
+// identity keys extracted once per record and performs no read.
 func (c *Classifier) Flush(
 	w io.Writer, nodes []*model.Node, probeByKey map[string]store.ProbeResult, waveSeq uint64, started time.Time,
 ) ([]*model.GeoRecord, Summary, error) {
@@ -248,11 +265,12 @@ func (c *Classifier) Flush(
 	}
 	c.mu.Unlock()
 
-	records, err := mergeGeoRecords(c.in.DataDir, nodes, probeByKey, waveSeq, byKey)
+	records, existing, err := mergeGeoRecords(c.readGeo, c.in.DataDir, nodes, probeByKey, waveSeq, byKey)
 	if err != nil {
 		return nil, Summary{}, err
 	}
-	if err := store.UpsertGeo(filepath.Join(c.in.DataDir, "geo-base.jsonl"), records); err != nil {
+	if err := c.writeGeo(filepath.Join(c.in.DataDir, "geo-base.jsonl"),
+		store.MergeGeoRecords(existing, records)); err != nil {
 		return nil, Summary{}, err
 	}
 	summary := summarize(reports, len(reports))

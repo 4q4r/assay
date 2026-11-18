@@ -108,7 +108,7 @@ func TestMergeGeoRecordsSameIdentityWinnerIsOrderIndependent(t *testing.T) {
 	winner := func(nodes []*model.Node) *model.GeoRecord {
 		t.Helper()
 		dir := t.TempDir()
-		recs, err := mergeGeoRecords(dir, nodes, probeByKey, 0, reports)
+		recs, _, err := mergeGeoRecords(store.ReadGeo, dir, nodes, probeByKey, 0, reports)
 		require.NoError(t, err)
 		require.Len(t, recs, 2, "both same-identity nodes produce records")
 		path := filepath.Join(dir, "geo-base.jsonl")
@@ -185,7 +185,7 @@ func TestMergeGeoRecordsEmissionOrderKeySortedUnderAllFeedPermutations(t *testin
 		for _, idx := range perm {
 			feed = append(feed, sorted[idx])
 		}
-		recs, err := mergeGeoRecords(t.TempDir(), feed, probeByKey, 0, map[string]*NodeReport{})
+		recs, _, err := mergeGeoRecords(store.ReadGeo, t.TempDir(), feed, probeByKey, 0, map[string]*NodeReport{})
 		require.NoError(t, err)
 		require.Len(t, recs, len(feed), "every probed same-identity node emits a record")
 		gotRTTs := make([]float64, len(recs))
