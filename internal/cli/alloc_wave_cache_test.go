@@ -373,7 +373,14 @@ func TestAllocWaveParityAgainstPreChangeGoldens(t *testing.T) {
 				if pair[1] == "selection.json" {
 					got = normalizeSelectionForParity(t, got)
 				}
-				require.Equal(t, string(want), string(got),
+				// .gitattributes pins LF checkouts; the strip is the belt to
+				// that for working trees materialized before the attribute
+				// (a windows checkout converts LF→CRLF and the CRLF bytes are
+				// checkout noise — the wave's writers emit \n verbatim, and
+				// the fixture seeds are built in memory, never copied from
+				// the checkout). On linux the strip is a no-op: the
+				// byte-exact contract is untouched.
+				require.Equal(t, strings.ReplaceAll(string(want), "\r\n", "\n"), string(got),
 					"%s must be byte-identical to the pre-change tree's output (golden-equal parity)", pair[1])
 			}
 			// The prune pass exercised the backup path (removals happened).

@@ -13,6 +13,7 @@ package store_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"assay/internal/model"
@@ -57,7 +58,13 @@ func TestMergeGeoRecordsAndWriteGeoSortedMatchPreChangeGolden(t *testing.T) {
 	require.NoError(t, err)
 	want, err := os.ReadFile(filepath.Join("testdata", "allocparity", "geo-sort-golden.jsonl"))
 	require.NoError(t, err)
-	require.Equal(t, string(want), string(raw),
+	// .gitattributes pins LF checkouts; the strip is the belt to that for
+	// working trees materialized before the attribute (a windows checkout
+	// converts LF→CRLF and the CRLF bytes are checkout noise, never content
+	// the writers emit — os.WriteFile stores the \n bytes it is given).
+	// On linux the strip is a no-op: the byte-exact contract is untouched.
+	golden := strings.ReplaceAll(string(want), "\r\n", "\n")
+	require.Equal(t, golden, string(raw),
 		"the fused merge+sort+write must be byte-identical to the pre-change UpsertGeo output")
 
 	// And UpsertGeo — recomposed on the same pieces — keeps matching the
@@ -65,7 +72,7 @@ func TestMergeGeoRecordsAndWriteGeoSortedMatchPreChangeGolden(t *testing.T) {
 	require.NoError(t, store.UpsertGeo(path, incoming))
 	again, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Equal(t, string(want), string(again),
+	require.Equal(t, golden, string(again),
 		"recomposed UpsertGeo must stay byte-identical to the pre-change output")
 }
 
