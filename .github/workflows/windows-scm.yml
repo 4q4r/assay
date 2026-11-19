@@ -25,8 +25,15 @@
 #      reaches Stopped, `assay uninstall` deletes it and leaves no entry;
 #      `assay status` works against the live service.
 #   4. the §2.2.9 running-image lock is ASSERTED while the service runs:
-#      a rename/copy over the running assay.exe must FAIL (the discipline
-#      the installer's stop→copy→start ordering exists for).
+#      an exclusive (FileShare.None, write-capable) open of the running
+#      assay.exe must FAIL with a sharing violation — the exact operation
+#      a replace-over-running would attempt — and, once the service is
+#      stopped, the same open must SUCCEED (replace-ready). A rename is
+#      NOT a valid lock probe: rename is delete-class ("Delete access
+#      allows both delete and rename operations", CreateFileW docs) and
+#      passes the sharing check against a running image (the 2026-11-19
+#      run 44567962619 root cause — the rename SUCCEEDED while the
+#      service ran and the assertion fired).
 #
 # Diagnostics run ALWAYS after the E2E step: the SCM service state, the
 # SCM/Application event-log tails, the data-dir tree, and the daemon's own
@@ -145,16 +152,30 @@ jobs:
           "service Running (pid $($Matches[1]))" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
           # §2.2.9 running-image lock: while the service runs, ITS image
-          # (the installed copy, not this build artifact) is locked — a
-          # rename over it MUST fail (the discipline the stop→copy→start
-          # ordering exists for; behavior-verified here).
+          # (the installed copy, not this build artifact) is locked — the
+          # kernel image section holds the backing file open WITHOUT
+          # FILE_SHARE_WRITE, so a write-capable exclusive open must fail
+          # with ERROR_SHARING_VIOLATION (winerror 32). The probe models
+          # exactly what a replace-over-running would attempt (open the
+          # destination for write). A rename is NOT a lock probe — it is
+          # delete-class and passes the sharing check against the image
+          # handle (run 44567962619: the rename SUCCEEDED against the
+          # Running service). The verdict is sharing-violation-SPECIFIC:
+          # any other open error is a loud throw, never a "locked" pass.
           $installed = "$env:LOCALAPPDATA\assay\bin\assay.exe"
           if (-not (Test-Path $installed)) { throw "the installed binary is missing at $installed" }
           $locked = $false
-          try { Rename-Item -Path $installed -NewName 'assay-locked.exe' -ErrorAction Stop }
-          catch { $locked = $true }
-          if (-not $locked) { throw "the running image was NOT locked — §2.2.9 discipline unproven" }
-          "running-image lock confirmed" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          try {
+            $probe = [System.IO.File]::Open($installed, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $probe.Dispose()
+          } catch [System.IO.IOException] {
+            if ((($_.Exception.HResult) -band 0xFFFF) -ne 32) {
+              throw "the exclusive-open probe failed with an unexpected error while the service runs — not provably the image lock: $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+            }
+            $locked = $true
+          }
+          if (-not $locked) { throw "the running image was NOT locked — an exclusive open succeeded against the RUNNING exe (§2.2.9 discipline unproven)" }
+          "running-image lock confirmed (exclusive open → sharing violation 32)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
           # Control(Stop) reaches Stopped (the handler's graceful ladder
           # through the daemon's SIGTERM seam), then Delete leaves nothing.
@@ -167,6 +188,26 @@ jobs:
             throw "the installed binary vanished — uninstall must keep it"
           }
           "uninstall OK (no running service, binary kept)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # §2.2.9 converse: with the service Stopped the image lock is
+          # GONE — the same exclusive open must SUCCEED (the replace-ready
+          # precondition the installer's stop→copy→start ordering relies
+          # on). SCM Stopped can precede the last handle close by a
+          # moment, so poll with a bounded deadline; still locked when it
+          # expires = loud failure, never a silent pass.
+          $unlocked = $false
+          $deadline = (Get-Date).AddSeconds(15)
+          while (-not $unlocked -and (Get-Date) -lt $deadline) {
+            try {
+              $probe = [System.IO.File]::Open($installed, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+              $probe.Dispose()
+              $unlocked = $true
+            } catch [System.IO.IOException] {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $unlocked) { throw "the image is still locked after the service stopped — the exclusive open never succeeded within 15s (§2.2.9 unlock unproven; replace-over-stopped would fail)" }
+          "stopped-image unlock confirmed (replace-ready)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
       - name: SCM diagnostics (service state, event log, daemon journal)
         # ALWAYS: on a red E2E this is the root-cause evidence (the
