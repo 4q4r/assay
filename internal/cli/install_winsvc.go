@@ -90,8 +90,24 @@ func installBinDirDefault(goos string) string {
 
 // runInstallWinSvc is the windows install flow (§2.2.4 + §2.2.9): resolve
 // the ALWAYS-explicit config path (§2.2.5 — the service runs as LocalSystem),
-// hand the spec to the scheduler (stop→copy→register→recovery→start pinned
-// in internal/install), run the D4 core bootstrap, print the loud summary.
+// run the D4 core bootstrap FIRST (see below), hand the spec to the
+// scheduler (stop→copy→register→recovery→start pinned in internal/install),
+// print the loud summary.
+//
+// The bootstrap runs BEFORE sched.Install — the SCM E2E root cause
+// (2026-11-19, run 44531634579): the windows service is fail-closed on a
+// missing core (the manager's construction gate refuses → exit 1 → SCM
+// 7024), so the previous after-start bootstrap was structurally
+// unreachable on every fresh host: sched.Install errored ("the assay
+// service exited during start") and the early return left the managed
+// core <data>\bin\xray.exe unplaced forever — the "re-run `assay install`"
+// recovery advice included. A bootstrap failure here is fatal BEFORE
+// anything is registered: the service could not boot without the core
+// (the unix "waves retry through auto-update" mitigation is false on
+// windows — a dead daemon runs no waves), and registering it would trade
+// the real download error for a crash-looping service. The unix/launchd
+// branches keep the after-install shape on purpose: their daemons run
+// core-less and DO retry through the waves.
 func runInstallWinSvc(
 	w io.Writer, cfg *config.Config, running, binDir, dataDir, cfgPath string, opts installOptions,
 ) error {
@@ -122,17 +138,22 @@ func runInstallWinSvc(
 	if avail, reason := sched.Available(); !avail {
 		return fmt.Errorf("install: the windows-service scheduler is unavailable: %s", reason)
 	}
+	// D4 core bootstrap BEFORE the service start (the ordering contract this
+	// module exists for — see the doc comment). The bootstrap anchors the
+	// SAME resolved data dir the service registration carries (the -c config
+	// the daemon reads), so EnsureCoreBinary's windows placement leg fills
+	// the managed spot the service-context resolution binds.
+	if cfg != nil {
+		if berr := ensureCoreBinary(context.Background(), cfg.Core, dataDir, w); berr != nil {
+			return fmt.Errorf("install: the core bootstrap failed and the windows service refuses to run "+
+				"without the managed core (fail-closed) — nothing was registered: %w\n"+
+				"(fix the download cause and re-run `assay install`; or set [core].xray_bin to an "+
+				"existing absolute binary path)", berr)
+		}
+	}
 	res, err := sched.Install(spec)
 	if err != nil {
 		return err
-	}
-	// D4 core bootstrap: identical contract to the systemd/launchd branches
-	// (loud non-fatal warning; the waves retry through auto-update).
-	if cfg != nil {
-		if berr := ensureCoreBinary(context.Background(), cfg.Core, config.ExpandHome(cfg.DataDir), w); berr != nil {
-			outf(w, "%s\n", ui.Warn("WARNING: core bootstrap: "+berr.Error()+
-				" (install completes; the daemon's waves retry through auto-update)", ui.Amber, opts.color))
-		}
 	}
 	printWinSvcInstallSummary(w, res, dataDir, opts)
 	return nil

@@ -29,6 +29,15 @@ own interactive sessions keep the user-local spot first. If the
 service log ever shows the systemprofile path, re-run
 `assay install -c <abs config>`.
 
+That placement leg is ORDERED before the service start on windows (the
+SCM E2E root cause, 2026-11-19: the bootstrap used to run after the
+service had already been started, so on a fresh host the fail-closed
+start refusal errored the install before the core was ever placed —
+no `<data>\bin\xray`, no `xray-staged`, the SCM 7024 loop). The
+install now bootstraps the core first and a bootstrap failure refuses
+BEFORE anything is registered: a windows install without the core
+fails with the real download error, never as a crash-looping service.
+
 ## 2. Windows PATH precedence — cwd wins in cmd.exe
 
 cmd.exe resolves bare commands against the **current directory first**.

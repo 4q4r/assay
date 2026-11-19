@@ -351,3 +351,87 @@ func TestInstallWindowsSchedulerFailureIsLoud(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CreateService")
 }
+
+// orderingWinSvcScheduler records the scheduler-install position into a
+// shared ops channel (the ordering-pin twin of the install package's
+// verbs recorder — the CLI layer needs the same evidence).
+type orderingWinSvcScheduler struct {
+	fakeWinSvcCliScheduler
+
+	ops *[]string
+}
+
+func (s *orderingWinSvcScheduler) Install(spec install.SchedulerInstallSpec) (install.Result, error) {
+	*s.ops = append(*s.ops, "scheduler-install")
+	return s.fakeWinSvcCliScheduler.Install(spec)
+}
+
+// TestInstallWindowsBranchBootstrapsCoreBeforeServiceStart pins the SCM E2E
+// root cause (2026-11-19, run 44531634579): the windows install must place
+// the managed core BEFORE the scheduler registers and starts the service.
+// The service is fail-closed on a missing core (the manager's construction
+// gate refuses → exit 1 → SCM 7024), so the old after-start bootstrap was
+// unreachable on every fresh host: sched.Install errored ("the assay
+// service exited during start") and runInstallWinSvc returned before the
+// bootstrap leg ever ran — no <data>\bin\xray, no xray-staged, the
+// placement guarantee dead code on exactly the host it exists for. The
+// unix branches keep the after-install shape (their daemons run core-less
+// and retry through the waves); windows is the one host where the order
+// inverts.
+func TestInstallWindowsBranchBootstrapsCoreBeforeServiceStart(t *testing.T) {
+	cfg, dataDir := winSvcCliConfig(t)
+	var ops []string
+	sched := &orderingWinSvcScheduler{}
+	sched.installRes = install.Result{ServiceActive: true}
+	sched.ops = &ops
+	withWindowsHost(t, sched)
+	ensureCoreBinary = func(_ context.Context, _ config.CoreConfig, _ string, _ io.Writer) error {
+		ops = append(ops, "ensure-core")
+		return nil
+	}
+	t.Cleanup(func() { ensureCoreBinary = core.EnsureCoreBinary })
+
+	out := &syncWriter{}
+	err := runInstall(out, cfg, "", installOptions{
+		binDir:          installBinDirDefault("windows"),
+		materializePath: filepath.Join(dataDir, "config.toml"),
+		color:           false,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ensure-core", "scheduler-install"}, ops,
+		"the core placement must land BEFORE the SCM registration/start — "+
+			"a service that cannot construct without the core must never be started without it")
+}
+
+// TestInstallWindowsBootstrapFailureRefusesServiceStart pins the
+// fatal-before-register posture (the loud-discipline half of the same fix):
+// a core bootstrap failure must FAIL the install and leave the SCM
+// UNTOUCHED. Registering the service anyway would trade the real download
+// error for a crash-looping 7024 (the fail-closed gate exits at every SCM
+// recovery restart; the "waves retry through auto-update" justification is
+// false on windows — the dead daemon runs no waves). The refusal carries
+// the underlying bootstrap error verbatim: the leg fails at the install
+// step with the real reason, never downstream at a service probe.
+func TestInstallWindowsBootstrapFailureRefusesServiceStart(t *testing.T) {
+	cfg, _ := winSvcCliConfig(t)
+	sched := &fakeWinSvcCliScheduler{}
+	withWindowsHost(t, sched)
+	ensureCoreBinary = func(_ context.Context, _ config.CoreConfig, _ string, _ io.Writer) error {
+		return errors.New("core: stage release v26.10.31: dial tcp: connection refused")
+	}
+	t.Cleanup(func() { ensureCoreBinary = core.EnsureCoreBinary })
+
+	err := runInstall(&syncWriter{}, cfg, "", installOptions{
+		binDir:          installBinDirDefault("windows"),
+		materializePath: filepath.Join(t.TempDir(), "config.toml"),
+		color:           false,
+	})
+	require.Error(t, err, "a bootstrap failure must fail the windows install — "+
+		"the service could not boot without the core")
+	assert.Contains(t, err.Error(), "core bootstrap", "the refusal names the failing leg")
+	assert.Contains(t, err.Error(), "connection refused",
+		"the REAL bootstrap failure is carried verbatim, not a downstream service symptom")
+	assert.Empty(t, sched.installSpecs,
+		"nothing may be registered in the SCM when the core placement failed — "+
+			"a fail-closed service without its core is a guaranteed crash loop")
+}
