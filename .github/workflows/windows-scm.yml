@@ -278,7 +278,7 @@ jobs:
 
       - name: Upload the install log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-scm-install-log
           path: ${{ env.WATCHLOG }}

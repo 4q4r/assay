@@ -96,7 +96,7 @@ jobs:
         with:
           version: "~> v2"
           args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/linux.yaml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-linux
           path: dist
@@ -151,7 +151,7 @@ jobs:
         with:
           version: "~> v2"
           args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/darwin.yaml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-darwin
           path: dist
@@ -204,7 +204,7 @@ jobs:
           args: release --clean --skip=publish -f ${{ runner.temp }}/goreleaser/windows.yaml
         env:
           SMOKE_DELEGATED_TARGETS: windows_arm64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-windows
           path: dist
@@ -285,7 +285,7 @@ jobs:
           > (build-only proof ran instead). The asset ships unsmoked — this
           > is the only sanctioned smoke gap, by owner decision (plan §4.4/§4.5.2).
           "@
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-arm64-verdict
           path: smoke-verdict
