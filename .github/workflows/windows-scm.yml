@@ -35,9 +35,14 @@
 # capture every red cycle stayed undiagnosable (the round-4 disclosed
 # limit); with it, a red cycle carries its own root-cause evidence.
 #
-# The managed-core download during `assay install` is allowed to fail loud
-# (non-fatal by design — the waves retry): the E2E asserts the SERVICE
-# lifecycle, not the core download.
+# Core placement is a FIRST-CLASS leg assertion (the SCM E2E root cause,
+# 2026-11-19, run 44531634579): the windows service is fail-closed on a
+# missing managed core, so the install places it BEFORE the service start
+# and a bootstrap failure is fatal-before-register. The leg checks the
+# install's exit code immediately (Tee-Object swallows $LASTEXITCODE into
+# the step's own success) and asserts <data>\bin\xray.exe exists BEFORE any
+# service probe — a red download fails AT the install step with the real
+# error, never downstream as a vague "status reports no pid".
 
 name: windows-scm
 
@@ -113,10 +118,25 @@ jobs:
           "### SCM end-to-end" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
           # Canonical user deploy: materializes %LOCALAPPDATA%\assay\config.toml
-          # and embeds it as -c (§2.2.5). The core download may fail loud
-          # (non-fatal by design — the SERVICE lifecycle is the assertion).
+          # and embeds it as -c (§2.2.5). The install places the managed core
+          # BEFORE registering/starting the service and fails fatal when the
+          # placement fails (fail-closed service), so the exit-code gate and
+          # the core assertion below are the leg's FIRST checks — a red
+          # download surfaces here with its real error.
           .\assay.exe install 2>&1 | Tee-Object -Variable installLog
-          "install log captured" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          if ($LASTEXITCODE -ne 0) {
+            throw "assay install exited $LASTEXITCODE — the install output above carries the exact reason"
+          }
+          "install OK (exit 0)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+          # Core placement assertion BEFORE the service lifecycle (the leg
+          # fails at the right step): the managed core must exist at
+          # <data>\bin\xray.exe — the spot the LocalSystem service resolution
+          # binds (install-guaranteed; run 44531634579 died downstream
+          # because this file asserted nothing about it).
+          $core = "$env:LOCALAPPDATA\assay\bin\xray.exe"
+          if (-not (Test-Path $core)) { throw "the managed core is missing at $core — install placed nothing" }
+          "managed core placed ($core)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
           # Query: Running with a real pid (§2.2.8).
           $out = & .\assay.exe status 2>&1 | Out-String
@@ -201,7 +221,10 @@ jobs:
         run: |
           # After install the SCM recovery actions must exist: ServiceRestart
           # after 5000 ms, reset period 86400 s — the Restart=always parity.
+          # The re-install is exit-code-gated like the E2E step (loud at
+          # every step — no Out-Null swallowing of a failed install).
           .\assay.exe install 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "re-install exited $LASTEXITCODE" }
           $svc = Get-CimInstance Win32_Service -Filter "Name='assay'"
           if (-not $svc) { throw "the assay service is not registered" }
           if ($svc.StartMode -ne 'Auto') { throw "StartMode is $($svc.StartMode), must be Auto (StartAutomatic)" }
