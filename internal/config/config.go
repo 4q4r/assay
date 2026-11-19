@@ -639,11 +639,17 @@ type CoreConfig struct {
 	// XrayBin is the SINGLE core-binary knob (S1): a path to the xray
 	// binary every consumer (probe/check temp-instance fleets, the batch
 	// pre-filter, the activation -test gate, the core manager) resolves.
-	// Empty = the owner-ruling resolution (CoreXrayBin, never stored):
-	// the user-local ~/.local/bin/xray first (assay's own install and
-	// auto-update target), then an existing system xray (bound, auto-update
-	// inert per S5), else the user-local install target. An explicit value
-	// makes core auto-update inert with a one-time loud INFO (S5).
+	// Empty = the owner-ruling resolution (CoreXrayBin, never stored),
+	// context-aware: INTERACTIVE — the user-local ~/.local/bin/xray first
+	// (assay's own install and auto-update target), then an existing system
+	// xray (bound, auto-update inert per S5), else the user-local install
+	// target. WINDOWS SERVICE — the managed core <data>/bin/xray first (the
+	// install placement leg guarantees it), then an existing system xray;
+	// the user-local spot is never consulted there (the SYSTEM profile's
+	// systemprofile tree is poison) and a missing core fails the manager's
+	// service gate loud, naming `assay install`. An explicit value wins in
+	// every context and makes core auto-update inert with a one-time loud
+	// INFO (S5).
 	XrayBin string `toml:"xray_bin"`
 	// AutoUpdate is the managed-core auto-update switch, default ON (D4,
 	// managed core only per S5). The default is pre-seeded by Load and
@@ -731,6 +737,23 @@ func UserLocalXrayBin() string {
 	return filepath.Join(dir, platform.CoreBinaryName(runtime.GOOS))
 }
 
+// ManagedCoreBin is the MANAGED core binary path — <data>/bin/xray[.exe]
+// (the D4 layout): the spot `assay install`'s windows placement leg fills
+// and the windows service context binds FIRST (the user-local spot is
+// never consulted there — the SYSTEM profile's systemprofile tree is
+// poison, docs/landmines-crossplatform.md §1). Also the degenerate no-home
+// fallback of the interactive resolution.
+func ManagedCoreBin(dataDir string) string {
+	return filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS))
+}
+
+// ServiceContextDetected reports whether the process runs in the WINDOWS
+// service context — svc.IsWindowsService(), the same process-token check
+// the service entrypoint gates on (cmd/assay svc_windows.go). Injectable
+// seam: the test suites pin the guard without a Windows machine; production
+// never reassigns it.
+var ServiceContextDetected = detectWindowsServiceContext
+
 // DefaultSystemXrayPaths is the standard-path scan list of the core-binary
 // resolution: an existing system xray at the FIRST of these paths binds
 // when no user-local binary exists. A var, not a const: slices are not
@@ -747,15 +770,42 @@ func isRegularExecutable(path string) bool {
 }
 
 // ResolveCoreXrayBin resolves the SINGLE binary knob (S1) in the
-// owner-ruling order: the explicit [core].xray_bin override when set
-// (~-expansion stays the caller's discipline); else the EXISTING user-local
-// ~/.local/bin/xray (assay's own binary — the install and auto-update
-// target); else an EXISTING system xray at the first standard path (bound,
-// never updated); else the user-local path again — the canonical install
-// target the next resolution pass fills.
+// owner-ruling order, context-aware:
+//
+//   - an explicit [core].xray_bin override when set (every context;
+//     ~-expansion stays the caller's discipline);
+//   - in the WINDOWS SERVICE context (ServiceContextDetected — the SCM runs
+//     us as LocalSystem): the user-local spot is NEVER consulted —
+//     os.UserHomeDir there resolves to the SYSTEM profile
+//     (C:\Windows\system32\config\systemprofile), whose .local\bin is the
+//     poison spot the production incident bound (a nonexistent path
+//     fork/exec failed on at every bootstrap + crash-supervision retry,
+//     docs/landmines-crossplatform.md §1). Order: the EXISTING managed core
+//     at <data>/bin (the D4 layout `assay install`'s windows placement leg
+//     guarantees) → an EXISTING system xray at the first standard path
+//     (real system-wide installs are fine) → the managed spot again as the
+//     canonical fill target — the manager's service gate refuses LOUD on
+//     that state, naming `assay install`.
+//   - INTERACTIVE (linux/darwin/interactive windows — unchanged): the
+//     EXISTING user-local ~/.local/bin/xray (assay's own binary — the
+//     install and auto-update target); else an EXISTING system xray (bound,
+//     never updated); else the user-local path again — the canonical
+//     install target the next resolution pass fills; the managed spot only
+//     as the degenerate no-home fallback.
 func ResolveCoreXrayBin(xrayBin, dataDir string) string {
 	if xrayBin != "" {
 		return xrayBin
+	}
+	if ServiceContextDetected() {
+		if managed := ManagedCoreBin(dataDir); isRegularExecutable(managed) {
+			return managed
+		}
+		for _, sys := range DefaultSystemXrayPaths {
+			if isRegularExecutable(sys) {
+				return sys
+			}
+		}
+		return ManagedCoreBin(dataDir)
 	}
 	if user := UserLocalXrayBin(); user != "" && isRegularExecutable(user) {
 		return user
@@ -768,7 +818,7 @@ func ResolveCoreXrayBin(xrayBin, dataDir string) string {
 	if user := UserLocalXrayBin(); user != "" {
 		return user
 	}
-	return filepath.Join(dataDir, "bin", platform.CoreBinaryName(runtime.GOOS))
+	return ManagedCoreBin(dataDir)
 }
 
 // CoreXrayBin resolves the SINGLE binary knob (S1) through
