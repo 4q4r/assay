@@ -60,14 +60,14 @@ func TestHysteriaV1LinksStayRejected(t *testing.T) {
 	// The core enforces version == 2; a v1 link is a DIFFERENT protocol the
 	// renderer could never express faithfully — it stays a parse-time
 	// rejection with the kind counted.
-	res := parse.Lines("s", "hysteria://auth@old.example.com:443/?auth=x&upmbps=50\n")
+	res := parse.Lines("s", []byte("hysteria://auth@old.example.com:443/?auth=x&upmbps=50\n"), nil)
 	assert.Empty(t, res.Nodes)
 	assert.Equal(t, 1, res.Rejected)
 	assert.Equal(t, 1, res.RejectedKinds["hysteria"])
 }
 
 func TestHysteria2AndHy2NoLongerInRejectedKinds(t *testing.T) {
-	res := parse.Lines("s", "hysteria2://pw@a.example.com:443\nhy2://pw@b.example.com:443\n")
+	res := parse.Lines("s", []byte("hysteria2://pw@a.example.com:443\nhy2://pw@b.example.com:443\n"), nil)
 	assert.Len(t, res.Nodes, 2, "hysteria2/hy2 are parsed now")
 	assert.Equal(t, 0, res.Rejected)
 	for _, kind := range []string{"hysteria2", "hy2"} {
@@ -87,7 +87,7 @@ func TestHysteria2MalformedInputsAreCounted(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res := parse.Lines("s", tc.line+"\n")
+			res := parse.Lines("s", []byte(tc.line+"\n"), nil)
 			assert.Equal(t, 1, res.Malformed, "the line must be counted malformed, never fatal")
 			assert.Empty(t, res.Nodes)
 		})

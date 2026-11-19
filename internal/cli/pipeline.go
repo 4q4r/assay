@@ -528,8 +528,9 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 	}
 
 	var all []*model.Node
-	totalRejected, totalMalformed := 0, 0
+	totalRejected, totalMalformed, totalPreRejected := 0, 0, 0
 	kindCounts := map[string]int{}
+	preKindCounts := map[string]int{}
 	// Stable source order: manifest.Sources is a Go map, and its iteration
 	// order is randomized. The node file order feeds dedup/cap/tag decisions
 	// downstream, so identical inputs must always parse identically (M-b).
@@ -540,37 +541,56 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 	sort.Strings(sourceIDs)
 	for _, id := range sourceIDs {
 		files := manifest.Sources[id]
-		res := &parse.Result{RejectedKinds: map[string]int{}}
+		// The F3 fused prefilter (allocation audit F3): cheap line-level
+		// rejects (raw-string duplicates, no reality/tls security,
+		// allowInsecure) run on the RAW link line, before the full parse
+		// allocates. One prefilter per source — its dedup map spans the
+		// source's files exactly like filter.Run's per-source cap
+		// accounting, so a cross-source duplicate still full-parses and the
+		// FIRST source's node stays the dedup winner. The same filter
+		// policy (protocols allowlist, allow_insecure) feeds both the
+		// prefilter and the filter stage, so a pre-rejected line is a line
+		// filter would have dropped with the same class.
+		pre := filter.NewPrefilter(
+			filter.WithProtocols(cfg.Filter.Protocols),
+			filter.WithAllowInsecure(cfg.Filter.AllowInsecure),
+		)
+		res := &parse.Result{RejectedKinds: map[string]int{}, PreRejectedKinds: map[string]int{}}
 		for _, f := range files {
 			body, err := os.ReadFile(filepath.Join(p.cacheDir, id, fetch.SafePath(f.Path)))
 			if err != nil {
 				return fmt.Errorf("read cached file %s: %w", f.Path, err)
 			}
-			// F3 instrument: count the cached-body string conversion (the
-			// first of the 2-3 full-body copies the pre-change tree pays).
-			parse.NoteBodyCopy()
-			r := parse.Lines(id, string(body))
+			r := parse.Lines(id, body, pre)
 			res.Nodes = append(res.Nodes, r.Nodes...)
 			res.Rejected += r.Rejected
 			res.Malformed += r.Malformed
+			res.PreRejected += r.PreRejected
 			for k, v := range r.RejectedKinds {
 				res.RejectedKinds[k] += v
+			}
+			for k, v := range r.PreRejectedKinds {
+				res.PreRejectedKinds[k] += v
 			}
 		}
 		totalRejected += res.Rejected
 		totalMalformed += res.Malformed
+		totalPreRejected += res.PreRejected
 		for k, v := range res.RejectedKinds {
 			kindCounts[k] += v
 		}
-		outf(cmd.OutOrStdout(), "source %-10s parsed: %d nodes, %d rejected, %d malformed\n",
-			id, len(res.Nodes), res.Rejected, res.Malformed)
+		for k, v := range res.PreRejectedKinds {
+			preKindCounts[k] += v
+		}
+		outf(cmd.OutOrStdout(), "source %-10s parsed: %d nodes, %d pre-rejected, %d rejected, %d malformed\n",
+			id, len(res.Nodes), res.PreRejected, res.Rejected, res.Malformed)
 		all = append(all, res.Nodes...)
 	}
 	if err := store.WriteNodes(p.nodes, all); err != nil {
 		return err
 	}
-	outf(cmd.OutOrStdout(), "parse complete: %d nodes, %d rejected (%v), %d malformed → %s\n",
-		len(all), totalRejected, kindCounts, totalMalformed, p.nodes)
+	outf(cmd.OutOrStdout(), "parse complete: %d nodes, %d pre-rejected %v, %d rejected (%v), %d malformed → %s\n",
+		len(all), totalPreRejected, preKindCounts, totalRejected, kindCounts, totalMalformed, p.nodes)
 	return nil
 }
 
