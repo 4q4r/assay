@@ -70,7 +70,15 @@ func schemeOf(line string) string {
 // first; remaining lines are parsed one by one.
 func Lines(source, body string) *Result {
 	res := &Result{RejectedKinds: map[string]int{}}
+	if s := seam(); s != nil {
+		s.LinesInvocations.Add(1)
+	}
 	body = decodeIfBase64(body)
+	// F3 instrument: the ReplaceAll below is the second full-body copy the
+	// pre-change tree pays per fetched body.
+	if s := seam(); s != nil {
+		s.BodyCopies.Add(1)
+	}
 	for _, raw := range splitLines(body) {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
@@ -92,6 +100,9 @@ func Lines(source, body string) *Result {
 			continue
 		}
 		n, err := Link(source, line)
+		if s := seam(); s != nil {
+			s.FullParses.Add(1)
+		}
 		if err != nil {
 			res.Malformed++
 			continue
@@ -113,6 +124,11 @@ func decodeIfBase64(body string) string {
 	decoded, err := decodeFlexible(trimmed)
 	if err != nil || !strings.Contains(decoded, "://") {
 		return body
+	}
+	// F3 instrument: the whole-body base64 decode is a full-body
+	// materialization.
+	if s := seam(); s != nil {
+		s.BodyCopies.Add(1)
 	}
 	return decoded
 }

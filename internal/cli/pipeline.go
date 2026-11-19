@@ -546,6 +546,9 @@ func runParse(cmd *cobra.Command, cfg *config.Config) error {
 			if err != nil {
 				return fmt.Errorf("read cached file %s: %w", f.Path, err)
 			}
+			// F3 instrument: count the cached-body string conversion (the
+			// first of the 2-3 full-body copies the pre-change tree pays).
+			parse.NoteBodyCopy()
 			r := parse.Lines(id, string(body))
 			res.Nodes = append(res.Nodes, r.Nodes...)
 			res.Rejected += r.Rejected
