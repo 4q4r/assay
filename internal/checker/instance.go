@@ -83,24 +83,45 @@ func instanceReapWaitBounded(reaped func() <-chan struct{}, pid int, bound time.
 // Temp-instance PRODUCTION scan band: 18xxx is clear of the live client's
 // 10808/10809 inbounds and fox-proxy 9999, and the watch daemon boots its
 // own temp instances there on every hourly wave — the daemon and the live
-// instances KEEP this band. It is a variable pair solely so TEST SUITES can
-// re-pin it to a disjoint band (SetTestPortBand): a full -race suite run
-// overlapped by a live daemon wave used to flake boot/ports/env-strip tests,
-// each side's bind-test-close window losing against the other's churn.
-// Production callers never reassign it — the production scan is unchanged.
+// instances KEEP this band. It is a variable pair solely so the process's
+// owner can re-pin it (SetPortBand): TEST SUITES pin a disjoint fixture
+// band (a full -race suite run overlapped by a live daemon wave used to
+// flake boot/ports/env-strip tests, each side's bind-test-close window
+// losing against the other's churn), and the CLI wires the
+// [probe].instance_port_band config seam — the cross-process fix: the live
+// daemon's waves and a locally-run CLI batch sharing one band contended for
+// the same ports ("no free port in [18500,18999]" × 704 in one journal
+// window). The production default is unchanged; production callers never
+// reassign it to anything but their configured band.
 var (
 	instancePortMin = 18500
 	instancePortMax = 18999
 )
 
-// SetTestPortBand re-pins the temp-instance port scan band. FOR TEST SUITES
-// ONLY (the checker TestMain and the probe boot-smoke TestMain): suite temp
-// instances must boot OUTSIDE the production 18xxx band so suite runs and
-// live daemon waves never contend for the same ports. Calling it from
-// production code is a bug.
-func SetTestPortBand(minPort, maxPort int) {
+// ErrPortBandExhausted marks a scan band with NO bindable port left for a
+// temp instance — every port refused to bind or is claimed within the
+// batch. The engine names it in a dedicated loud line (instead of letting
+// the halving ladder grind generic boot failures) and the operator
+// diagnoses on it; the sentinel is checked with errors.Is, never string
+// matching.
+var ErrPortBandExhausted = errors.New("instance port band exhausted")
+
+// SetPortBand re-pins the temp-instance port scan band. The caller owns the
+// process's band and pins it ONCE before any temp instance spawns:
+//   - production CLI wiring: the parsed [probe].instance_port_band config
+//     seam (the cross-process fix — see the band vars above);
+//   - test suites: the disjoint fixture band in TestMain (suite temp
+//     instances must boot OUTSIDE the band the live daemon churns).
+//
+// Invalid bands fail loud — a silent fall-back to the previous band would
+// resurrect exactly the contention this seam removes.
+func SetPortBand(minPort, maxPort int) error {
+	if minPort < 1 || maxPort > 65535 || minPort > maxPort {
+		return fmt.Errorf("checker: invalid instance port band [%d,%d] — need 1 <= min <= max <= 65535", minPort, maxPort)
+	}
 	instancePortMin = minPort
 	instancePortMax = maxPort
+	return nil
 }
 
 // NewXrayFactory returns the production InstanceFactory: each node gets a
@@ -582,8 +603,9 @@ func (b *batchXrayInstance) awaitReadiness(ctx context.Context, stderr *limitedW
 }
 
 // freeInstancePort hands out a bindable 127.0.0.1 port from the configured
-// scan band (production: 18xxx; test suites: the disjoint band pinned via
-// SetTestPortBand). The bind test closes before xray binds — the resulting
+// scan band (production: the [probe].instance_port_band config seam,
+// default 18xxx; test suites: the disjoint band pinned via SetPortBand).
+// The bind test closes before xray binds — the resulting
 // boot-to-bind window is exactly why bootMu serializes handout-to-readiness:
 // inside one process a second factory cannot even SCAN while an instance is
 // booting, so the loser-rides-the-winner's-socket collision cannot happen
@@ -613,7 +635,10 @@ func freeInstancePort(ctx context.Context, used map[int]struct{}) (int, error) {
 		_ = ln.Close()
 		return p, nil
 	}
-	return 0, fmt.Errorf("no free port in [%d,%d] for a temp instance", instancePortMin, instancePortMax)
+	return 0, fmt.Errorf("%w: no free port in [%d,%d] for a temp instance — "+
+		"every port in the band refused to bind or is already claimed; "+
+		"repoint [probe].instance_port_band or free the contending process",
+		ErrPortBandExhausted, instancePortMin, instancePortMax)
 }
 
 // dropProxyEnv strips ambient proxy variables from a child environment
