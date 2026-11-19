@@ -186,6 +186,14 @@ jobs:
             Write-Host "--- $name ---"
             Write-Host $out
           }
+          # The artifact upload below resolves env-context expressions
+          # against the WORKFLOW env context, which does NOT carry runner env
+          # vars — the literal LOCALAPPDATA reference rendered as
+          # "\assay\logs\watch.log" and uploaded nothing (run 44495986878:
+          # "No files were found"). Export the runtime path through
+          # GITHUB_ENV so the upload step sees it; if-no-files-found:ignore
+          # stays honest (a pre-sink failure genuinely has no journal).
+          "WATCHLOG=$env:LOCALAPPDATA\assay\logs\watch.log" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
           exit 0
 
       - name: Recovery actions visible (§2.2.4 parity)
@@ -209,5 +217,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-scm-install-log
-          path: ${{ env.LOCALAPPDATA }}\assay\logs\watch.log
+          path: ${{ env.WATCHLOG }}
           if-no-files-found: ignore
