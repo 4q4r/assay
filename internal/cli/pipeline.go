@@ -2189,7 +2189,7 @@ func computePluginUnlockCounts(
 		if st == nil {
 			continue
 		}
-		geoKey := model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})
+		geoKey := model.GeoIdentityOf(n.Scheme, n.Host, n.Port)
 		gr := modelGeoByKey[geoKey]
 		if gr == nil {
 			continue
@@ -2348,7 +2348,7 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) e
 	}
 	referenced := make(map[string]bool, len(filtered))
 	for _, n := range filtered {
-		referenced[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})] = true
+		referenced[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)] = true
 	}
 	kept, removed, report := prune.Select(records, referenced, prune.Options{
 		DeadAfter: cfg.Maintain.PruneDeadAfter.Duration,

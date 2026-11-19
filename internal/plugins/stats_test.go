@@ -3,6 +3,8 @@ package plugins
 import (
 	"testing"
 
+	"assay/internal/model"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -235,6 +237,32 @@ func TestGeoIdentityKey(t *testing.T) {
 	expected = "vmess|test.org|8443"
 	if key != expected {
 		t.Errorf("GeoIdentityKey = %q, want %q", key, expected)
+	}
+}
+
+// TestGeoIdentityKeyDelegatesToModel is the allocation-audit M2 unification
+// pin: ONE identity-key implementation lives in the codebase (model's), and
+// this package's public helper delegates to it. A divergence here would make
+// the plugin-stats join key records differently than the store/rank/prune
+// join — silent cross-stage mis-joins.
+func TestGeoIdentityKeyDelegatesToModel(t *testing.T) {
+	cases := []struct {
+		name   string
+		scheme string
+		host   string
+		port   int
+	}{
+		{"plain", "vless", "de.example.com", 443},
+		{"host case is normalized", "trojan", "De.Example.COM", 8443},
+		{"ipv6-ish host", "vless", "2001:db8::1", 2053},
+		{"zero port", "ss", "nl1.example.com", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, model.GeoIdentityOf(tc.scheme, tc.host, tc.port),
+				GeoIdentityKey(tc.scheme, tc.host, tc.port),
+				"plugins.GeoIdentityKey must be byte-identical to the canonical model key")
+		})
 	}
 }
 

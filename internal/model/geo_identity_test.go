@@ -33,6 +33,35 @@ func TestGeoIdentityFormat(t *testing.T) {
 	}
 }
 
+// TestGeoIdentityOfMatchesGeoIdentity is the allocation-audit M2 pin: the
+// field-form identity key is THE implementation (GeoIdentity delegates), so
+// per-node lookup sites key maps without constructing throwaway GeoRecord
+// structs. Every edge input must produce the exact same bytes through both
+// forms — a divergence would split or mis-join cold-base records.
+func TestGeoIdentityOfMatchesGeoIdentity(t *testing.T) {
+	cases := []struct {
+		name   string
+		scheme string
+		host   string
+		port   int
+	}{
+		{"plain", "vless", "de.example.com", 443},
+		{"host case is normalized", "trojan", "De.Example.COM", 8443},
+		{"scheme is verbatim", "VLESS", "de.example.com", 443},
+		{"ipv6-ish host", "vless", "2001:db8::1", 2053},
+		{"bracketed ipv6 host", "vless", "[2001:db8::2]", 65535},
+		{"zero port", "ss", "nl1.example.com", 0},
+		{"empty host", "vless", "", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			viaStruct := model.GeoIdentity(&model.GeoRecord{Scheme: tc.scheme, Host: tc.host, Port: tc.port})
+			assert.Equal(t, viaStruct, model.GeoIdentityOf(tc.scheme, tc.host, tc.port),
+				"field-form key must be byte-identical to the record-form key")
+		})
+	}
+}
+
 // TestGeoIdentitySeparatesCaseVariants pins that case-variant spellings of the
 // SAME host collapse onto one identity (the upsert join key), while a
 // different scheme or port never does.

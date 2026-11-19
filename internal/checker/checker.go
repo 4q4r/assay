@@ -163,7 +163,7 @@ func selectPool(
 	var all []poolEntry
 	skipped := 0
 	for _, n := range nodes {
-		rec, ok := geoByIdentity[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+		rec, ok := geoByIdentity[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)]
 		if !ok {
 			skipped++ // no geo context → nothing to rank on
 			continue

@@ -313,7 +313,19 @@ func PoolTag(cc string, seq int) string {
 // deliberately not case-normalized: that is the historical on-disk key
 // semantics, and changing it would silently re-key the cold base.
 func GeoIdentity(g *GeoRecord) string {
-	return fmt.Sprintf("%s|%s|%d", g.Scheme, strings.ToLower(g.Host), g.Port)
+	return GeoIdentityOf(g.Scheme, g.Host, g.Port)
+}
+
+// GeoIdentityOf is the field form of GeoIdentity (allocation audit M2/F5):
+// lookup sites that hold scheme/host/port separately (rank admission,
+// prune referenced-set, checker, status intel) key their maps through this
+// and stop constructing throwaway GeoRecord structs per node. Concat form,
+// no fmt.Sprintf: the key runs per node in 100k-scale loops, and Sprintf is
+// an escape-triggering sink. Byte-identical to the historical Sprintf form —
+// pinned by TestGeoIdentityOfMatchesGeoIdentity and the pre-existing
+// equivalence test.
+func GeoIdentityOf(scheme, host string, port int) string {
+	return scheme + "|" + strings.ToLower(host) + "|" + strconv.Itoa(port)
 }
 
 // CountryBalancerTag renders the per-country balancer tag: pool_<cc>.
