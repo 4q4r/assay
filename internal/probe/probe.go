@@ -435,9 +435,23 @@ func runBatchJobAdaptive(
 		fillUnprobedFailures(out, unprobed, jobs, opts, failure)
 		return out
 	}
-	progressf(opts.Progress,
-		"probing batch of %d nodes failed as a batch (%v) — adaptive halving: %d unprobed nodes retry at batch size %d",
-		batchSize, failure, len(unprobed), half)
+	if errors.Is(failure, checker.ErrPortBandExhausted) {
+		// Band exhaustion gets its DEDICATED loud line BEFORE the ladder
+		// spins (the live failure mode printed 704 bare "no free port"
+		// lines in one window — cause unnamed, remedy unmentioned). The
+		// halving retries remain the recovery — a smaller batch needs
+		// fewer ports, which is how the 1000-node batch vs band-capacity
+		// structural class recovers — the seam is the durable fix.
+		progressf(opts.Progress,
+			"probing batch of %d nodes failed: %v — halving still retries (smaller "+
+				"batches need fewer ports); to stop the contention for good, widen or "+
+				"repoint [probe].instance_port_band",
+			batchSize, failure)
+	} else {
+		progressf(opts.Progress,
+			"probing batch of %d nodes failed as a batch (%v) — adaptive halving: %d unprobed nodes retry at batch size %d",
+			batchSize, failure, len(unprobed), half)
+	}
 	for start := 0; start < len(unprobed); start += half {
 		end := min(start+half, len(unprobed))
 		chunk := unprobed[start:end]

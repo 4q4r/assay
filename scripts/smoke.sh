@@ -12,12 +12,20 @@
 #            foreign targets run transparently once release.yml's
 #            qemu-user-binfmt has registered the binfmt_misc handler for
 #            their arch. Only when direct exec fails with a "never ran"
-#            signal (bash 126 exec-format/permission or 127 not-found;
-#            dash ENOEXEC script-fallback = exit 2 with empty stdout) do we
-#            fall back to the explicit qemu interpreter from the qemu-user
-#            package. A probe that actually RAN and exited nonzero is a
-#            genuine failure: it is never retried under the emulator and
-#            aborts the smoke (and the release) with that exit code.
+#            signal (the POSIX sh diagnostics bash and dash share: 126
+#            found-but-not-executable, 127 not-found; plus dash's ENOEXEC
+#            script-fallback = exit 2 with empty stdout) do we fall back
+#            to the explicit qemu interpreter from the qemu-user package.
+#            A probe that actually RAN and exited nonzero is a genuine
+#            failure and aborts the smoke (and the release) with that
+#            exit code — never retried, with ONE honest collision: a
+#            binary that genuinely exits 126/127 is indistinguishable
+#            from those shell diagnostics and takes the fallback leg.
+#            That still fails closed: the rerun under the emulator
+#            reproduces the same exit code and the smoke aborts with it
+#            (the same "probe exited N" label the direct leg prints),
+#            and a native target has no fallback leg at all — the code
+#            surfaces unchanged.
 #
 #   darwin:  direct exec only — arm64 binaries run natively on the arm64
 #            runner; amd64 binaries run transparently under Rosetta 2 once
@@ -110,9 +118,10 @@ windows_amd64* | windows_386* | windows_arm64*) runner="" ;;
 esac
 
 # Attempt 1: DIRECT exec. stderr stays attached so the CI log keeps the
-# exact kernel/shell diagnosis for any failure. set -eu makes a nonzero
-# FINAL probe exit (missing qemu, broken binary, bad flag) abort here; the
-# case below additionally rejects an empty/garbled version line so a
+# exact kernel/shell diagnosis for any failure. A nonzero probe exit
+# aborts loudly — the direct leg below carries the "probe exited N" label,
+# the fallback leg gets the same labeled abort (see attempt 2); the
+# version-line case additionally rejects an empty/garbled print so a
 # silent-print binary cannot pass.
 set +e
 out=$("$bin" -v)
@@ -121,12 +130,16 @@ set -e
 
 # Did the direct attempt actually run the binary, or did the kernel or
 # the shell refuse it? "Never ran" signals only:
-#   126/127 — bash's exec-format ("cannot execute binary file"),
-#             permission, or not-found diagnostics.
+#   126/127 — the POSIX sh exec diagnostics bash and dash share: 126 =
+#             found but not executable (exec-format "cannot execute
+#             binary file", permission), 127 = not found.
 #   2 with EMPTY stdout — dash has no binary-magic guard: on ENOEXEC it
 #             re-parses a foreign binary as a shell script and dies with a
 #             syntax error before executing anything. A binary that ran
 #             and really exited 2 WITH output is NOT routed to fallback.
+# The one collision: a binary that genuinely exits 126/127 reads as
+# "never ran" and takes the fallback leg — see the header; that leg
+# still fails closed with the same code, loudly labeled.
 never_ran=0
 case "$direct_rc" in
 126 | 127)
@@ -156,10 +169,21 @@ else
 	# Attempt 2: explicit runner. $runner is UNQUOTED on purpose: it is
 	# either "" or fixed literal words (one emulator name, or
 	# "arch -x86_64"); POSIX word-splitting is safe here. Any failure —
-	# e.g. the emulator not installed, Rosetta absent, exit 127 — aborts
-	# via set -e and takes the release with it, exactly as before.
+	# e.g. the emulator not installed (127), Rosetta absent, or a genuine
+	# nonzero probe exit (including the honest rc126/127 collision
+	# rerouted from attempt 1) — gets the SAME "probe exited N" label the
+	# direct leg prints and takes the release with it, exactly as set -e
+	# did before (the label is the addition, the fail-closed abort is
+	# unchanged).
 	# shellcheck disable=SC2086  # runner is "" or fixed literal words
+	set +e
 	out=$($runner "$bin" -v)
+	fallback_rc=$?
+	set -e
+	if [ "$fallback_rc" -ne 0 ]; then
+		echo "smoke [$target]: probe exited $fallback_rc (under $runner)" >&2
+		exit "$fallback_rc"
+	fi
 fi
 
 echo "smoke [$target]: $out"

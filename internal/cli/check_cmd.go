@@ -132,6 +132,11 @@ func runCheck(cmd *cobra.Command, cfg *config.Config, targets []string, f checkF
 	}
 	opts := newCheckOptions(cfg, p, targets, f)
 	opts.Progress = cmd.ErrOrStderr()
+	// The check stage's temp instances draw from the SAME band seam as the
+	// probe stage — one process, one band ([probe].instance_port_band).
+	if err := applyProbePortBand(cfg); err != nil {
+		return err
+	}
 	report, err := checker.Run(cmd.Context(), opts)
 	if err != nil {
 		return err

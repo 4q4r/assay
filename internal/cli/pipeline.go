@@ -733,6 +733,21 @@ func newProbeBatchFactory(cfg *config.Config, p paths) probe.BatchFactory {
 	})
 }
 
+// applyProbePortBand pins the checker's temp-instance port scan band from
+// [probe].instance_port_band (the cross-process seam): the live daemon's
+// waves and a locally-run CLI batch share the default 18xxx band, and two
+// processes booting temp instances into one band contend for ports — the
+// config seam lets one of them take a disjoint band. Called by every CLI
+// path that spawns temp instances (the probe stage, the check stage),
+// BEFORE the first factory exists: single-writer-before-first-spawn.
+func applyProbePortBand(cfg *config.Config) error {
+	minPort, maxPort, err := config.ParsePortBand(cfg.Probe.InstancePortBand)
+	if err != nil {
+		return err
+	}
+	return checker.SetPortBand(minPort, maxPort)
+}
+
 // newProbeFactory is the probe stage's single-node temp-instance fleet (the
 // checker factory the W14 probe uses). S1: the binary resolves from the
 // SINGLE core knob ([core].xray_bin / CoreXrayBin) — the legacy
@@ -858,6 +873,9 @@ func runProbe(
 	}
 	// The SAME temp-instance infrastructure the check stage uses — one
 	// factory, one render.BuildOutbound outbound builder, zero drift (W14).
+	if err := applyProbePortBand(cfg); err != nil {
+		return err
+	}
 	factory := newProbeFactory(cfg, p)
 	batchFactory := newProbeBatchFactory(cfg, p)
 	opts := probeOptions(cfg, speedtest)

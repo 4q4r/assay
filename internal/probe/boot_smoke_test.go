@@ -39,7 +39,9 @@ const (
 // band (the live watch daemon churns it hourly) and OUTSIDE every other
 // test binary's band — cross-process band sharing is the false-ready class.
 func TestMain(m *testing.M) {
-	checker.SetTestPortBand(testPortBandMin, testPortBandMax)
+	if err := checker.SetPortBand(testPortBandMin, testPortBandMax); err != nil {
+		panic(err) // fixture constants are structurally valid — never fires
+	}
 	os.Exit(m.Run())
 }
 

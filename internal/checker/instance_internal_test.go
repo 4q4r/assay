@@ -58,12 +58,61 @@ func TestMain(m *testing.M) {
 	// The suite's temp instances boot OUTSIDE the production 18xxx band —
 	// the live watch daemon churns that band hourly and a full -race run
 	// used to flake against it (live-ops fix; see testPortBand below).
-	SetTestPortBand(testPortBandMin, testPortBandMax)
+	if err := SetPortBand(testPortBandMin, testPortBandMax); err != nil {
+		panic(err) // fixture constants are structurally valid — never fires
+	}
 	os.Exit(m.Run())
 }
 
-// testPortBand is the suite's DISJOINT temp-instance scan band — the twin of
-// the production 18500-18799 (same 300-port width), below the kernel
+// TestSetPortBandRejectsInvalidAndPreserves: invalid bands fail loud and
+// leave the pinned band untouched — a silent fall-back to the previous (or
+// default) band would resurrect exactly the cross-process contention the
+// seam exists to remove.
+func TestSetPortBandRejectsInvalidAndPreserves(t *testing.T) {
+	require.NoError(t, SetPortBand(testPortBandMin, testPortBandMax))
+	t.Cleanup(func() { _ = SetPortBand(testPortBandMin, testPortBandMax) })
+	beforeMin, beforeMax := instancePortMin, instancePortMax
+	for _, tc := range []struct {
+		name       string
+		minP, maxP int
+	}{
+		{"min below 1", 0, 100},
+		{"min above max", 18999, 18500},
+		{"max beyond the port space", 100, 65536},
+	} {
+		err := SetPortBand(tc.minP, tc.maxP)
+		require.Error(t, err, tc.name)
+		assert.Equal(t, beforeMin, instancePortMin, "a rejected band must not clobber the pinned band (%s)", tc.name)
+		assert.Equal(t, beforeMax, instancePortMax, "a rejected band must not clobber the pinned band (%s)", tc.name)
+	}
+	require.NoError(t, SetPortBand(28000, 28000))
+	assert.Equal(t, 28000, instancePortMin)
+	assert.Equal(t, 28000, instancePortMax)
+}
+
+// TestFreeInstancePortExhaustedNamesBand: a band whose every port refuses
+// to bind fails with the ErrPortBandExhausted sentinel carrying the band —
+// the loud, named failure the halving ladder and the operator diagnose on
+// (the live failure mode printed 704 bare "no free port" lines in one
+// window with no remedy named).
+func TestFreeInstancePortExhaustedNamesBand(t *testing.T) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, SetPortBand(port, port))
+	t.Cleanup(func() { _ = SetPortBand(testPortBandMin, testPortBandMax) })
+
+	_, err = freeInstancePort(context.Background(), nil)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrPortBandExhausted)
+	assert.Contains(t, err.Error(), fmt.Sprintf("[%d,%d]", port, port),
+		"the exhaustion error names the band it scanned")
+}
+
+// testPortBand is the suite's DISJOINT temp-instance scan band — disjoint
+// from the production 18500-18999 (300 ports cover every suite boot), below the kernel
 // ephemeral range (32768-60999 on this box, so the kernel never auto-assigns
 // these ports to unrelated sockets) and verified clear of every listener.
 // The production watch daemon boots its own temp instances into 18xxx on

@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"assay/internal/checker"
 	"assay/internal/model"
 
 	"github.com/stretchr/testify/assert"
@@ -370,4 +371,74 @@ func TestBigBatchRunsAsSingleBatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAdaptiveHalvingNamesPortBandExhaustion: a batch factory failing with
+// checker.ErrPortBandExhausted gets a DEDICATED loud progress line naming
+// the band and the [probe].instance_port_band remedy BEFORE the halving
+// ladder spins (the live failure mode printed bare "no free port" lines
+// with no diagnosis and no remedy), and the ladder STILL retries — the seam
+// is the fix, not a new silent failure (a smaller batch needs fewer ports,
+// which is how the 1000-vs-band-capacity structural class recovers).
+func TestAdaptiveHalvingNamesPortBandExhaustion(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	rec := &batchBootRecorder{
+		alwaysFail: true,
+		bootErr:    fmt.Errorf("checker: %w", checker.ErrPortBandExhausted),
+		socksAddr:  socks.Addr(),
+	}
+	nodes := halvingNodes(t, "band", 40)
+
+	opts := baseOpts(site.URL, exitIPEcho(t, "9.9.9.9"))
+	opts.Threads = 1
+	opts.BatchSize = 40
+	opts.ExitProbe = falsePtr()
+	opts.Attempts = 1
+	var log strings.Builder
+	opts.Progress = &log
+
+	results, err := RunWithBatchFactory(context.Background(), nodes, nil, rec.factory(), opts, "")
+	require.NoError(t, err, "band exhaustion is a loud per-node outcome, never a wave error")
+
+	assert.Greater(t, len(rec.bootSizes()), 1,
+		"halving still retries on band exhaustion — smaller batches need fewer ports")
+	assert.Contains(t, log.String(), "instance port band exhausted",
+		"the exhaustion cause is named loudly in the wave log")
+	assert.Contains(t, log.String(), "[probe].instance_port_band",
+		"the remedy (the config seam) is named in the same loud line")
+	require.Len(t, results, 40)
+	for _, r := range results {
+		assert.False(t, r.Alive, "nothing can be alive when every boot exhausts the band")
+		assert.Equal(t, "instance-boot", r.FailureKind, "exhaustion keeps the instance-boot class")
+	}
+}
+
+// TestGenericBatchFailureDoesNotNameBandExhaustion: a plain boot failure
+// keeps the generic halving line — the band-exhaustion diagnosis must not
+// fire on failures it cannot explain (false loudness dilutes the real one).
+func TestGenericBatchFailureDoesNotNameBandExhaustion(t *testing.T) {
+	site := healthySite(t)
+	socks := newSocksServer(t, site.Listener.Addr().String())
+	rec := &batchBootRecorder{
+		alwaysFail: true,
+		bootErr:    errors.New("boom: temp xray instance failed to start"),
+		socksAddr:  socks.Addr(),
+	}
+	nodes := halvingNodes(t, "generic", 40)
+
+	opts := baseOpts(site.URL, exitIPEcho(t, "9.9.9.9"))
+	opts.Threads = 1
+	opts.BatchSize = 40
+	opts.ExitProbe = falsePtr()
+	opts.Attempts = 1
+	var log strings.Builder
+	opts.Progress = &log
+
+	_, err := RunWithBatchFactory(context.Background(), nodes, nil, rec.factory(), opts, "")
+	require.NoError(t, err)
+
+	assert.Contains(t, log.String(), "adaptive halving")
+	assert.NotContains(t, log.String(), "instance_port_band",
+		"a generic boot failure must not carry the band-exhaustion diagnosis")
 }

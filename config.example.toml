@@ -147,6 +147,17 @@ tcp_prefilter_workers = 256          # concurrent pre-filter dials (a plain SYN 
                                      # invalid.
 tcp_prefilter_timeout = "1s"         # bounds ONE pre-filter dial, DNS resolution included.
                                      # 0 = default 1s. Negative = invalid.
+instance_port_band = "18500-18999"   # the 127.0.0.1 scan band temp probe instances draw
+                                     # their socks inbound ports from ("min-max",
+                                     # inclusive). The LIVE daemon's waves AND a
+                                     # locally-run `assay check` on the same machine
+                                     # share this band by default — two processes
+                                     # booting temp instances into one band contend
+                                     # for ports (the "no free port in [18500,18999]"
+                                     # failures). If you run CLI batches while the
+                                     # daemon is waving, repoint ONE of them here
+                                     # (e.g. "28000-28499") so their boot windows
+                                     # never overlap.
 
 [geo]
 # W11 self-report design: every alive node asks geo endpoints THROUGH ITS

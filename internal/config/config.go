@@ -194,6 +194,17 @@ type ProbeConfig struct {
 	// included. 0 = unset → DefaultProbePrefilterTimeout. Negative values
 	// are structurally invalid; no upper bound (owner ruling).
 	TCPPrefilterTimeout Duration `toml:"tcp_prefilter_timeout"`
+	// InstancePortBand is the 127.0.0.1 scan band temp probe instances draw
+	// their socks inbound ports from, "min-max" inclusive (default
+	// "18500-18999" — the production band is unchanged). The LIVE daemon's
+	// waves AND a locally-run CLI batch share that band by default, and two
+	// processes booting temp instances into one band contend for ports
+	// (the cross-process contention class behind the "no free port in
+	// [18500,18999]" journal failures): repoint ONE of them here so their
+	// boot windows never overlap. Structural validation only — the band
+	// must parse as min-max with 1 <= min <= max <= 65535; values carry no
+	// range recommendation (the owner's no-floor/ceiling ruling).
+	InstancePortBand string `toml:"instance_port_band"`
 }
 
 // TCPPrefilterEnabled resolves the tri-state knob: nil (absent) = true — the
@@ -210,6 +221,30 @@ func (p ProbeConfig) TCPPrefilterEnabled() bool {
 // scheduler passes -S explicitly for it (probeOptions ORs the wave flag).
 func (p ProbeConfig) IsSpeedtest() bool {
 	return p.Speedtest != nil && *p.Speedtest
+}
+
+// ParsePortBand parses an inclusive "min-max" port band. Structural checks
+// only: the grammar is min-max with two integers and 1 <= min <= max <=
+// 65535; values carry no recommendation (the owner's no-floor/ceiling
+// ruling). The error names the knob for the loud config-load failure.
+func ParsePortBand(band string) (int, int, error) {
+	const name = "probe.instance_port_band"
+	minRaw, maxRaw, ok := strings.Cut(band, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("%s: %q is not a min-max band", name, band)
+	}
+	minPort, err := strconv.Atoi(minRaw)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%s: min port %q is not an integer", name, minRaw)
+	}
+	maxPort, err := strconv.Atoi(maxRaw)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%s: max port %q is not an integer", name, maxRaw)
+	}
+	if minPort < 1 || maxPort > 65535 || minPort > maxPort {
+		return 0, 0, fmt.Errorf("%s: [%d,%d] is not a valid band — need 1 <= min <= max <= 65535", name, minPort, maxPort)
+	}
+	return minPort, maxPort, nil
 }
 
 // GeoConfig controls the exit-classification knobs (W11 self-report design;
@@ -555,6 +590,13 @@ const (
 	// DefaultProbePrefilterTimeout bounds ONE pre-filter TCP dial, DNS
 	// resolution included (0 in config → this default).
 	DefaultProbePrefilterTimeout = time.Second
+	// DefaultProbeInstancePortBand is the temp-instance scan band the probe
+	// stage draws its socks inbound ports from ([probe].instance_port_band
+	// default, verbatim — the production 18xxx scan is unchanged). The knob
+	// exists so a second process on the same machine (a locally-run CLI
+	// batch against the live daemon's waves) can take a disjoint band; see
+	// ProbeConfig.InstancePortBand.
+	DefaultProbeInstancePortBand = "18500-18999"
 	// DefaultGeoSelfReportConcurrency is the default number of concurrent
 	// temp instances during geo self-report (0 in config → this default).
 	DefaultGeoSelfReportConcurrency = 8
@@ -1356,6 +1398,7 @@ func applyProbeDefaults(p *ProbeConfig) {
 	if p.Granularity == "" {
 		p.Granularity = "country"
 	}
+	applyProbeBandDefault(p)
 	if p.TCPPrefilterWorkers == 0 {
 		p.TCPPrefilterWorkers = DefaultProbePrefilterWorkers
 	}
@@ -1370,6 +1413,17 @@ func applyProbeDefaults(p *ProbeConfig) {
 	if p.TCPPrefilter == nil {
 		v := true
 		p.TCPPrefilter = &v
+	}
+}
+
+// applyProbeBandDefault materializes the [probe].instance_port_band default
+// (extracted to keep applyProbeDefaults under the cyclop limit): absent →
+// the production band verbatim (the scan behavior is byte-identical to
+// pre-knob configs; the knob only ever MOVES the band, never changes what
+// the default does).
+func applyProbeBandDefault(p *ProbeConfig) {
+	if p.InstancePortBand == "" {
+		p.InstancePortBand = DefaultProbeInstancePortBand
 	}
 }
 
@@ -1604,7 +1658,25 @@ func validateProbe(p ProbeConfig) error {
 	if err := validateNonNegative("probe.tcp_prefilter_workers", p.TCPPrefilterWorkers); err != nil {
 		return err
 	}
-	return validateNonNegative("probe.tcp_prefilter_timeout", p.TCPPrefilterTimeout.Duration)
+	if err := validateNonNegative("probe.tcp_prefilter_timeout", p.TCPPrefilterTimeout.Duration); err != nil {
+		return err
+	}
+	return validateProbePortBand(p)
+}
+
+// validateProbePortBand checks the [probe].instance_port_band grammar
+// (extracted to keep validateProbe under the cyclop limit). Only a
+// non-empty band is validated: applyProbeDefaults materializes the default
+// on every Load path, so an empty value here can only come from a
+// hand-built config — and an unset knob is not a load failure.
+func validateProbePortBand(p ProbeConfig) error {
+	if p.InstancePortBand == "" {
+		return nil
+	}
+	if _, _, err := ParsePortBand(p.InstancePortBand); err != nil {
+		return err
+	}
+	return nil
 }
 
 // validatePlugins carries the structural checks for the [plugins] section:

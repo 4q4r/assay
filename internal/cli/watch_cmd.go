@@ -225,6 +225,13 @@ type waveScheduler struct {
 	selfWatcher       *binarySelfWatcher
 	selfUpdateEnabled bool
 
+	// unitFileCheck is the incident-#3 detector's periodic leg (nil-safe):
+	// one stat of the daemon's own unit file at every DUE-WAVE instant —
+	// bounded by the wave cadence (hourly in production), never a ticker.
+	// A vanished unit file leaves Restart=always powerless; the daemon
+	// cannot reinstall itself, but the loud line flags the state.
+	unitFileCheck func()
+
 	lastWaveCompletedAt time.Time
 	onRestart           func(string)
 }
@@ -300,6 +307,9 @@ func (s *waveScheduler) run(stop <-chan struct{}, between func() bool) []waveKin
 		case <-timerC:
 			if s.beat != nil {
 				s.beat() // the loop woke for a due wave
+			}
+			if s.unitFileCheck != nil {
+				s.unitFileCheck() // the incident-#3 detector's periodic leg
 			}
 		case <-s.heartbeatTick:
 			// Idle tick: the loop reached its select — the strongest idle
@@ -565,6 +575,13 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		mgr.Release()
 	})
 	between := shutdown.Load
+	// The incident-#3 detector (deferred minor): the startup leg runs HERE —
+	// before any wave — and the periodic leg rides the scheduler's due-wave
+	// instants. One loud line per detection (unit file vanished → Restart=
+	// always powerless → silent death); the daemon never touches the unit
+	// itself (allowlist discipline — no self-install).
+	unitGuard := &unitFileGuard{out: out, path: resolveDaemonUnitPath(), stat: os.Stat}
+	unitGuard.check()
 	sched := &waveScheduler{
 		cfg:             cfg,
 		refreshInterval: cfg.Maintain.RefreshInterval.Duration,
@@ -575,6 +592,7 @@ func runWatch(out io.Writer, cfg *config.Config, deps watchDeps) error {
 		out:               out,
 		exePath:           exe,
 		selfUpdateEnabled: cfg.SelfUpdate.Enabled,
+		unitFileCheck:     unitGuard.check,
 	}
 	// Self-update watcher (binary change detection) — started alongside the
 	// plugin watchdog when enabled (loud non-fatal on failure); the closer
