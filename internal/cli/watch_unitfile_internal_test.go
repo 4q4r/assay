@@ -32,7 +32,12 @@ func TestUnitFileGuardLogsOneLoudLineWhenMissing(t *testing.T) {
 	g.check()
 	out := log.String()
 	assert.Contains(t, out, "missing on disk")
-	assert.Contains(t, out, "systemd will not restart this daemon")
+	// The mechanism is named per OS (per-OS excellence): systemd on linux,
+	// launchd on darwin, the service manager elsewhere — the semantic pin
+	// is "the loud line names the restart mechanism the missing file
+	// disarms", whichever mechanism THIS OS has.
+	assert.Contains(t, out,
+		unitFileSupervisorName()+" will not restart this daemon")
 	assert.Contains(t, out, "re-run assay install")
 	assert.Contains(t, out, g.path, "the loud line names the missing path")
 	assert.Equal(t, 1, strings.Count(out, "\n"), "ONE loud line — a flagged state, not a warning block")
@@ -73,7 +78,22 @@ func TestUnitFileGuardStatErrorIsLoudNotSilent(t *testing.T) {
 	g.check()
 	out := log.String()
 	assert.Contains(t, out, "permission denied", "a stat error that is not NotExist must still fail loud — silent would hide the flagged state")
-	assert.Contains(t, out, "systemd will not restart this daemon")
+	assert.Contains(t, out,
+		unitFileSupervisorName()+" will not restart this daemon")
+}
+
+// TestUnitFileSupervisorNamePerOS pins the mechanism-name mapping per OS —
+// the loud line's honesty contract is naming THIS platform's restart
+// mechanism (a darwin line saying "systemd" would be a lie, not polish).
+func TestUnitFileSupervisorNamePerOS(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux":
+		assert.Equal(t, "systemd", unitFileSupervisorName())
+	case "darwin":
+		assert.Equal(t, "launchd", unitFileSupervisorName())
+	default:
+		assert.Equal(t, "the service manager", unitFileSupervisorName())
+	}
 }
 
 func TestResolveDaemonUnitPathPerOS(t *testing.T) {
