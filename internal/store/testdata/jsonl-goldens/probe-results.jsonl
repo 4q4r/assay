@@ -1,0 +1,2 @@
+{"key":"k1","host":"de1.example.com","alive":true,"status":"passed","exit_ip":"203.0.113.7","rtt_ms":12.5,"speed_bps":1000000,"checks":2,"total_checks":2,"checked_at":"2026-06-01T12:00:00Z"}
+{"key":"k2","host":"jp1.example.jp","alive":false,"status":"failed","reason":"http \u003c403\u003e \u0026 blocked","rtt_ms":0,"speed_bps":0,"checks":0,"total_checks":0,"failure_kind":"http-status","checked_at":"2026-06-01T12:00:00Z"}

@@ -1,0 +1,2 @@
+{"key":"k1","host":"de1.example.com","link":"vless://u%26s%40er@de1.example.com:443","last_seen":"2026-06-01T12:00:00Z","last_status":"passed","alive_streak":3,"alive_wave_seq":9}
+{"key":"k2","host":"jp1.example.jp","link":"","last_seen":"2026-06-01T11:00:00Z","last_status":"semi-passed","alive_streak":1,"alive_wave_seq":8}
