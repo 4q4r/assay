@@ -13,7 +13,6 @@ import (
 	"sort"
 	"time"
 
-	"assay/internal/config"
 	"assay/internal/store"
 )
 
@@ -201,45 +200,34 @@ func (m *Manager) readHealthStateLocked() *HealthState {
 	return state
 }
 
-// userLocalPreviousBin is the binary-level rollback artifact: the copy of
-// ~/.local/bin/xray as it was BEFORE the latest update's atomic swap. Kept
-// through the swap (graceful-migration contract), restored by the D8
-// strike trigger — the binary-level mirror of the config-level rollback.
-func userLocalPreviousBin() string {
-	user := config.UserLocalXrayBin()
-	if user == "" {
-		return ""
-	}
-	return user + ".previous"
-}
-
 // restorePreviousBinaryLocked performs the binary-level rollback when one
-// is possible: the bound binary is assay's own user-local install AND the
-// .previous copy exists. The restore is the atomic same-directory rename —
-// the swap's own mechanism, run in reverse. Reports whether a restore
-// happened (the caller's log line names it).
+// is possible: the bound binary is an ASSAY-OWNED install (the interactive
+// user-local spot or the managed <data>/bin spot the windows service
+// context binds) AND the .previous copy exists next to it — the artifact
+// the context-aware installCoreBinary swap lays down. The restore is the
+// atomic same-directory rename — the swap's own mechanism, run in reverse.
+// Reports whether a restore happened (the caller's log line names it).
 func (m *Manager) restorePreviousBinaryLocked() bool {
-	prev := userLocalPreviousBin()
-	if prev == "" || m.source != SourceUserLocal {
+	if m.source != SourceUserLocal && m.source != SourceManaged {
 		return false
 	}
+	prev := m.bin + ".previous"
 	if _, err := os.Stat(prev); err != nil {
 		return false
 	}
-	user := config.UserLocalXrayBin()
-	if err := os.Rename(prev, user); err != nil {
+	if err := os.Rename(prev, m.bin); err != nil {
 		_, _ = fmt.Fprintf(m.log, "WARNING: core: binary rollback failed — the previous binary stays at %s: %v\n",
 			prev, err)
 		return false
 	}
-	_, _ = fmt.Fprintf(m.log, "core: binary-level rollback — restored the previous core binary over %s\n", user)
+	_, _ = fmt.Fprintf(m.log, "core: binary-level rollback — restored the previous core binary over %s\n", m.bin)
 	// The resolution CHANGED (a different binary now sits at the bound path)
 	// — re-probe its version and rewrite the provenance record (the
 	// "provenance on every resolution change" contract); the record must
 	// never keep describing the failed update.
-	version := probeBoundVersion(context.Background(), user, m.log)
-	warnBelowFloor(binarySourceKind(m.source), user, version, m.log)
-	writeCoreProvenance(m.dataDir, m.source, user, version, m.log)
+	version := probeBoundVersion(context.Background(), m.bin, m.log)
+	warnBelowFloor(binarySourceKind(m.source), m.bin, version, m.log)
+	writeCoreProvenance(m.dataDir, m.source, m.bin, version, m.log)
 	return true
 }
 

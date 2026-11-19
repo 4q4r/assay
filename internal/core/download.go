@@ -13,22 +13,38 @@ package core
 // (<data>/share/xray), the update interval state, and the restart after a
 // swap.
 //
-// Resolution order (owner ruling, binding):
+// Resolution order (owner ruling, binding; context-aware since the
+// 2026-11-19 service-core fix):
 //   1. an explicit [core].xray_bin override → honored as-is (download and
 //      auto-update inert, one-time INFO per S5);
-//   2. an existing user-local ~/.local/bin/xray → bound (assay's OWN
-//      binary — auto-update keeps it current);
-//   3. an existing system xray (/usr/local/bin/xray, /usr/bin/xray — first
+//   2. WINDOWS SERVICE context (svc.IsWindowsService() — the SCM runs us
+//      as LocalSystem): an existing MANAGED core at <data>/bin/xray →
+//      bound (assay's OWN binary — auto-update keeps it current), else an
+//      existing system xray. The user-local spot is NEVER consulted there:
+//      os.UserHomeDir under LocalSystem resolves to the SYSTEM profile
+//      (C:\Windows\system32\config\systemprofile), whose .local\bin is the
+//      poison spot a prior release bound and fork/exec then failed on at
+//      every bootstrap + crash-supervision retry (the live SCM E2E
+//      diagnostics, docs/landmines-crossplatform.md §1). The manager's
+//      service gate refuses LOUD on a missing core, naming `assay install`;
+//      `assay install`'s windows placement leg guarantees the managed spot
+//      exists (EnsureCoreBinary materializes the bound/downloaded core
+//      there — the installing user's context fills the SAME -c data dir
+//      the service reads).
+//   3. INTERACTIVE (linux/darwin/interactive windows): an existing
+//      user-local ~/.local/bin/xray → bound (assay's OWN binary —
+//      auto-update keeps it current);
+//   4. an existing system xray (/usr/local/bin/xray, /usr/bin/xray — first
 //      match) → bound as found (auto-update inert; a below-floor core
 //      warns LOUD and non-blocking — the owner's 26.3.27 bound core is the
 //      expected case, and the W19 adaptive observatory interval already
 //      caps the probe rate);
-//   4. none of the above → download the sha-verified release and install
-//      it ATOMICALLY to ~/.local/bin/xray (user-writable — no elevation,
-//      no sudo anywhere), keeping the previous binary as
-//      ~/.local/bin/xray.previous for instant binary-level rollback, with
-//      a one-time loud PATH note (~/.local/bin precedes /usr/bin on PATH,
-//      so assay's copy shadows any later apt-installed xray).
+//   5. none of the above → download the sha-verified release and install
+//      it ATOMICALLY to the context target (~/.local/bin/xray interactive
+//      with a one-time loud PATH note — user-writable, no elevation, no
+//      sudo anywhere; <data>/bin/xray in the service context), keeping the
+//      previous binary as <target>.previous for instant binary-level
+//      rollback.
 //
 // Contracts:
 //   - S5: auto-update is ASSAY-OWNED-BINARY-ONLY — an override or a bound
@@ -113,7 +129,20 @@ const (
 	// /usr/bin/xray) bound as found: auto-update inert, floor warning
 	// non-blocking.
 	SourceSystemPreexisting BinarySource = "system-preexisting"
+	// SourceManaged — the managed core at <data>/bin/xray[.exe] (the D4
+	// layout): the windows service context's binding (the user-local spot is
+	// never consulted there) and the interactive no-home degenerate bind.
+	// Assay-owned and updatable like SourceUserLocal.
+	SourceManaged BinarySource = "managed"
 )
+
+// managedCorePlacementEnabled gates the windows service-copy leg of
+// EnsureCoreBinary (the leg-completion guarantee: the installing user's
+// context fills <data>/bin/xray so the LocalSystem service finds a real
+// core). Windows-only by construction — linux/darwin installs keep today's
+// shape exactly. Injectable seam: tests pin both postures; production never
+// reassigns it.
+var managedCorePlacementEnabled = func() bool { return runtime.GOOS == "windows" }
 
 // VersionFloor is the observatory-safe core floor (the status block renders
 // it next to the bound version).
@@ -141,7 +170,11 @@ type coreUpdateState struct {
 // user-local or system binary is bound (no download — the user-local one
 // with its floor probed, the system one with the non-blocking floor
 // warning); with neither, the latest sha-verified release installs
-// atomically to ~/.local/bin/xray (no elevation anywhere). A
+// atomically to the context-aware target (interactive: ~/.local/bin/xray;
+// windows service: the managed <data>/bin spot — no elevation anywhere).
+// On WINDOWS the bound/downloaded core is ALSO materialized at the managed
+// spot <data>/bin/xray (placeManagedCoreForService) — the leg-completion
+// guarantee the LocalSystem service resolution consumes. A
 // download/verification failure is a loud error: the daemon's waves retry
 // through auto-update, so install stays a warning in the caller's hands.
 func EnsureCoreBinary(ctx context.Context, cfg config.CoreConfig, dataDir string, log io.Writer) error {
@@ -157,6 +190,13 @@ func EnsureCoreBinary(ctx context.Context, cfg config.CoreConfig, dataDir string
 		_, _ = fmt.Fprintf(log, "core: user-local xray core present (%s) — nothing to download "+
 			"(assay owns it; auto-update keeps it current per [core].update_interval)\n", user)
 		writeCoreProvenance(dataDir, SourceUserLocal, user, version, log)
+		// The leg-completion guarantee: the windows service context binds the
+		// managed spot, never the user-local one — a windows install also
+		// materializes the copy there (a failure is loud; the service gate
+		// names `assay install` if the copy is missing at boot).
+		if perr := placeManagedCoreForService(user, dataDir, log); perr != nil {
+			return perr
+		}
 		return nil
 	}
 	for _, sys := range config.DefaultSystemXrayPaths {
@@ -168,24 +208,87 @@ func EnsureCoreBinary(ctx context.Context, cfg config.CoreConfig, dataDir string
 		_, _ = fmt.Fprintf(log, "core: binding existing system xray %s — assay does not manage it: "+
 			"the core download and auto-update stay inert (S5)\n", sys)
 		writeCoreProvenance(dataDir, SourceSystemPreexisting, sys, version, log)
+		// No placement leg here BY CONSTRUCTION: the windows system-path scan
+		// list is empty (§2.2.11 — upstream xray ships zips with no standard
+		// install location), so this branch is unreachable on the only host
+		// the placement leg applies to.
 		return nil
 	}
 
 	// No binary anywhere: download the sha-verified release and install it
-	// to the user-local target (the resolution's canonical fill).
+	// to the context-aware target (interactive: the user-local canonical
+	// fill; service: the managed spot).
 	staged, tag, err := downloadStagedCore(ctx, dataDir, log)
 	if err != nil {
 		return err
 	}
-	installed, err := installUserLocalCore(staged, log)
+	installed, err := installCoreBinary(staged, dataDir, log)
 	if err != nil {
 		return err
 	}
 	materializeAssets(dataDir, log)
 	_, _ = fmt.Fprintf(log, "core: xray core %s installed at %s (sha256 verified, "+
 		"-test gate passed; assets in %s)\n", tag, installed, managedAssetDir(dataDir))
-	writeCoreProvenance(dataDir, SourceUserLocal, installed, strings.TrimPrefix(tag, "v"), log)
+	src := SourceUserLocal
+	if config.ServiceContextDetected() {
+		src = SourceManaged
+	}
+	writeCoreProvenance(dataDir, src, installed, strings.TrimPrefix(tag, "v"), log)
+	// The same windows leg-completion guarantee for the fresh-install path
+	// (a service-context download already landed on the managed spot and the
+	// placement no-ops there).
+	if perr := placeManagedCoreForService(installed, dataDir, log); perr != nil {
+		return perr
+	}
 	return nil
+}
+
+// placeManagedCoreForService is the windows leg-completion guarantee: the
+// service (LocalSystem, reading the SAME explicit -c data dir) binds the
+// MANAGED core at <data>/bin/xray — the user-local spot is never consulted
+// there — so a windows install ALSO materializes the bound core as a
+// byte-identical executable copy at that spot. Gated by
+// managedCorePlacementEnabled (windows-only by construction — linux/darwin
+// installs keep today's shape exactly). bound == the managed spot is the
+// clean no-op. A copy that cannot land (a transient AV lock on a running
+// exe, per the cross-platform landmines §6) retries briefly, then fails
+// LOUD — the install caller prints it non-fatally and the service gate
+// names `assay install` at the next boot.
+func placeManagedCoreForService(bound, dataDir string, log io.Writer) error {
+	if !managedCorePlacementEnabled() {
+		return nil
+	}
+	managed := config.ManagedCoreBin(dataDir)
+	if bound == managed {
+		return nil
+	}
+	binDir := filepath.Dir(managed)
+	if err := os.MkdirAll(binDir, 0o750); err != nil {
+		return fmt.Errorf("core: create managed core dir %s: %w", binDir, err)
+	}
+	stamp := time.Now().UTC().Format("20060102-150405")
+	temp := filepath.Join(binDir, ".xray-managed-"+stamp)
+	var lastErr error
+	for attempt := range 3 {
+		if attempt > 0 {
+			time.Sleep(750 * time.Millisecond) // the bounded AV-lock retry (landmines §6)
+		}
+		if err := copyFile(bound, temp, 0o755); err != nil {
+			_ = os.Remove(temp)
+			lastErr = fmt.Errorf("core: managed copy stage %s: %w", temp, err)
+			continue
+		}
+		if err := os.Rename(temp, managed); err != nil {
+			_ = os.Remove(temp)
+			lastErr = fmt.Errorf("core: managed copy place %s: %w", managed, err)
+			continue
+		}
+		_, _ = fmt.Fprintf(log, "core: managed core copy placed at %s (byte-identical to %s) — "+
+			"the windows service context binds this spot; the user-local path is never consulted there\n",
+			managed, bound)
+		return nil
+	}
+	return lastErr
 }
 
 // isRegularExecutable is the download package-local twin of
@@ -291,17 +394,23 @@ func managedAssetDir(dataDir string) string {
 	return filepath.Join(dataDir, managedAssetDirRel)
 }
 
-// installUserLocalCore atomically installs the staged binary at the
-// user-local target (~/.local/bin/xray — user-writable, NO elevation
-// anywhere; the owner ruling «запись в локал не требует судо»): a
+// installCoreBinary atomically installs the staged binary at the
+// CONTEXT-AWARE core target: the user-local spot (~/.local/bin/xray —
+// user-writable, NO elevation anywhere; the owner ruling «запись в локал не
+// требует судо») in interactive contexts, the MANAGED spot
+// (<data>/bin/xray) in the windows service context (the SYSTEM-profile
+// user-local path is poison and is never written there). The install is a
 // same-directory temp + rename (xrayupdate's applyStaged shape — a crash
 // never leaves a half-written binary), and the CURRENT binary is preserved
 // as <target>.previous FIRST — the instant binary-level rollback artifact
 // the D8 strike trigger restores (graceful-migration contract; the swap
 // itself is zero-downtime at the file level, and the cutover budget is the
 // stop/start restart).
-func installUserLocalCore(staged string, log io.Writer) (string, error) {
+func installCoreBinary(staged, dataDir string, log io.Writer) (string, error) {
 	target := config.UserLocalXrayBin()
+	if config.ServiceContextDetected() {
+		target = config.ManagedCoreBin(dataDir)
+	}
 	if target == "" {
 		return "", errors.New("user-local core install: no home directory could be resolved " +
 			"(~/.local/bin is unavailable) — set HOME or point [core].xray_bin at a binary")
@@ -431,14 +540,14 @@ func (m *Manager) AutoUpdate(ctx context.Context, cfg config.CoreConfig) error {
 }
 
 // updatable reports whether auto-update may act on the CURRENT binding:
-// only the assay-owned user-local binary (and the pending-install state
-// that will become one). An override and a pre-existing system core are
-// inert (S5).
+// the assay-owned binaries (the user-local install and the managed
+// <data>/bin spot) and the pending-install state that will become one. An
+// override and a pre-existing system core are inert (S5).
 func (m *Manager) updatable() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	switch m.source {
-	case SourceUserLocal, "":
+	case SourceUserLocal, SourceManaged, "":
 		return true
 	case SourceOverride, SourceSystemPreexisting:
 		return false
@@ -477,7 +586,7 @@ func (m *Manager) logInertInfo() {
 		m.inertInfoLogged = true
 		_, _ = fmt.Fprintf(m.log, "INFO: core: bound pre-existing system xray %s — auto-update "+
 			"stays inert (assay does not manage a binary it did not install; S5)\n", m.bin)
-	case SourceUserLocal, "": // updatable bindings never log inert
+	case SourceUserLocal, SourceManaged, "": // updatable bindings never log inert
 	}
 }
 
@@ -485,10 +594,23 @@ func (m *Manager) logInertInfo() {
 // re-run (pure stat — no download, no network) and the binding flips when
 // the answer changed (a binary installed or removed between waves). Every
 // other entry point is read-only, so this is the one place the wave
-// reconciles the binding with the disk.
+// reconciles the binding with the disk. In the windows service context a
+// resolution that lands on a MISSING path keeps the current binding (the
+// running child holds its own inode) and warns loud naming the fix —
+// flipping the binding onto a missing path would silently re-create the
+// poison-class regression this module exists to prevent.
 func (m *Manager) reattach(_ context.Context) {
 	bin := config.ResolveCoreXrayBin(m.override, m.dataDir)
-	src := classifyBinarySource(m.override, bin)
+	if m.override == "" && config.ServiceContextDetected() {
+		if _, serr := os.Stat(bin); serr != nil {
+			_, _ = fmt.Fprintf(m.log, "WARNING: core: the service-context resolution found no core binary "+
+				"at %s — keeping the current binding %s (a running child holds its own inode); "+
+				"re-run `assay install` in the owning user's session to restore the managed core\n",
+				bin, m.bin)
+			return
+		}
+	}
+	src := classifyBinarySource(m.override, bin, m.dataDir)
 	// m.override is immutable after NewManager; the CURRENT binding reads
 	// under mu — the single-writer invariant (only this wave path and the
 	// constructor mutate bin/source) holds, and the lock keeps it honest
@@ -507,13 +629,17 @@ func (m *Manager) reattach(_ context.Context) {
 // classifyBinarySource maps a resolved binary path back onto its
 // provenance (the resolution order's inverse for bookkeeping). "" = the
 // pending-install state (no binary anywhere; the bound path is the
-// install target).
-func classifyBinarySource(override, bin string) BinarySource {
+// install target). The managed spot classifies SourceManaged — assay-owned
+// and updatable in every context that binds it.
+func classifyBinarySource(override, bin, dataDir string) BinarySource {
 	if override != "" {
 		return SourceOverride
 	}
 	if user := config.UserLocalXrayBin(); user != "" && bin == user {
 		return SourceUserLocal
+	}
+	if dataDir != "" && bin == config.ManagedCoreBin(dataDir) {
+		return SourceManaged
 	}
 	if slices.Contains(config.DefaultSystemXrayPaths, bin) {
 		return SourceSystemPreexisting
@@ -549,6 +675,9 @@ func (m *Manager) applyBindingLocked(src BinarySource, bin string) {
 	case SourceUserLocal:
 		_, _ = fmt.Fprintf(m.log, "core: bound user-local xray core %s (assay owns it — "+
 			"auto-update keeps it current)\n", bin)
+	case SourceManaged:
+		_, _ = fmt.Fprintf(m.log, "core: bound managed xray core %s (assay owns it — "+
+			"auto-update keeps it current; the service context binds this spot)\n", bin)
 	case SourceSystemPreexisting:
 		_, _ = fmt.Fprintf(m.log, "core: bound existing system xray %s (S5: assay does not "+
 			"update a binary it did not install)\n", bin)
@@ -563,10 +692,16 @@ func (m *Manager) applyBindingLocked(src BinarySource, bin string) {
 
 // binarySourceKind names the binding kind for the floor-warning lines.
 func binarySourceKind(src BinarySource) string {
-	if src == SourceUserLocal {
+	switch src {
+	case SourceUserLocal:
 		return "user-local"
+	case SourceManaged:
+		return "managed"
+	case SourceOverride, SourceSystemPreexisting:
+		return "system"
+	default:
+		return "system"
 	}
-	return "system"
 }
 
 // updateCheckSkipped reports whether the persisted check state makes the
@@ -676,7 +811,7 @@ func (m *Manager) updateToLatest(ctx context.Context, statePath string) error {
 	if err != nil {
 		return fmt.Errorf("staging failed: %w", err)
 	}
-	installed, err := installUserLocalCore(staged, m.log)
+	installed, err := installCoreBinary(staged, m.dataDir, m.log)
 	if err != nil {
 		return fmt.Errorf("install failed (the previous binary is untouched): %w", err)
 	}
@@ -723,7 +858,7 @@ func (m *Manager) updateToLatest(ctx context.Context, statePath string) error {
 	} else {
 		_, _ = fmt.Fprintf(m.log, "core: xray core updated v%s → %s at %s (sha256 verified, "+
 			"-test gate passed; the previous binary stays at %s for the D8 binary-level rollback)\n",
-			current, newTag, m.bin, userLocalPreviousBin())
+			current, newTag, m.bin, m.bin+".previous")
 	}
 	return nil
 }

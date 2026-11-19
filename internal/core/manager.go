@@ -241,6 +241,32 @@ func newManager(cfg config.CoreConfig, dataDir string, log io.Writer, containmen
 		return nil, err
 	}
 	bin := config.ResolveCoreXrayBin(cfg.XrayBin, dataDir)
+	// The service-context fail-closed gate (the live SCM diagnostics root
+	// cause, 2026-11-19): in the windows service context, with NO explicit
+	// override, a resolved-but-MISSING core refuses construction LOUD,
+	// naming the fix — the old shape silently bound the nonexistent
+	// SYSTEM-profile user-local path (the resolution's pending-install
+	// fall-through) and fork/exec failed on it at every bootstrap and every
+	// crash-supervision retry, opaque to the operator. A construction error
+	// is fatal for the daemon (wireDaemonCore: a manager failure stays
+	// fatal), which the SCM recovery actions answer with a restart — the
+	// boot succeeds the moment `assay install` re-runs and places the
+	// managed core. An explicit override keeps today's as-is binding (the
+	// spawn failure names a bad override path loud); the interactive
+	// pending-install shape is untouched (install fills the target later).
+	if cfg.XrayBin == "" && config.ServiceContextDetected() {
+		//nolint:gosec // G703: the resolved path comes from the owner-ruling
+		// resolution — the owner's config and the standard-path tables are
+		// the trust root (the same suppression the data-dir MkdirAll above
+		// carries); there is no fixed-path alternative.
+		if _, serr := os.Stat(bin); serr != nil {
+			return nil, fmt.Errorf("core: the windows service context found no xray core binary "+
+				"at the resolved spot %s (the user-local ~/.local/bin path is never consulted there — "+
+				"the SYSTEM profile's systemprofile tree is poison): the managed core is missing — "+
+				"re-run `assay install` in the owning user's session to place it, or set "+
+				"[core].xray_bin to an absolute binary path", bin)
+		}
+	}
 	socksPort := cfg.SocksPort
 	if socksPort <= 0 {
 		socksPort = config.DefaultCoreSocksPort
@@ -252,7 +278,7 @@ func newManager(cfg config.CoreConfig, dataDir string, log io.Writer, containmen
 	m := &Manager{
 		bin:         bin,
 		override:    cfg.XrayBin,
-		source:      classifyBinarySource(cfg.XrayBin, bin),
+		source:      classifyBinarySource(cfg.XrayBin, bin, dataDir),
 		dataDir:     dataDir,
 		livePath:    filepath.Join(dataDir, "rendered", "live.json"),
 		lockPath:    filepath.Join(dataDir, coreLockName),
