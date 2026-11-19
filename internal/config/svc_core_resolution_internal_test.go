@@ -72,13 +72,18 @@ func svcResolutionFixture(t *testing.T) (string, string, string) {
 
 // TestManagedCoreBinShape pins the managed spot: <data>/bin/<core binary
 // name> — the D4 layout the uninstall's removeManagedCore already owns and
-// the windows install placement leg fills.
+// the windows install placement leg fills. The first assert joins the §4.2
+// binname table on every GOOS; the literal-name pin is the table's non-windows
+// row ("xray" on linux/darwin — windows is "xray.exe", already covered by the
+// table join above).
 func TestManagedCoreBinShape(t *testing.T) {
 	dir := t.TempDir()
 	want := filepath.Join(dir, "bin", platform.CoreBinaryName(runtime.GOOS))
 	assert.Equal(t, want, ManagedCoreBin(dir), "the managed core spot is <data>/bin/<binary>")
-	assert.Equal(t, filepath.Join(dir, "bin", "xray"), ManagedCoreBin(dir),
-		"the linux binary name is xray (the §4.2 binname table)")
+	if runtime.GOOS != "windows" {
+		assert.Equal(t, filepath.Join(dir, "bin", "xray"), ManagedCoreBin(dir),
+			"the linux/darwin binary name is xray (the §4.2 binname table)")
+	}
 }
 
 // TestResolveCoreXrayBinServiceContextPrefersManaged pins the guard's
@@ -104,6 +109,20 @@ func TestResolveCoreXrayBinServiceContextPrefersManaged(t *testing.T) {
 // the service order: with the managed core ABSENT (install never ran or was
 // purged), an existing system xray binds — real system-wide installs are
 // fine — while the user-local spot stays skipped even though it exists.
+//
+// GOOS split, both halves pinned (the windows reality verified against two
+// facts): (1) the production windows system scan list is EMPTY
+// (platform.SystemXrayPaths("windows") — the §2.2.11 row: upstream ships
+// zips, no standard install location), so the system-bind branch never fires
+// in a real windows service; (2) Go's os.Stat on windows never reports POSIX
+// execute bits (os/types_windows.go fileStat.mode: a regular file is 0444
+// read-only or 0666, never any 0o111 bit — the 0111 bits exist only on
+// directories, which IsRegular filters out), so isRegularExecutable rejects
+// the fixture and the resolution lands on the managed fill target — exactly
+// the state the manager's service gate then refuses LOUD naming
+// `assay install`. The system-bind pin is therefore a POSIX (linux/darwin)
+// pin; the windows pin is the managed-fill convergence with the user-local
+// spot still skipped.
 func TestResolveCoreXrayBinServiceContextSystemFallthrough(t *testing.T) {
 	userLocal, system, dataDir := svcResolutionFixture(t)
 	writeExecFixture(t, userLocal) // exists — still skipped in the service context
@@ -111,8 +130,13 @@ func TestResolveCoreXrayBinServiceContextSystemFallthrough(t *testing.T) {
 	withServiceContextDetected(t, true)
 
 	got := ResolveCoreXrayBin("", dataDir)
-	assert.Equal(t, system, got, "no managed core → an existing system xray binds")
 	assert.NotEqual(t, userLocal, got, "the user-local spot stays poison in the service context")
+	if runtime.GOOS == "windows" {
+		assert.Equal(t, ManagedCoreBin(dataDir), got,
+			"windows, managed absent: the managed fill target (the service gate refuses loud on it)")
+		return
+	}
+	assert.Equal(t, system, got, "no managed core → an existing system xray binds")
 }
 
 // TestResolveCoreXrayBinServiceContextManagedTargetWhenNothingExists pins
