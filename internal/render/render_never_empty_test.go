@@ -308,6 +308,61 @@ func TestBalancerFallbackChain(t *testing.T) {
 	}
 }
 
+// TestUSCleanVariantChainsToParentCountry pins the production contract chain
+// for the exact shape the owner surfaced (2026-11-19: a clean variant with
+// NON-EMPTY strict members next to its parent country balancer): a US
+// country whose clean subset qualifies strictly renders pool_us AND
+// pool_us_clean in the same config, and pool_us_clean MUST chain
+// pool_us_clean → pool_us → pool_all → block. The whole-tree audit proves
+// no balancer outside the root carries block — a rendered pool_us_clean
+// with fallbackTag block cannot come from this renderer.
+func TestUSCleanVariantChainsToParentCountry(t *testing.T) {
+	// Two strictly-qualifying clean US nodes (flags clean, risk in band) and
+	// one flags-dirty live US node: pool_us_clean is non-empty STRICT and
+	// pool_us carries the wider live set in the same render.
+	n1, sn1, g1 := mkNE(t, "pool-us-01", "us", "Ashburn", "us1.example.com", true, 10,
+		model.MediaUnlockStatus{Netflix: model.UnlockNetflixFull})
+	n2, sn2, g2 := mkNE(t, "pool-us-02", "us", "Ashburn", "us2.example.com", true, 20,
+		model.MediaUnlockStatus{})
+	n3, sn3, _ := mkNE(t, "pool-us-03", "us", "Dallas", "us3.example.com", false, -1,
+		model.MediaUnlockStatus{})
+	nodes := []*model.Node{n1, n2, n3}
+	sel := &model.Selection{Nodes: []model.SelectedNode{sn1, sn2, sn3}}
+	m := doRenderGeo(t, nodes, sel, neverEmptyGeo(nodes, map[string]model.GeoRecord{
+		"us1.example.com": g1, "us2.example.com": g2,
+	}))
+
+	us := balancerByTag(t, m, "pool_us")
+	require.NotNil(t, us, "parent country balancer must render")
+	usClean := balancerByTag(t, m, "pool_us_clean")
+	require.NotNil(t, usClean, "strict non-empty clean variant must render")
+	assert.Equal(t, []any{"pool-us-01", "pool-us-02"}, usClean["selector"],
+		"pool_us_clean carries its strict clean subset")
+	assert.Equal(t, model.CountryBalancerTag("us"), usClean["fallbackTag"],
+		"pool_us_clean MUST chain to its parent pool_us (owner contract: "+
+			"pool_us_clean → pool_us → pool_all → block)")
+	assert.Equal(t, model.PoolAllBalancerTag, us["fallbackTag"],
+		"pool_us chains to the pool-wide live set")
+	assert.Equal(t, "block", balancerByTag(t, m, model.PoolAllBalancerTag)["fallbackTag"],
+		"pool_all is the chain root — block (D7)")
+
+	// Whole-tree audit: EVERY non-root balancer chains to a parent; block
+	// appears on pool_all ONLY. A clean variant with block fallback cannot
+	// be produced by this renderer — if the live config shows one, the
+	// artifact predates this renderer (stale live.json / old binary), not a
+	// render defect.
+	for _, b := range balancersOf(t, m) {
+		tag, _ := b["tag"].(string)
+		fb, _ := b["fallbackTag"].(string)
+		if tag == model.PoolAllBalancerTag {
+			assert.Equal(t, "block", fb)
+			continue
+		}
+		assert.NotEqual(t, "block", fb,
+			"balancer %s must chain to its parent, never straight to block", tag)
+	}
+}
+
 // TestBalancerMembersSubsetOfSelection pins the stale-corpses class: every
 // selector entry of every rendered pool_ balancer names an outbound of the
 // CURRENT selection — balancer membership is selection-derived, never
