@@ -103,6 +103,12 @@ func collectCandidates(
 // TLS-intercept exclusion (counted loud at the select stage); admitted=false
 // with hijackExcluded=false is any other drop (no geo record, stale, dead,
 // dirty, probe-dead) — those keep their existing silent semantics.
+//
+// Allocation audit M1/F4: the evaluation runs READ-ONLY against the shared
+// record and the GeoRecord clone happens ONLY on the admission path. The
+// clone is deliberate (documented below) — but its protection is only needed
+// by candidates carrying their own writable copy; the rejected majority
+// (most of the filtered set) never pays it.
 func admitCandidate(
 	n *model.Node,
 	geoByKey map[string]*model.GeoRecord,
@@ -112,22 +118,19 @@ func admitCandidate(
 	ka map[string]store.KnownAliveRecord,
 	now time.Time,
 ) (candidate, bool, bool) {
-	orig, ok := geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+	orig, ok := geoByKey[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)]
 	if !ok {
 		return candidate{}, false, false
 	}
-	// Clone GeoRecord so mutations (e.g. from knownAlive or node-specific probe status)
-	// do not leak across distinct candidates sharing the same pointer or identity.
-	gCopy := *orig
-	g := &gCopy
-
-	if !ensureAlive(g, n, ka) {
+	aliveOK, aliveEV := aliveEvidence(orig, n, ka)
+	if !aliveOK {
 		return candidate{}, false, false
 	}
-	if !ensureFresh(g, n, ka, maxAliveAge, now) {
+	freshOK, freshEV := freshEvidence(orig, n, ka, maxAliveAge, now)
+	if !freshOK {
 		return candidate{}, false, false
 	}
-	if cfg.OnlyClean != nil && *cfg.OnlyClean && !cleanIP(g) {
+	if cfg.OnlyClean != nil && *cfg.OnlyClean && !cleanIP(orig) {
 		return candidate{}, false, false
 	}
 	if !probeAllows(n, probeByKey, ka) {
@@ -145,12 +148,81 @@ func admitCandidate(
 	// itself stays in the cold base (classification history); render-side
 	// service pools keep their own structural hijack exclusion (blocked ≠
 	// yes, PR #17) — this gate removes the node before any pool sees it.
-	if g.MediaUnlocks.Hijack {
+	if orig.MediaUnlocks.Hijack {
 		return candidate{}, false, true
 	}
+	// Clone GeoRecord ONLY here, on the admission path: the candidate gets
+	// its own writable copy so the evidence stamps below (known-alive rescue
+	// liveness, rescued probe time) mutate the candidate's record, never the
+	// shared record other candidates — and the wave cache — read. Before the
+	// audit-M1 reorder this clone stood BEFORE the cheap gates, charging the
+	// rejected majority for protection only admitted candidates need.
+	gCopy := *orig
+	g := &gCopy
+	applyGeoEvidence(g, aliveEV, freshEV)
 	c := candidate{node: n, rec: g}
 	applyProbeOutcome(&c, n, probeByKey, ka)
 	return c, true, false
+}
+
+// geoEvidence carries the mutations the pre-check evaluation WOULD stamp onto
+// a candidate's own record: the known-alive rescue's liveness flip and probe
+// stamps. Evidence is computed read-only against the shared record during
+// admission and applied only to the admitted candidate's clone.
+type geoEvidence struct {
+	forceAlive     bool   // the ka rescue flips Alive on the candidate record
+	aliveLastProbe string // first-probe fill from the ka record (only when the record had none)
+	freshLastProbe string // freshness-rescue probe stamp (overwrites unconditionally, pre-fix order)
+}
+
+// aliveEvidence is the read-only form of the pre-fix ensureAlive: verdict
+// plus the evidence the ka rescue would stamp. The shared record is never
+// written.
+func aliveEvidence(g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord) (bool, geoEvidence) {
+	if g.Alive {
+		return true, geoEvidence{}
+	}
+	rec, ok2 := ka[n.Key]
+	if !ok2 {
+		return false, geoEvidence{}
+	}
+	ev := geoEvidence{forceAlive: true}
+	if g.LastProbe == "" {
+		ev.aliveLastProbe = rec.LastSeen.UTC().Format(time.RFC3339)
+	}
+	return true, ev
+}
+
+// freshEvidence is the read-only form of the pre-fix ensureFresh.
+func freshEvidence(
+	g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord,
+	maxAliveAge time.Duration, now time.Time,
+) (bool, geoEvidence) {
+	if maxAliveAge <= 0 || AliveDataFresh(g.LastProbe, maxAliveAge, now) {
+		return true, geoEvidence{}
+	}
+	rec, ok2 := ka[n.Key]
+	if !ok2 || rec.LastSeen.IsZero() || time.Since(rec.LastSeen) > maxAliveAge {
+		return false, geoEvidence{}
+	}
+	return true, geoEvidence{freshLastProbe: rec.LastSeen.UTC().Format(time.RFC3339)}
+}
+
+// applyGeoEvidence stamps the collected evidence onto the candidate's own
+// record in the pre-fix mutation order: Alive flip, conditional first-probe
+// fill, unconditional freshness overwrite.
+func applyGeoEvidence(g *model.GeoRecord, evs ...geoEvidence) {
+	for _, ev := range evs {
+		if ev.forceAlive {
+			g.Alive = true
+		}
+		if ev.aliveLastProbe != "" && g.LastProbe == "" {
+			g.LastProbe = ev.aliveLastProbe
+		}
+		if ev.freshLastProbe != "" {
+			g.LastProbe = ev.freshLastProbe
+		}
+	}
 }
 
 // probeAllows gates candidates by their OWN latest probe result. The
@@ -174,36 +246,6 @@ func probeAllows(n *model.Node, probeByKey map[string]store.ProbeResult, ka map[
 	}
 	_, ok2 := ka[n.Key]
 	return ok2
-}
-
-func ensureAlive(g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord) bool {
-	if g.Alive {
-		return true
-	}
-	rec, ok2 := ka[n.Key]
-	if !ok2 {
-		return false
-	}
-	g.Alive = true
-	if g.LastProbe == "" {
-		g.LastProbe = rec.LastSeen.UTC().Format(time.RFC3339)
-	}
-	return true
-}
-
-func ensureFresh(
-	g *model.GeoRecord, n *model.Node, ka map[string]store.KnownAliveRecord,
-	maxAliveAge time.Duration, now time.Time,
-) bool {
-	if maxAliveAge <= 0 || AliveDataFresh(g.LastProbe, maxAliveAge, now) {
-		return true
-	}
-	rec, ok2 := ka[n.Key]
-	if !ok2 || rec.LastSeen.IsZero() || time.Since(rec.LastSeen) > maxAliveAge {
-		return false
-	}
-	g.LastProbe = rec.LastSeen.UTC().Format(time.RFC3339)
-	return true
 }
 
 func cleanIP(g *model.GeoRecord) bool {

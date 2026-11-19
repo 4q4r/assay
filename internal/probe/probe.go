@@ -57,9 +57,16 @@ type Options struct {
 	KnownAliveMu     *sync.RWMutex                     // optional guard for KnownAlive (nil = unlocked)
 	Now              func() time.Time                  // clock seam (nil = time.Now().UTC())
 	Progress         io.Writer                         // progress output (nil = discard)
-	ExitProbe        *bool                             // D8 exit-IP echo (nil = ON)
-	ExitIPURL        string                            // exit-IP echo endpoint override
-	Limiter          *AdaptiveLimiter                  // optional dynamic concurrency limiter
+	// DebugProgress is the per-node skip-detail sink (allocation audit
+	// M4/F7, the S7 journal-flood lesson): per-class skip decisions print
+	// ONE summary line with counts to Progress, and each per-node line goes
+	// HERE instead — nil (the production wiring) discards them, so the
+	// daemon journal stays bounded at any node count while tests and manual
+	// debugging can still see the full skip list.
+	DebugProgress io.Writer        // per-node skip detail (nil = discard)
+	ExitProbe     *bool            // D8 exit-IP echo (nil = ON)
+	ExitIPURL     string           // exit-IP echo endpoint override
+	Limiter       *AdaptiveLimiter // optional dynamic concurrency limiter
 	// TCPPrefilter gates the wave-1 TCP pre-filter stage (prefilter.go):
 	// plain TCP-dial each unique endpoint before batching; closed endpoints
 	// never reach an xray boot. Tri-state like ExitProbe: nil (absent) = ON
@@ -123,10 +130,9 @@ type Factory = checker.InstanceFactory
 // Returns a BatchSocksInstance with N addresses matching the input node order.
 type BatchFactory = checker.BatchInstanceFactory
 
-// probeJob is one unique-link unit of work: every node carrying the link
-// takes the outcome.
+// probeJob is one unique-identity unit of work: every node carrying the
+// identity key takes the outcome.
 type probeJob struct {
-	link  string
 	keys  []string
 	host  string
 	node  *model.Node
@@ -178,20 +184,27 @@ func RunWithBatchFactory(
 			skipped[k] = true
 		}
 	}
-	byLink := make(map[string]*probeJob, len(nodes))
+	// Dedup on the STORED identity key (allocation audit M5/F8): the key
+	// hashes scheme|host|port|credential|params, so equal keys are equal
+	// wire semantics; equal links always imply equal keys (pinned by
+	// TestLinkImpliesIdentityKey). The old path rebuilt each node's full
+	// share-link URL per wave ONLY to key this map — dropped. Same-key
+	// twins that differ only in the remark fragment (fragment never
+	// reaches the wire config — pinned by TestFragmentNeverReachesTheWire-
+	// Config) now merge into one job; both keys still take the outcome.
+	byKey := make(map[string]*probeJob, len(nodes))
 	ordered := make([]*probeJob, 0, len(nodes))
 	for _, n := range nodes {
 		if skipped[n.Key] {
 			continue
 		}
-		link := n.Link()
-		job, dup := byLink[link]
+		job, dup := byKey[n.Key]
 		if dup {
-			job.keys = append(job.keys, n.Key) // identical links probe once; both nodes take the outcome
+			job.keys = append(job.keys, n.Key) // identical identities probe once; both nodes take the outcome
 			continue
 		}
-		job = &probeJob{link: link, keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
-		byLink[link] = job
+		job = &probeJob{keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
+		byKey[n.Key] = job
 		ordered = append(ordered, job)
 	}
 
@@ -745,7 +758,10 @@ func median(xs []float64) float64 {
 
 // freshSkipSet resolves the [probe].skip_fresh_within skip list: a node is
 // skipped when its latest outcome is exactly `passed` (strict — semi-passed
-// is re-probed) and its age is inside the window. Every skip is logged.
+// is re-probed) and its age is inside the window. Journal-bounded (audit
+// M4/F7): ONE summary line with the skip count goes to Progress; the
+// per-node detail lines go to DebugProgress (nil = discarded — the daemon
+// journal never carries thousands of per-node skips per wave).
 func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]bool {
 	if opts.SkipFreshWithin <= 0 || len(opts.Latest) == 0 {
 		return nil
@@ -761,10 +777,15 @@ func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]b
 				skipped = map[string]bool{}
 			}
 			skipped[n.Key] = true
-			progressf(opts.Progress,
+			progressf(opts.DebugProgress,
 				"skipping %s (%s): latest passed %s ago, within skip_fresh_within %s",
 				n.Key, n.Host, age.Round(time.Second), opts.SkipFreshWithin)
 		}
+	}
+	if len(skipped) > 0 {
+		progressf(opts.Progress,
+			"skipping %d fresh-within passes (skip_fresh_within %s; per-node detail at debug)",
+			len(skipped), opts.SkipFreshWithin)
 	}
 	return skipped
 }
@@ -772,7 +793,9 @@ func freshSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]b
 // knownAliveSkipSet resolves the KnownAlive skip list: a node present in the
 // KnownAlive set is skipped when its entry is still within KnownAliveTTL.
 // Both `passed` and `semi-passed` (and any non-failed known-alive) entries
-// are skipped — the whole point of the redesign. Every skip is logged.
+// are skipped — the whole point of the redesign. Journal-bounded (audit
+// M4/F7): ONE summary line with the skip count on Progress, per-node detail
+// on DebugProgress.
 func knownAliveSkipSet(nodes []*model.Node, opts Options, now time.Time) map[string]bool {
 	if opts.KnownAliveTTL <= 0 || len(opts.KnownAlive) == 0 {
 		return nil
@@ -796,10 +819,15 @@ func knownAliveSkipSet(nodes []*model.Node, opts Options, now time.Time) map[str
 				skipped = map[string]bool{}
 			}
 			skipped[n.Key] = true
-			progressf(opts.Progress,
+			progressf(opts.DebugProgress,
 				"skipping known-alive node %s (%s): last seen %s ago",
 				n.Key, n.Host, age.Round(time.Second))
 		}
+	}
+	if len(skipped) > 0 {
+		progressf(opts.Progress,
+			"skipping %d known-alive nodes (TTL %s; per-node detail at debug)",
+			len(skipped), opts.KnownAliveTTL)
 	}
 	return skipped
 }

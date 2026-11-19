@@ -487,12 +487,11 @@ func AppendProbeResults(path string, results []ProbeResult) error {
 	}
 	if err := writeFileAtomicNoSync(path, func(f *os.File) error {
 		w := bufio.NewWriter(f)
+		// Single-pass encode (allocation audit M3/F6): one Encoder over the
+		// buffered writer, no per-record Marshal slice + newline-append copy.
+		enc := json.NewEncoder(w)
 		for _, r := range merged {
-			b, err := json.Marshal(r)
-			if err != nil {
-				return err
-			}
-			if _, err := w.Write(append(b, '\n')); err != nil {
+			if err := enc.Encode(r); err != nil {
 				return err
 			}
 		}
@@ -601,16 +600,15 @@ func WriteKnownAlive(path string, m map[string]KnownAliveRecord) error {
 	sort.Strings(keys)
 	return writeFileAtomic(path, func(f *os.File) error {
 		w := bufio.NewWriter(f)
+		// Single-pass encode (allocation audit M3/F6): one Encoder over the
+		// buffered writer, no per-record Marshal slice + newline-append copy.
+		enc := json.NewEncoder(w)
 		for _, k := range keys {
 			r := m[k]
 			if r.Key == "" {
 				r.Key = k
 			}
-			b, err := json.Marshal(r)
-			if err != nil {
-				return err
-			}
-			if _, err := w.Write(append(b, '\n')); err != nil {
+			if err := enc.Encode(r); err != nil {
 				return err
 			}
 		}
@@ -643,16 +641,19 @@ func writeJSONL(path string, n int, sync bool, at func(int) (any, error)) error 
 	}
 	return write(path, func(f *os.File) error {
 		w := bufio.NewWriter(f)
+		// Allocation audit M3/F6: one Encoder straight onto the buffered
+		// writer — Encode appends the record newline itself and reuses its
+		// pooled marshal buffer, so the per-record json.Marshal slice plus
+		// the append(b, '\n') copy pair disappears. Encode's bytes are
+		// identical to Marshal + '\n' (same escaping, same sorted map keys)
+		// — pinned byte-for-byte by TestJSONLWritersByteParityAgainstGoldens.
+		enc := json.NewEncoder(w)
 		for i := range n {
 			v, err := at(i)
 			if err != nil {
 				return err
 			}
-			b, err := json.Marshal(v)
-			if err != nil {
-				return err
-			}
-			if _, err := w.Write(append(b, '\n')); err != nil {
+			if err := enc.Encode(v); err != nil {
 				return err
 			}
 		}

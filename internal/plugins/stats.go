@@ -5,7 +5,8 @@ import (
 	"encoding/hex"
 	"sort"
 	"strconv"
-	"strings"
+
+	"assay/internal/model"
 )
 
 // PluginStats holds per-plugin statistics collected during a fetch wave.
@@ -114,14 +115,20 @@ type PluginStatsCollector struct {
 	GeoByKey map[string]*GeoRecord   // geo records keyed by GeoIdentity for hosting/proxy flags
 }
 
-// geoIdentityKey computes the GeoIdentity key: scheme|lowercase(host)|port.
-func geoIdentityKey(scheme, host string, port int) string {
-	return scheme + "|" + strings.ToLower(host) + "|" + strconv.Itoa(port)
+// GeoIdentityKey is the cross-package form of the canonical geo-record
+// identity key (scheme|lowercase(host)|port). The duplication the allocation
+// audit flagged (M2/F5) is collapsed: the ONE implementation lives in
+// model.GeoIdentityOf and this helper delegates, so the plugin-stats join
+// can never drift from the store/rank/prune join. (The GeoRecord projection
+// type above stays — that is a field-projection decision, not a key one.)
+func GeoIdentityKey(scheme, host string, port int) string {
+	return model.GeoIdentityOf(scheme, host, port)
 }
 
-// GeoIdentityKey is the public version of geoIdentityKey for cross-package use.
-func GeoIdentityKey(scheme, host string, port int) string {
-	return geoIdentityKey(scheme, host, port)
+// geoIdentityKey is the internal alias of GeoIdentityKey (the collector's
+// call sites); kept as a thin alias so the enrichment join reads the same.
+func geoIdentityKey(scheme, host string, port int) string {
+	return GeoIdentityKey(scheme, host, port)
 }
 
 // NewPluginStatsCollector creates a new collector. Geo records can be nil

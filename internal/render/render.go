@@ -1044,7 +1044,7 @@ func serviceGeoRecord(
 	if n == nil || len(geoByKey) == 0 {
 		return nil
 	}
-	return geoByKey[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+	return geoByKey[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)]
 }
 
 // cleanServicePoolQualifies is clean-FAMILY membership (owner ruling

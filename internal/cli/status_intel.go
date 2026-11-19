@@ -414,7 +414,7 @@ func aggregateProviderGeo(
 	out := make(map[string]providerGeoIntel)
 	breadth := make(map[string]map[string]bool)
 	for _, n := range nodes {
-		gr, ok := geoByID[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})]
+		gr, ok := geoByID[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)]
 		if !ok {
 			continue
 		}

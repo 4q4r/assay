@@ -716,24 +716,18 @@ func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 }
 
 func newProbeBatchFactory(cfg *config.Config, p paths) probe.BatchFactory {
+	// Render-once per wave (allocation audit M6/F9): the halving recursion
+	// re-invokes this factory per retry chunk; the cache reuses each node's
+	// outbound definition across those invocations (knobs are wave-
+	// constant; StartTempXrayBatch re-tags per position on its own clone).
+	cache := newBatchOutboundCache()
 	return probe.BatchFactory(func(ctx context.Context, nodes []*model.Node) (probe.BatchSocksInstance, error) {
-		outbounds := make([]map[string]any, len(nodes))
-		for i, n := range nodes {
-			rcfg := render.Config{
-				TCPMaxSeg:      cfg.Render.TCPMaxSeg,
-				TLSFingerprint: cfg.Render.TLSFingerprint,
-			}
-			if rcfg.TCPMaxSeg == 0 {
-				rcfg.TCPMaxSeg = config.DefaultTCPMaxSeg
-			}
-			if rcfg.TLSFingerprint == "" {
-				rcfg.TLSFingerprint = config.DefaultTLSFingerprint
-			}
-			ob, _, err := render.BuildOutbound(n, fmt.Sprintf("probe-out-%d", i), rcfg)
-			if err != nil {
-				return nil, fmt.Errorf("render outbound for batch node %d: %w", i, err)
-			}
-			outbounds[i] = ob
+		outbounds, err := buildBatchOutbounds(render.Config{
+			TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+			TLSFingerprint: cfg.Render.TLSFingerprint,
+		}, cache, nodes)
+		if err != nil {
+			return nil, err
 		}
 		return checker.StartTempXrayBatch(ctx, coreXrayBin(cfg), p.workDir, outbounds)
 	})
@@ -950,8 +944,17 @@ func runProbe(
 	return nil
 }
 
+// orphanDisclosureLimit caps the per-node orphan examples in the
+// known-alive disclosure (allocation audit M4/F7, the S7 journal-flood
+// lesson): a wave that drops a whole source must not print one journal line
+// per orphaned entry — the count travels in ONE summary line, up to this
+// many examples are named individually (deterministic: iterated in sorted
+// key order).
+const orphanDisclosureLimit = 5
+
 // updateKnownAliveSet merges probe results into the known-alive set, logs
-// orphaned entries, prunes expired ones, and persists the set.
+// orphaned entries (bounded: one summary + orphanDisclosureLimit examples),
+// prunes expired ones, and persists the set.
 func updateKnownAliveSet(
 	cmd *cobra.Command,
 	opts probe.Options,
@@ -981,14 +984,25 @@ func updateKnownAliveSet(
 		rec.AliveWaveSeq++
 		ka[r.Key] = rec
 	}
-	for k, rec := range ka {
+	var orphanKeys []string
+	for k := range ka {
 		if nodeKeys[k] {
 			continue
 		}
-		remaining := opts.KnownAliveTTL - now.Sub(rec.LastSeen)
-		remaining = max(remaining, 0)
-		outf(cmd.OutOrStdout(), "known-alive but absent from sources — retained (TTL %s remaining): %s\n",
-			remaining.Round(time.Second), k)
+		orphanKeys = append(orphanKeys, k)
+	}
+	if len(orphanKeys) > 0 {
+		// Deterministic disclosure order (map iteration is randomized).
+		sort.Strings(orphanKeys)
+		outf(cmd.OutOrStdout(),
+			"known-alive: %d entries absent from sources — retained within TTL %s (%d examples below)\n",
+			len(orphanKeys), opts.KnownAliveTTL, min(len(orphanKeys), orphanDisclosureLimit))
+		for _, k := range orphanKeys[:min(len(orphanKeys), orphanDisclosureLimit)] {
+			remaining := opts.KnownAliveTTL - now.Sub(ka[k].LastSeen)
+			remaining = max(remaining, 0)
+			outf(cmd.OutOrStdout(), "known-alive but absent from sources — retained (TTL %s remaining): %s\n",
+				remaining.Round(time.Second), k)
+		}
 	}
 	store.PruneKnownAlive(ka, now, opts.KnownAliveTTL)
 	return nil
@@ -2189,7 +2203,7 @@ func computePluginUnlockCounts(
 		if st == nil {
 			continue
 		}
-		geoKey := model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})
+		geoKey := model.GeoIdentityOf(n.Scheme, n.Host, n.Port)
 		gr := modelGeoByKey[geoKey]
 		if gr == nil {
 			continue
@@ -2348,7 +2362,7 @@ func runPruneStage(cmd *cobra.Command, cfg *config.Config, r *waveRecordCache) e
 	}
 	referenced := make(map[string]bool, len(filtered))
 	for _, n := range filtered {
-		referenced[model.GeoIdentity(&model.GeoRecord{Scheme: n.Scheme, Host: n.Host, Port: n.Port})] = true
+		referenced[model.GeoIdentityOf(n.Scheme, n.Host, n.Port)] = true
 	}
 	kept, removed, report := prune.Select(records, referenced, prune.Options{
 		DeadAfter: cfg.Maintain.PruneDeadAfter.Duration,

@@ -1,0 +1,2 @@
+{"key":"k1","source":"plug-a","scheme":"vless","uuid":"u\u0026s@er","host":"de1.example.com","port":443,"network":"","security":"","params":{"path":"/ws\u0026x=1","sni":"\u003csvc\u003e.example.com"},"first_seen":"2026-06-01T12:00:00Z","last_seen":"2026-06-01T12:00:00Z"}
+{"key":"k2","source":"plug-b","scheme":"vmess","uuid":"юникод-user","host":"jp1.example.jp","port":2053,"network":"","security":"","params":null,"fragment":"узел-01","first_seen":"2026-06-01T12:00:00Z","last_seen":"2026-06-01T12:00:00Z"}
