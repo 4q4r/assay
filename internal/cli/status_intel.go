@@ -42,6 +42,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -55,6 +56,7 @@ import (
 
 	"assay/internal/config"
 	"assay/internal/core"
+	"assay/internal/hotapply"
 	"assay/internal/model"
 	"assay/internal/plugins"
 	"assay/internal/render"
@@ -1257,13 +1259,17 @@ type coreState struct {
 	health     *core.HealthState
 	healthErr  error
 	strikeK    int
+	hot        *hotapply.State
+	hotErr     error
 }
 
 // collectCoreState observes the own core from the data dir: the manager's
 // pidfile (PID + liveness), /proc for the uptime, the managed binary for
 // the version banner (xrayupdate.CurrentVersion — the same banner contract
-// the auto-update path parses), live.json for the inbounds, and the
-// persisted D8 health-state mirror (core.ReadHealthState) for strikes.
+// the auto-update path parses), live.json for the inbounds, the
+// persisted D8 health-state mirror (core.ReadHealthState) for strikes, and
+// the hot-apply state mirror (hotapply.ReadState — the T5 status surface:
+// last activation hot/restart with the pid transition).
 func collectCoreState(p paths, cfg *config.Config) *coreState {
 	cs := &coreState{binPath: cfg.CoreXrayBin()}
 	cs.strikeK = cfg.Core.RollbackStrikes
@@ -1297,6 +1303,7 @@ func collectCoreState(p paths, cfg *config.Config) *coreState {
 	cs.inbounds, cs.liveErr = readCoreInbounds(ownLivePath(p))
 
 	cs.health, cs.healthErr = core.ReadHealthState(p.dataDir)
+	cs.hot, cs.hotErr = hotapply.ReadState(p.dataDir)
 	return cs
 }
 
@@ -1443,7 +1450,43 @@ func printCoreStatus(out io.Writer, cs *coreState, color bool) {
 		outf(out, "%s\n", ui.ChipKV("  inbound: ", formatCoreInbounds(cs.inbounds), color))
 	}
 
+	printCoreHotApply(out, cs.hot, cs.hotErr, color)
+
 	printCoreHealth(out, cs.health, cs.healthErr, cs.strikeK, cs.running, color)
+}
+
+// printCoreHotApply renders the hot-apply state line (the T5 status
+// surface): what the LAST activation did — a hot apply through the running
+// core's API (pid stable across it) or a full restart (the pid transition
+// shown). No state on file = no line (a fresh deployment); a corrupt file
+// is a degraded line — the dashboard's honesty discipline, nothing
+// fabricated.
+func printCoreHotApply(out io.Writer, st *hotapply.State, stateErr error, color bool) {
+	if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
+		outf(out, "%s\n", ui.ChipKV("  hotapply: ",
+			fmt.Sprintf("state unreadable: %v", stateErr), color))
+		return
+	}
+	if st == nil {
+		return
+	}
+	stamp := st.UpdatedAt
+	if ts, err := time.Parse(time.RFC3339, st.UpdatedAt); err == nil {
+		stamp = ts.Local().Format(time.RFC3339) //nolint:gosmopolitan // owner ruling 2026-11-05
+	}
+	switch st.Mode {
+	case hotapply.ModeHot:
+		outf(out, "%s\n", ui.ChipKV("  hotapply: ", fmt.Sprintf(
+			"last activation: HOT — pid %d → %d (stable, no core restart) at %s",
+			st.PIDBefore, st.PIDAfter, stamp), color))
+	case hotapply.ModeRestart:
+		outf(out, "%s\n", ui.ChipKV("  hotapply: ", fmt.Sprintf(
+			"last activation: RESTART — pid %d → %d (the core restarted on the replaced config) at %s",
+			st.PIDBefore, st.PIDAfter, stamp), color))
+	default:
+		outf(out, "%s\n", ui.ChipKV("  hotapply: ",
+			fmt.Sprintf("unknown apply mode %q", st.Mode), color))
+	}
 }
 
 // printCoreSource renders the core-binary RESOLUTION provenance (owner

@@ -54,6 +54,17 @@ var (
 	restartFallback = runApplyRestartFallback
 )
 
+// hotApplyClient is the API surface the hot-apply flow consumes (the
+// consumer-side seam per the interface discipline): probe, full routing
+// replace, verification query. *hotapply.Client is the production
+// implementation (built through newApplyClient / newWaveHotClient); the
+// recorded doubles in the test batteries implement the identical contract.
+type hotApplyClient interface {
+	Reachable(ctx context.Context) error
+	ReplaceRouting(ctx context.Context, payloadPath string) error
+	ListRules(ctx context.Context) ([]hotapply.RuleEntry, error)
+}
+
 func newApplyCommand(cfgPath *string) *cobra.Command {
 	var dryRun bool
 	cmd := &cobra.Command{
@@ -290,7 +301,7 @@ func persistAppliedRender(
 // (plan §3.5/3.6). A verification miss counts as an apply failure (the
 // caller heals) — no verification, no success claim (R1).
 func applyRouting(
-	ctx context.Context, client *hotapply.Client, cand map[string]any, wantTags []string, wantCount int,
+	ctx context.Context, client hotApplyClient, cand map[string]any, wantTags []string, wantCount int,
 ) error {
 	payloadPath, cleanup, err := hotapply.WritePayloadFile(cand)
 	defer cleanup()
@@ -314,7 +325,7 @@ func applyRouting(
 // verifies it (plan §3.8a). false + nil error = the live config has no
 // routing section to heal with (bootstrap shape); false + err = the healing
 // attempt failed — the restart fallback is the remedy.
-func healPreviousRouting(ctx context.Context, client *hotapply.Client, live map[string]any) (bool, error) {
+func healPreviousRouting(ctx context.Context, client hotApplyClient, live map[string]any) (bool, error) {
 	routing, ok := live["routing"].(map[string]any)
 	if !ok {
 		return false, errors.New("live config has no routing section to heal with")

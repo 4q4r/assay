@@ -25,6 +25,7 @@ import (
 	"assay/internal/fetch"
 	"assay/internal/filter"
 	"assay/internal/geo"
+	"assay/internal/hotapply"
 	"assay/internal/model"
 	"assay/internal/parse"
 	"assay/internal/plugins"
@@ -2464,21 +2465,13 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 		return config.ConfiglessBoundaryError("activate")
 	}
 	if mgr == nil {
-		var err error
-		mgr, err = core.NewTransientManager(cfg.Core, p.dataDir, out)
-		if err != nil {
-			if errors.Is(err, core.ErrDaemonHoldsCore) {
-				return fmt.Errorf("activate: %s", daemonOwnsCoreMessage)
-			}
-			return fmt.Errorf("activate: core manager: %w", err)
+		var release func()
+		var aerr error
+		mgr, release, aerr = acquireStageManager(cfg, p, out)
+		if aerr != nil {
+			return aerr
 		}
-		// One-shot lifecycle: the singleton hold's lifetime is the process
-		// (A2 — a spawned/adopted core outlives the stage; a one-shot CLI
-		// never stops the core). Releasing the lock HERE is byte-equivalent
-		// to the process exit that always freed it, and an embedded run
-		// (tests) stops pinning <data>/core.lock open past the stage —
-		// windows cannot remove an open file (run 43330792666).
-		defer mgr.Release()
+		defer release()
 	}
 
 	candidate, err := os.ReadFile(ownCandidatePath(p))
@@ -2489,15 +2482,14 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 		return fmt.Errorf("activate: read candidate %s: %w", ownCandidatePath(p), err)
 	}
 	live, liveErr := os.ReadFile(ownLivePath(p))
-	if liveErr == nil && bytes.Equal(candidate, live) {
-		// Activate-if-changed: byte-identical steady state — no restart, no
-		// backup, no strike. The core is revived if it died between waves
-		// (the minimal crash-recovery seam; full supervision is Task 5).
-		if rerr := mgr.EnsureRunning(context.Background()); rerr != nil {
-			return fmt.Errorf("activate: core revive: %w", rerr)
+	if liveErr == nil {
+		handled, herr := activateHotOrNoop(cmd, cfg, p, mgr, candidate, live)
+		if herr != nil {
+			return herr
 		}
-		outln(out, "no changes — the live core config already matches the rendered pool; nothing activated")
-		return nil
+		if handled {
+			return nil
+		}
 	}
 
 	// L10: the -test gate runs on the CANDIDATE (never the live config)
@@ -2521,10 +2513,14 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 		return err
 	}
 
-	// The core restarts ON the replaced live config. The ctx is deliberately
-	// NON-canceling (C4): the exec path kills the child on ctx cancellation,
-	// and the core must outlive this stage (and a one-shot process entirely —
-	// A2 reparenting + pidfile adoption); shutdown goes through Stop.
+	// The pid transition is OBSERVED before the restart leg (the hot-apply
+	// state mirror's before-half; a first activation has no pidfile — pid 0
+	// reads honestly as "no prior pid"). The core restarts ON the replaced
+	// live config. The ctx is deliberately NON-canceling (C4): the exec path
+	// kills the child on ctx cancellation, and the core must outlive this
+	// stage (and a one-shot process entirely — A2 reparenting + pidfile
+	// adoption); shutdown goes through Stop.
+	pidBefore := readCorePID(p.dataDir)
 	if rerr := mgr.Restart(context.Background()); rerr != nil {
 		return fmt.Errorf("activate: core restart failed (the replaced config %s is on disk): %w",
 			ownLivePath(p), rerr)
@@ -2534,6 +2530,15 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 		ui.Chip("activation complete:", fmt.Sprintf("%s replaced from %s",
 			ownLivePath(p), ownCandidatePath(p)), stageColor(cmd)),
 		orNone(res.BackupPath), selectionSize(p.selection))
+
+	// The hot-apply state mirror (the T5 status surface): the restart is
+	// recorded with the observed pid transition — the honest supervision
+	// parity (hot and restart activations both leave the last-apply state).
+	recordWaveHotApplyState(p.dataDir, out, &hotapply.State{
+		Mode:      hotapply.ModeRestart,
+		PIDBefore: pidBefore,
+		PIDAfter:  readCorePID(p.dataDir),
+	})
 
 	// D8: the strike counter eats ONLY post-activation health checks (C3) —
 	// K consecutive failures roll back to the newest dated backup through
@@ -2550,6 +2555,229 @@ func runActivateStageWithManager(cmd *cobra.Command, cfg *config.Config, mgr *co
 			stageColor(cmd)), stageColor(cmd)))
 	}
 	return nil
+}
+
+// acquireStageManager creates the transient one-shot manager (S3 — refuses
+// loud under the daemon's flock) with the release func the stage defers.
+// The flock hold's lifetime is the PROCESS (A2 — a spawned/adopted core
+// outlives the stage; a one-shot CLI never stops the core). Releasing HERE
+// is byte-equivalent to the process exit that always freed it, and an
+// embedded run (tests) stops pinning <data>/core.lock open past the stage
+// — windows cannot remove an open file (run 43330792666).
+func acquireStageManager(cfg *config.Config, p paths, out io.Writer) (*core.Manager, func(), error) {
+	mgr, err := core.NewTransientManager(cfg.Core, p.dataDir, out)
+	if err != nil {
+		if errors.Is(err, core.ErrDaemonHoldsCore) {
+			return nil, nil, fmt.Errorf("activate: %s", daemonOwnsCoreMessage)
+		}
+		return nil, nil, fmt.Errorf("activate: core manager: %w", err)
+	}
+	return mgr, mgr.Release, nil
+}
+
+// activateHotOrNoop handles the wave's two no-restart activation shapes:
+// the byte-identical steady state (the T4 no-op, core revive included) and
+// the T5 routing-only hot apply. handled=true — the activation is COMPLETE
+// and the full activate path must not run; handled=false — the wave falls
+// through to the full path below (every decline journaled loud by the
+// callee).
+func activateHotOrNoop(
+	cmd *cobra.Command, cfg *config.Config, p paths, mgr *core.Manager, candidate, live []byte,
+) (bool, error) {
+	out := cmd.OutOrStdout()
+	if bytes.Equal(candidate, live) {
+		// Activate-if-changed: byte-identical steady state — no restart, no
+		// backup, no strike. The core is revived if it died between waves
+		// (the minimal crash-recovery seam; full supervision is Task 5).
+		if rerr := mgr.EnsureRunning(context.Background()); rerr != nil {
+			return false, fmt.Errorf("activate: core revive: %w", rerr)
+		}
+		outln(out, "no changes — the live core config already matches the rendered pool; nothing activated")
+		return true, nil
+	}
+	// T5 (the 2026-11-13 hot-apply plan, in-daemon leg): a ROUTING-ONLY
+	// delta hot-applies through the running core's own API client — no
+	// restart, no balancer warm-up outage, the core pid unchanged. Every
+	// other shape (mixed diffs, an unreachable hot target, a failed hot
+	// apply) falls through to the full activate path, UNCHANGED — every
+	// skip and fallback is journaled loud, and disk truth (live.json) stays
+	// the reconciler either way: the hot state is ephemeral by design and
+	// the next full activation reconverges it.
+	return runWaveHotApply(cmd, cfg, p, live, candidate)
+}
+
+// newWaveHotClient builds the wave hot path's API client against the
+// RESOLVED core binary (S1) and the rendered api inbound's port — the same
+// dialect-neutral construction as the apply CLI (R3: the core's own binary
+// speaks its own api dialect, whatever version answers).
+var newWaveHotClient = func(cfg *config.Config) hotApplyClient {
+	return hotapply.NewClient(coreXrayBin(cfg), cfg.Core.APIPort)
+}
+
+// runWaveHotApply is the in-daemon hot path (the T5 wave leg): when the
+// wave's live/candidate pair diff-classifies as routing-only-changed (the
+// V1 classifier, plan §2 table), the CANDIDATE routing hot-applies to the
+// running core through its own API client and the applied render persists
+// to live.json — the core pid unchanged, no restart, no W17 stage wait.
+//
+// The ladder (plan §3, the apply-CLI semantics inside the wave):
+//   - gate BEFORE any API verb (L10) — a gate failure fails the stage loud
+//     (the full path would refuse the same file at the same gate);
+//   - the apply lock serializes against a manual `assay apply` — held
+//     lock yields the hot path loud;
+//   - probe failure is a first-class loud input, nothing mutated;
+//   - a replace/verify failure heals the last-good routing FIRST (never a
+//     silent partial state), then falls back loud to the full activate
+//     path below.
+//
+// Returns hotDone=true when the wave's activation completed hot (the
+// caller returns); hotDone=false sends the wave down the full activate
+// path; a non-nil error fails the stage (only the pre-API gate failure
+// reaches here).
+func runWaveHotApply(
+	cmd *cobra.Command, cfg *config.Config, p paths, live, candidate []byte,
+) (bool, error) {
+	out := cmd.OutOrStdout()
+	var liveDoc, candDoc map[string]any
+	if err := json.Unmarshal(live, &liveDoc); err != nil {
+		outf(out, "activate: hot-apply skipped — the live config is unparseable (%v); "+
+			"the full activate path converges it\n", err)
+		return false, nil
+	}
+	if err := json.Unmarshal(candidate, &candDoc); err != nil {
+		// The candidate is the wave's own artifact; the full path's gate
+		// names a corrupt one loud — nothing extra to disclose here.
+		return false, nil
+	}
+	diff := hotapply.Classify(liveDoc, candDoc)
+	if !diff.HotCapable || !diff.RoutingChanged {
+		// The ordinary course: restart-only sections changed (or a byte
+		// diff with no semantic delta) — the full activate path is the
+		// by-the-book remedy; no hot-path journaling for the normal case.
+		return false, nil
+	}
+
+	// L10 on the hot path: the -test gate runs BEFORE any API verb — a bad
+	// config never reaches the running core.
+	if err := activate.TestGate(activate.Input{
+		RenderedPath: ownCandidatePath(p),
+		XrayBin:      coreXrayBin(cfg),
+		AssetDir:     coreAssetDir(cfg, p),
+		TestTimeout:  activateTestTimeout(cfg),
+	}); err != nil {
+		return false, err
+	}
+
+	// Serialize against a manual `assay apply` (the same lock the apply CLI
+	// holds): contention yields the hot path loud — the in-flight apply and
+	// the full path below land the same candidate either way (disk truth
+	// wins, Order B).
+	release, err := acquireApplyLock(p.dataDir)
+	if err != nil {
+		outf(out, "activate: hot-apply skipped — %v; the full activate path runs\n", err)
+		return false, nil
+	}
+	defer release()
+
+	client := newWaveHotClient(cfg)
+	// The ctx is deliberately NON-canceling (C4 parity with the restart
+	// leg): the core outlives the stage, and the client's exec carries the
+	// core CLI's own per-call timeout.
+	ctx := context.Background()
+	pidBefore := readCorePID(p.dataDir)
+	if perr := client.Reachable(ctx); perr != nil {
+		outf(out, "activate: hot-apply skipped — the core API probe failed (%s: %v); "+
+			"nothing was mutated, the full activate path runs\n", hotProbeClass(perr), perr)
+		return false, nil
+	}
+
+	candRouting, ok := candDoc["routing"].(map[string]any)
+	if !ok {
+		outf(out, "activate: hot-apply skipped — the candidate render has no routing section; "+
+			"nothing was mutated, the full activate path runs\n")
+		return false, nil
+	}
+	candTags, candCount, err := hotapply.ExpectedFromRouting(candRouting)
+	if err != nil {
+		outf(out, "activate: hot-apply skipped — %v; nothing was mutated, the full activate path runs\n", err)
+		return false, nil
+	}
+
+	added, removed := ruleTagDelta(liveDoc, candDoc)
+	if aerr := applyRouting(ctx, client, candDoc, candTags, candCount); aerr != nil {
+		// The healing reload first (plan §3.8a): the last-good routing goes
+		// back on the core BEFORE the fallback churn — never a silent
+		// partial state, whatever the fallback's own fate.
+		healed, herr := healPreviousRouting(ctx, client, liveDoc)
+		if healed {
+			outf(out, "activate: hot-apply FAILED (%v) — previous routing restored (last-good); "+
+				"falling back to the full activate path\n", aerr)
+		} else {
+			outf(out, "activate: hot-apply FAILED (%v) — healing ALSO failed (%s: %v); "+
+				"falling back to the full activate path\n", aerr, hotProbeClass(herr), herr)
+		}
+		return false, nil
+	}
+
+	// Disk truth converges: the applied render persists through the same
+	// gate/backup/atomic-replace contract as a full activation (the D8
+	// backup source survives the hot path; the next wave's re-render is a
+	// clean no-op). A persist failure is loud but NOT an apply failure —
+	// the hot state is live on the core and the next wave re-persists (the
+	// wave pipeline IS the reconciler).
+	if _, err := activate.Run(activate.Input{
+		RenderedPath: ownCandidatePath(p),
+		TargetPath:   ownLivePath(p),
+		XrayBin:      coreXrayBin(cfg),
+		AssetDir:     coreAssetDir(cfg, p),
+		BackupDir:    p.backupDir,
+		Backup:       true,
+		BackupBase:   "config.json",
+		TestTimeout:  activateTestTimeout(cfg),
+		BackupKeep:   cfg.Activate.BackupKeep,
+	}); err != nil {
+		outf(out, "WARNING: hot-apply succeeded but persisting live.json failed: %v "+
+			"(the next wave re-render converges the disk)\n", err)
+	}
+
+	// The hot state mirror: both pids are OBSERVED from the pidfile (never
+	// presumed — the honest supervision parity).
+	pidAfter := readCorePID(p.dataDir)
+	recordWaveHotApplyState(p.dataDir, out, &hotapply.State{
+		Mode:      hotapply.ModeHot,
+		PIDBefore: pidBefore,
+		PIDAfter:  pidAfter,
+	})
+	outf(out, "%s\n", ui.Chip("hot-apply:", fmt.Sprintf(
+		"routing replaced on the running core: +%d/-%d ruleTag(s) — pid %d unchanged, no core restart; live.json converged",
+		len(added), len(removed), pidAfter), stageColor(cmd)))
+	return true, nil
+}
+
+// hotProbeClass names a probe/heal failure class for the wave journal (the
+// same ProbeFailureKind classification the apply CLI renders loud — core
+// down and a missing RoutingService are first-class, named inputs).
+func hotProbeClass(err error) string {
+	switch hotapply.ProbeFailureKind(err) {
+	case hotapply.CoreDown:
+		return "the core is unreachable"
+	case hotapply.ServiceMissing:
+		return "RoutingService missing (the enablement restart has not happened yet)"
+	case hotapply.FailureOther:
+		return "probe failed"
+	default:
+		return "probe failed"
+	}
+}
+
+// recordWaveHotApplyState persists the status mirror; a write failure is
+// loud and non-fatal — the activation is already decided, and the status
+// block degrades honestly (never fabricates a state it cannot read).
+func recordWaveHotApplyState(dataDir string, out io.Writer, st *hotapply.State) {
+	if err := hotapply.WriteState(dataDir, st); err != nil {
+		outf(out, "WARNING: recording the hot-apply state failed: %v "+
+			"(the status core block will not show this activation)\n", err)
+	}
 }
 
 // activateMissingCandidate is the candidate-missing activate (T4-I-1): the
