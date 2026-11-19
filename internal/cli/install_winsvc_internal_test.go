@@ -123,8 +123,17 @@ func TestInstallWindowsBranchPins(t *testing.T) {
 		},
 	}
 	withWindowsHost(t, sched)
-	// The core bootstrap is stubbed (no network in unit tests).
-	ensureCoreBinary = func(_ context.Context, _ config.CoreConfig, _ string, _ io.Writer) error {
+	// The core bootstrap is stubbed (no network in unit tests); the stub
+	// RECORDS its arguments — the leg-completion trace: the bootstrap must
+	// run with the SAME Core config and data dir the scheduler spec carries
+	// (the service reads that exact -c data dir, and EnsureCoreBinary's
+	// windows placement leg fills <data>/bin/xray in it — the spot the
+	// service-context resolution binds).
+	var bootCfg config.CoreConfig
+	var bootDataDir string
+	var bootRan bool
+	ensureCoreBinary = func(_ context.Context, core config.CoreConfig, dataDir string, _ io.Writer) error {
+		bootCfg, bootDataDir, bootRan = core, dataDir, true
 		return nil
 	}
 	t.Cleanup(func() { ensureCoreBinary = core.EnsureCoreBinary })
@@ -144,6 +153,14 @@ func TestInstallWindowsBranchPins(t *testing.T) {
 	assert.Empty(t, spec.ConfigPath, "no explicit -c → ConfigPath empty; the scheduler embeds the default")
 	assert.Equal(t, dataDir, spec.DataDir)
 	assert.Equal(t, filepath.Join(dataDir, "bin"), spec.BinDir, "the §2.2.10 bin dir")
+	// The leg-completion trace (the SCM E2E root cause, 2026-11-19): the
+	// core bootstrap runs in the INSTALLING user's context against the SAME
+	// data dir the service registration carries — EnsureCoreBinary places
+	// the managed copy at <data>/bin/xray there, and the service-context
+	// resolution binds exactly that spot.
+	assert.True(t, bootRan, "the windows install runs the D4 core bootstrap")
+	assert.Equal(t, dataDir, bootDataDir, "the bootstrap anchors the SAME data dir the service reads")
+	assert.Equal(t, cfg.Core, bootCfg, "the bootstrap receives the service's [core] config verbatim")
 
 	// The summary is loud and windows-honest:
 	for _, want := range []string{

@@ -764,11 +764,14 @@ func newProbeFactory(cfg *config.Config, p paths) probe.Factory {
 }
 
 // coreXrayBin resolves the SINGLE core binary knob (S1): the explicit
-// [core].xray_bin override (~-expanded), else the owner-ruling resolution
-// (user-local ~/.local/bin/xray → existing system xray → the user-local
-// install target). Every consumer in this package — the probe/check
-// temp-instance fleets, the activation -test gate, the core manager — goes
-// through this one resolver; [activate].xray_bin is retired for all of them.
+// [core].xray_bin override (~-expanded), else the owner-ruling resolution —
+// context-aware (config.ResolveCoreXrayBin): interactive = user-local
+// ~/.local/bin/xray → existing system xray → the user-local install target;
+// windows service = the managed <data>/bin core → existing system xray (the
+// user-local spot is never consulted there). Every consumer in this
+// package — the probe/check temp-instance fleets, the activation -test
+// gate, the core manager — goes through this one resolver;
+// [activate].xray_bin is retired for all of them.
 func coreXrayBin(cfg *config.Config) string {
 	return config.ExpandHome(cfg.CoreXrayBin())
 }
