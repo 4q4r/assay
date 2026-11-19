@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -12,6 +13,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/windows/svc"
 )
+
+// serviceProcessArgs is the canonical registered command line the handler
+// tests run under (the ImagePath arguments after the executable).
+func serviceProcessArgs(t *testing.T) {
+	t.Helper()
+	setServiceProcessArgs(t, "watch", "-c", `C:\x\config.toml`)
+}
 
 // The svc.Handler state-machine pins (plan §2.2.2): StartPending first;
 // Running with AcceptStop|AcceptShutdown reported PROMPTLY after the daemon
@@ -38,12 +46,26 @@ func svcTestHandler(run func(wired chan<- struct{}, stopRequest <-chan struct{})
 	}
 }
 
-// driveExecute runs Execute on a goroutine and returns a channel carrying
-// the (svcSpecificEC, exitCode) pair.
+// setServiceProcessArgs installs the PROCESS command line the handler reads
+// (os.Args — the registered ImagePath arguments; the SCM's ServiceMain argv
+// never carries them, see the Execute parse comment) and restores it on
+// cleanup.
+func setServiceProcessArgs(t *testing.T, args ...string) {
+	t.Helper()
+	orig := os.Args
+	os.Args = append([]string{`C:\assay.exe`}, args...)
+	t.Cleanup(func() { os.Args = orig })
+}
+
+// driveExecute runs Execute on a goroutine with the REAL SCM delivery — the
+// ServiceMain argv is the service name alone (mgr.Service.Start() passes no
+// arguments; the registered arguments ride os.Args, set separately via
+// setServiceProcessArgs) — and returns a channel carrying the
+// (svcSpecificEC, exitCode) pair.
 func driveExecute(h *watchHandler, r <-chan svc.ChangeRequest, s chan<- svc.Status) <-chan [2]uint32 {
 	result := make(chan [2]uint32, 1)
 	go func() {
-		ss, code := h.Execute([]string{"assay", "watch", "-c", `C:\x\config.toml`}, r, s)
+		ss, code := h.Execute([]string{"assay"}, r, s)
 		result <- [2]uint32{boolToUint32(ss), code}
 	}()
 	return result
@@ -73,6 +95,7 @@ func expectStatus(t *testing.T, s <-chan svc.Status) svc.Status {
 // StartPending → (wired) → Running{AcceptStop|AcceptShutdown} → Stop →
 // StopPending → (false, 0).
 func TestHandlerStateMachineHappyPath(t *testing.T) {
+	serviceProcessArgs(t)
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
@@ -103,6 +126,7 @@ func TestHandlerStateMachineHappyPath(t *testing.T) {
 // keeps working for a long time afterwards — Running is still reported
 // immediately.
 func TestHandlerRunningNotGatedOnWave(t *testing.T) {
+	serviceProcessArgs(t)
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	release := make(chan struct{})
@@ -138,6 +162,7 @@ func TestHandlerRunningNotGatedOnWave(t *testing.T) {
 // out (run 43339290411: the interrogate echo passed, then
 // "handler did not exit after the stop completed" — no stop had been sent).
 func TestHandlerInterrogateEchoes(t *testing.T) {
+	serviceProcessArgs(t)
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
@@ -170,6 +195,7 @@ func TestHandlerInterrogateEchoes(t *testing.T) {
 // TestHandlerShutdownRidesStopSeam pins that svc.Shutdown feeds the SAME
 // graceful-stop transport as svc.Stop.
 func TestHandlerShutdownRidesStopSeam(t *testing.T) {
+	serviceProcessArgs(t)
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	h := svcTestHandler(func(wired chan<- struct{}, stopRequest <-chan struct{}) error {
@@ -198,6 +224,7 @@ func TestHandlerShutdownRidesStopSeam(t *testing.T) {
 // erroring during wiring never reports Running and exits with a
 // service-specific failure code (SCM recovery actions apply — ADDENDUM §1).
 func TestHandlerWiringFailureFailsService(t *testing.T) {
+	serviceProcessArgs(t)
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	h := svcTestHandler(func(chan<- struct{}, <-chan struct{}) error {
@@ -219,10 +246,11 @@ func TestHandlerWiringFailureFailsService(t *testing.T) {
 	require.NotZero(t, res[1], "a wiring failure is a service failure")
 }
 
-// TestHandlerMalformedArgsFailLoud pins the arg-contract refusal: service
-// arguments outside `watch [-c <path>]` fail the service at start; the
+// TestHandlerMalformedArgsFailLoud pins the arg-contract refusal: a service
+// command line outside `watch [-c <path>]` fails the service at start; the
 // daemon never runs on mis-read args.
 func TestHandlerMalformedArgsFailLoud(t *testing.T) {
+	setServiceProcessArgs(t, "maintain")
 	s := make(chan svc.Status, 32)
 	r := make(chan svc.ChangeRequest)
 	daemonRan := false
@@ -233,7 +261,7 @@ func TestHandlerMalformedArgsFailLoud(t *testing.T) {
 		},
 		out: io.Discard,
 	}
-	ss, code := h.Execute([]string{"assay", "maintain"}, r, s)
+	ss, code := h.Execute([]string{"assay"}, r, s)
 	require.True(t, ss)
 	require.NotZero(t, code)
 	assert.False(t, daemonRan, "the daemon never runs on malformed service args")
@@ -257,6 +285,7 @@ func TestHandlerMalformedArgsFailLoud(t *testing.T) {
 // StartPending heartbeats precede Running, and Running closes the pending
 // phase — never a fixed count (run 43428880158).
 func TestHandlerStartPendingHeartbeatPins(t *testing.T) {
+	serviceProcessArgs(t)
 	orig := startPendingHeartbeat
 	startPendingHeartbeat = 10 * time.Millisecond
 	t.Cleanup(func() { startPendingHeartbeat = orig })

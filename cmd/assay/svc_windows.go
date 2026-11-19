@@ -91,7 +91,11 @@ type watchHandler struct {
 	out       io.Writer
 }
 
-// Execute drives the §2.2.2 state machine.
+// Execute drives the §2.2.2 state machine. The args parameter is the SCM's
+// ServiceMain argv — the service name plus StartService arguments only; it
+// is deliberately ignored (the registered arguments are read from the
+// process command line below — the delivery contract is documented at the
+// parse call).
 func (h *watchHandler) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
 	s <- svc.Status{State: svc.StartPending, WaitHint: startPendingWaitHintMs}
 	// The wiring heartbeat (§2.2.2 + the SCM SERVICE_STATUS contract): the
@@ -122,7 +126,22 @@ func (h *watchHandler) Execute(args []string, r <-chan svc.ChangeRequest, s chan
 		<-heartbeatDone
 	}
 
-	cfgPath, err := cli.ParseServiceArgs(args)
+	// The service arguments come from the PROCESS command line (os.Args[1:]
+	// — the registered ImagePath arguments), never from the SCM-delivered
+	// args parameter: ServiceMain's argv carries only the arguments passed
+	// to StartService (the installer's mgr.Service.Start() passes none —
+	// the argv here is the service name alone), while the ImagePath
+	// arguments are delivered as the process command line (MSDN CreateService
+	// lpBinaryPathName; golang/go#20440). Parsing the Execute argv instead
+	// refused the real registration on every live cycle: the service died
+	// at start with serviceExitFailure before any wiring ran — invisible
+	// until the SCM diagnostics step landed (run 44495986878: STOPPED with
+	// service-specific exit 1, no logs dir, no journal, under one second).
+	procArgs := []string(nil)
+	if len(os.Args) > 1 {
+		procArgs = os.Args[1:]
+	}
+	cfgPath, err := cli.ParseServiceArgs(procArgs)
 	if err != nil {
 		stopHeartbeat()
 		h.failf("service argument contract refused: %v", err)

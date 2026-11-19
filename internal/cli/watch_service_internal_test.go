@@ -183,30 +183,36 @@ func TestServiceSelfWatchActive(t *testing.T) {
 	stop()
 }
 
-// TestParseServiceArgsPins the handler's arg contract (the SCM delivers
-// the registered arguments after the service name; x/sys windows/svc
-// service.go): `watch [-c <abs>]` and nothing else.
+// TestParseServiceArgsPins the handler's arg contract: the SERVICE COMMAND
+// LINE arguments (the registered ImagePath arguments after the executable —
+// the SCM's ServiceMain argv never carries them; see ParseServiceArgs and
+// the run-44495986878 root cause): `watch [-c <abs>]` and nothing else.
 func TestParseServiceArgsPins(t *testing.T) {
-	cfg, err := ParseServiceArgs([]string{"assay", "watch", "-c", `C:\x\config.toml`})
+	cfg, err := ParseServiceArgs([]string{"watch", "-c", `C:\x\config.toml`})
 	require.NoError(t, err)
 	assert.Equal(t, `C:\x\config.toml`, cfg)
 
-	cfg, err = ParseServiceArgs([]string{"assay", "watch", "--config", `C:\y\config.toml`})
+	cfg, err = ParseServiceArgs([]string{"watch", "--config", `C:\y\config.toml`})
 	require.NoError(t, err)
 	assert.Equal(t, `C:\y\config.toml`, cfg)
 
-	cfg, err = ParseServiceArgs([]string{"assay", "watch"})
+	cfg, err = ParseServiceArgs([]string{"watch"})
 	require.NoError(t, err)
 	assert.Empty(t, cfg, "no -c → the §2.2.5 refusal applies downstream, not here")
 
 	for _, args := range [][]string{
-		{"assay", "maintain"},
-		{"other", "watch"},
-		{"assay"},
-		{"assay", "watch", "-c"},
-		{"assay", "watch", "-c", ""},
-		{"assay", "watch", "-c", "a", "b"},
-		{"assay", "watch", "extra"},
+		{"maintain"},
+		{},
+		// The delivery the OLD contract assumed — the ServiceMain argv with
+		// the service name prefixing the registered arguments — is not what
+		// the SCM delivers and must refuse: the ImagePath arguments ride the
+		// process command line (golang/go#20440; the live signature was an
+		// instant serviceExitFailure before any wiring).
+		{"assay", "watch", "-c", `C:\x\config.toml`},
+		{"watch", "-c"},
+		{"watch", "-c", ""},
+		{"watch", "-c", "a", "b"},
+		{"watch", "extra"},
 	} {
 		_, err := ParseServiceArgs(args)
 		require.Error(t, err, "args %v must refuse", args)

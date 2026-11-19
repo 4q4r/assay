@@ -61,38 +61,44 @@ func newServiceWatchDeps(wired chan<- struct{}, stopRequest <-chan struct{}) wat
 	return deps
 }
 
-// ParseServiceArgs parses the registered service arguments (§2.2.4/§2.2.5).
-// The SCM delivers the service name followed by the registered arguments
-// (x/sys windows/svc/service.go), so the contract is exactly
-// `assay watch [-c <abs config>]` — anything else refuses loudly instead
-// of being silently mis-read. An absent -c is legal HERE (the §2.2.5
-// refusal applies downstream, in resolveServiceConfig) so a hand-created
-// -c-less service produces the actionable refusal rather than an arg error;
-// an explicit EMPTY -c value refuses at this gate instead — an empty string
-// is a malformed value, not an absent one.
+// ParseServiceArgs parses the SERVICE command-line arguments (§2.2.4/§2.2.5):
+// the registered ImagePath arguments after the executable — exactly
+// `watch [-c <abs config>]`. These arguments ride the PROCESS command line,
+// NOT the SCM's ServiceMain argv: ServiceMain receives only the argument
+// strings passed to StartService (MSDN winsvc.h LPSERVICE_MAIN_FUNCTION —
+// "the first argument (lpServiceArgVectors[0]) is the name of the service,
+// followed by any additional arguments" passed at start), the installer
+// calls mgr.Service.Start() with none, and the ImagePath arguments are
+// delivered as the process command line instead (MSDN CreateService
+// lpBinaryPathName: "These arguments are passed to the service entry
+// point"; golang/go#20440 confirms x/sys Handler.Execute never sees them).
+// The windows svc handler therefore reads os.Args[1:] — the Execute argv
+// carries no assay arguments and would refuse the real registration
+// (every SCM E2E cycle failed with serviceExitFailure before any wiring
+// until the live diagnostics isolated this). An absent -c is legal HERE
+// (the §2.2.5 refusal applies downstream, in resolveServiceConfig) so a
+// hand-created -c-less service produces the actionable refusal rather than
+// an arg error; an explicit EMPTY -c value refuses at this gate instead —
+// an empty string is a malformed value, not an absent one.
 func ParseServiceArgs(args []string) (string, error) {
-	if len(args) < 2 || args[0] != install.WinSvcName {
-		return "", fmt.Errorf("service arguments %v are malformed — the assay service runs "+
-			"`watch [-c <abs config>]` only (the SCM delivers the service name first)", args)
-	}
-	if args[1] != "watch" {
-		return "", fmt.Errorf("service verb %q is not `watch` — the assay service runs "+
-			"`watch [-c <abs config>]` only", args[1])
+	if len(args) < 1 || args[0] != install.WinSvcWatchVerb {
+		return "", fmt.Errorf("service command line %v is malformed — the assay service runs "+
+			"`watch [-c <abs config>]` only (the ImagePath arguments after the executable)", args)
 	}
 	switch len(args) {
-	case 2:
+	case 1:
 		return "", nil
-	case 4:
+	case 3:
 		// An explicit `-c ""` is an EMPTY value, not an absent one: it
 		// refuses at this same malformed-args gate instead of silently
 		// downgrading to the default-resolution path (the §2.2.5 SYSTEM
 		// profile check is for the absent case, not the empty one).
-		if (args[2] == "-c" || args[2] == "--config") && args[3] != "" {
-			return args[3], nil
+		if (args[1] == "-c" || args[1] == "--config") && args[2] != "" {
+			return args[2], nil
 		}
 	}
-	return "", fmt.Errorf("service arguments %v are malformed — the assay service runs "+
-		"`watch [-c <abs config>]` only", args)
+	return "", fmt.Errorf("service command line %v is malformed — the assay service runs "+
+		"`watch [-c <abs config>]` only (the ImagePath arguments after the executable)", args)
 }
 
 // RunWatchService is the windows service context's daemon entry (the svc

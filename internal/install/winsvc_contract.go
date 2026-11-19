@@ -15,10 +15,16 @@ import (
 	"assay/internal/platform"
 )
 
-// WinSvcName is the SCM database name of the service (§2.2.4) — also the
-// handler's args[0] contract (x/sys windows/svc delivers the service name
-// first) and the svc.Run name. One definition everywhere.
+// WinSvcName is the SCM database name of the service (§2.2.4) and the
+// svc.Run name. One definition everywhere.
 const WinSvcName = "assay"
+
+// WinSvcWatchVerb is the service command line's verb (§2.2.4): the
+// registered ImagePath arguments are exactly `watch [-c <abs config>]` —
+// ONE definition shared by WinSvcArgs (the installer's registration side)
+// and cli.ParseServiceArgs (the handler's parse side), so the two ends of
+// the contract can never drift.
+const WinSvcWatchVerb = "watch"
 
 // WinSvcDisplayName and WinSvcDescription are the SCM-visible identity
 // (§2.2.4 Config{DisplayName, Description}). The description stays one
@@ -39,7 +45,7 @@ func WinSvcArgs(configPath string) ([]string, error) {
 			"-c <abs config> — a -c-less service would resolve the SYSTEM profile and refuses to start; " +
 			"re-run `assay install` (it embeds your absolute config path)")
 	}
-	return []string{"watch", "-c", configPath}, nil
+	return []string{WinSvcWatchVerb, "-c", configPath}, nil
 }
 
 // WinSvcRecoveryType mirrors the mgr recovery-action kinds with our own
