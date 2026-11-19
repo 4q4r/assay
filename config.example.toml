@@ -226,11 +226,18 @@ tie_band_rtt_tolerance = 1.2 # city tie-break band: rtt ≤ head·tolerance join
 # xray_bin = ""              # the SINGLE binary knob (S1): path to the xray binary
                             # every consumer resolves (probe/check fleets, the -test
                             # gate, the core manager). Empty = the owner-ruling
-                            # resolution: the user-local ~/.local/bin/xray first (assay's
-                            # own install, auto-updated), then an existing system xray
+                            # resolution, context-aware: INTERACTIVE — the user-local
+                            # ~/.local/bin/xray first (assay's own install,
+                            # auto-updated), then an existing system xray
                             # (/usr/local/bin/xray, /usr/bin/xray — bound as found, with a
                             # non-blocking floor warning; auto-update inert there), else
-                            # the user-local install target. An explicit value makes
+                            # the user-local install target. WINDOWS SERVICE — the
+                            # managed core <data>/bin/xray first (assay install's
+                            # placement leg guarantees it), then an existing system
+                            # xray; the user-local spot is never consulted there (the
+                            # SYSTEM profile's systemprofile tree is poison) and a
+                            # missing core fails the boot loud, naming `assay install`.
+                            # An explicit value wins in every context and makes
                             # auto-update inert with a one-time loud INFO (S5).
                             #
                             # Per-OS deltas (internal/platform tables): the core file

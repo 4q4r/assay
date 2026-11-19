@@ -128,7 +128,7 @@ assay/
 
 ### 1. Build
 
-You need Go 1.27+. The xray core itself is **managed, user-local**: `assay install` resolves the core per the owner-ruling order — an existing `~/.local/bin/xray` is bound (assay's own binary, auto-updated), else an existing system xray (`/usr/local/bin/xray`, `/usr/bin/xray`) is bound as found (auto-update inert), else the sha256-verified release downloads and installs ATOMICALLY to `~/.local/bin/xray` (user-writable, no elevation; the previous binary stays at `~/.local/bin/xray.previous` for instant rollback; floor-pinned at 26.9.9+). `~/.local/bin` precedes `/usr/bin` on PATH, so assay's copy shadows any later apt-installed xray. The probe, the site check, the `-test` gate, and the core manager all exec the single `[core].xray_bin` knob, which may also point at a binary of your choice (auto-update inert then).
+You need Go 1.27+. The xray core itself is **managed, user-local**: `assay install` resolves the core per the owner-ruling order — an existing `~/.local/bin/xray` is bound (assay's own binary, auto-updated), else an existing system xray (`/usr/local/bin/xray`, `/usr/bin/xray`) is bound as found (auto-update inert), else the sha256-verified release downloads and installs ATOMICALLY to `~/.local/bin/xray` (user-writable, no elevation; the previous binary stays at `~/.local/bin/xray.previous` for instant rollback; floor-pinned at 26.9.9+). `~/.local/bin` precedes `/usr/bin` on PATH, so assay's copy shadows any later apt-installed xray. On Windows this install ALSO materializes the managed copy at `<data>\bin\xray.exe` — the spot the SCM service context binds (it never consults `~/.local/bin` there, because LocalSystem's home is the SYSTEM profile). The probe, the site check, the `-test` gate, and the core manager all exec the single `[core].xray_bin` knob, which may also point at a binary of your choice (auto-update inert then).
 
 ```bash
 go build ./cmd/assay
@@ -342,7 +342,7 @@ The adaptive timeout formula: each classification request gets `clamp(10 × the 
 
 | Knob | Default | Meaning |
 | :-- | :-- | :-- |
-| `xray_bin` | resolution: `~/.local/bin/xray` → system xray → install target | the SINGLE binary knob — probe/check fleets, the `-test` gate, and the core manager all resolve it; a system xray binds as found (auto-update inert); an explicit override makes auto-update inert (S5) |
+| `xray_bin` | resolution: `~/.local/bin/xray` → system xray → install target (windows service: `<data>/bin/xray` → system xray, user-local never consulted) | the SINGLE binary knob — probe/check fleets, the `-test` gate, and the core manager all resolve it; a system xray binds as found (auto-update inert); an explicit override makes auto-update inert (S5) |
 | `auto_update` | `true` | core auto-update for the assay-owned user-local binary (D4 + owner ruling); checked each maintenance wave |
 | `update_interval` | `24h` | auto-update check cadence |
 | `socks_port` | `10810` | the own socks5 inbound, loopback-only (D2) |

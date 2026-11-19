@@ -16,6 +16,19 @@ loudly before anything is created, naming both fixes. `assay install`
 therefore ALWAYS embeds your absolute config path into the service
 command line. Never hand-create the service without `-c`.
 
+The same poisoning applies to the core binary: under LocalSystem,
+`~/.local/bin/xray` means the SYSTEM profile's
+`systemprofile\.local\bin\xray.exe` — a spot that does not exist and is
+never consulted in the service context (a prior release bound it and
+every bootstrap fork/exec'd against the missing path). In the service
+context assay binds the MANAGED core at `<data>\bin\xray.exe`
+(`assay install`'s windows placement leg copies the bound/downloaded
+core there), then an existing system-wide xray; with neither, the
+daemon refuses to start LOUD, naming `assay install` as the fix. Your
+own interactive sessions keep the user-local spot first. If the
+service log ever shows the systemprofile path, re-run
+`assay install -c <abs config>`.
+
 ## 2. Windows PATH precedence — cwd wins in cmd.exe
 
 cmd.exe resolves bare commands against the **current directory first**.
