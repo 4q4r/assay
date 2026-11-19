@@ -950,8 +950,17 @@ func runProbe(
 	return nil
 }
 
+// orphanDisclosureLimit caps the per-node orphan examples in the
+// known-alive disclosure (allocation audit M4/F7, the S7 journal-flood
+// lesson): a wave that drops a whole source must not print one journal line
+// per orphaned entry — the count travels in ONE summary line, up to this
+// many examples are named individually (deterministic: iterated in sorted
+// key order).
+const orphanDisclosureLimit = 5
+
 // updateKnownAliveSet merges probe results into the known-alive set, logs
-// orphaned entries, prunes expired ones, and persists the set.
+// orphaned entries (bounded: one summary + orphanDisclosureLimit examples),
+// prunes expired ones, and persists the set.
 func updateKnownAliveSet(
 	cmd *cobra.Command,
 	opts probe.Options,
@@ -981,14 +990,25 @@ func updateKnownAliveSet(
 		rec.AliveWaveSeq++
 		ka[r.Key] = rec
 	}
-	for k, rec := range ka {
+	var orphanKeys []string
+	for k := range ka {
 		if nodeKeys[k] {
 			continue
 		}
-		remaining := opts.KnownAliveTTL - now.Sub(rec.LastSeen)
-		remaining = max(remaining, 0)
-		outf(cmd.OutOrStdout(), "known-alive but absent from sources — retained (TTL %s remaining): %s\n",
-			remaining.Round(time.Second), k)
+		orphanKeys = append(orphanKeys, k)
+	}
+	if len(orphanKeys) > 0 {
+		// Deterministic disclosure order (map iteration is randomized).
+		sort.Strings(orphanKeys)
+		outf(cmd.OutOrStdout(),
+			"known-alive: %d entries absent from sources — retained within TTL %s (%d examples below)\n",
+			len(orphanKeys), opts.KnownAliveTTL, min(len(orphanKeys), orphanDisclosureLimit))
+		for _, k := range orphanKeys[:min(len(orphanKeys), orphanDisclosureLimit)] {
+			remaining := opts.KnownAliveTTL - now.Sub(ka[k].LastSeen)
+			remaining = max(remaining, 0)
+			outf(cmd.OutOrStdout(), "known-alive but absent from sources — retained (TTL %s remaining): %s\n",
+				remaining.Round(time.Second), k)
+		}
 	}
 	store.PruneKnownAlive(ka, now, opts.KnownAliveTTL)
 	return nil

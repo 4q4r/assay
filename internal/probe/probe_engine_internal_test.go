@@ -569,15 +569,20 @@ func TestSkipFreshWindowSkipsFreshPassed(t *testing.T) {
 		_ = n
 		return &staticInstance{addr: socks.Addr()}, nil
 	})
-	var logText strings.Builder
-	opts := Options{SkipFreshWithin: 30 * time.Minute, Latest: latest, Progress: &logText, TCPPrefilter: prefilterOff()}
+	var logText, debugText strings.Builder
+	opts := Options{
+		SkipFreshWithin: 30 * time.Minute, Latest: latest, Progress: &logText,
+		DebugProgress: &debugText, TCPPrefilter: prefilterOff(),
+	}
 	out, err := Run(context.Background(), nodes, factory, opts, "")
 	require.NoError(t, err)
 	require.Len(t, out, 1, "the skipped node gets NO probe-log entry (its history stays intact)")
 	assert.Equal(t, nodes[1].Key, out[0].Key, "only the stale node is probed")
 	assert.Equal(t, int32(1), probed.Load())
-	assert.Contains(t, logText.String(), "skipping", "the skip must be logged per node")
-	assert.Contains(t, logText.String(), nodes[0].Key)
+	assert.Contains(t, logText.String(), "skipping", "the skip must be journaled as a bounded summary")
+	assert.Contains(t, logText.String(), "1", "the summary carries the skip count")
+	assert.NotContains(t, logText.String(), nodes[0].Key, "per-node skip detail stays off the journal (M4)")
+	assert.Contains(t, debugText.String(), nodes[0].Key, "the debug sink carries the per-node skip line")
 }
 
 func TestSkipFreshIncludesFailedAndSemiPassed(t *testing.T) {
