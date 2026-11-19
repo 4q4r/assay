@@ -716,24 +716,18 @@ func probeOptions(cfg *config.Config, speedtestFlag bool) probe.Options {
 }
 
 func newProbeBatchFactory(cfg *config.Config, p paths) probe.BatchFactory {
+	// Render-once per wave (allocation audit M6/F9): the halving recursion
+	// re-invokes this factory per retry chunk; the cache reuses each node's
+	// outbound definition across those invocations (knobs are wave-
+	// constant; StartTempXrayBatch re-tags per position on its own clone).
+	cache := newBatchOutboundCache()
 	return probe.BatchFactory(func(ctx context.Context, nodes []*model.Node) (probe.BatchSocksInstance, error) {
-		outbounds := make([]map[string]any, len(nodes))
-		for i, n := range nodes {
-			rcfg := render.Config{
-				TCPMaxSeg:      cfg.Render.TCPMaxSeg,
-				TLSFingerprint: cfg.Render.TLSFingerprint,
-			}
-			if rcfg.TCPMaxSeg == 0 {
-				rcfg.TCPMaxSeg = config.DefaultTCPMaxSeg
-			}
-			if rcfg.TLSFingerprint == "" {
-				rcfg.TLSFingerprint = config.DefaultTLSFingerprint
-			}
-			ob, _, err := render.BuildOutbound(n, fmt.Sprintf("probe-out-%d", i), rcfg)
-			if err != nil {
-				return nil, fmt.Errorf("render outbound for batch node %d: %w", i, err)
-			}
-			outbounds[i] = ob
+		outbounds, err := buildBatchOutbounds(render.Config{
+			TCPMaxSeg:      cfg.Render.TCPMaxSeg,
+			TLSFingerprint: cfg.Render.TLSFingerprint,
+		}, cache, nodes)
+		if err != nil {
+			return nil, err
 		}
 		return checker.StartTempXrayBatch(ctx, coreXrayBin(cfg), p.workDir, outbounds)
 	})

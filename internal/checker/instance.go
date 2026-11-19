@@ -385,15 +385,27 @@ func StartTempXrayBatch(
 			"rules": routingRules,
 		},
 	}
-	raw, err := json.Marshal(cfg)
+	// Allocation audit M6/F9: encode straight into the file instead of
+	// materializing the whole config as one intermediate slice (a 1000-
+	// outbound big-batch config is ~0.7-1MB per boot; the halving ladder
+	// multiplies boots on failure). Encoder's bytes are Marshal's plus the
+	// trailing newline it appends — the core's JSON parser accepts both.
+	cfgPath := filepath.Join(dir, "config.json")
+	f, err := os.OpenFile(cfgPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	cfgPath := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+	enc := json.NewEncoder(f)
+	encErr := enc.Encode(cfg)
+	closeErr := f.Close()
+	if encErr != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, encErr
+	}
+	if closeErr != nil {
+		_ = os.RemoveAll(dir)
+		return nil, closeErr
 	}
 	//nolint:gosec // the binary comes from the owner's config.toml — the config file IS the trust root
 	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", cfgPath)
