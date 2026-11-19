@@ -133,19 +133,19 @@ func tcpNode(name, host string, port int) *model.Node {
 		map[string]string{"security": "tls", "type": "tcp"})
 }
 
-// jobsOf wraps nodes into the link-unique probe jobs the engine builds.
+// jobsOf wraps nodes into the identity-unique probe jobs the engine builds
+// (same construction as the engine's dedup: keyed on the stored identity).
 func jobsOf(nodes []*model.Node) []*probeJob {
-	byLink := make(map[string]*probeJob, len(nodes))
+	byKey := make(map[string]*probeJob, len(nodes))
 	ordered := make([]*probeJob, 0, len(nodes))
 	for _, n := range nodes {
-		link := n.Link()
-		job, dup := byLink[link]
+		job, dup := byKey[n.Key]
 		if dup {
 			job.keys = append(job.keys, n.Key)
 			continue
 		}
-		job = &probeJob{link: link, keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
-		byLink[link] = job
+		job = &probeJob{keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
+		byKey[n.Key] = job
 		ordered = append(ordered, job)
 	}
 	return ordered

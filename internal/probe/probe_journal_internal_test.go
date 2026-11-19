@@ -127,7 +127,7 @@ func TestRunContextSkipsStayOffOutcomeOrder(t *testing.T) {
 	site := healthySite(t)
 	socks := newSocksServer(t, site.Listener.Addr().String())
 	var probed atomic.Int32
-	factory := Factory(func(_ context.Context, nd *model.Node) (SocksInstance, error) {
+	factory := Factory(func(_ context.Context, _ *model.Node) (SocksInstance, error) {
 		probed.Add(1)
 		return &staticInstance{addr: socks.Addr()}, nil
 	})

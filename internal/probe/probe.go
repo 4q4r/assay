@@ -63,10 +63,10 @@ type Options struct {
 	// HERE instead — nil (the production wiring) discards them, so the
 	// daemon journal stays bounded at any node count while tests and manual
 	// debugging can still see the full skip list.
-	DebugProgress io.Writer // per-node skip detail (nil = discard)
-	ExitProbe        *bool                             // D8 exit-IP echo (nil = ON)
-	ExitIPURL        string                            // exit-IP echo endpoint override
-	Limiter          *AdaptiveLimiter                  // optional dynamic concurrency limiter
+	DebugProgress io.Writer        // per-node skip detail (nil = discard)
+	ExitProbe     *bool            // D8 exit-IP echo (nil = ON)
+	ExitIPURL     string           // exit-IP echo endpoint override
+	Limiter       *AdaptiveLimiter // optional dynamic concurrency limiter
 	// TCPPrefilter gates the wave-1 TCP pre-filter stage (prefilter.go):
 	// plain TCP-dial each unique endpoint before batching; closed endpoints
 	// never reach an xray boot. Tri-state like ExitProbe: nil (absent) = ON
@@ -130,10 +130,9 @@ type Factory = checker.InstanceFactory
 // Returns a BatchSocksInstance with N addresses matching the input node order.
 type BatchFactory = checker.BatchInstanceFactory
 
-// probeJob is one unique-link unit of work: every node carrying the link
-// takes the outcome.
+// probeJob is one unique-identity unit of work: every node carrying the
+// identity key takes the outcome.
 type probeJob struct {
-	link  string
 	keys  []string
 	host  string
 	node  *model.Node
@@ -185,20 +184,27 @@ func RunWithBatchFactory(
 			skipped[k] = true
 		}
 	}
-	byLink := make(map[string]*probeJob, len(nodes))
+	// Dedup on the STORED identity key (allocation audit M5/F8): the key
+	// hashes scheme|host|port|credential|params, so equal keys are equal
+	// wire semantics; equal links always imply equal keys (pinned by
+	// TestLinkImpliesIdentityKey). The old path rebuilt each node's full
+	// share-link URL per wave ONLY to key this map — dropped. Same-key
+	// twins that differ only in the remark fragment (fragment never
+	// reaches the wire config — pinned by TestFragmentNeverReachesTheWire-
+	// Config) now merge into one job; both keys still take the outcome.
+	byKey := make(map[string]*probeJob, len(nodes))
 	ordered := make([]*probeJob, 0, len(nodes))
 	for _, n := range nodes {
 		if skipped[n.Key] {
 			continue
 		}
-		link := n.Link()
-		job, dup := byLink[link]
+		job, dup := byKey[n.Key]
 		if dup {
-			job.keys = append(job.keys, n.Key) // identical links probe once; both nodes take the outcome
+			job.keys = append(job.keys, n.Key) // identical identities probe once; both nodes take the outcome
 			continue
 		}
-		job = &probeJob{link: link, keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
-		byLink[link] = job
+		job = &probeJob{keys: []string{n.Key}, host: n.Host, node: n, order: len(ordered)}
+		byKey[n.Key] = job
 		ordered = append(ordered, job)
 	}
 
