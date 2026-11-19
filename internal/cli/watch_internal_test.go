@@ -392,7 +392,7 @@ func TestWatchFetchContinuesWithBrokenPlugin(t *testing.T) {
 	reg := plugins.NewRegistry()
 	reg.Set(&plugins.Plugin{ID: "healthy", Path: "healthy.lua", Code: []byte(`
 		return function()
-			return { assay.node{ raw = "vless://a@h:1?s=1" }, assay.node{ raw = "vless://b@h:2?s=1" } }
+			return { assay.node{ raw = "vless://a@h:1?security=tls&s=1" }, assay.node{ raw = "vless://b@h:2?security=tls&s=1" } }
 		end`)})
 	reg.Set(&plugins.Plugin{ID: "broken", Path: "broken.lua", Code: []byte(`
 		return function() error("discovery exploded") end`)})

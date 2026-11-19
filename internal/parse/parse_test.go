@@ -99,7 +99,7 @@ func TestRejectedSchemesAreCounted(t *testing.T) {
 		"ssr://base64stuff",
 		"vless://u@ok.example.com:443?security=tls&type=tcp#ok",
 	}
-	res := parse.Lines("s", strings.Join(lines, "\n"))
+	res := parse.Lines("s", []byte(strings.Join(lines, "\n")), nil)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, 3, res.Rejected, "tuic/hysteria-v1/ssr are rejected (W7 item 10: hysteria2/hy2 moved to parsed — the core has a real hysteria2 client)")
 	assert.Equal(t, "ok.example.com", res.Nodes[0].Host)
@@ -109,7 +109,7 @@ func TestRejectedSchemesAreCounted(t *testing.T) {
 // TestSSIsParsedNotRejected pins the W5 policy shift: ss links are PARSED
 // (acceptance is a filter policy — [filter].protocols), never scheme-rejected.
 func TestSSIsParsedNotRejected(t *testing.T) {
-	res := parse.Lines("s", "ss://YWVzLTI1Ni1nY206cHc@h:443")
+	res := parse.Lines("s", []byte("ss://YWVzLTI1Ni1nY206cHc@h:443"), nil)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, 0, res.Rejected, "ss is parsed; acceptance is the filter's allowlist decision")
 	assert.Equal(t, "ss", res.Nodes[0].Scheme)
@@ -117,7 +117,7 @@ func TestSSIsParsedNotRejected(t *testing.T) {
 
 func TestBase64BodyIsDetectedAndDecoded(t *testing.T) {
 	body := b64("vless://u@b64.example.com:443?security=tls&type=tcp#a\nvless://u2@b64b.example.com:443?security=tls&type=tcp#b")
-	res := parse.Lines("s", body)
+	res := parse.Lines("s", []byte(body), nil)
 	require.Len(t, res.Nodes, 2)
 	assert.Equal(t, 0, res.Rejected)
 }
@@ -125,14 +125,14 @@ func TestBase64BodyIsDetectedAndDecoded(t *testing.T) {
 func TestBase64WithURLEncodingAndNoPadding(t *testing.T) {
 	body := b64URL("vless://u@nopad.example.com:443?security=tls&type=tcp#x")
 	body = strings.TrimRight(body, "=")
-	res := parse.Lines("s", body)
+	res := parse.Lines("s", []byte(body), nil)
 	require.Len(t, res.Nodes, 1)
 	assert.Equal(t, "nopad.example.com", res.Nodes[0].Host)
 }
 
 func TestPlainBodyPassesThrough(t *testing.T) {
 	body := "vless://u@p1.example.com:443?security=tls&type=tcp#a\n\n# just a comment\nvless://u2@p2.example.com:443?security=tls&type=tcp#b"
-	res := parse.Lines("s", body)
+	res := parse.Lines("s", []byte(body), nil)
 	require.Len(t, res.Nodes, 2)
 }
 
@@ -146,7 +146,7 @@ func TestMalformedInputsAreCountedNotFatal(t *testing.T) {
 		"::::not a link at all::::",         // garbage line
 		"vmess://bm90IGpzb24gYXQgYWxsIQ==",  // base64 of "not json at all!"
 	}
-	res := parse.Lines("s", strings.Join(lines, "\n"))
+	res := parse.Lines("s", []byte(strings.Join(lines, "\n")), nil)
 	assert.Len(t, res.Nodes, 1)
 	assert.Equal(t, 6, res.Malformed, "malformed lines are counted, never fatal")
 }
@@ -302,4 +302,117 @@ func TestVMESSHeaderTypePreserved(t *testing.T) {
 	assert.Equal(t, "tcp", n.Network, "net wins as the network")
 	assert.Equal(t, "http", n.Params["headerType"], "the header datum is preserved as headerType")
 	assert.Equal(t, "tcp", n.Params["type"])
+}
+
+// recordingPrefilter is a LinePrefilter test double that rejects lines by
+// exact match and records every MarkSeen — enough to pin Lines' seam
+// behavior (when the hook fires, what gets counted, what gets marked).
+type recordingPrefilter struct {
+	rejects map[string]string
+	marked  []string
+	asked   []string
+}
+
+func (r *recordingPrefilter) PreReject(_ []byte, line []byte) string {
+	r.asked = append(r.asked, string(line))
+	if class, ok := r.rejects[string(line)]; ok {
+		return class
+	}
+	return ""
+}
+
+func (r *recordingPrefilter) MarkSeen(line string) {
+	r.marked = append(r.marked, line)
+}
+
+// TestLinesPreRejectSeam pins the F3 scan loop's contract: the prefilter is
+// consulted with the TRIMMED raw line before any full parse, pre-rejects are
+// counted by class and never produce nodes, survivors are MarkSeen'd with
+// the line string they parsed from (so a prefilter dedup can key on it), and
+// a nil prefilter changes nothing.
+func TestLinesPreRejectSeam(t *testing.T) {
+	keep := "vless://k@keep.example.com:443?security=reality&type=tcp#k"
+	body := strings.Join([]string{
+		keep,
+		"vless://n@nosec.example.com:443?security=none#n",
+		keep + "-again-x",
+	}, "\n") + "\n"
+
+	pre := &recordingPrefilter{rejects: map[string]string{
+		"vless://n@nosec.example.com:443?security=none#n": "no-tls-security",
+	}}
+	res := parse.Lines("s", []byte(body), pre)
+	require.Len(t, res.Nodes, 2)
+	assert.Equal(t, 1, res.PreRejected)
+	assert.Equal(t, map[string]int{"no-tls-security": 1}, res.PreRejectedKinds)
+	require.Len(t, pre.marked, 2, "exactly the two full-parse survivors are marked")
+	assert.Equal(t, keep, pre.marked[0], "MarkSeen receives the trimmed line string")
+	require.Len(t, pre.asked, 3, "every accepted-scheme line is consulted")
+
+	// The marked line string is the exact string the full parse consumed:
+	// feeding it to Link yields the same node identity the scan produced.
+	n, err := parse.Link("s", pre.marked[0])
+	require.NoError(t, err)
+	assert.Equal(t, res.Nodes[0].Key, n.Key)
+
+	// Nil prefilter: identical node set, zero pre-rejects.
+	resNil := parse.Lines("s", []byte(body), nil)
+	require.Len(t, resNil.Nodes, 3)
+	assert.Equal(t, 0, resNil.PreRejected)
+}
+
+// TestLinesBlankCountsMatchPreF3Semantics pins the byte scanner's line
+// segmentation against the pre-F3 reference (ReplaceAll CRLF + strings.Split
+// + TrimSpace): the blank-line counts and parseable-line sets the old
+// scanner produced must be reproduced verbatim — a trailing newline is a
+// final empty segment, an empty body is one empty segment, CRLF lines trim
+// identically without the full-body ReplaceAll pass.
+func TestLinesBlankCountsMatchPreF3Semantics(t *testing.T) {
+	cases := []string{
+		"",
+		"\n",
+		"a\n",
+		"a",
+		"a\nb",
+		"a\nb\n",
+		"a\r\nb\r\n",
+		"\r\n\r\n",
+		"a\n\nb\n",
+		"\n\n",
+		"vless://u@x.example.com:443?security=tls#x\r\n\r\n# c\r\n",
+	}
+	for _, tc := range cases {
+		wantBlank := 0
+		for raw := range strings.SplitSeq(strings.ReplaceAll(tc, "\r\n", "\n"), "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+				wantBlank++
+			}
+		}
+		res := parse.Lines("s", []byte(tc), nil)
+		assert.Equal(t, wantBlank, res.Blank, "blank count of %q must match the pre-F3 scanner", tc)
+	}
+}
+
+// TestLinesSeamCountersPostFusion pins the fused scan's allocation contract
+// at the parse-package level: one full-body materialization ONLY for a
+// base64 body (the decode), none for a plain body, one full parse per
+// pre-reject survivor.
+func TestLinesSeamCountersPostFusion(t *testing.T) {
+	plain := "vless://p@plain.example.com:443?security=tls#p\nvless://p2@plain2.example.com:443?security=tls#p2"
+	encoded := b64("vless://b@b64.example.com:443?security=tls#b")
+
+	parse.WithSeam(func(seam *parse.Seam) {
+		res := parse.Lines("s", []byte(plain), nil)
+		require.Len(t, res.Nodes, 2)
+		assert.Equal(t, int64(0), seam.BodyCopies.Load(),
+			"a plain body scans in place: zero full-body copies")
+		assert.Equal(t, int64(2), seam.FullParses.Load())
+
+		res = parse.Lines("s", []byte(encoded), nil)
+		require.Len(t, res.Nodes, 1)
+		assert.Equal(t, int64(1), seam.BodyCopies.Load(),
+			"a base64 body pays exactly the decode")
+		assert.Equal(t, int64(3), seam.FullParses.Load())
+	})
 }

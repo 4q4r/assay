@@ -231,7 +231,7 @@ func TestConfiglessWaveDataStagesWorkThenRenderLoud(t *testing.T) {
 	reg := plugins.NewRegistry()
 	reg.Set(&plugins.Plugin{ID: "stub", Path: "stub.lua", Code: []byte(`
 		return function()
-			return { assay.node{ raw = "vless://a@h1.example.com:443?s=1" }, assay.node{ raw = "vless://b@h2.example.com:443?s=1" } }
+			return { assay.node{ raw = "vless://a@h1.example.com:443?security=tls&s=1" }, assay.node{ raw = "vless://b@h2.example.com:443?security=tls&s=1" } }
 		end`)})
 	cmd := &cobra.Command{}
 	out := &bytes.Buffer{}
@@ -285,7 +285,7 @@ func TestWatchConfiglessBootStaysUp(t *testing.T) {
 	require.NoError(t, os.MkdirAll(pluginsDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(pluginsDir, "stub.lua"), []byte(`
 		return function()
-			return { assay.node{ raw = "vless://a@h1.example.com:443?s=1" } }
+			return { assay.node{ raw = "vless://a@h1.example.com:443?security=tls&s=1" } }
 		end`), 0o600))
 
 	sigs := make(chan os.Signal, 1)

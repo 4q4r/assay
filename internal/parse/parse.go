@@ -4,10 +4,13 @@
 // (tuic, hysteria v1, ssr, socks/http/https), and never fails fatally on
 // malformed lines — they are counted and reported. Protocol acceptance is a
 // FILTER policy ([filter].protocols allowlist — W14 default: every rendered
-// protocol): parse normalizes everything it can.
+// protocol): parse normalizes everything it can. Since the allocation-audit
+// F3 wave, the scan can consult a LinePrefilter on the RAW line so the
+// cheaply-rejectable classes never pay the full parse.
 package parse
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -42,6 +45,11 @@ var rejectedSchemes = map[string]bool{
 	"ssr": true, "socks": true, "http": true, "https": true,
 }
 
+var (
+	schemeSep      = []byte("://")
+	commentSlashes = []byte("//")
+)
+
 // Result aggregates one parse wave over one or many source bodies.
 type Result struct {
 	Nodes         []*model.Node
@@ -49,6 +57,31 @@ type Result struct {
 	RejectedKinds map[string]int // scheme -> count
 	Malformed     int            // accepted-scheme links that failed to parse
 	Blank         int            // blank/comment lines
+	// PreRejected counts links rejected by the LinePrefilter on the RAW
+	// line — before any per-link allocation (the F3 fused pre-reject). The
+	// classes use the same vocabulary as the filter stage's drop report
+	// (duplicate / no-tls-security / insecure), so the two stages aggregate
+	// into identical funnel buckets.
+	PreRejected      int
+	PreRejectedKinds map[string]int
+}
+
+// LinePrefilter is the fused-filter seam (allocation audit F3): cheap
+// verdicts on the RAW accepted-scheme link line BEFORE the full parse
+// allocates. parse defines the seam at its consumer (the scan loop); the
+// filter package implements it from the filter policy, so rejection policy
+// stays in filter and the stage contracts stay intact.
+type LinePrefilter interface {
+	// PreReject returns the drop class for a raw line that must not reach
+	// the full parse; "" means proceed. scheme is the lowercased scheme the
+	// scan already extracted; line is the trimmed raw line. Both are
+	// sub-slices of the body — implementations must not retain them.
+	PreReject(scheme, line []byte) string
+	// MarkSeen records a line that reached the full parse, feeding the
+	// raw-line dedup. Called only after a SUCCESSFUL Link, so a malformed
+	// line's duplicates keep their malformed class instead of shifting to
+	// duplicate.
+	MarkSeen(line string)
 }
 
 // IsSupported reports whether a line starts with an accepted scheme.
@@ -66,61 +99,176 @@ func schemeOf(line string) string {
 	return strings.ToLower(scheme)
 }
 
+// schemeOfBytes is the zero-copy byte variant of schemeOf over a line slice.
+// Unlike strings.ToLower — which returns the input unchanged when no upper
+// byte is present — bytes.ToLower ALWAYS allocates a copy, so the fast path
+// here hands back the input slice untouched and only mixed-case spellings
+// pay the copy.
+func schemeOfBytes(line []byte) []byte {
+	scheme, _, ok := bytes.Cut(line, schemeSep)
+	if !ok {
+		return nil
+	}
+	if !hasUpperByte(scheme) {
+		return scheme
+	}
+	return bytes.ToLower(scheme)
+}
+
+func hasUpperByte(b []byte) bool {
+	for _, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// isSupportedScheme is the byte variant of IsSupported's scheme test.
+func isSupportedScheme(scheme []byte) bool {
+	switch string(scheme) {
+	case SchemeVLESS, SchemeVMESS, SchemeTrojan, SchemeSS, SchemeHysteria2, "hy2":
+		return true
+	}
+	return false
+}
+
+// linesSeq yields the newline-separated segments of body with EXACTLY
+// strings.Split semantics: a trailing newline produces one final empty
+// segment, and an empty body yields a single empty segment (the blank-line
+// counts the pre-F3 tree produced must be reproduced verbatim).
+func linesSeq(body []byte) func(func([]byte) bool) {
+	return func(yield func([]byte) bool) {
+		rest := body
+		for {
+			var raw []byte
+			i := bytes.IndexByte(rest, '\n')
+			if i >= 0 {
+				raw, rest = rest[:i], rest[i+1:]
+			} else {
+				raw, rest = rest, nil
+			}
+			if !yield(raw) {
+				return
+			}
+			if i < 0 {
+				return
+			}
+		}
+	}
+}
+
 // Lines parses a whole fetched body. Base64 bodies are detected and decoded
-// first; remaining lines are parsed one by one.
-func Lines(source, body string) *Result {
-	res := &Result{RejectedKinds: map[string]int{}}
-	body = decodeIfBase64(body)
-	for _, raw := range splitLines(body) {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+// first; the remaining lines are scanned in place (zero-copy byte slices) —
+// the only copies are the base64 decode (one per base64 body) and the one
+// line string per pre-reject SURVIVOR that reaches the string-based full
+// parse. A non-nil pre rejects the cheap classes at raw-line level before
+// any per-link work; nil keeps the pure-parse behavior.
+func Lines(source string, body []byte, pre LinePrefilter) *Result {
+	res := &Result{RejectedKinds: map[string]int{}, PreRejectedKinds: map[string]int{}}
+	if s := seam(); s != nil {
+		s.LinesInvocations.Add(1)
+	}
+	if decoded, ok := decodeIfBase64Bytes(body); ok {
+		body = decoded
+		// F3 instrument: the whole-body base64 decode is the one full-body
+		// materialization a body can pay (plain bodies scan in place).
+		if s := seam(); s != nil {
+			s.BodyCopies.Add(1)
+		}
+	}
+	for raw := range linesSeq(body) {
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 || line[0] == '#' || bytes.HasPrefix(line, commentSlashes) {
 			res.Blank++
 			continue
 		}
-		scheme := schemeOf(line)
-		if scheme == "" {
+		scheme := schemeOfBytes(line)
+		if len(scheme) == 0 {
 			res.Malformed++
 			continue
 		}
-		if rejectedSchemes[scheme] {
+		if rejectedSchemes[string(scheme)] {
 			res.Rejected++
-			res.RejectedKinds[scheme]++
+			res.RejectedKinds[string(scheme)]++
 			continue
 		}
-		if !IsSupported(line) {
+		if !isSupportedScheme(scheme) {
 			res.Malformed++
 			continue
 		}
-		n, err := Link(source, line)
-		if err != nil {
-			res.Malformed++
-			continue
-		}
-		res.Nodes = append(res.Nodes, n)
+		acceptLine(source, scheme, line, pre, res)
 	}
 	return res
 }
 
-// decodeIfBase64 decodes a whole-body base64 payload: subscription files are
-// often a single base64 blob of newline-separated links. Detection is strict —
-// the body must have no link scheme at all, decode cleanly, and the decoded
-// text must contain at least one scheme.
-func decodeIfBase64(body string) string {
-	trimmed := strings.TrimSpace(body)
-	if trimmed == "" || strings.Contains(trimmed, "://") {
-		return body
+// acceptLine applies the F3 prefilter seam and the full parse to one
+// accepted-scheme line. A pre-reject is counted by class and allocates
+// nothing; a survivor pays the one line-string copy the string-based full
+// parse needs (net/url) and is marked seen on success, so a prefilter dedup
+// never records lines the full parse rejected.
+func acceptLine(source string, scheme, line []byte, pre LinePrefilter, res *Result) {
+	if pre != nil {
+		if class := pre.PreReject(scheme, line); class != "" {
+			res.PreRejected++
+			res.PreRejectedKinds[class]++
+			if s := seam(); s != nil {
+				s.PreRejects.Add(1)
+			}
+			return
+		}
 	}
-	decoded, err := decodeFlexible(trimmed)
-	if err != nil || !strings.Contains(decoded, "://") {
-		return body
+	lineStr := string(line)
+	n, err := Link(source, lineStr)
+	if s := seam(); s != nil {
+		s.FullParses.Add(1)
 	}
-	return decoded
+	if err != nil {
+		res.Malformed++
+		return
+	}
+	if pre != nil {
+		pre.MarkSeen(lineStr)
+	}
+	res.Nodes = append(res.Nodes, n)
 }
 
-// splitLines handles LF and CRLF.
-func splitLines(body string) []string {
-	return strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+// decodeIfBase64Bytes decodes a whole-body base64 payload: subscription
+// files are often a single base64 blob of newline-separated links. Detection
+// is strict — the body must have no link scheme at all, decode cleanly, and
+// the decoded text must contain at least one scheme.
+func decodeIfBase64Bytes(body []byte) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || bytes.Contains(trimmed, schemeSep) {
+		return body, false
+	}
+	decoded, err := decodeFlexibleBytes(trimmed)
+	if err != nil || !bytes.Contains(decoded, schemeSep) {
+		return body, false
+	}
+	return decoded, true
 }
+
+// decodeFlexibleBytes is decodeFlexible's whole-body variant: same encoder
+// ladder, but it decodes into one pre-sized buffer instead of a string
+// round-trip.
+func decodeFlexibleBytes(s []byte) ([]byte, error) {
+	var lastErr error
+	for _, enc := range base64Encodings {
+		dst := make([]byte, enc.DecodedLen(len(s)))
+		n, err := enc.Decode(dst, s)
+		if err == nil {
+			return dst[:n], nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// splitLines is gone (allocation audit F3): linesSeq scans the body in
+// place, and CRLF handling lives in the TrimSpace the scan already applies
+// to every line — a trailing \r is whitespace, so both encodings yield
+// identical trimmed lines without the full-body ReplaceAll pass.
 
 // Link parses a single share-link URI into a normalized node.
 func Link(source, line string) (*model.Node, error) {
@@ -400,17 +548,21 @@ func vmessParams(raw map[string]any, get func(string) string) map[string]string 
 	return params
 }
 
+// base64Encodings is the standard-or-URL-safe, padding-optional decoder
+// ladder shared by decodeFlexible (per-link payloads) and
+// decodeFlexibleBytes (whole bodies).
+var base64Encodings = []*base64.Encoding{
+	base64.StdEncoding,
+	base64.RawStdEncoding,
+	base64.URLEncoding,
+	base64.RawURLEncoding,
+}
+
 // decodeFlexible decodes standard or URL-safe base64, padding optional.
 func decodeFlexible(s string) (string, error) {
 	s = strings.TrimSpace(s)
-	encoders := []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	}
 	var lastErr error
-	for _, enc := range encoders {
+	for _, enc := range base64Encodings {
 		b, err := enc.DecodeString(s)
 		if err == nil {
 			return string(b), nil
